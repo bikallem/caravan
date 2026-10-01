@@ -1,0 +1,4 @@
+(library
+ (name affect_http)
+ (public_name affect-http)
+ (libraries affect affect.unix))

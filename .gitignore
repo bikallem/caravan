@@ -1,0 +1,10 @@
+# direnv / nix-direnv cache
+.direnv/
+
+# nix build output
+result
+result-*
+
+# dune
+_build/
+*.install
