@@ -21,6 +21,17 @@
           system:
           let
             pkgs = nixpkgs.legacyPackages.${system};
+            windtrapRelease = rec {
+              version = "0.2.0";
+              src = pkgs.fetchurl {
+                url = "https://github.com/invariant-hq/windtrap/releases/download/v${version}/windtrap-${version}.tbz";
+                hash = "sha256-LmGob4yXUCwfilk8KOJV1ZGkSxUzxu7YzQyEevo9dyo=";
+              };
+              meta = {
+                homepage = "https://github.com/invariant-hq/windtrap";
+                license = pkgs.lib.licenses.isc;
+              };
+            };
             ocamlPackages = pkgs.ocaml-ng.ocamlPackages_5_5.overrideScope (
               final: prev: {
                 # Not packaged in nixpkgs yet: https://ocaml.org/p/affect/latest
@@ -59,6 +70,30 @@
                     };
                   }
                 ) { };
+
+                # nixpkgs ships windtrap 0.1.0 and no ppx_windtrap. Both 0.2.0
+                # packages are built from the same release tarball.
+                windtrap = final.buildDunePackage {
+                  pname = "windtrap";
+                  inherit (windtrapRelease) version src;
+                  minimalOCamlVersion = "5.0";
+                  meta = windtrapRelease.meta // {
+                    description = "One library for all your OCaml tests";
+                  };
+                };
+
+                ppx_windtrap = final.buildDunePackage {
+                  pname = "ppx_windtrap";
+                  inherit (windtrapRelease) version src;
+                  minimalOCamlVersion = "5.0";
+                  propagatedBuildInputs = [
+                    final.windtrap
+                    final.ppxlib
+                  ];
+                  meta = windtrapRelease.meta // {
+                    description = "Inline tests, coverage and mutation testing for windtrap";
+                  };
+                };
               }
             );
           in
@@ -86,6 +121,10 @@
 
               # Dependencies
               affect
+
+              # Test dependencies
+              windtrap
+              ppx_windtrap
 
               # Dev tools
               ocaml-lsp

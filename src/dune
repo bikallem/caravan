@@ -1,4 +1,8 @@
 (library
  (name affect_http)
  (public_name affect-http)
- (libraries affect affect.unix))
+ (libraries affect affect.unix threads.posix)
+ (instrumentation
+  (backend ppx_windtrap.mutate))
+ (instrumentation
+  (backend ppx_windtrap.coverage)))

@@ -23,4 +23,12 @@
    (>= 5.5.0))
   (affect
    (>= 0.0.0))
+  (windtrap
+   (and
+    :with-test
+    (>= 0.2.0)))
+  (ppx_windtrap
+   (and
+    :with-test
+    (>= 0.2.0)))
   (odoc :with-doc)))

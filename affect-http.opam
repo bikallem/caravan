@@ -12,6 +12,8 @@ depends: [
   "dune" {>= "3.20"}
   "ocaml" {>= "5.5.0"}
   "affect" {>= "0.0.0"}
+  "windtrap" {with-test & >= "0.2.0"}
+  "ppx_windtrap" {with-test & >= "0.2.0"}
   "odoc" {with-doc}
 ]
 build: [
