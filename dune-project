@@ -4,6 +4,9 @@
 
 (generate_opam_files true)
 
+(source
+ (github bikallem/affect-http))
+
 (authors "Bikal Gurung <gbikal@gmail.com>")
 
 (maintainers "Bikal Gurung <gbikal@gmail.com>")
