@@ -1,0 +1,3 @@
+(executables
+ (names l1_async l2_actions l3_cancel l4_echo_server)
+ (libraries affect affect.unix threads.posix))
