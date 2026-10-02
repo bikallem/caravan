@@ -129,7 +129,7 @@
               # Dev tools
               ocaml-lsp
               utop
-              ocamlformat
+              ocp-indent
               odoc
             ];
           };
