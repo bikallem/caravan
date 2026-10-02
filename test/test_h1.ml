@@ -603,8 +603,167 @@ let h1_body_tests =
            equal string body (read_body ~size:read_size b);
            equal string next (read_n r (String.length next + 1))) ]
 
+(* Chunked bodies *)
+
+let limits = H1_parse.default_limits
+
+(* The decoded body, its trailers and what follows it, or the error. *)
+let show_chunked ?max_body input =
+  let r = Buf_reader.of_string input in
+  let b = H1_body.chunked ?max_body ~limits r in
+  match Body.to_string b with
+  | body ->
+      let trailers =
+        String.concat "" (List.map (fun (n, v) -> Printf.sprintf " [%s: %s]" n v) (Headers.to_list (Body.trailers b)))
+      in
+      Printf.sprintf "%S%s rest %S" body trailers (read_n r 100)
+  | exception H1_error.E e -> Format.asprintf "%a" H1_error.pp e
+  | exception Body.Truncated -> "truncated"
+
+let chunked_table ?max_body cases =
+  String.concat "\n" (List.map (fun s -> Printf.sprintf "%S\n=> %s" s (show_chunked ?max_body s)) cases)
+
+let chunked_tests =
+  group "H1_body.chunked"
+    [ test "valid chunked bodies" (fun () ->
+          expect
+            (chunked_table
+               [ "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\nNEXT";
+                 "0\r\n\r\n";
+                 "A\r\n0123456789\r\na\r\nabcdefghij\r\n000\r\n\r\n";
+                 "0005\r\nhello\r\n0\r\n\r\n";
+                 "5;name\r\nhello\r\n0;last=1\r\n\r\n";
+                 "5 ; a = b ;c\r\nhello\r\n0\r\n\r\n";
+                 "5;q=\"a \\\"b;\"\r\nhello\r\n0\r\n\r\n";
+                 "5\r\nhello\r\n0\r\nX-Checksum: abc\r\nX-Other:  v \r\n\r\nNEXT";
+                 "5;a=\"\\x\"\r\nhello\r\n0\r\n\r\n";
+                 "5;a=\"\\\\\"\r\nhello\r\n0\r\n\r\n";
+                 "000000000000005\r\nhello\r\n0\r\n\r\n" ])
+          @@ __POS_OF__ {|
+            "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\nNEXT"
+            => "hello world" rest "NEXT"
+            "0\r\n\r\n"
+            => "" rest ""
+            "A\r\n0123456789\r\na\r\nabcdefghij\r\n000\r\n\r\n"
+            => "0123456789abcdefghij" rest ""
+            "0005\r\nhello\r\n0\r\n\r\n"
+            => "hello" rest ""
+            "5;name\r\nhello\r\n0;last=1\r\n\r\n"
+            => "hello" rest ""
+            "5 ; a = b ;c\r\nhello\r\n0\r\n\r\n"
+            => "hello" rest ""
+            "5;q=\"a \\\"b;\"\r\nhello\r\n0\r\n\r\n"
+            => "hello" rest ""
+            "5\r\nhello\r\n0\r\nX-Checksum: abc\r\nX-Other:  v \r\n\r\nNEXT"
+            => "hello" [X-Checksum: abc] [X-Other: v] rest "NEXT"
+            "5;a=\"\\x\"\r\nhello\r\n0\r\n\r\n"
+            => "hello" rest ""
+            "5;a=\"\\\\\"\r\nhello\r\n0\r\n\r\n"
+            => "hello" rest ""
+            "000000000000005\r\nhello\r\n0\r\n\r\n"
+            => "hello" rest ""
+            |});
+      test "malformed and truncated chunked bodies" (fun () ->
+          expect
+            (chunked_table
+               [ "5\r\nhelloX\r\n0\r\n\r\n"; "g\r\n"; "\r\nhello\r\n"; "5 x\r\nhello\r\n";
+                 "-5\r\nhello\r\n"; "5 \r\nhello\r\n"; "5;\r\nhello\r\n"; "5;a=\r\nhello\r\n";
+                 "5;a=\"x\r\nhello\r\n"; "5;a=\"\\\001\"\r\nhello\r\n"; "5;a=\"\\\r\nhello\r\n";
+                 "1000000000000000\r\n"; "5\nhello\r\n";
+                 "5\r\nhello\r\n0\r\nBad Trailer: x\r\n\r\n"; "5\r\nhel"; "5\r\nhello\r\n";
+                 "5\r\nhello\r\n0\r\nX: y\r\n"; "5\r\nhello" ])
+          @@ __POS_OF__ {|
+            "5\r\nhelloX\r\n0\r\n\r\n"
+            => 400 Bad Request (missing CRLF after chunk data)
+            "g\r\n"
+            => 400 Bad Request (invalid chunk size)
+            "\r\nhello\r\n"
+            => 400 Bad Request (invalid chunk size)
+            "5 x\r\nhello\r\n"
+            => 400 Bad Request (invalid chunk size line)
+            "-5\r\nhello\r\n"
+            => 400 Bad Request (invalid chunk size)
+            "5 \r\nhello\r\n"
+            => 400 Bad Request (invalid chunk size line)
+            "5;\r\nhello\r\n"
+            => 400 Bad Request (invalid chunk extension)
+            "5;a=\r\nhello\r\n"
+            => 400 Bad Request (invalid chunk extension)
+            "5;a=\"x\r\nhello\r\n"
+            => 400 Bad Request (unterminated chunk extension value)
+            "5;a=\"\\\001\"\r\nhello\r\n"
+            => 400 Bad Request (invalid chunk extension value)
+            "5;a=\"\\\r\nhello\r\n"
+            => 400 Bad Request (invalid chunk extension value)
+            "1000000000000000\r\n"
+            => 400 Bad Request (chunk size too large)
+            "5\nhello\r\n"
+            => 400 Bad Request (invalid chunk size line)
+            "5\r\nhello\r\n0\r\nBad Trailer: x\r\n\r\n"
+            => 400 Bad Request (invalid field name "Bad Trailer")
+            "5\r\nhel"
+            => truncated
+            "5\r\nhello\r\n"
+            => truncated
+            "5\r\nhello\r\n0\r\nX: y\r\n"
+            => truncated
+            "5\r\nhello"
+            => truncated
+            |});
+      test "max_body" (fun () ->
+          expect
+            (chunked_table ~max_body:10
+               [ "5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n"; "5\r\nhello\r\n6\r\nworld!\r\n0\r\n\r\n";
+                 "b\r\n" ])
+          @@ __POS_OF__ {|
+            "5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n"
+            => "helloworld" rest ""
+            "5\r\nhello\r\n6\r\nworld!\r\n0\r\n\r\n"
+            => 413 Content Too Large
+            "b\r\n"
+            => 413 Content Too Large
+            |});
+      test "of_framing" (fun () ->
+          let reads = ref 0 in
+          let r = Buf_reader.make (fun _ _ _ -> incr reads; 0) in
+          equal (option int) (Some 0) (Body.length (H1_body.of_framing ~limits r No_body));
+          raises (H1_error.E H1_error.Content_too_large) (fun () ->
+              H1_body.of_framing ~max_body:10 ~limits r (Fixed 11));
+          equal int 0 !reads;
+          let r = Buf_reader.of_string "helloXchunk" in
+          equal string "hello"
+            (Body.to_string (H1_body.of_framing ~max_body:5 ~limits r (Fixed 5)));
+          equal string "X" (read_n r 1);
+          equal string "ab"
+            (Body.to_string
+               (H1_body.of_framing ~limits (Buf_reader.of_string "2\r\nab\r\n0\r\n\r\n") Chunked))) ]
+
+(* Chunked encoding of a body in pieces, for the round-trip property. *)
+let encode_chunked pieces ext trailers =
+  let chunk p = Printf.sprintf "%x%s\r\n%s\r\n" (String.length p) ext p in
+  String.concat "" (List.map chunk (List.filter (fun p -> p <> "") pieces))
+  ^ "0" ^ ext ^ "\r\n"
+  ^ String.concat "" (List.map (fun (n, v) -> n ^ ": " ^ v ^ "\r\n") trailers)
+  ^ "\r\n"
+
+let chunked_props =
+  group "H1_body.chunked properties"
+    [ prop "decodes what was encoded, however the input is split"
+        Gen.(
+          triple
+            (pair (list ~size:(int_range 0 5) string) (of_list [ ""; ";a"; ";a=b"; " ; a = \"q\"" ]))
+            (pair (list ~size:(int_range 0 3) (pair token_gen (map String.trim (string_of (char_range 'a' 'z'))))) string)
+            (triple (int_range 1 9) (int_range 1 9) (int_range 1 9)))
+        (fun ((pieces, ext), (trailers, next), (chunk, size, read_size)) ->
+           let r = Buf_reader.of_string ~chunk ~size (encode_chunked pieces ext trailers ^ next) in
+           let b = H1_body.chunked ~limits r in
+           equal string (String.concat "" pieces) (read_body ~size:read_size b);
+           equal (list (pair string string)) trailers (Headers.to_list (Body.trailers b));
+           equal string next (read_n r (String.length next + 1))) ]
+
 let () =
   exit
     (run "h1"
        [ buf_reader_tests; buf_reader_model; request_head_tests; head_props; framing_tests;
-         target_tests; framing_props; h1_body_tests ])
+         target_tests; framing_props; h1_body_tests; chunked_tests;
+         chunked_props ])
