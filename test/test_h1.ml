@@ -3,6 +3,7 @@ open Affect_http
 module Buf_reader = Private.Buf_reader
 
 let is_invalid_arg = function Invalid_argument _ -> true | _ -> false
+let ignore3 _ _ _ = ()
 
 (* Buf_reader *)
 
@@ -862,9 +863,85 @@ let handle_tests =
            is_true (H1_body.is_complete t);
            equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100)) ]
 
+(* Buf_writer *)
+
+module Buf_writer = Private.Buf_writer
+
+(* A writer whose output calls are recorded. *)
+let recorded ?size () =
+  let calls = ref [] in
+  let w = Buf_writer.make ?size (fun buf off len -> calls := Bytes.sub_string buf off len :: !calls) in
+  (w, fun () -> List.rev !calls)
+
+let buf_writer_tests =
+  group "Buf_writer"
+    [ test "writes are buffered until flush" (fun () ->
+          let w, calls = recorded () in
+          Buf_writer.write_string w "HTTP/1.1 200 OK\r\n";
+          Buf_writer.write_char w 'X';
+          Buf_writer.write_bytes w (Bytes.of_string "--abc--") 2 3;
+          equal (list string) [] (calls ());
+          equal int 21 (Buf_writer.buffered w);
+          Buf_writer.flush w;
+          equal (list string) [ "HTTP/1.1 200 OK\r\nXabc" ] (calls ());
+          equal int 0 (Buf_writer.buffered w);
+          Buf_writer.flush w;
+          equal int 1 (List.length (calls ()));
+          equal int 21 (Buf_writer.written w));
+      test "a write that does not fit flushes first" (fun () ->
+          let w, calls = recorded ~size:4 () in
+          Buf_writer.write_string w "abc";
+          Buf_writer.write_string w "de";
+          Buf_writer.write_string w "fg";
+          Buf_writer.flush w;
+          equal (list string) [ "abc"; "defg" ] (calls ()));
+      test "write_char flushes a full buffer" (fun () ->
+          let w, calls = recorded ~size:2 () in
+          String.iter (Buf_writer.write_char w) "abcde";
+          Buf_writer.flush w;
+          equal (list string) [ "ab"; "cd"; "e" ] (calls ());
+          equal int 5 (Buf_writer.written w));
+      test "large writes go straight to the output" (fun () ->
+          let w, calls = recorded ~size:4 () in
+          Buf_writer.write_string w "ab";
+          Buf_writer.write_string w "0123456789";
+          Buf_writer.write_string w "abcd";
+          Buf_writer.write_string w "";
+          equal (list string) [ "ab"; "0123456789"; "abcd" ] (calls ());
+          equal int 0 (Buf_writer.buffered w);
+          equal int 16 (Buf_writer.written w));
+      test "invalid arguments" (fun () ->
+          (* Large writes skip the copy, so only the range check can raise. *)
+          let w = Buf_writer.make ~size:2 ignore3 in
+          List.iter
+            (fun (off, len) ->
+               raises_match is_invalid_arg (fun () -> Buf_writer.write_bytes w (Bytes.create 4) off len))
+            [ (-1, 1); (0, -1); (2, 3); (5, 0) ];
+          raises_match is_invalid_arg (fun () -> Buf_writer.make ~size:0 ignore3));
+      test "of_flow writes to the flow" (fun () ->
+          let out = Buffer.create 8 in
+          let w = Buf_writer.of_flow (Flow.of_string "" out) in
+          Buf_writer.write_string w "hi";
+          equal string "" (Buffer.contents out);
+          Buf_writer.flush w;
+          equal string "hi" (Buffer.contents out));
+      prop "output is the writes in order; calls are bounded"
+        Gen.(pair (list ~size:(int_range 0 12) (string_of ~size:(int_range 0 12) (char_range 'a' 'z'))) (int_range 1 8))
+        (fun (writes, size) ->
+           let w, calls = recorded ~size () in
+           List.iter (Buf_writer.write_string w) writes;
+           Buf_writer.flush w;
+           equal string (String.concat "" writes) (String.concat "" (calls ()));
+           equal int (String.length (String.concat "" writes)) (Buf_writer.written w);
+           List.iter
+             (fun c ->
+                is_true ~msg:"a call is at most size bytes, or one large write"
+                  (String.length c <= size || List.mem c writes))
+             (calls ())) ]
+
 let () =
   exit
     (run "h1"
        [ buf_reader_tests; buf_reader_model; request_head_tests; head_props; framing_tests;
          target_tests; framing_props; h1_body_tests; chunked_tests;
-         chunked_props; handle_tests ])
+         chunked_props; handle_tests; buf_writer_tests ])

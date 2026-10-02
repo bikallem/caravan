@@ -20,6 +20,7 @@ module Handler = Handler
 module Private : sig
   module Date = Date
   module Buf_reader = Buf_reader
+  module Buf_writer = Buf_writer
   module H1_error = H1_error
   module H1_parse = H1_parse
   module H1_body = H1_body
