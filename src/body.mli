@@ -51,6 +51,10 @@ type t
 exception Too_large
 (** Raised by {!to_string} when a body exceeds its [max]. *)
 
+exception Truncated
+(** Raised by reads when the peer ends a body before its declared end, for
+    example when a connection closes in the middle of a request body. *)
+
 (** {1:make Making bodies} *)
 
 val empty : t

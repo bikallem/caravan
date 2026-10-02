@@ -22,4 +22,5 @@ module Private : sig
   module Buf_reader = Buf_reader
   module H1_error = H1_error
   module H1_parse = H1_parse
+  module H1_body = H1_body
 end

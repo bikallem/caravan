@@ -19,6 +19,7 @@ module Writer = struct
 end
 
 exception Too_large
+exception Truncated
 
 type source = {
   read : bytes -> int -> int -> int;

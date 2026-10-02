@@ -551,8 +551,60 @@ let framing_props =
            equal (option string) (Some h) t.authority;
            equal string target t.path) ]
 
+(* H1_body *)
+
+module H1_body = Private.H1_body
+
+(* Reads [b] to its end, [size] bytes at a time. *)
+let read_body ?(size = 4096) b =
+  let buf = Bytes.create size and out = Buffer.create 64 in
+  let rec loop () =
+    match Body.read b buf 0 size with
+    | 0 -> Buffer.contents out
+    | n -> Buffer.add_subbytes out buf 0 n; loop ()
+  in
+  loop ()
+
+let h1_body_tests =
+  group "H1_body.fixed"
+    [ test "reads exactly n bytes and leaves the next request" (fun () ->
+          let r = Buf_reader.of_string "hello worldGET / HTTP/1.1\r\n" in
+          let b = H1_body.fixed r 11 in
+          equal (option int) (Some 11) (Body.length b);
+          let buf = Bytes.create 64 in
+          equal int 11 (Body.read b buf 0 64);
+          equal string "hello world" (Bytes.sub_string buf 0 11);
+          equal int 0 (Body.read b buf 0 64);
+          equal string "GET / HTTP/1.1" (Buf_reader.read_line r ~max:100));
+      test "reads are capped by what remains" (fun () ->
+          let r = Buf_reader.of_string "abcdefXYZ" in
+          let b = H1_body.fixed r 6 in
+          let buf = Bytes.create 4 in
+          equal (list int) [ 4; 2; 0 ] (List.init 3 (fun _ -> Body.read b buf 0 4));
+          equal string "XYZ" (read_n r 10));
+      test "an empty body reads nothing" (fun () ->
+          let reads = ref 0 in
+          let r = Buf_reader.make (fun _ _ _ -> incr reads; 0) in
+          equal string "" (Body.to_string (H1_body.fixed r 0));
+          equal int 0 !reads);
+      test "early end of input is Truncated" (fun () ->
+          let b = H1_body.fixed (Buf_reader.of_string "abc") 5 in
+          let buf = Bytes.create 8 in
+          equal int 3 (Body.read b buf 0 8);
+          raises Body.Truncated (fun () -> Body.read b buf 0 8);
+          raises Body.Truncated (fun () ->
+              Body.to_string (H1_body.fixed (Buf_reader.of_string "") 1)));
+      prop "the body and what follows it, however the input is split"
+        Gen.(
+          pair (pair string string) (triple (int_range 1 9) (int_range 1 9) (int_range 1 9)))
+        (fun ((body, next), (chunk, size, read_size)) ->
+           let r = Buf_reader.of_string ~chunk ~size (body ^ next) in
+           let b = H1_body.fixed r (String.length body) in
+           equal string body (read_body ~size:read_size b);
+           equal string next (read_n r (String.length next + 1))) ]
+
 let () =
   exit
     (run "h1"
        [ buf_reader_tests; buf_reader_model; request_head_tests; head_props; framing_tests;
-         target_tests; framing_props ])
+         target_tests; framing_props; h1_body_tests ])
