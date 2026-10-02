@@ -164,4 +164,196 @@ let buf_reader_model =
   group "Buf_reader model"
     [ stateful ~count:300 "behaves like scanning the string" buf_reader_commands ]
 
-let () = exit (run "h1" [ buf_reader_tests; buf_reader_model ])
+(* H1_parse.request_head *)
+
+module H1_error = Private.H1_error
+module H1_parse = Private.H1_parse
+
+let pp_head ppf (h : H1_parse.head) =
+  Format.fprintf ppf "%a %s %a" Method.pp h.meth h.target Version.pp h.version;
+  Headers.iter (fun n v -> Format.fprintf ppf "@\n  %s: %S" n v) h.headers
+
+let parse ?(limits = H1_parse.default_limits) ?size ?chunk s =
+  H1_parse.request_head limits (Buf_reader.of_string ?size ?chunk s)
+
+let show ?limits s =
+  match parse ?limits s with
+  | h -> Format.asprintf "%a" pp_head h
+  | exception H1_error.E e -> Format.asprintf "%a" H1_error.pp e
+  | exception Buf_reader.Eof -> "end of input"
+
+let table ?limits cases =
+  String.concat "\n" (List.map (fun s -> Printf.sprintf "%S\n=> %s" s (show ?limits s)) cases)
+
+let small = { H1_parse.max_request_line = 16; max_header_bytes = 24; max_header_count = 2 }
+
+let request_head_tests =
+  group "H1_parse.request_head"
+    [ test "valid heads" (fun () ->
+          expect
+            (table
+               [ "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+                 "\r\n\r\nPOST /a?b=1 HTTP/1.0\r\n\r\n";
+                 "get /!~ HTTP/1.9\r\n\r\n";
+                 "CONNECT example.com:443 HTTP/1.1\r\nhost:example.com:443\r\n\r\n";
+                 "GET http://a.example/x HTTP/1.1\r\nX-Empty:\r\nX-Ows: \t v a l \t\r\nSet-Cookie: a\r\nset-cookie: b\r\n\r\n" ])
+          @@ __POS_OF__ {|
+            "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+            => GET / HTTP/1.1
+              Host: "example.com"
+            "\r\n\r\nPOST /a?b=1 HTTP/1.0\r\n\r\n"
+            => POST /a?b=1 HTTP/1.0
+            "get /!~ HTTP/1.9\r\n\r\n"
+            => get /!~ HTTP/1.1
+            "CONNECT example.com:443 HTTP/1.1\r\nhost:example.com:443\r\n\r\n"
+            => CONNECT example.com:443 HTTP/1.1
+              host: "example.com:443"
+            "GET http://a.example/x HTTP/1.1\r\nX-Empty:\r\nX-Ows: \t v a l \t\r\nSet-Cookie: a\r\nset-cookie: b\r\n\r\n"
+            => GET http://a.example/x HTTP/1.1
+              X-Empty: ""
+              X-Ows: "v a l"
+              Set-Cookie: "a"
+              set-cookie: "b"
+            |});
+      test "invalid request lines" (fun () ->
+          expect
+            (table
+               [ "GET  / HTTP/1.1\r\n\r\n"; "GET / HTTP/1.1 \r\n\r\n"; "GET /\r\n\r\n";
+                 " GET / HTTP/1.1\r\n\r\n"; "G(T / HTTP/1.1\r\n\r\n"; "GET /a\tb HTTP/1.1\r\n\r\n";
+                 "GET /\x80 HTTP/1.1\r\n\r\n"; "GET / HTTP/1\r\n\r\n"; "GET / http/1.1\r\n\r\n";
+                 "GET / HTTP/1.x\r\n\r\n"; "GET / HTTP/0.9\r\n\r\n"; "GET / HTTP/2.0\r\n\r\n";
+                 "GET / HTTP/1.1\n\n"; "\r\n\r\n\r\n\r\n\r\nGET / HTTP/1.1\r\n\r\n" ])
+          @@ __POS_OF__ {|
+            "GET  / HTTP/1.1\r\n\r\n"
+            => 400 Bad Request (malformed request line)
+            "GET / HTTP/1.1 \r\n\r\n"
+            => 400 Bad Request (malformed request line)
+            "GET /\r\n\r\n"
+            => 400 Bad Request (malformed request line)
+            " GET / HTTP/1.1\r\n\r\n"
+            => 400 Bad Request (malformed request line)
+            "G(T / HTTP/1.1\r\n\r\n"
+            => 400 Bad Request (invalid method "G(T")
+            "GET /a\tb HTTP/1.1\r\n\r\n"
+            => 400 Bad Request (invalid request target "/a\tb")
+            "GET /\128 HTTP/1.1\r\n\r\n"
+            => 400 Bad Request (invalid request target "/\128")
+            "GET / HTTP/1\r\n\r\n"
+            => 400 Bad Request (invalid HTTP version "HTTP/1")
+            "GET / http/1.1\r\n\r\n"
+            => 400 Bad Request (invalid HTTP version "http/1.1")
+            "GET / HTTP/1.x\r\n\r\n"
+            => 400 Bad Request (invalid HTTP version "HTTP/1.x")
+            "GET / HTTP/0.9\r\n\r\n"
+            => 400 Bad Request (unsupported HTTP version "HTTP/0.9")
+            "GET / HTTP/2.0\r\n\r\n"
+            => 505 HTTP Version Not Supported
+            "GET / HTTP/1.1\n\n"
+            => 400 Bad Request (bare CR or LF)
+            "\r\n\r\n\r\n\r\n\r\nGET / HTTP/1.1\r\n\r\n"
+            => 400 Bad Request (too many empty lines before the request line)
+            |});
+      test "invalid field lines" (fun () ->
+          expect
+            (table
+               [ "GET / HTTP/1.1\r\nHost: a\r\n folded\r\n\r\n";
+                 "GET / HTTP/1.1\r\nHost : a\r\n\r\n"; "GET / HTTP/1.1\r\n: a\r\n\r\n";
+                 "GET / HTTP/1.1\r\nHost\r\n\r\n"; "GET / HTTP/1.1\r\nX: a\000b\r\n\r\n";
+                 "GET / HTTP/1.1\r\nX: a\rb\r\n\r\n"; "GET / HTTP/1.1\r\nX\x80: a\r\n\r\n";
+                 "GET / HTTP/1.1\r\nX: \t \r\n\r\n" ])
+          @@ __POS_OF__ {|
+            "GET / HTTP/1.1\r\nHost: a\r\n folded\r\n\r\n"
+            => 400 Bad Request (obsolete line folding)
+            "GET / HTTP/1.1\r\nHost : a\r\n\r\n"
+            => 400 Bad Request (invalid field name "Host ")
+            "GET / HTTP/1.1\r\n: a\r\n\r\n"
+            => 400 Bad Request (invalid field name "")
+            "GET / HTTP/1.1\r\nHost\r\n\r\n"
+            => 400 Bad Request (field line without a colon)
+            "GET / HTTP/1.1\r\nX: a\000b\r\n\r\n"
+            => 400 Bad Request (invalid value for X)
+            "GET / HTTP/1.1\r\nX: a\rb\r\n\r\n"
+            => 400 Bad Request (bare CR or LF)
+            "GET / HTTP/1.1\r\nX\128: a\r\n\r\n"
+            => 400 Bad Request (invalid field name "X\128")
+            "GET / HTTP/1.1\r\nX: \t \r\n\r\n"
+            => GET / HTTP/1.1
+              X: ""
+            |});
+      test "limits" (fun () ->
+          expect
+            (table ~limits:small
+               [ "GET /01 HTTP/1.1\r\n\r\n"; "GET /012 HTTP/1.1\r\n\r\n";
+                 "GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\n\r\n"; "GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n";
+                 "GET / HTTP/1.1\r\nA: 0123456789\r\nB: 1234\r\n\r\n";
+                 "GET / HTTP/1.1\r\nA: 0123456789\r\nB: 12345\r\n\r\n";
+                 "GET / HTTP/1.1\r\nA: 0123456789012345678901\r\n\r\n" ])
+          @@ __POS_OF__ {|
+            "GET /01 HTTP/1.1\r\n\r\n"
+            => GET /01 HTTP/1.1
+            "GET /012 HTTP/1.1\r\n\r\n"
+            => 414 URI Too Long
+            "GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\n\r\n"
+            => GET / HTTP/1.1
+              A: "1"
+              B: "2"
+            "GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n"
+            => 431 Request Header Fields Too Large
+            "GET / HTTP/1.1\r\nA: 0123456789\r\nB: 1234\r\n\r\n"
+            => GET / HTTP/1.1
+              A: "0123456789"
+              B: "1234"
+            "GET / HTTP/1.1\r\nA: 0123456789\r\nB: 12345\r\n\r\n"
+            => 431 Request Header Fields Too Large
+            "GET / HTTP/1.1\r\nA: 0123456789012345678901\r\n\r\n"
+            => 431 Request Header Fields Too Large
+            |});
+      test "input ending early" (fun () ->
+          expect (table [ ""; "GET / HTTP/1.1"; "GET / HTTP/1.1\r\nHost: a\r\n"; "GET / HTTP/1.1\r\nHost: a\r\n\r" ])
+          @@ __POS_OF__ {|
+            ""
+            => end of input
+            "GET / HTTP/1.1"
+            => end of input
+            "GET / HTTP/1.1\r\nHost: a\r\n"
+            => end of input
+            "GET / HTTP/1.1\r\nHost: a\r\n\r"
+            => end of input
+            |}) ]
+
+(* Generated valid heads, serialized with random optional whitespace. *)
+let token_gen =
+  Gen.string_of ~size:(Gen.int_range 1 8)
+    (Gen.of_list (List.of_seq (String.to_seq "abcxyzABC019-_.!~")))
+
+let head_gen =
+  let open Gen in
+  let meth = one_of [ of_list Method.[ GET; POST; HEAD; DELETE; OPTIONS ]; map Method.of_string token_gen ] in
+  let target =
+    map (fun s -> "/" ^ s) (string_of ~size:(int_range 0 12) (of_list (List.of_seq (String.to_seq "abz09/?=&%-._~"))))
+  in
+  let value =
+    map (fun s -> String.trim s) (string_of ~size:(int_range 0 10) (of_list (List.of_seq (String.to_seq "ab z9,;=\t\""))))
+  in
+  let ows = of_list [ ""; " "; "\t"; "  " ] in
+  triple (triple meth target (of_list Version.[ Http_1_0; Http_1_1 ]))
+    (list ~size:(int_range 0 6) (pair token_gen (pair value (pair ows ows))))
+    (pair (int_range 1 9) (int_range 1 32))
+
+let serialize ((meth, target, v), fields, _) =
+  Printf.sprintf "%s %s %s\r\n%s\r\n" (Method.to_string meth) target (Version.to_string v)
+    (String.concat "" (List.map (fun (n, (v, (o, o'))) -> n ^ ":" ^ o ^ v ^ o' ^ "\r\n") fields))
+
+let head_props =
+  group "H1_parse.request_head properties"
+    [ prop "parses what it is given, however it is split" head_gen (fun (((meth, target, v), fields, (chunk, size)) as g) ->
+          let h = parse ~chunk ~size (serialize g) in
+          equal string (Method.to_string meth) (Method.to_string h.meth);
+          equal string target h.target;
+          is_true (h.version = v);
+          equal (list (pair string string))
+            (List.map (fun (n, (v, _)) -> (n, v)) fields)
+            (Headers.to_list h.headers)) ]
+
+let () =
+  exit (run "h1" [ buf_reader_tests; buf_reader_model; request_head_tests; head_props ])
