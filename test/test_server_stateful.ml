@@ -7,12 +7,18 @@ open Affect
 open Affect_http
 open Server_support
 
-(* Request kinds. Chunked bodies are HTTP/1.1 only. A request that makes the
-   server close may not carry a body the handler leaves unread: closing over
-   unread bytes resets the connection (lingering close, chunk 6.1). *)
+(* Request kinds. Chunked bodies are HTTP/1.1 only. /ignore also gets a body
+   larger than the server's buffer, so that some of it is still unread in the
+   kernel when the server drains it or closes over it. *)
+let large = String.make 40_000 'x'
+
 let kinds =
   let open List in
-  let bodies v10 = [ No_body; Length "data" ] @ if v10 then [] else [ Chunked "data!" ] in
+  let bodies v10 path =
+    [ No_body; Length "data" ]
+    @ (if v10 then [] else [ Chunked "data!" ])
+    @ if path = "/ignore" then [ Length large ] else []
+  in
   concat_map
     (fun v10 ->
        concat_map
@@ -21,7 +27,7 @@ let kinds =
               (fun conn ->
                  let methods =
                    [ ("GET", No_body); ("HEAD", No_body) ]
-                   @ map (fun b -> ("POST", b)) (filter (fun b -> b <> No_body) (bodies v10))
+                   @ map (fun b -> ("POST", b)) (filter (fun b -> b <> No_body) (bodies v10 path))
                  in
                  map (fun (meth, body) -> { meth; path; v10; conn; body }) methods)
               [ None; Some "close"; Some "keep-alive" ])
@@ -47,11 +53,13 @@ let expected k =
   let closes = closes_by_request || closes_by_response in
   (summary code (if head then "" else body) closes, closes)
 
-let unread_body_at_close k =
-  k.path = "/ignore" && k.body <> No_body && snd (expected k)
-
-let kinds = List.filter (fun k -> not (unread_body_at_close k)) kinds
-let kind_gen = Gen.of_list ~pp:pp_kind kinds
+(* Requests that make the server close over a body still unread in the
+   kernel are rare among the kinds, so they get a share of their own. *)
+let kind_gen =
+  let closes_over_unread k = k.body = Length large && snd (expected k) in
+  Gen.frequency
+    [ (4, Gen.of_list ~pp:pp_kind kinds);
+      (1, Gen.of_list ~pp:pp_kind (List.filter closes_over_unread kinds)) ]
 
 (* The model of a connection. *)
 module Model = struct
@@ -67,8 +75,10 @@ module Model = struct
     cover "HEAD" (k.meth = "HEAD");
     cover "chunked body" (match k.body with Chunked _ -> true | _ -> false);
     cover "HTTP/1.0 kept alive" (k.v10 && k.conn = Some "keep-alive");
-    cover "unread body drained" (k.path = "/ignore" && k.body <> No_body);
     let response, closes = expected k in
+    let unread = k.path = "/ignore" && k.body <> No_body in
+    cover "unread body drained" (unread && not closes);
+    cover "unread body lingered over" (unread && closes);
     m.owed <- m.owed @ [ response ];
     if closes then m.closing <- true
 

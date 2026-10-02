@@ -14,6 +14,7 @@ type t = {
   idle_timeout : Mtime.Span.t;
   read_timeout : Mtime.Span.t;
   write_timeout : Mtime.Span.t;
+  linger_timeout : Mtime.Span.t;
   shutdown_grace : Mtime.Span.t;
   date_header : bool;
   on_error : exn -> Printexc.raw_backtrace -> unit;
@@ -38,6 +39,7 @@ let default =
     idle_timeout = Mtime.Span.(30 * s);
     read_timeout = Mtime.Span.(30 * s);
     write_timeout = Mtime.Span.(30 * s);
+    linger_timeout = Mtime.Span.(2 * s);
     shutdown_grace = Mtime.Span.(10 * s);
     date_header = true;
     on_error = print_error;

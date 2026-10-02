@@ -22,6 +22,7 @@ let conn = Conn_info.make ~id:7 ~peer:(loopback 50000) ~local:(loopback 8080) ()
 let handler req =
   match Request.path_only req with
   | "/echo" -> Response.string (Body.to_string (Request.body req))
+  | "/stream-echo" -> Response.stream (Body.write_to (Request.body req))
   | "/ignore" -> Response.string "ignored"
   | "/stream" ->
       Response.stream (fun w ->
@@ -41,17 +42,31 @@ let handler req =
            (match Request.conn req with Some c -> Format.asprintf "%a" Conn_info.pp c | None -> "-"))
   | _ -> Response.string "hello"
 
-(* Serves [input] on one connection; the bytes written and the errors
-   reported. *)
+(* Serves [input] on one connection. The bytes written, with [[FIN]] where
+   the server half-closed and [[unread n]] if it left input unread, and the
+   errors reported. *)
 let serve ?(config = { Config.default with date_header = false }) ?chunk input =
   let errors = ref [] in
   let config = { config with on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) } in
-  let out = Buffer.create 256 in
+  let out = Buffer.create 256 and consumed = ref 0 in
+  let inner = Flow.of_string ?chunk input out in
+  let read buf off len =
+    let n = Flow.read inner buf off len in
+    consumed := !consumed + n;
+    n
+  in
+  let flow =
+    Flow.make ~read ~write:(Flow.write inner) ~readable:(Flow.readable' inner ())
+      ~shutdown_send:(fun () -> Buffer.add_string out "[FIN]")
+      ~close:ignore ~set_read_deadline:ignore ~set_write_deadline:ignore
+  in
   Affect_unix.Unix.main ~domain_count:1 (fun () ->
       let ctx =
         { Engine.config; conn; stopping = Action.never; is_stopping = (fun () -> false) }
       in
-      Private.H1_server.serve ctx (Flow.of_string ?chunk input out) handler);
+      Private.H1_server.serve ctx flow handler);
+  let unread = String.length input - !consumed in
+  if unread > 0 then Printf.bprintf out "[unread %d]" unread;
   (Buffer.contents out, List.rev !errors)
 
 let show ?config ?chunk input =
@@ -111,7 +126,7 @@ let connection_tests =
             Content-Length: 5\r\n
             Connection: close\r\n
             \r\n
-            hello
+            hello[FIN]
             --
             HTTP/1.1 200 OK\r\n
             Content-Type: text/plain; charset=utf-8\r\n
@@ -134,14 +149,14 @@ let connection_tests =
             Content-Length: 5\r\n
             Connection: close\r\n
             \r\n
-            hello
+            hello[FIN]
             --
             HTTP/1.1 200 OK\r\n
             Content-Type: text/plain; charset=utf-8\r\n
             Content-Length: 3\r\n
             Connection: close\r\n
             \r\n
-            bye
+            bye[FIN]
             |});
       test "request bodies: read, unread and drained, chunked" (fun () ->
           expect
@@ -182,7 +197,7 @@ let connection_tests =
             HTTP/1.1 200 OK\r\n
             Connection: close\r\n
             \r\n
-            ab
+            ab[FIN]
             |});
       test "HEAD" (fun () ->
           expect (show ("HEAD / HTTP/1.1\r\nHost: a\r\n\r\n" ^ get "/ignore")) @@ __POS_OF__ {|
@@ -207,10 +222,11 @@ let connection_tests =
             Content-Length: 5\r\n
             Connection: close\r\n
             \r\n
-            --
+            [FIN]--
             HTTP/1.1 204 No Content\r\n
             Connection: close\r\n
             \r\n
+            [FIN]
             |});
       test "malformed requests get 400 and close" (fun () ->
           expect (show ("GET / HTTP/1.1\r\n\r\n" ^ get "/")) @@ __POS_OF__ {|
@@ -220,6 +236,7 @@ let connection_tests =
             Connection: close\r\n
             \r\n
             Bad Request
+            [FIN]
             |});
       test "a body over max_body gets 413" (fun () ->
           let config = { Config.default with date_header = false; max_body = Some 3 } in
@@ -230,6 +247,7 @@ let connection_tests =
             Connection: close\r\n
             \r\n
             Content Too Large
+            [FIN]
             |});
       test "100-continue is sent when the handler reads the body" (fun () ->
           expect
@@ -256,7 +274,7 @@ let connection_tests =
             Content-Length: 7\r\n
             Connection: close\r\n
             \r\n
-            ignored
+            ignored[FIN]
             |});
       test "100-continue with an empty body keeps the connection" (fun () ->
           expect
@@ -307,7 +325,7 @@ let connection_tests =
             Connection: close\r\n
             \r\n
             Internal Server Error
-
+            [FIN]
             ! Failure("boom")
             |});
       test "a body shorter than its length closes the connection" (fun () ->
@@ -315,7 +333,7 @@ let connection_tests =
             HTTP/1.1 200 OK\r\n
             Content-Length: 5\r\n
             \r\n
-            abc
+            abc[FIN]
             ! response body length differs from its Content-Length
             |});
       test "upgrades are not supported yet" (fun () ->
@@ -326,8 +344,50 @@ let connection_tests =
             Connection: close\r\n
             \r\n
             Internal Server Error
-
+            [FIN]
             ! Failure("Response.upgrade is not supported yet")
+            |});
+      test "a closing response is followed by a half-close, and input is read to its end"
+        (fun () ->
+           expect
+             (show
+                (post ~headers:[ ("Connection", "close") ] "/ignore" (String.make 100 'x')
+                 ^ get "/"))
+           @@ __POS_OF__ {|
+             HTTP/1.1 200 OK\r\n
+             Content-Type: text/plain; charset=utf-8\r\n
+             Content-Length: 7\r\n
+             Connection: close\r\n
+             \r\n
+             ignored[FIN]
+             |});
+      test "lingering reads at most max_drain bytes" (fun () ->
+          let config = { Config.default with date_header = false; max_drain = 10 } in
+          expect (show ~config ~chunk:16 (post "/ignore" (String.make 100 'x'))) @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 7\r\n
+            \r\n
+            ignored[FIN][unread 79]
+            |});
+      test "a client that leaves is not lingered on" (fun () ->
+          expect (show (get "/" ^ "GET / HT")) @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 5\r\n
+            \r\n
+            hello
+            |});
+      test "a streamed request body cut short ends the response unreported" (fun () ->
+          expect
+            (show "POST /stream-echo HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nhel")
+          @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Transfer-Encoding: chunked\r\n
+            \r\n
+            3\r\n
+            hel\r\n
+            [FIN]
             |});
       test "a request cut short gets no response" (fun () ->
           expect

@@ -87,6 +87,34 @@ let integration_tests =
           let c, r = connect server in
           Flow.write_string c (get "/hello");
           equal string {|200 "hello"|} (read_response ~head:false r);
-          Flow.close c) ]
+          Flow.close c);
+      test "a closing response over an unread body is not reset" (fun () ->
+          with_server @@ fun server ->
+          let flow, r = connect server in
+          let body = Length (String.make 60_000 'x') in
+          Flow.write_string flow
+            (serialize { meth = "POST"; path = "/ignore"; v10 = false; conn = Some "close"; body });
+          equal string {|200 "ignored" close|} (read_response ~head:false r);
+          equal int ~msg:"end of stream" 0 (Buf_reader.read_into r (Bytes.create 1) 0 1);
+          Flow.close flow);
+      test "a client that never closes is let go after linger_timeout" (fun () ->
+          let config =
+            { config with max_connections = 1; linger_timeout = Mtime.Span.(200 * ms) }
+          in
+          with_server ~config @@ fun server ->
+          let a, ra = connect server in
+          Flow.write_string a (get ~conn:(Some "close") "/hello");
+          equal string {|200 "hello" close|} (read_response ~head:false ra);
+          (* [a] stays open and holds the only connection slot while the
+             server lingers on it. *)
+          let clock = Mtime.counter () in
+          let b, rb = connect server in
+          Flow.set_read_deadline b (Mtime.add_span (Mtime.now ()) Mtime.Span.(5 * s));
+          Flow.write_string b (get "/hello");
+          equal string {|200 "hello"|} (read_response ~head:false rb);
+          let waited = Mtime.Span.to_float_ns (Mtime.count clock) /. 1e6 in
+          is_true ~msg:(Printf.sprintf "waited %.0fms" waited) (waited > 150.);
+          Flow.close a;
+          Flow.close b) ]
 
 let () = exit (run "server" [ integration_tests ])

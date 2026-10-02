@@ -30,6 +30,9 @@ type t = {
   (** Time allowed for each read of a request body. *)
   write_timeout : Affect_unix.Mtime.Span.t;
   (** Time allowed for each write of a response. *)
+  linger_timeout : Affect_unix.Mtime.Span.t;
+  (** Time a connection the server ends keeps reading, at most [max_drain]
+      bytes, for the client to close it first (RFC 9112 §9.6). *)
   shutdown_grace : Affect_unix.Mtime.Span.t;
   (** Time in-flight requests get to finish when the server stops. *)
   date_header : bool; (** Whether responses get a [Date] field. *)
@@ -43,5 +46,5 @@ val default : t
 (** [default] listens on [127.0.0.1:8080] with a backlog of 1024 and at most
     1024 connections, 16 KiB buffers, default limits (8 KiB request
     line, 16 KiB and 100 header fields), no body limit, 64 KiB drains,
-    timeouts of 10s (head), 30s (idle, read, write), a 10s shutdown grace, a
-    [Date] field, and errors printed on [stderr]. *)
+    timeouts of 10s (head), 30s (idle, read, write), 2s lingering, a 10s
+    shutdown grace, a [Date] field, and errors printed on [stderr]. *)

@@ -8,8 +8,8 @@ module Buf_reader = Private.Buf_reader
 
 let loopback = Unix.ADDR_INET (Unix.inet_addr_loopback, 0)
 
-(* Handlers read request bodies, except /ignore, so that a closing response
-   never leaves unread bytes behind (which would reset the connection). *)
+(* Handlers read request bodies, except /ignore, which leaves its body to be
+   drained or lingered over. *)
 let handler req =
   let body = Request.body req in
   let read () = ignore (Body.to_string body) in
@@ -56,6 +56,7 @@ let pp_kind ppf k =
     (match k.conn with None -> "" | Some c -> " conn:" ^ c)
     (match k.body with
     | No_body -> ""
+    | Length s when String.length s > 16 -> Printf.sprintf " len:%d" (String.length s)
     | Length s -> Printf.sprintf " len:%S" s
     | Chunked s -> Printf.sprintf " chunked:%S" s)
 
