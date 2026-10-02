@@ -10,15 +10,6 @@ type t =
 | PATCH
 | Other of string
 
-(* RFC 9110 §5.6.2: token = 1*tchar *)
-let is_tchar = function
-| 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9'
-| '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' | '_' | '`'
-| '|' | '~' -> true
-| _ -> false
-
-let is_token s = s <> "" && String.for_all is_tchar s
-
 let of_string = function
 | "GET" -> GET
 | "HEAD" -> HEAD
@@ -29,7 +20,7 @@ let of_string = function
 | "OPTIONS" -> OPTIONS
 | "TRACE" -> TRACE
 | "PATCH" -> PATCH
-| s when is_token s -> Other s
+| s when Token.is_token s -> Other s
 | s -> invalid_arg (Printf.sprintf "Method.of_string: %S is not a token" s)
 
 let to_string = function

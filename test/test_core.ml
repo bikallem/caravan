@@ -92,4 +92,114 @@ let status_tests =
                 (internal_server_error, 500); (not_implemented, 501);
                 (http_version_not_supported, 505) ]) ]
 
-let () = exit (run "core" [ method_tests; version_tests; status_tests ])
+(* Headers *)
+
+let fields = list (pair string string)
+let h = Headers.of_list
+
+let headers_tests =
+  group "Headers"
+    [ test "find is case-insensitive and returns the first field" (fun () ->
+          let h = h [ ("Content-Type", "text/plain"); ("content-type", "x") ] in
+          equal (option string) (Some "text/plain") (Headers.find "CONTENT-TYPE" h);
+          equal (list string) [ "text/plain"; "x" ] (Headers.find_all "content-type" h);
+          equal (option string) None (Headers.find "Host" h));
+      test "to_list keeps order, case and duplicates" (fun () ->
+          let l = [ ("Set-Cookie", "a=1"); ("Host", "x"); ("set-cookie", "b=2") ] in
+          equal fields l (Headers.to_list (h l)));
+      test "set replaces the first match in place and drops the others" (fun () ->
+          let h' = Headers.set "accept" "*/*"
+              (h [ ("Accept", "a"); ("Host", "x"); ("ACCEPT", "b") ]) in
+          equal fields [ ("accept", "*/*"); ("Host", "x") ] (Headers.to_list h');
+          equal fields [ ("Host", "x"); ("Accept", "a") ]
+            (Headers.to_list (Headers.set "Accept" "a" (h [ ("Host", "x") ]))));
+      test "tokens span every field of the name" (fun () ->
+          let h = h [ ("Connection", "keep-alive, Upgrade"); ("Connection", ",close ,,") ] in
+          equal (list string) [ "keep-alive"; "Upgrade"; "close" ] (Headers.tokens "connection" h);
+          is_true (Headers.has_token "Connection" "UPGRADE" h);
+          is_true (not (Headers.has_token "connection" "keep" h)));
+      test "remove_hop_by_hop drops fields named by Connection" (fun () ->
+          let h = h [ ("Host", "x"); ("Connection", "X-Trace, close");
+                      ("X-Trace", "1"); ("Keep-Alive", "timeout=5");
+                      ("Transfer-Encoding", "chunked"); ("TE", "trailers");
+                      ("Upgrade", "websocket"); ("Accept", "*/*") ] in
+          equal fields [ ("Host", "x"); ("Accept", "*/*") ]
+            (Headers.to_list (Headers.remove_hop_by_hop h)));
+      test "rejects invalid names and values" (fun () ->
+          List.iter
+            (fun (n, v) -> raises_match is_invalid_arg (fun () -> Headers.add n v Headers.empty))
+            [ ("", "x"); ("Bad Name", "x"); ("Name:", "x"); ("X", "a\r\nSet-Cookie: s=1");
+              ("X", "a\nb"); ("X", "a\000b"); ("X", " leading"); ("X", "trailing\t");
+              ("X", "del\127") ];
+          equal fields [ ("X", ""); ("Y", "a\tb c") ]
+            (Headers.to_list (h [ ("X", ""); ("Y", "a\tb c") ])));
+      test "equal ignores name case but not order or values" (fun () ->
+          let a = h [ ("Host", "x"); ("Accept", "*/*") ] in
+          is_true (Headers.equal a (h [ ("host", "x"); ("ACCEPT", "*/*") ]));
+          is_true (not (Headers.equal a (h [ ("Accept", "*/*"); ("Host", "x") ])));
+          is_true (not (Headers.equal a (h [ ("Host", "X"); ("Accept", "*/*") ])));
+          is_true (not (Headers.equal a (h [ ("Host", "x") ]))));
+      test "pp" (fun () ->
+          expect (Format.asprintf "%a" Headers.pp (h [ ("Host", "x"); ("Accept", "*/*") ]))
+          @@ __POS_OF__ {|Host: x
+Accept: */*|}) ]
+
+(* Generators that hit name collisions in different cases. *)
+let name_gen =
+  Gen.of_list ~pp:Format.pp_print_string
+    [ "Host"; "host"; "HOST"; "Accept"; "accept"; "X-Id"; "x-id" ]
+
+let value_gen =
+  Gen.of_list ~pp:(fun ppf -> Format.fprintf ppf "%S") [ ""; "a"; "b"; "c d"; "*/*" ]
+
+let fields_gen = Gen.list ~size:(Gen.int_range 0 8) (Gen.pair name_gen value_gen)
+
+let headers_props =
+  group "Headers laws"
+    [ prop "to_list (of_list l) = l" fields_gen (fun l ->
+          equal fields l (Headers.to_list (h l)));
+      prop "find n (set n v h) = Some v" (Gen.triple name_gen value_gen fields_gen)
+        (fun (n, v, l) -> equal (option string) (Some v) (Headers.find n (Headers.set n v (h l))));
+      prop "remove n h has no field n" (Gen.pair name_gen fields_gen) (fun (n, l) ->
+          is_true (not (Headers.mem n (Headers.remove n (h l)))));
+      prop "add keeps the existing fields as a prefix"
+        (Gen.triple name_gen value_gen fields_gen) (fun (n, v, l) ->
+            equal fields (l @ [ (n, v) ]) (Headers.to_list (Headers.add n v (h l)))) ]
+
+(* Stateful: Headers against an association list written as a specification. *)
+module Model = struct
+  let same a b = String.lowercase_ascii a = String.lowercase_ascii b
+  let empty () = []
+  let add n v l = l @ [ (n, v) ]
+  let remove n l = List.filter (fun (n', _) -> not (same n n')) l
+  let find_all n l = List.map snd (List.filter (fun (n', _) -> same n n') l)
+  let find n l = match find_all n l with [] -> None | v :: _ -> Some v
+
+  let set n v l =
+    match List.find_index (fun (n', _) -> same n n') l with
+    | None -> add n v l
+    | Some i ->
+        List.filteri (fun j (n', _) -> j = i || not (same n n')) l
+        |> List.mapi (fun j f -> if j = i then (n, v) else f)
+end
+
+let hs = abstract "h" ~pp:(fun ppf l -> Testable.pp fields ppf l)
+
+let headers_commands =
+  [ command "empty" (Gen.unit @-> makes hs) Model.empty (fun () -> Headers.empty);
+    command "add" (name_gen @-> value_gen @-> hs ^-> makes hs) Model.add Headers.add;
+    command "set" (name_gen @-> value_gen @-> hs ^-> makes hs) Model.set Headers.set;
+    command "remove" (name_gen @-> hs ^-> makes hs) Model.remove Headers.remove;
+    command "find" (name_gen @-> hs ^-> returns (option string)) Model.find Headers.find;
+    command "find_all" (name_gen @-> hs ^-> returns (list string)) Model.find_all
+      Headers.find_all;
+    command "to_list" (hs ^-> returns fields) Fun.id Headers.to_list ]
+
+let headers_stateful =
+  group "Headers model" [ stateful "behaves like an association list" headers_commands ]
+
+let () =
+  exit
+    (run "core"
+       [ method_tests; version_tests; status_tests; headers_tests; headers_props;
+         headers_stateful ])
