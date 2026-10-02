@@ -21,10 +21,40 @@ val chunked : ?max_body:int -> limits:H1_parse.limits -> Buf_reader.t -> Body.t
     body past [max_body] bytes (default: no limit), and {!Body.Truncated} if
     [r] ends first. *)
 
-val of_framing :
-  ?max_body:int -> limits:H1_parse.limits -> Buf_reader.t -> H1_parse.framing -> Body.t
-(** [of_framing ~max_body ~limits r framing] is the request body delimited by
-    [framing]: {!Body.empty}, {!fixed} or {!chunked}.
+(** {1:handle Request body handles} *)
+
+type t
+(** The type for the engine's handle on a request body: the body the handler
+    reads, and what the engine needs once the handler is done. *)
+
+val make :
+  ?max_body:int ->
+  ?expect_continue:(unit -> unit) ->
+  limits:H1_parse.limits ->
+  Buf_reader.t ->
+  H1_parse.framing ->
+  t
+(** [make ~max_body ~expect_continue ~limits r framing] is the request body
+    delimited by [framing]: {!Body.empty}, {!fixed} or {!chunked}. If the
+    request expects [100-continue], [expect_continue ()] runs once, just
+    before the handler's first read of the body; the engine sends
+    [100 Continue] from it.
 
     @raise H1_error.E with {!H1_error.Content_too_large} if the framing
     declares more than [max_body] bytes, before anything is read. *)
+
+val body : t -> Body.t
+(** [body t] is the body for the handler. *)
+
+val is_complete : t -> bool
+(** [is_complete t] is [true] iff the body was read to its end, or there is
+    none. A [Content-Length] body is complete once its last byte is read. *)
+
+val drain : t -> max:int -> bool
+(** [drain t ~max] reads and discards what remains of the body, so that the
+    next request on the connection can be read. It is [true] iff the
+    connection can be reused: the body ended within [max] more bytes. It is
+    [false], and the connection must close, if more remains, if the framing
+    is malformed or truncated, or if [100-continue] was expected but never
+    sent, because the client may still be holding the body back; nothing is
+    read in that case. *)

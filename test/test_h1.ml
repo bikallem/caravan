@@ -723,20 +723,21 @@ let chunked_tests =
             "b\r\n"
             => 413 Content Too Large
             |});
-      test "of_framing" (fun () ->
+      test "make: framing and max_body" (fun () ->
           let reads = ref 0 in
           let r = Buf_reader.make (fun _ _ _ -> incr reads; 0) in
-          equal (option int) (Some 0) (Body.length (H1_body.of_framing ~limits r No_body));
+          equal (option int) (Some 0) (Body.length (H1_body.body (H1_body.make ~limits r No_body)));
           raises (H1_error.E H1_error.Content_too_large) (fun () ->
-              H1_body.of_framing ~max_body:10 ~limits r (Fixed 11));
+              H1_body.make ~max_body:10 ~limits r (Fixed 11));
           equal int 0 !reads;
           let r = Buf_reader.of_string "helloXchunk" in
           equal string "hello"
-            (Body.to_string (H1_body.of_framing ~max_body:5 ~limits r (Fixed 5)));
+            (Body.to_string (H1_body.body (H1_body.make ~max_body:5 ~limits r (Fixed 5))));
           equal string "X" (read_n r 1);
           equal string "ab"
             (Body.to_string
-               (H1_body.of_framing ~limits (Buf_reader.of_string "2\r\nab\r\n0\r\n\r\n") Chunked))) ]
+               (H1_body.body
+                  (H1_body.make ~limits (Buf_reader.of_string "2\r\nab\r\n0\r\n\r\n") Chunked)))) ]
 
 (* Chunked encoding of a body in pieces, for the round-trip property. *)
 let encode_chunked pieces ext trailers =
@@ -761,9 +762,109 @@ let chunked_props =
            equal (list (pair string string)) trailers (Headers.to_list (Body.trailers b));
            equal string next (read_n r (String.length next + 1))) ]
 
+(* Request body handles: 100-continue, completion, draining *)
+
+let handle ?max_body ?expect_continue ?chunk input framing =
+  let r = Buf_reader.of_string ?chunk input in
+  (r, H1_body.make ?max_body ?expect_continue ~limits r framing)
+
+let next = "GET /next HTTP/1.1\r\n"
+
+let handle_tests =
+  group "H1_body handle"
+    [ test "expect_continue runs once, before the first read" (fun () ->
+          let log = ref [] in
+          let r, t =
+            handle ~expect_continue:(fun () -> log := "100" :: !log) "hello" (Fixed 5)
+          in
+          equal (list string) [] !log;
+          let b = H1_body.body t in
+          let buf = Bytes.create 2 in
+          equal int 0 (Buf_reader.consumed r);
+          ignore (Body.read b buf 0 2);
+          log := "read" :: !log;
+          ignore (Body.read b buf 0 2);
+          equal (list string) [ "100"; "read" ] (List.rev !log));
+      test "expect_continue never runs without a body" (fun () ->
+          let ran = ref false in
+          let _, t = handle ~expect_continue:(fun () -> ran := true) "" No_body in
+          equal string "" (Body.to_string (H1_body.body t));
+          is_true (H1_body.drain t ~max:0);
+          is_true (not !ran));
+      test "is_complete" (fun () ->
+          let _, t = handle "" No_body in
+          is_true (H1_body.is_complete t);
+          let _, t = handle ("hello" ^ next) (Fixed 5) in
+          is_true (not (H1_body.is_complete t));
+          ignore (Body.read (H1_body.body t) (Bytes.create 5) 0 5);
+          is_true ~msg:"complete at its last byte" (H1_body.is_complete t);
+          let _, t = handle "5\r\nhello\r\n0\r\n\r\n" Chunked in
+          ignore (Body.read (H1_body.body t) (Bytes.create 5) 0 5);
+          is_true ~msg:"chunked needs its last chunk" (not (H1_body.is_complete t));
+          ignore (Body.to_string (H1_body.body t));
+          is_true (H1_body.is_complete t));
+      test "drain within max keeps the next request" (fun () ->
+          let r, t = handle ~chunk:3 ("hello world" ^ next) (Fixed 11) in
+          let read = Body.read (H1_body.body t) (Bytes.create 4) 0 4 in
+          is_true (H1_body.drain t ~max:(11 - read));
+          equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100);
+          let r, t = handle ("5\r\nhello\r\n6\r\n world\r\n0\r\nX: y\r\n\r\n" ^ next) Chunked in
+          is_true (H1_body.drain t ~max:11);
+          equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100));
+      test "drain gives up past max" (fun () ->
+          let _, t = handle ~chunk:3 ("hello world" ^ next) (Fixed 11) in
+          let read = Body.read (H1_body.body t) (Bytes.create 4) 0 4 in
+          is_true (not (H1_body.drain t ~max:(11 - read - 1)));
+          let _, t = handle "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n" Chunked in
+          is_true (not (H1_body.drain t ~max:10));
+          (* [max] at the size of drain's scratch buffer *)
+          let _, t = handle (String.make 5000 'x') (Fixed 5000) in
+          is_true (not (H1_body.drain t ~max:4096));
+          let _, t = handle (String.make 4096 'x') (Fixed 4096) in
+          is_true (H1_body.drain t ~max:4096));
+      test "drain fails on bad or truncated bodies" (fun () ->
+          let _, t = handle "5\r\nhelloX" Chunked in
+          is_true (not (H1_body.drain t ~max:100));
+          let _, t = handle "hel" (Fixed 5) in
+          is_true (not (H1_body.drain t ~max:100));
+          let _, t = handle ~max_body:3 "5\r\nhello\r\n0\r\n\r\n" Chunked in
+          is_true (not (H1_body.drain t ~max:100)));
+      test "drain refuses while 100 Continue is owed" (fun () ->
+          let r, t = handle ~expect_continue:ignore ("hello" ^ next) (Fixed 5) in
+          is_true (not (H1_body.drain t ~max:100));
+          equal int 0 (Buf_reader.consumed r);
+          let r, t = handle ~expect_continue:ignore ("hello" ^ next) (Fixed 5) in
+          ignore (Body.read (H1_body.body t) (Bytes.create 1) 0 1);
+          is_true (H1_body.drain t ~max:100);
+          equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100));
+      test "drain works after the handler closed the body" (fun () ->
+          let r, t = handle ("hello" ^ next) (Fixed 5) in
+          Body.close (H1_body.body t);
+          is_true (H1_body.drain t ~max:5);
+          equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100));
+      prop "drain completes any partly read body and keeps what follows"
+        Gen.(triple (pair string bool) (int_range 0 40) (pair (int_range 1 9) (list ~size:(int_range 0 4) string)))
+        (fun ((body, chunked), read, (chunk, pieces)) ->
+           let input, framing =
+             if chunked
+             then (encode_chunked (body :: pieces) "" [], H1_parse.Chunked)
+             else (body, H1_parse.Fixed (String.length body))
+           in
+           let r, t = handle ~chunk (input ^ next) framing in
+           let b = H1_body.body t in
+           let buf = Bytes.create 64 in
+           let rec read_some left =
+             if left > 0
+             then match Body.read b buf 0 (Int.min 64 left) with 0 -> () | n -> read_some (left - n)
+           in
+           read_some read;
+           is_true (H1_body.drain t ~max:max_int);
+           is_true (H1_body.is_complete t);
+           equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100)) ]
+
 let () =
   exit
     (run "h1"
        [ buf_reader_tests; buf_reader_model; request_head_tests; head_props; framing_tests;
          target_tests; framing_props; h1_body_tests; chunked_tests;
-         chunked_props ])
+         chunked_props; handle_tests ])
