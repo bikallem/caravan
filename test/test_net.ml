@@ -158,6 +158,120 @@ let tcp_tests =
           Flow.close client;
           Tcp.Listener.close l) ]
 
+(* Server *)
+
+let quiet = { Config.default with addr = loopback; date_header = false }
+
+let handler req =
+  match Request.path_only req with
+  | "/sleep" ->
+      Mtime.wait_for Mtime.Span.(10 * s);
+      Response.string "late"
+  | "/id" ->
+      Response.string
+        (match Request.conn req with Some c -> string_of_int (Conn_info.id c) | None -> "-")
+  | _ -> Response.string "hello"
+
+let get ?(close = false) path =
+  Printf.sprintf "GET %s HTTP/1.1\r\nHost: x\r\n%s\r\n" path
+    (if close then "Connection: close\r\n" else "")
+
+(* Reads one response with a Content-Length body from [r]. *)
+let read_response_from r =
+  let status = Private.Buf_reader.read_line r ~max:1000 in
+  let rec headers len =
+    match Private.Buf_reader.read_line r ~max:1000 with
+    | "" -> len
+    | line ->
+        let lower = String.lowercase_ascii line in
+        if String.starts_with ~prefix:"content-length: " lower
+        then headers (int_of_string (String.sub line 16 (String.length line - 16)))
+        else headers len
+  in
+  let len = headers 0 in
+  let buf = Bytes.create len in
+  let rec body got = if got < len then body (got + Private.Buf_reader.read_into r buf got (len - got)) in
+  body 0;
+  (status, Bytes.to_string buf)
+
+let read_response flow = read_response_from (Private.Buf_reader.of_flow flow)
+
+let with_server ?(config = quiet) ?engine f =
+  in_main @@ fun () ->
+  let server = Server.start ~config ?engine handler in
+  Fun.protect ~finally:(fun () -> Server.shutdown server; Server.wait server) @@ fun () ->
+  f server
+
+let server_tests =
+  group "Server"
+    [ test "serves a GET on a free port" (fun () ->
+          with_server @@ fun server ->
+          let c = Tcp.connect (Server.local_addr server) in
+          Flow.write_string c (get ~close:true "/");
+          equal string "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+            (read_all c);
+          Flow.close c);
+      test "keeps a connection alive" (fun () ->
+          with_server @@ fun server ->
+          let c = Tcp.connect (Server.local_addr server) in
+          let r = Private.Buf_reader.of_flow c in
+          Flow.write_string c (get "/id");
+          let status, id1 = read_response_from r in
+          Flow.write_string c (get "/id");
+          let _, id2 = read_response_from r in
+          equal string "HTTP/1.1 200 OK" status;
+          equal string id1 id2;
+          Flow.close c);
+      test "serves 20 clients at once" (fun () ->
+          with_server @@ fun server ->
+          let clients =
+            List.init 20 (fun _ ->
+                Fun.Async.call (fun () ->
+                    let c = Tcp.connect (Server.local_addr server) in
+                    Flow.write_string c (get ~close:true "/");
+                    let _, body = read_response c in
+                    Flow.close c;
+                    body))
+          in
+          equal (list string) (List.init 20 (fun _ -> "hello")) (Fun.Async.get_all clients));
+      test "max_connections holds back extra connections" (fun () ->
+          with_server ~config:{ quiet with max_connections = 1 } @@ fun server ->
+          let first = Tcp.connect (Server.local_addr server) in
+          Flow.write_string first (get "/");
+          ignore (read_response first);
+          let second = Tcp.connect (Server.local_addr server) in
+          Flow.write_string second (get ~close:true "/");
+          Flow.set_read_deadline second (Some (deadline_in 200));
+          raises Flow.Timeout (fun () -> Flow.read second (Bytes.create 1) 0 1);
+          Flow.set_read_deadline second None;
+          Flow.close first;
+          let _, body = read_response second in
+          equal string "hello" body;
+          Flow.close second);
+      test "shutdown cancels requests in progress" (fun () ->
+          in_main @@ fun () ->
+          let server = Server.start ~config:quiet handler in
+          let c = Tcp.connect (Server.local_addr server) in
+          Flow.write_string c (get "/sleep");
+          Mtime.wait_for Mtime.Span.(50 * ms);
+          let clock = Mtime.counter () in
+          Server.shutdown server;
+          Server.wait server;
+          is_true ~msg:"wait returned promptly" (elapsed_ms clock < 1000.);
+          equal string "" (read_all c);
+          Flow.close c);
+      test "an address in use is an error" (fun () ->
+          with_server @@ fun server ->
+          raises_match
+            (function Unix.Unix_error (Unix.EADDRINUSE, _, _) -> true | _ -> false)
+            (fun () -> Server.start ~config:{ quiet with addr = Server.local_addr server } handler));
+      test "the engine can be replaced" (fun () ->
+          let engine _ctx flow _handler = Flow.write_string flow "custom engine" in
+          with_server ~engine @@ fun server ->
+          let c = Tcp.connect (Server.local_addr server) in
+          equal string "custom engine" (read_all c);
+          Flow.close c) ]
+
 (* Date across domains *)
 
 let date_tests =
@@ -177,4 +291,4 @@ let date_tests =
           in
           ignore (Fun.Async.get_all (List.init 8 worker))) ]
 
-let () = exit (run "net" [ tcp_tests; date_tests ])
+let () = exit (run "net" [ tcp_tests; server_tests; date_tests ])

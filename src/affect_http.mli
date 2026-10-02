@@ -19,6 +19,7 @@ module Handler = Handler
 module Tcp = Tcp
 module Config = Config
 module Engine = Engine
+module Server = Server
 
 (**/**)
 

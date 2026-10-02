@@ -32,5 +32,9 @@ val scheme : t -> [ `Http | `Https ]
 val alpn : t -> string option
 (** [alpn c] is the protocol negotiated with TLS ALPN, for example ["h2"]. *)
 
+val pp_addr : Format.formatter -> Unix.sockaddr -> unit
+(** [pp_addr] formats a socket address as [host:port], [\[ipv6\]:port] or a
+    Unix domain socket path. *)
+
 val pp : Format.formatter -> t -> unit
 (** [pp] formats a connection as [#id peer -> local]. *)

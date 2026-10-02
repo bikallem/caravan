@@ -1,0 +1,37 @@
+(* A small affect-http server.
+
+   dune exec examples/hello.exe, then try:
+     curl -i localhost:8080/hello
+     curl -i --data-binary 'some text' localhost:8080/echo
+     curl -N localhost:8080/stream
+     curl -i localhost:8080/slow *)
+
+open Affect_http
+module Mtime = Affect_unix.Mtime
+
+let handler req =
+  match Request.path_only req with
+  | "/hello" -> Response.string "Hello from affect-http!\n"
+  | "/echo" ->
+      (* Streams the request body back as it arrives. *)
+      let body = Request.body req in
+      Response.stream ?length:(Body.length body) (fun w -> Body.write_to body w)
+  | "/stream" ->
+      Response.stream (fun w ->
+          for i = 1 to 5 do
+            Body.Writer.write_string w (Printf.sprintf "event %d\n" i);
+            Body.Writer.flush w;
+            Mtime.wait_for Mtime.Span.(200 * ms)
+          done)
+  | "/slow" ->
+      Mtime.wait_for Mtime.Span.(5 * s);
+      Response.string "Sorry for the wait.\n"
+  | _ -> Handler.not_found req
+
+let main () =
+  Affect_unix.Unix.main @@ fun () ->
+  let server = Server.start handler in
+  Format.printf "Listening on http://%a@." Conn_info.pp_addr (Server.local_addr server);
+  Server.wait server
+
+let () = if !Sys.interactive then () else main ()
