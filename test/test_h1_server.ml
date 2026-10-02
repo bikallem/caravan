@@ -32,6 +32,7 @@ let handler req =
   | "/short" -> Response.stream ~length:5 (fun w -> Body.Writer.write_string w "abc")
   | "/close" -> Response.string ~headers:(Headers.of_list [ ("Connection", "close") ]) "bye"
   | "/upgrade" -> Response.upgrade ignore
+  | "/empty" -> Response.empty ()
   | "/info" ->
       Response.string
         (Format.asprintf "%a %s %s %s %a %s" Method.pp (Request.meth req) (Request.scheme req)
@@ -194,6 +195,22 @@ let connection_tests =
             Content-Length: 7\r\n
             \r\n
             ignored
+            |});
+      test "a last response without a body is sent" (fun () ->
+          expect
+            (show ("HEAD / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+             ^ "--\n"
+             ^ show (get ~headers:[ ("Connection", "close") ] "/empty"))
+          @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 5\r\n
+            Connection: close\r\n
+            \r\n
+            --
+            HTTP/1.1 204 No Content\r\n
+            Connection: close\r\n
+            \r\n
             |});
       test "malformed requests get 400 and close" (fun () ->
           expect (show ("GET / HTTP/1.1\r\n\r\n" ^ get "/")) @@ __POS_OF__ {|

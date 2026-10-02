@@ -1270,6 +1270,14 @@ let response_body_tests =
             H1_write.[ No_body; Head_length 1 ];
           equal int 2 !closes;
           is_true (not !ran));
+      test "framings without a body still flush the head" (fun () ->
+          List.iter
+            (fun framing ->
+               let w, calls = recorded () in
+               Buf_writer.write_string w "HTTP/1.1 204 No Content\r\n\r\n";
+               H1_write.body w framing Body.empty;
+               equal (list string) [ "HTTP/1.1 204 No Content\r\n\r\n" ] (calls ()))
+            H1_write.[ No_body; Head_length 5 ]);
       test "the body is closed once, also when writing fails" (fun () ->
           let closes = ref 0 in
           ignore (write_body (Length 2) (pieces_source ~close:(fun () -> incr closes) [ "ab" ]));

@@ -71,7 +71,7 @@ let body w framing b =
     flush ()
   in
   match framing with
-  | No_body | Head_length _ -> ()
+  | No_body | Head_length _ -> flush ()
   | Close_delimited -> write_all (Buf_writer.write_bytes w)
   | Length n ->
       let count = ref 0 in
