@@ -939,9 +939,216 @@ let buf_writer_tests =
                   (String.length c <= size || List.mem c writes))
              (calls ())) ]
 
+(* H1_write: framing and response heads *)
+
+module H1_write = Private.H1_write
+
+let show_framing_of ~meth ~version r =
+  match H1_write.framing ~meth ~version r with
+  | H1_write.No_body -> "no body"
+  | Head_length n -> Printf.sprintf "head, length %d" n
+  | Length n -> Printf.sprintf "length %d" n
+  | Chunked -> "chunked"
+  | Close_delimited -> "close-delimited"
+
+let stream_body = Response.stream ignore
+let sized s = Response.string s
+
+let response_framing_tests =
+  group "H1_write.framing"
+    [ test "framing table" (fun () ->
+          let row (label, meth, version, r) =
+            Printf.sprintf "%-26s => %s" label (show_framing_of ~meth ~version r)
+          in
+          let st code = Response.with_status (Status.v code) in
+          expect
+            (String.concat "\n"
+               (List.map row
+                  Method.
+                    [ ("GET 200 sized", GET, Version.Http_1_1, sized "hello");
+                      ("GET 200 empty", GET, Http_1_1, Response.make Body.empty);
+                      ("GET 200 stream 1.1", GET, Http_1_1, stream_body);
+                      ("GET 200 stream 1.0", GET, Http_1_0, stream_body);
+                      ("GET 200 sized 1.0", GET, Http_1_0, sized "hello");
+                      ("GET 100", GET, Http_1_1, st 100 (sized "x"));
+                      ("GET 101 upgrade", GET, Http_1_1, Response.upgrade ignore);
+                      ("GET 204", GET, Http_1_1, Response.empty ());
+                      ("GET 204 with a body", GET, Http_1_1, st 204 (sized "x"));
+                      ("GET 304", GET, Http_1_1, st 304 (sized "x"));
+                      ("GET 404 sized", GET, Http_1_1, st 404 (sized "nope"));
+                      ("HEAD 200 sized", HEAD, Http_1_1, sized "hello");
+                      ("HEAD 200 stream", HEAD, Http_1_1, stream_body);
+                      ("HEAD 304", HEAD, Http_1_1, st 304 (sized "x"));
+                      ("CONNECT 200", CONNECT, Http_1_1, sized "x");
+                      ("CONNECT 200 upgrade", CONNECT, Http_1_1, Response.upgrade ~status:Status.ok ignore);
+                      ("CONNECT 404", CONNECT, Http_1_1, st 404 (sized "no"));
+                      ("CONNECT 299", CONNECT, Http_1_1, st 299 stream_body);
+                      ("CONNECT 300 stream", CONNECT, Http_1_1, st 300 stream_body) ]))
+          @@ __POS_OF__ {|
+            GET 200 sized              => length 5
+            GET 200 empty              => length 0
+            GET 200 stream 1.1         => chunked
+            GET 200 stream 1.0         => close-delimited
+            GET 200 sized 1.0          => length 5
+            GET 100                    => no body
+            GET 101 upgrade            => no body
+            GET 204                    => no body
+            GET 204 with a body        => no body
+            GET 304                    => no body
+            GET 404 sized              => length 4
+            HEAD 200 sized             => head, length 5
+            HEAD 200 stream            => no body
+            HEAD 304                   => no body
+            CONNECT 200                => no body
+            CONNECT 200 upgrade        => no body
+            CONNECT 404                => length 2
+            CONNECT 299                => no body
+            CONNECT 300 stream         => chunked
+            |});
+      test "wants_close" (fun () ->
+          let with_conn v = Response.string ~headers:(Headers.of_list [ ("Connection", v) ]) "" in
+          is_true (H1_write.wants_close (with_conn "close"));
+          is_true (H1_write.wants_close (with_conn "Close"));
+          is_true (H1_write.wants_close (with_conn "keep-alive, close"));
+          is_true (not (H1_write.wants_close (with_conn "keep-alive")));
+          is_true (not (H1_write.wants_close (Response.string "")))) ]
+
+let render ?date ?(version = Version.Http_1_1) ?(keep_alive = true) ?(meth = Method.GET) r =
+  let out = Buffer.create 256 in
+  let w = Buf_writer.make (fun b o l -> Buffer.add_subbytes out b o l) in
+  H1_write.head w ?date ~version ~keep_alive (H1_write.framing ~meth ~version r) r;
+  Buf_writer.flush w;
+  (* Show CRLFs, so that the expected bytes are exact. *)
+  String.concat "\\r\\n\n" (String.split_on_char '\n' (String.concat "" (String.split_on_char '\r' (Buffer.contents out))))
+
+let date = "Sun, 06 Nov 1994 08:49:37 GMT"
+let hs = Headers.of_list
+
+let response_head_tests =
+  group "H1_write.head"
+    [ test "a sized response with a Date" (fun () ->
+          expect (render ~date (sized "hello")) @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Date: Sun, 06 Nov 1994 08:49:37 GMT\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 5\r\n
+            \r\n
+            |});
+      test "the handler's Date wins; no Date when none is given" (fun () ->
+          let r = Response.string ~headers:(hs [ ("date", "Mon, 07 Nov 1994 00:00:00 GMT") ]) "x" in
+          expect (render ~date r ^ render (sized "x")) @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            date: Mon, 07 Nov 1994 00:00:00 GMT\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 1\r\n
+            \r\n
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 1\r\n
+            \r\n
+            |});
+      test "fields the connection owns are dropped, others keep their order" (fun () ->
+          let r =
+            Response.stream
+              ~headers:
+                (hs
+                   [ ("X-First", "1"); ("Content-Length", "99"); ("transfer-encoding", "gzip");
+                     ("CONNECTION", "keep-alive"); ("Keep-Alive", "timeout=5"); ("Upgrade", "h2c");
+                     ("Proxy-Connection", "x"); ("TE", "trailers"); ("Set-Cookie", "a=1");
+                     ("Set-Cookie", "b=2"); ("Trailer", "X-Sum") ])
+              ignore
+          in
+          expect (render r) @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            X-First: 1\r\n
+            Set-Cookie: a=1\r\n
+            Set-Cookie: b=2\r\n
+            Trailer: X-Sum\r\n
+            Transfer-Encoding: chunked\r\n
+            \r\n
+            |});
+      test "101 keeps Upgrade and says Connection: Upgrade" (fun () ->
+          let r = Response.upgrade ~headers:(hs [ ("Upgrade", "websocket"); ("Connection", "x") ]) ignore in
+          expect (render ~keep_alive:false r) @@ __POS_OF__ {|
+            HTTP/1.1 101 Switching Protocols\r\n
+            Upgrade: websocket\r\n
+            Connection: Upgrade\r\n
+            \r\n
+            |});
+      test "an unregistered status has an empty reason" (fun () ->
+          expect (render (Response.with_status (Status.v 299) (sized ""))) @@ __POS_OF__ {|
+            HTTP/1.1 299 \r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 0\r\n
+            \r\n
+            |});
+      test "Connection by version and keep_alive" (fun () ->
+          let r = sized "x" in
+          expect
+            (String.concat "--\n"
+               [ render ~keep_alive:true r; render ~keep_alive:false r;
+                 render ~version:Http_1_0 ~keep_alive:true r;
+                 render ~version:Http_1_0 ~keep_alive:false r;
+                 render ~version:Http_1_0 ~keep_alive:false stream_body;
+                 render ~version:Http_1_0 ~keep_alive:true stream_body ])
+          @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 1\r\n
+            \r\n
+            --
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 1\r\n
+            Connection: close\r\n
+            \r\n
+            --
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 1\r\n
+            Connection: keep-alive\r\n
+            \r\n
+            --
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 1\r\n
+            Connection: close\r\n
+            \r\n
+            --
+            HTTP/1.1 200 OK\r\n
+            Connection: close\r\n
+            \r\n
+            --
+            HTTP/1.1 200 OK\r\n
+            Connection: close\r\n
+            \r\n
+            |});
+      test "HEAD and 204/304 heads" (fun () ->
+          expect
+            (String.concat "--\n"
+               [ render ~meth:Method.HEAD (sized "hello"); render ~meth:Method.HEAD stream_body;
+                 render (Response.empty ()); render (Response.with_status Status.not_modified (sized "x")) ])
+          @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 5\r\n
+            \r\n
+            --
+            HTTP/1.1 200 OK\r\n
+            \r\n
+            --
+            HTTP/1.1 204 No Content\r\n
+            \r\n
+            --
+            HTTP/1.1 304 Not Modified\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            \r\n
+            |}) ]
+
 let () =
   exit
     (run "h1"
        [ buf_reader_tests; buf_reader_model; request_head_tests; head_props; framing_tests;
          target_tests; framing_props; h1_body_tests; chunked_tests;
-         chunked_props; handle_tests; buf_writer_tests ])
+         chunked_props; handle_tests; buf_writer_tests;
+         response_framing_tests; response_head_tests ])

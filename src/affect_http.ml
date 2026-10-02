@@ -16,4 +16,5 @@ module Private = struct
   module H1_error = H1_error
   module H1_parse = H1_parse
   module H1_body = H1_body
+  module H1_write = H1_write
 end
