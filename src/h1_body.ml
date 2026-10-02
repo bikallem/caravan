@@ -143,12 +143,13 @@ let make ?max_body ?expect_continue ~limits r (framing : H1_parse.framing) =
   match src with
   | None -> t
   | Some src ->
-      (* The handler's reads send 100 Continue first, if it is expected. *)
+      (* The handler's reads send 100 Continue first, if it is expected. A
+         read that times out is the client's fault: 408. *)
       let read buf off len =
         (match t.continue with
         | Expected f -> t.continue <- Sent; f ()
         | No_expectation | Sent -> ());
-        src.read buf off len
+        try src.read buf off len with Flow.Timeout -> fail H1_error.Request_timeout
       in
       t.body <- to_body { src with read };
       t

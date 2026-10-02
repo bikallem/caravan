@@ -44,19 +44,25 @@ let handler req =
 
 (* Serves [input] on one connection. The bytes written, with [[FIN]] where
    the server half-closed and [[unread n]] if it left input unread, and the
-   errors reported. *)
-let serve ?(config = { Config.default with date_header = false }) ?chunk input =
+   errors reported. With [~stall:true] the client goes quiet at the end of
+   [input] instead of closing: the flow is no longer readable and reads time
+   out. *)
+let serve ?(config = { Config.default with date_header = false }) ?chunk ?(stall = false) input
+  =
   let errors = ref [] in
   let config = { config with on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) } in
   let out = Buffer.create 256 and consumed = ref 0 in
   let inner = Flow.of_string ?chunk input out in
+  let stalled () = stall && !consumed = String.length input in
   let read buf off len =
+    if stalled () then raise Flow.Timeout;
     let n = Flow.read inner buf off len in
     consumed := !consumed + n;
     n
   in
+  let readable = Action.guard (fun () -> if stalled () then Action.never else Action.always ()) in
   let flow =
-    Flow.make ~read ~write:(Flow.write inner) ~readable:(Flow.readable' inner ())
+    Flow.make ~read ~write:(Flow.write inner) ~readable
       ~shutdown_send:(fun () -> Buffer.add_string out "[FIN]")
       ~close:ignore ~set_read_deadline:ignore ~set_write_deadline:ignore
   in
@@ -69,8 +75,8 @@ let serve ?(config = { Config.default with date_header = false }) ?chunk input =
   if unread > 0 then Printf.bprintf out "[unread %d]" unread;
   (Buffer.contents out, List.rev !errors)
 
-let show ?config ?chunk input =
-  let out, errors = serve ?config ?chunk input in
+let show ?config ?chunk ?stall input =
+  let out, errors = serve ?config ?chunk ?stall input in
   show_crlf out ^ String.concat "" (List.map (fun e -> "\n! " ^ e) errors)
 
 let get ?(v = "HTTP/1.1") ?(headers = []) path =
@@ -396,4 +402,60 @@ let connection_tests =
              ^ show "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhel")
           @@ __POS_OF__ {| | |}) ]
 
-let () = exit (run "h1_server" [ connection_tests ])
+let timeout_tests =
+  let quick =
+    { Config.default with date_header = false;
+                          header_timeout = Affect_unix.Mtime.Span.(10 * ms);
+                          idle_timeout = Affect_unix.Mtime.Span.(10 * ms) }
+  in
+  let body_10 path = Printf.sprintf "POST %s HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nhel" path in
+  group "H1_server timeouts"
+    [ test "a request head that is late gets 408" (fun () ->
+          expect (show ~stall:true "GET / HTTP/1.1\r\nHost: a") @@ __POS_OF__ {|
+            HTTP/1.1 408 Request Timeout\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 16\r\n
+            Connection: close\r\n
+            \r\n
+            Request Timeout
+            [FIN]
+            |});
+      test "a request body that is late gets 408" (fun () ->
+          expect (show ~stall:true (body_10 "/echo")) @@ __POS_OF__ {|
+            HTTP/1.1 408 Request Timeout\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 16\r\n
+            Connection: close\r\n
+            \r\n
+            Request Timeout
+            [FIN]
+            |});
+      test "a body that is late once the response started ends it" (fun () ->
+          expect (show ~stall:true (body_10 "/stream-echo")) @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Transfer-Encoding: chunked\r\n
+            \r\n
+            3\r\n
+            hel\r\n
+            [FIN]
+            |});
+      test "an unread body that is late when drained closes" (fun () ->
+          expect (show ~stall:true (body_10 "/ignore")) @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 7\r\n
+            \r\n
+            ignored
+            |});
+      test "a new connection that sends nothing is closed" (fun () ->
+          expect (show ~config:quick ~stall:true "") @@ __POS_OF__ {||});
+      test "an idle connection is closed" (fun () ->
+          expect (show ~config:quick ~stall:true (get "/")) @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 5\r\n
+            \r\n
+            hello
+            |}) ]
+
+let () = exit (run "h1_server" [ connection_tests; timeout_tests ])

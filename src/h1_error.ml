@@ -3,6 +3,7 @@ type t =
 | Uri_too_long
 | Header_fields_too_large
 | Content_too_large
+| Request_timeout
 | Not_implemented of string
 | Version_not_supported
 
@@ -13,6 +14,7 @@ let status = function
 | Uri_too_long -> Status.uri_too_long
 | Header_fields_too_large -> Status.request_header_fields_too_large
 | Content_too_large -> Status.content_too_large
+| Request_timeout -> Status.request_timeout
 | Not_implemented _ -> Status.not_implemented
 | Version_not_supported -> Status.http_version_not_supported
 

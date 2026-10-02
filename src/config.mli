@@ -23,11 +23,13 @@ type t = {
   (** At most this many bytes of a request body that the handler did not read
       are discarded to keep the connection open; larger ones close it. *)
   header_timeout : Affect_unix.Mtime.Span.t;
-  (** Time allowed to receive a request head. *)
+  (** Time allowed to receive a request head, and for a new connection to
+      start its first one. A head that is late gets 408. *)
   idle_timeout : Affect_unix.Mtime.Span.t;
   (** Time a kept-alive connection may wait for its next request. *)
   read_timeout : Affect_unix.Mtime.Span.t;
-  (** Time allowed for each read of a request body. *)
+  (** Time allowed for each read of a request body. A late read gets 408 if
+      the response has not started yet. *)
   write_timeout : Affect_unix.Mtime.Span.t;
   (** Time allowed for each write of a response. *)
   linger_timeout : Affect_unix.Mtime.Span.t;

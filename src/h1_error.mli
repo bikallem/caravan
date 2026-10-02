@@ -5,6 +5,7 @@ type t =
 | Uri_too_long (** 414: the request line is too long. *)
 | Header_fields_too_large (** 431 *)
 | Content_too_large (** 413 *)
+| Request_timeout (** 408: the request did not arrive in time. *)
 | Not_implemented of string (** 501, for example an unknown transfer coding. *)
 | Version_not_supported (** 505 *)
 (** The type for request errors. *)

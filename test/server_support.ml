@@ -27,6 +27,10 @@ let handler req =
           Body.Writer.flush w;
           Body.Writer.write_string w "cd")
   | "/ignore" -> Response.string "ignored"
+  | "/big" ->
+      (* 64 MiB, more than socket buffers hold. *)
+      let chunk = String.make 65536 'x' in
+      Response.stream (fun w -> for _ = 1 to 1024 do Body.Writer.write_string w chunk done)
   | "/drip" ->
       Response.stream (fun w ->
           for i = 1 to 3 do

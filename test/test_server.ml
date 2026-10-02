@@ -117,4 +117,66 @@ let integration_tests =
           Flow.close a;
           Flow.close b) ]
 
-let () = exit (run "server" [ integration_tests ])
+(* Timeouts of 100ms. The clients wait at most 5s for anything. *)
+let timeout_tests =
+  let config =
+    { config with header_timeout = Mtime.Span.(100 * ms); idle_timeout = Mtime.Span.(100 * ms);
+                  read_timeout = Mtime.Span.(100 * ms); write_timeout = Mtime.Span.(100 * ms) }
+  in
+  let connect server =
+    let flow, r = connect server in
+    Flow.set_read_deadline flow (Mtime.add_span (Mtime.now ()) Mtime.Span.(5 * s));
+    (flow, r)
+  in
+  let eof r = equal int ~msg:"end of stream" 0 (Buf_reader.read_into r (Bytes.create 1) 0 1) in
+  group "Server timeouts"
+    [ test "a request head sent too slowly gets 408" (fun () ->
+          with_server ~config @@ fun server ->
+          let flow, r = connect server in
+          Flow.write_string flow "GET /hello HTTP/1.1\r\nHo";
+          equal string {|408 "Request Timeout\n" close|} (read_response ~head:false r);
+          eof r;
+          Flow.close flow);
+      test "a connection that sends nothing is closed" (fun () ->
+          with_server ~config @@ fun server ->
+          let flow, r = connect server in
+          eof r;
+          Flow.close flow);
+      test "an idle connection is closed" (fun () ->
+          with_server ~config @@ fun server ->
+          let flow, r = connect server in
+          Flow.write_string flow (get "/hello");
+          equal string {|200 "hello"|} (read_response ~head:false r);
+          eof r;
+          Flow.close flow);
+      test "a stalled upload gets 408" (fun () ->
+          with_server ~config @@ fun server ->
+          let flow, r = connect server in
+          Flow.write_string flow "POST /hello HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc";
+          equal string {|408 "Request Timeout\n" close|} (read_response ~head:false r);
+          eof r;
+          Flow.close flow);
+      test "a slow upload that keeps sending is not cut off" (fun () ->
+          with_server ~config @@ fun server ->
+          let flow, r = connect server in
+          Flow.write_string flow "POST /hello HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\n\r\n";
+          (* 300ms in all, but never 100ms without a byte. *)
+          for _ = 1 to 6 do
+            Mtime.wait_for Mtime.Span.(50 * ms);
+            Flow.write_string flow "x"
+          done;
+          equal string {|200 "hello"|} (read_response ~head:false r);
+          Flow.close flow);
+      test "a client that does not read its response is let go" (fun () ->
+          with_server ~config:{ config with max_connections = 1 } @@ fun server ->
+          let a, _ = connect server in
+          Flow.write_string a (get "/big");
+          (* [a] never reads: once the socket buffers are full, the server's
+             writes block, and it lets [a] go after write_timeout. *)
+          let b, rb = connect server in
+          Flow.write_string b (get "/hello");
+          equal string {|200 "hello"|} (read_response ~head:false rb);
+          Flow.close a;
+          Flow.close b) ]
+
+let () = exit (run "server" [ integration_tests; timeout_tests ])
