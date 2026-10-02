@@ -58,6 +58,11 @@ let head w ?date ~version ~keep_alive framing r =
 
 exception Length_mismatch
 
+let () =
+  Printexc.register_printer (function
+    | Length_mismatch -> Some "response body length differs from its Content-Length"
+    | _ -> None)
+
 let body w framing b =
   Fun.protect ~finally:(fun () -> Body.close b) @@ fun () ->
   let flush () = Buf_writer.flush w in

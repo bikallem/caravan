@@ -9,6 +9,8 @@ module Request = Request
 module Response = Response
 module Handler = Handler
 module Tcp = Tcp
+module Config = Config
+module Engine = Engine
 
 module Private = struct
   module Date = Date
@@ -18,4 +20,5 @@ module Private = struct
   module H1_parse = H1_parse
   module H1_body = H1_body
   module H1_write = H1_write
+  module H1_server = H1_server
 end
