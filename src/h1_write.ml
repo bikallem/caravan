@@ -55,3 +55,35 @@ let head w ?date ~version ~keep_alive framing r =
   else if version = Version.Http_1_0
   then field w "Connection" "keep-alive";
   Buf_writer.write_string w "\r\n"
+
+exception Length_mismatch
+
+let body w framing b =
+  Fun.protect ~finally:(fun () -> Body.close b) @@ fun () ->
+  let flush () = Buf_writer.flush w in
+  let write_all write =
+    Body.write_to b (Body.Writer.make ~write ~flush);
+    flush ()
+  in
+  match framing with
+  | No_body | Head_length _ -> ()
+  | Close_delimited -> write_all (Buf_writer.write_bytes w)
+  | Length n ->
+      let count = ref 0 in
+      write_all (fun buf off len ->
+          if len > n - !count then raise Length_mismatch;
+          count := !count + len;
+          Buf_writer.write_bytes w buf off len);
+      if !count <> n then raise Length_mismatch
+  | Chunked ->
+      let chunk buf off len =
+        Buf_writer.write_string w (Printf.sprintf "%x\r\n" len);
+        Buf_writer.write_bytes w buf off len;
+        Buf_writer.write_string w "\r\n"
+      in
+      let sink = Body.Writer.make ~write:chunk ~flush in
+      Body.write_to b sink;
+      Buf_writer.write_string w "0\r\n";
+      Headers.iter (field w) (Body.Writer.trailers sink);
+      Buf_writer.write_string w "\r\n";
+      flush ()

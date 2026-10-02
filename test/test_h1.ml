@@ -1145,10 +1145,165 @@ let response_head_tests =
             \r\n
             |}) ]
 
+(* H1_write.body *)
+
+(* Shows each CRLF as a visible \\r\\n and a line break; other bytes as they are. *)
+let show_crlf s =
+  let b = Buffer.create (String.length s) and n = String.length s in
+  let rec loop i =
+    if i < n
+    then
+      if s.[i] = '\r' && i + 1 < n && s.[i + 1] = '\n'
+      then (Buffer.add_string b "\\r\\n\n"; loop (i + 2))
+      else (Buffer.add_char b s.[i]; loop (i + 1))
+  in
+  loop 0;
+  Buffer.contents b
+
+(* The bytes [H1_write.body] writes, and its output calls. *)
+let write_body ?(size = 64) framing b =
+  let w, calls = recorded ~size () in
+  H1_write.body w framing b;
+  (String.concat "" (calls ()), calls ())
+
+let pieces_source ?close pieces =
+  let rest = ref pieces in
+  Body.of_source ?close (fun buf off _ ->
+      match !rest with
+      | [] -> 0
+      | p :: tl -> rest := tl; Bytes.blit_string p 0 buf off (String.length p); String.length p)
+
+let response_body_tests =
+  group "H1_write.body"
+    [ test "golden bodies" (fun () ->
+          let producer =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "data: 1\n\n";
+                Body.Writer.flush w;
+                Body.Writer.write_string w "";
+                Body.Writer.write_string w "0123456789abcdef!";
+                Body.Writer.set_trailers w (Headers.of_list [ ("X-Sum", "42") ]))
+          in
+          let cases =
+            [ ("length", H1_write.Length 5, Body.of_string "hello");
+              ("length 0", Length 0, Body.empty);
+              ("chunked string", Chunked, Body.of_string "hello");
+              ("chunked source", Chunked, pieces_source [ "ab"; "cdefghijklmnopq" ]);
+              ("chunked producer", Chunked, producer);
+              ("chunked empty", Chunked, Body.empty);
+              ("close-delimited", Close_delimited, pieces_source [ "ab"; "cd" ]);
+              ("no body", No_body, Body.of_string "hidden");
+              ("head", Head_length 6, Body.of_string "hidden") ]
+          in
+          expect
+            (String.concat "\n"
+               (List.map
+                  (fun (label, framing, b) ->
+                     Printf.sprintf "-- %s\n%s" label (show_crlf (fst (write_body framing b))))
+                  cases))
+          @@ __POS_OF__ {|
+            -- length
+            hello
+            -- length 0
+
+            -- chunked string
+            5\r\n
+            hello\r\n
+            0\r\n
+            \r\n
+
+            -- chunked source
+            2\r\n
+            ab\r\n
+            f\r\n
+            cdefghijklmnopq\r\n
+            0\r\n
+            \r\n
+
+            -- chunked producer
+            9\r\n
+            data: 1
+
+            \r\n
+            11\r\n
+            0123456789abcdef!\r\n
+            0\r\n
+            X-Sum: 42\r\n
+            \r\n
+
+            -- chunked empty
+            0\r\n
+            \r\n
+
+            -- close-delimited
+            abcd
+            -- no body
+
+            -- head
+            |});
+      test "Content-Length mismatches" (fun () ->
+          raises H1_write.Length_mismatch (fun () ->
+              write_body (Length 6) (Body.of_string "hello"));
+          let w, calls = recorded () in
+          raises H1_write.Length_mismatch (fun () ->
+              H1_write.body w (Length 4) (pieces_source [ "ab"; "cde" ]));
+          Buf_writer.flush w;
+          equal string "ab" (String.concat "" (calls ()));
+          raises H1_write.Length_mismatch (fun () ->
+              write_body (Length 4) (Body.of_writer (fun w -> Body.Writer.write_string w "hello"))));
+      test "bodies that are not sent are closed, producers never run" (fun () ->
+          let closes = ref 0 and ran = ref false in
+          List.iter
+            (fun framing ->
+               ignore (write_body framing (pieces_source ~close:(fun () -> incr closes) [ "x" ]));
+               equal string "" (fst (write_body framing (Body.of_writer (fun _ -> ran := true)))))
+            H1_write.[ No_body; Head_length 1 ];
+          equal int 2 !closes;
+          is_true (not !ran));
+      test "the body is closed once, also when writing fails" (fun () ->
+          let closes = ref 0 in
+          ignore (write_body (Length 2) (pieces_source ~close:(fun () -> incr closes) [ "ab" ]));
+          equal int 1 !closes;
+          raises H1_write.Length_mismatch (fun () ->
+              write_body (Length 9) (pieces_source ~close:(fun () -> incr closes) [ "ab" ]));
+          equal int 2 !closes;
+          raises Exit (fun () ->
+              write_body Chunked
+                (Body.of_source ~close:(fun () -> incr closes) (fun _ _ _ -> raise Exit)));
+          equal int 3 !closes);
+      test "each source chunk and each producer flush reaches the output" (fun () ->
+          equal (list string) [ "2\r\nab\r\n"; "2\r\ncd\r\n"; "0\r\n\r\n" ]
+            (snd (write_body Chunked (pieces_source [ "ab"; "cd" ])));
+          equal (list string) [ "a"; "b" ]
+            (snd
+               (write_body (Length 2)
+                  (Body.of_writer (fun w ->
+                       Body.Writer.write_string w "a";
+                       Body.Writer.flush w;
+                       Body.Writer.write_string w "b")))));
+      prop "what is written decodes back"
+        Gen.(
+          triple (list ~size:(int_range 0 6) string)
+            (list ~size:(int_range 0 3) (pair token_gen (map String.trim (string_of (char_range 'a' 'z')))))
+            (pair (int_range 1 9) (int_range 1 64)))
+        (fun (pieces, trailers, (chunk, size)) ->
+           let produce w =
+             List.iter (Body.Writer.write_string w) pieces;
+             Body.Writer.set_trailers w (Headers.of_list trailers)
+           in
+           let wire, _ = write_body ~size Chunked (Body.of_writer produce) in
+           let b = H1_body.chunked ~limits (Buf_reader.of_string ~chunk (wire ^ next)) in
+           equal string (String.concat "" pieces) (Body.to_string b);
+           equal (list (pair string string)) trailers (Headers.to_list (Body.trailers b));
+           let all = String.concat "" pieces in
+           let wire, _ = write_body ~size (Length (String.length all)) (Body.of_writer produce) in
+           equal string all wire) ]
+
 let () =
   exit
     (run "h1"
        [ buf_reader_tests; buf_reader_model; request_head_tests; head_props; framing_tests;
          target_tests; framing_props; h1_body_tests; chunked_tests;
          chunked_props; handle_tests; buf_writer_tests;
-         response_framing_tests; response_head_tests ])
+         response_framing_tests; response_head_tests;
+         response_body_tests ])

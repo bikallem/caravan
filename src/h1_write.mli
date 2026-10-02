@@ -41,3 +41,22 @@ val head :
       if not [keep_alive] or the body is {!Close_delimited}, or
       [Connection: keep-alive] for an HTTP/1.0 request that is kept alive.
     - The empty line that ends the head. *)
+
+(** {1:body Bodies} *)
+
+exception Length_mismatch
+(** Raised by {!body} when a body produces fewer or more bytes than its
+    [Content-Length]. The response is broken: the connection must close. *)
+
+val body : Buf_writer.t -> framing -> Body.t -> unit
+(** [body w framing b] writes [b] to [w] as [framing] says, and flushes [w]:
+    - {!No_body} and {!Head_length} write nothing; a writer body never runs.
+    - [Length n] writes exactly [n] bytes. It raises {!Length_mismatch}
+      before writing a byte past [n], or at the end if [b] was shorter.
+    - {!Chunked} writes each write of [b] as a chunk, then the last chunk,
+      the trailers of [b] and the final CRLF.
+    - {!Close_delimited} writes the bytes of [b] as they are.
+
+    Each chunk of a source body, and each {!Body.Writer.flush} of a writer
+    body, flushes [w], so that streamed data is not held back. [b] is closed
+    when [body] returns or raises, which releases a proxied source. *)
