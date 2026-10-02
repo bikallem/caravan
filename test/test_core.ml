@@ -235,8 +235,122 @@ let date_tests =
           is_true ~msg:"decodes as IMF"
             (match Http_date.decode s with `IMF _ -> true | _ -> false)) ]
 
+(* Flow *)
+
+(* Reads [flow] to the end, [size] bytes at a time. *)
+let read_all ?(size = 4096) flow =
+  let buf = Bytes.create size and out = Buffer.create 64 in
+  let rec loop () =
+    match Flow.read flow buf 0 size with
+    | 0 -> Buffer.contents out
+    | n -> Buffer.add_subbytes out buf 0 n; loop ()
+  in
+  loop ()
+
+let in_main f = Affect_unix.Unix.main ~domain_count:1 f
+
+let readable_within_20ms flow =
+  in_main @@ fun () ->
+  Affect.Action.invoke
+    (Affect.Action.choose
+       [ Flow.readable' flow true;
+         Affect_unix.Mtime.wait_for' Affect_unix.Mtime.Span.(20 * ms) false ])
+
+let flow_tests =
+  group "Flow"
+    [ test "of_string reads the input, then 0 for good" (fun () ->
+          let flow = Flow.of_string "hello" (Buffer.create 0) in
+          equal string "hello" (read_all flow);
+          equal int 0 (Flow.read flow (Bytes.create 4) 0 4));
+      test "chunk caps each read" (fun () ->
+          let flow = Flow.of_string ~chunk:2 "hello" (Buffer.create 0) in
+          let buf = Bytes.create 8 in
+          equal (list int) [ 2; 2; 1; 0 ]
+            (List.init 4 (fun _ -> Flow.read flow buf 0 8)));
+      test "writes append to the output" (fun () ->
+          let out = Buffer.create 16 in
+          let flow = Flow.of_string "" out in
+          Flow.write flow (Bytes.of_string "xxabcxx") 2 3;
+          Flow.write_string flow "def";
+          Flow.write flow (Bytes.of_string "z") 0 0;
+          equal string "abcdef" (Buffer.contents out));
+      test "invalid ranges are rejected" (fun () ->
+          let flow = Flow.of_string "abc" (Buffer.create 0) in
+          let buf = Bytes.create 4 in
+          List.iter
+            (fun (off, len) -> raises_match is_invalid_arg (fun () -> Flow.read flow buf off len))
+            [ (0, 0); (-1, 2); (0, 5); (3, 2) ];
+          raises_match is_invalid_arg (fun () -> Flow.write flow buf 2 3);
+          raises_match is_invalid_arg (fun () -> Flow.of_string ~chunk:0 "" (Buffer.create 0)));
+      test "close is idempotent and later use raises Closed" (fun () ->
+          let closes = ref 0 in
+          let flow =
+            Flow.make ~read:(fun _ _ _ -> 0) ~write:(fun _ _ _ -> ())
+              ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
+              ~close:(fun () -> incr closes)
+              ~set_read_deadline:ignore ~set_write_deadline:ignore
+          in
+          Flow.close flow;
+          Flow.close flow;
+          equal int 1 !closes;
+          raises Flow.Closed (fun () -> Flow.read flow (Bytes.create 1) 0 1);
+          raises Flow.Closed (fun () -> Flow.write_string flow "x"));
+      test "make delegates to its functions" (fun () ->
+          let log = ref [] in
+          let note s = log := s :: !log in
+          let flow =
+            Flow.make
+              ~read:(fun buf off _ -> note "read"; Bytes.set buf off 'a'; 1)
+              ~write:(fun _ _ len -> note (Printf.sprintf "write %d" len))
+              ~readable:(Affect.Action.always ())
+              ~shutdown_send:(fun () -> note "shutdown")
+              ~close:(fun () -> note "close")
+              ~set_read_deadline:(fun d -> note (if d = None then "rd none" else "rd"))
+              ~set_write_deadline:(fun d -> note (if d = None then "wd none" else "wd"))
+          in
+          equal int 1 (Flow.read flow (Bytes.create 1) 0 1);
+          Flow.write_string flow "abc";
+          Flow.write_string flow "";
+          Flow.shutdown_send flow;
+          Flow.set_read_deadline flow None;
+          Flow.set_write_deadline flow None;
+          Flow.close flow;
+          equal (list string)
+            [ "read"; "write 3"; "shutdown"; "rd none"; "wd none"; "close" ]
+            (List.rev !log));
+      test "prepend reads its bytes first" (fun () ->
+          let out = Buffer.create 8 in
+          let flow = Flow.prepend "ab" (Flow.prepend "" (Flow.of_string "cd" out)) in
+          equal string "abcd" (read_all ~size:3 flow);
+          Flow.write_string flow "w";
+          equal string "w" (Buffer.contents out);
+          equal string "xyz"
+            (read_all (Flow.prepend "x" (Flow.prepend "y" (Flow.of_string "z" out)))));
+      test "prepend is readable while its bytes remain" (fun () ->
+          let never =
+            Flow.make ~read:(fun _ _ _ -> 0) ~write:(fun _ _ _ -> ())
+              ~readable:Affect.Action.never ~shutdown_send:ignore ~close:ignore
+              ~set_read_deadline:ignore ~set_write_deadline:ignore
+          in
+          let flow = Flow.prepend "a" never in
+          is_true ~msg:"readable before the prefix is read" (readable_within_20ms flow);
+          equal int 1 (Flow.read flow (Bytes.create 4) 0 4);
+          is_true ~msg:"waits on the underlying flow after"
+            (not (readable_within_20ms flow)));
+      prop "reads return the input however it is split"
+        Gen.(pair (pair string (int_range 0 64)) (pair (int_range 1 9) (int_range 1 9)))
+        (fun ((input, cut), (chunk, size)) ->
+           let cut = Int.min cut (String.length input) in
+           let flow =
+             Flow.prepend (String.sub input 0 cut)
+               (Flow.of_string ~chunk
+                  (String.sub input cut (String.length input - cut))
+                  (Buffer.create 0))
+           in
+           equal string input (read_all ~size flow)) ]
+
 let () =
   exit
     (run "core"
        [ method_tests; version_tests; status_tests; headers_tests; headers_props;
-         headers_stateful; date_tests ])
+         headers_stateful; date_tests; flow_tests ])
