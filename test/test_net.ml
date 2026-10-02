@@ -156,17 +156,40 @@ let tcp_tests =
           let fd, _ = Tcp.Listener.accept l in
           Unix.close fd;
           Flow.close client;
+          Tcp.Listener.close l);
+      test "try_accept does not wait" (fun () ->
+          in_main @@ fun () ->
+          let l = Tcp.Listener.listen loopback in
+          is_true ~msg:"nothing pending" (Tcp.Listener.try_accept l = None);
+          let client = Tcp.connect (Tcp.Listener.addr l) in
+          let rec accepted tries =
+            match Tcp.Listener.try_accept l with
+            | Some (fd, _) -> Unix.close fd; true
+            | None -> tries > 0 && (Mtime.wait_for Mtime.Span.(5 * ms); accepted (tries - 1))
+          in
+          is_true ~msg:"a pending connection" (accepted 20);
+          is_true ~msg:"nothing pending again" (Tcp.Listener.try_accept l = None);
+          Flow.close client;
           Tcp.Listener.close l) ]
 
 (* Server *)
 
 let quiet = { Config.default with addr = loopback; date_header = false }
 
+(* Set when /sleep or /pause starts, so that a test can stop the server
+   while it is in progress. *)
+let started = ref (Cell.Once.make ())
+
 let handler req =
   match Request.path_only req with
   | "/sleep" ->
+      Cell.Once.try_set !started ();
       Mtime.wait_for Mtime.Span.(10 * s);
       Response.string "late"
+  | "/pause" ->
+      Cell.Once.try_set !started ();
+      Mtime.wait_for Mtime.Span.(300 * ms);
+      Response.string "done"
   | "/id" ->
       Response.string
         (match Request.conn req with Some c -> string_of_int (Conn_info.id c) | None -> "-")
@@ -260,18 +283,102 @@ let server_tests =
           let _, body = read_response second in
           equal string "hello" body;
           Flow.close second);
-      test "shutdown cancels requests in progress" (fun () ->
+      test "requests that outlast shutdown_grace are cancelled" (fun () ->
           in_main @@ fun () ->
-          let server = Server.start ~config:quiet handler in
+          started := Cell.Once.make ();
+          let config = { quiet with shutdown_grace = Mtime.Span.(100 * ms) } in
+          let server = Server.start ~config handler in
           let c = Tcp.connect (Server.local_addr server) in
           Flow.write_string c (get "/sleep");
-          Mtime.wait_for Mtime.Span.(50 * ms);
+          Cell.Once.get !started;
           let clock = Mtime.counter () in
           Server.shutdown server;
           Server.wait server;
-          is_true ~msg:"wait returned promptly" (elapsed_ms clock < 1000.);
+          let waited = elapsed_ms clock in
+          is_true ~msg:(Printf.sprintf "waited %.0fms" waited) (waited > 90. && waited < 1000.);
           equal string "" (read_all c);
           Flow.close c);
+      test "a request in progress at shutdown finishes, closing its connection" (fun () ->
+          in_main @@ fun () ->
+          started := Cell.Once.make ();
+          let server = Server.start ~config:quiet handler in
+          let c = Tcp.connect (Server.local_addr server) in
+          Flow.write_string c (get "/pause");
+          Cell.Once.get !started;
+          let clock = Mtime.counter () in
+          Server.shutdown server;
+          equal string
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone"
+            (read_all c);
+          Flow.close c;
+          Server.wait server;
+          let waited = elapsed_ms clock in
+          is_true ~msg:(Printf.sprintf "waited %.0fms, not the 10s grace" waited) (waited < 2000.));
+      test "idle connections close at once on shutdown" (fun () ->
+          in_main @@ fun () ->
+          let server = Server.start ~config:quiet handler in
+          let c = Tcp.connect (Server.local_addr server) in
+          let r = Private.Buf_reader.of_flow c in
+          Flow.write_string c (get "/");
+          ignore (read_response_from r);
+          let clock = Mtime.counter () in
+          Server.shutdown server;
+          equal int ~msg:"end of stream" 0 (Private.Buf_reader.read_into r (Bytes.create 1) 0 1);
+          Server.wait server;
+          is_true ~msg:"well before the 10s grace" (elapsed_ms clock < 2000.);
+          Flow.close c);
+      test "an engine sees the server stopping" (fun () ->
+          let engine (ctx : Engine.ctx) flow _handler =
+            let before = ctx.is_stopping () in
+            Flow.write_string flow "ready ";
+            Action.invoke ctx.stopping;
+            Flow.write_string flow (Printf.sprintf "%b %b" before (ctx.is_stopping ()))
+          in
+          in_main @@ fun () ->
+          let server = Server.start ~config:quiet ~engine handler in
+          let c = Tcp.connect (Server.local_addr server) in
+          equal string "ready " (read_exactly c 6);
+          Server.shutdown server;
+          Server.wait server;
+          equal string "false true" (read_all c);
+          Flow.close c);
+      test "with every slot busy, shutdown still refuses new clients at once" (fun () ->
+          in_main @@ fun () ->
+          started := Cell.Once.make ();
+          let server = Server.start ~config:{ quiet with max_connections = 1 } handler in
+          let addr = Server.local_addr server in
+          let c = Tcp.connect addr in
+          Flow.write_string c (get "/pause");
+          Cell.Once.get !started;
+          Server.shutdown server;
+          (* The listener closes while the only slot is still taken. *)
+          let rec refused tries =
+            let retry () = tries > 0 && (Mtime.wait_for Mtime.Span.(5 * ms); refused (tries - 1)) in
+            match Tcp.connect addr with
+            | exception Unix.Unix_error (Unix.ECONNREFUSED, _, _) -> true
+            (* Queued just as the listener closed. *)
+            | exception Unix.Unix_error (Unix.ECONNRESET, _, _) -> retry ()
+            | c -> Flow.close c; retry ()
+          in
+          is_true ~msg:"refused" (refused 20);
+          let _, body = read_response c in
+          equal string "done" body;
+          Flow.close c;
+          Server.wait server);
+      test "200 starts and shutdowns in a row all finish" (fun () ->
+          (* Readiness of the listener can be spurious: the acceptor must not
+             then block in accept, deaf to the stop. *)
+          let engine _ctx flow _handler = Flow.write_string flow "x" in
+          for _ = 1 to 200 do
+            in_main @@ fun () ->
+            let server = Server.start ~config:quiet ~engine handler in
+            let c = Tcp.connect (Server.local_addr server) in
+            Flow.set_read_deadline c (Some (deadline_in 2000));
+            equal string "x" (read_all c);
+            Flow.close c;
+            Server.shutdown server;
+            Server.wait server
+          done);
       test "after shutdown, new clients are refused" (fun () ->
           in_main @@ fun () ->
           let server = Server.start ~config:quiet handler in

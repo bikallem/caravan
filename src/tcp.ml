@@ -69,6 +69,7 @@ module Listener = struct
   let listen ?(backlog = 1024) addr =
     let fd = Aunix.socket (Unix.domain_of_sockaddr addr) Unix.SOCK_STREAM 0 in
     match
+      Unix.set_nonblock fd;
       Unix.setsockopt fd Unix.SO_REUSEADDR true;
       Unix.bind fd addr;
       Unix.listen fd backlog
@@ -78,12 +79,18 @@ module Listener = struct
 
   let addr l = l.addr
 
-  let accept l =
-    let fd, peer = Aunix.accept ~cloexec:true l.fd in
-    (* affect's accept leaves the new socket blocking. *)
-    Unix.set_nonblock fd;
-    set_nodelay fd peer;
-    (fd, peer)
+  (* Accepted sockets are blocking, whatever the listener is. *)
+  let setup (fd, peer) =
+    match Unix.set_nonblock fd; set_nodelay fd peer with
+    | () -> (fd, peer)
+    | exception e -> Aunix.close_noerr fd; raise e
+
+  let accept l = setup (Aunix.accept ~cloexec:true l.fd)
+
+  let try_accept l =
+    match Unix.accept ~cloexec:true l.fd with
+    | conn -> Some (setup conn)
+    | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK), _, _) -> None
 
   let wait_acceptable l tag = Aunix.wait_readable l.fd tag
   let close l = Aunix.close_noerr l.fd

@@ -40,9 +40,14 @@ module Listener : sig
       non-blocking and close-on-exec, with [TCP_NODELAY] on inet sockets, and
       the peer's address. *)
 
+  val try_accept : t -> (Unix.file_descr * Unix.sockaddr) option
+  (** [try_accept l] is like {!accept} but does not wait: it is [None] if no
+      connection is pending. *)
+
   val wait_acceptable : t -> 'tag -> 'tag Affect.Action.t
   (** [wait_acceptable l tag] is an action enabled with [tag] when {!accept}
-      would not wait. *)
+      would probably not wait. It can be enabled spuriously: follow it with
+      {!try_accept}. *)
 
   val close : t -> unit
   (** [close l] stops listening. *)

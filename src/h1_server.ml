@@ -78,9 +78,12 @@ let serve : Engine.t =
   in
   let scheme = match Conn_info.scheme ctx.conn with `Http -> "http" | `Https -> "https" in
   let report e = config.on_error e (Printexc.get_raw_backtrace ()) in
-  (* Waits at most [idle] for the next request. *)
+  (* Waits at most [idle] for the next request. A stopping server takes no
+     new request, even one already received. *)
   let rec next_request ~idle =
-    if Buf_reader.buffered r > 0
+    if ctx.is_stopping ()
+    then (if Buf_reader.buffered r > 0 then `Linger else `Close)
+    else if Buf_reader.buffered r > 0
     then exchange ()
     else
     let input = Flow.readable' flow `Input and stop = Action.map (fun () -> `Stop) ctx.stopping in

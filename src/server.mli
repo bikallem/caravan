@@ -29,9 +29,11 @@ val local_addr : t -> Unix.sockaddr
     [config.addr] has port [0]. *)
 
 val shutdown : t -> unit
-(** [shutdown s] stops [s]: it closes the listening socket, so that new
-    clients are refused, and cancels the connections in progress, which
-    close. It returns at once; see {!wait}. *)
+(** [shutdown s] stops [s]. It closes the listening socket, so that new
+    clients are refused, and idle connections close. Requests in progress
+    get [config.shutdown_grace] to finish, their responses ending their
+    connections; then they are cancelled. [shutdown] returns at once; see
+    {!wait}. *)
 
 val wait : t -> unit
 (** [wait s] waits until [s] has stopped and all its connections are closed.

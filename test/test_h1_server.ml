@@ -19,8 +19,15 @@ let show_crlf s =
 let loopback port = Unix.ADDR_INET (Unix.inet_addr_loopback, port)
 let conn = Conn_info.make ~id:7 ~peer:(loopback 50000) ~local:(loopback 8080) ()
 
+(* Set by /stop, as a server stopping while its response is written. *)
+let stopping = ref false
+
 let handler req =
   match Request.path_only req with
+  | "/stop" ->
+      Response.stream (fun w ->
+          stopping := true;
+          Body.Writer.write_string w "bye")
   | "/echo" -> Response.string (Body.to_string (Request.body req))
   | "/stream-echo" -> Response.stream (Body.write_to (Request.body req))
   | "/ignore" -> Response.string "ignored"
@@ -66,9 +73,10 @@ let serve ?(config = { Config.default with date_header = false }) ?chunk ?(stall
       ~shutdown_send:(fun () -> Buffer.add_string out "[FIN]")
       ~close:ignore ~set_read_deadline:ignore ~set_write_deadline:ignore
   in
+  stopping := false;
   Affect_unix.Unix.main ~domain_count:1 (fun () ->
       let ctx =
-        { Engine.config; conn; stopping = Action.never; is_stopping = (fun () -> false) }
+        { Engine.config; conn; stopping = Action.never; is_stopping = (fun () -> !stopping) }
       in
       Private.H1_server.serve ctx flow handler);
   let unread = String.length input - !consumed in
@@ -356,6 +364,17 @@ let connection_tests =
             Content-Length: 5\r\n
             \r\n
             hello
+            |});
+      test "a server that starts stopping takes no further request" (fun () ->
+          expect (show (get "/stop" ^ get "/")) @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Transfer-Encoding: chunked\r\n
+            \r\n
+            3\r\n
+            bye\r\n
+            0\r\n
+            \r\n
+            [FIN]
             |});
       test "a stopping server ends an idle connection without reading" (fun () ->
           let flow =

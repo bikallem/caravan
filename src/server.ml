@@ -5,22 +5,24 @@ type t = {
   listener : Tcp.Listener.t;
   acceptor : unit Fun.Async.t;
   supervisor : unit Fun.Async.t;
+  grace : unit Fun.Async.t;
   stopping : unit Cell.Once.t;
 }
 
 let report (config : Config.t) e = config.on_error e (Printexc.get_raw_backtrace ())
 
-(* Accepts the next connection, riding out errors that do not concern the
-   listener: a client that gave up while queued, or running out of file
-   descriptors, which is reported and waited out. *)
-let rec accept config listener =
-  match Tcp.Listener.accept listener with
+(* Accepts a pending connection, if there is one: readiness can be spurious.
+   Errors that do not concern the listener are ridden out: a client that gave
+   up while queued, or running out of file descriptors, which is reported and
+   waited out. *)
+let accept config listener =
+  match Tcp.Listener.try_accept listener with
   | conn -> conn
-  | exception Unix.Unix_error ((ECONNABORTED | EINTR), _, _) -> accept config listener
+  | exception Unix.Unix_error ((ECONNABORTED | EINTR), _, _) -> None
   | exception (Unix.Unix_error ((EMFILE | ENFILE | ENOBUFS | ENOMEM), _, _) as e) ->
       report config e;
       Mtime.wait_for Mtime.Span.(100 * ms);
-      accept config listener
+      None
 
 let serve_connection (config : Config.t) engine handler ~stopping ~id flow (fd, peer) =
   let local = try Unix.getsockname fd with Unix.Unix_error _ -> peer in
@@ -44,11 +46,15 @@ let acceptor config listener ~stopping ~slots handoff =
   let rec loop () =
     match wait (Semaphore.acquire' slots `Slot) with
     | `Stop -> ()
-    | `Slot -> (
-        match wait (Tcp.Listener.wait_acceptable listener `Ready) with
-        | `Stop -> Semaphore.release slots
-        | `Ready -> (
-            let conn = try accept config listener with e -> Semaphore.release slots; raise e in
+    | `Slot -> with_slot ()
+  and with_slot () =
+    match wait (Tcp.Listener.wait_acceptable listener `Ready) with
+    | `Stop -> Semaphore.release slots
+    | `Ready -> (
+        match accept config listener with
+        | exception e -> Semaphore.release slots; raise e
+        | None -> with_slot ()
+        | Some conn -> (
             match wait (Port.offer' handoff conn `Taken) with
             | `Taken -> loop ()
             | `Stop ->
@@ -90,16 +96,25 @@ let start ?(config = Config.default) ?(engine = H1_server.serve) handler =
           ~finally:(fun () -> Cell.Once.try_set stopping ())
           (fun () -> acceptor config listener ~stopping ~slots handoff))
   in
-  { listener; acceptor; supervisor; stopping }
+  (* Once stopping, the connections get [shutdown_grace] to finish. *)
+  let grace =
+    Fun.Async.call (fun () ->
+        Action.invoke (Cell.Once.get' stopping);
+        let finished = Action.map (fun () -> `Finished) (Fun.Async.get' supervisor) in
+        let expired = Mtime.wait_for' config.shutdown_grace `Expired in
+        match Action.invoke (Action.choose [ finished; expired ]) with
+        | `Finished -> ()
+        | `Expired -> Fun.Async.cancel supervisor)
+  in
+  { listener; acceptor; supervisor; grace; stopping }
 
 let local_addr s = Tcp.Listener.addr s.listener
 
-let shutdown s =
-  Cell.Once.try_set s.stopping ();
-  Fun.Async.cancel s.supervisor
+let shutdown s = Cell.Once.try_set s.stopping ()
 
+(* The supervisor returns as soon as it stops, and then waits for its
+   connections; cancelling it cancels those, not its return. *)
 let wait s =
-  (match Fun.Async.get s.supervisor with
-  | () -> ()
-  | exception Fun.Async.Cancelled when Cell.Once.is_set s.stopping -> ());
+  Fun.Async.get s.supervisor;
+  Fun.Async.get s.grace;
   Fun.Async.get s.acceptor
