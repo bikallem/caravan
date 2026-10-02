@@ -112,9 +112,27 @@ let local_addr s = Tcp.Listener.addr s.listener
 
 let shutdown s = Cell.Once.try_set s.stopping ()
 
+let abort s =
+  shutdown s;
+  Fun.Async.cancel s.supervisor
+
 (* The supervisor returns as soon as it stops, and then waits for its
    connections; cancelling it cancels those, not its return. *)
 let wait s =
   Fun.Async.get s.supervisor;
   Fun.Async.get s.grace;
   Fun.Async.get s.acceptor
+
+let run ?config ?engine ?domain_count ?(on_start = ignore) handler =
+  let signals = Stop_signal.install () in
+  Affect_unix.Unix.main ?domain_count @@ fun () ->
+  let server = start ?config ?engine handler in
+  on_start server;
+  let stopper =
+    Fun.Async.call (fun () ->
+        Stop_signal.wait signals;
+        shutdown server;
+        Stop_signal.wait signals;
+        abort server)
+  in
+  Fun.Async.protect ~finally:(fun () -> Fun.Async.cancel stopper) (fun () -> wait server)

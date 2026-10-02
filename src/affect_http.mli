@@ -20,6 +20,7 @@ module Tcp = Tcp
 module Config = Config
 module Engine = Engine
 module Server = Server
+module Stop_signal = Stop_signal
 
 (**/**)
 

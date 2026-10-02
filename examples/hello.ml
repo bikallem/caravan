@@ -29,9 +29,8 @@ let handler req =
   | _ -> Handler.not_found req
 
 let main () =
-  Affect_unix.Unix.main @@ fun () ->
-  let server = Server.start handler in
-  Format.printf "Listening on http://%a@." Conn_info.pp_addr (Server.local_addr server);
-  Server.wait server
+  Server.run handler ~on_start:(fun server ->
+      Format.printf "Listening on http://%a (Ctrl-C to stop)@." Conn_info.pp_addr
+        (Server.local_addr server))
 
 let () = if !Sys.interactive then () else main ()

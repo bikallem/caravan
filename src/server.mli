@@ -1,13 +1,11 @@
 (** HTTP servers.
 
     {[
-      let () =
-        Affect_unix.Unix.main @@ fun () ->
-        let server = Server.start (fun _req -> Response.string "hello\n") in
-        Server.wait server
+      let () = Server.run (fun _req -> Response.string "hello\n")
     ]}
 
-    A server must be started inside [Affect_unix.Unix.main]. *)
+    {!run} serves until Ctrl-C. For more control, {!start} servers inside
+    [Affect_unix.Unix.main] and stop them with {!shutdown}. *)
 
 type t
 (** The type for running servers. *)
@@ -35,8 +33,34 @@ val shutdown : t -> unit
     connections; then they are cancelled. [shutdown] returns at once; see
     {!wait}. *)
 
+val abort : t -> unit
+(** [abort s] is like {!shutdown} but cancels the connections in progress at
+    once, without a grace period. *)
+
 val wait : t -> unit
 (** [wait s] waits until [s] has stopped and all its connections are closed.
 
     @raise Unix.Unix_error if accepting connections failed, which stops [s]
     too. *)
+
+(** {1:run Running} *)
+
+val run :
+  ?config:Config.t ->
+  ?engine:Engine.t ->
+  ?domain_count:int ->
+  ?on_start:(t -> unit) ->
+  Handler.t ->
+  unit
+(** [run ~config ~engine ~domain_count ~on_start handler] serves [handler]
+    until the process gets [SIGINT] (Ctrl-C) or [SIGTERM]:
+    {ol
+    {- It installs the {!Stop_signal}s and runs [Affect_unix.Unix.main] with
+       [domain_count].}
+    {- It {!start}s the server and calls [on_start] with it, for example to
+       print its address.}
+    {- On the first signal it calls {!shutdown}, on a second one {!abort}.}}
+    It returns once the server has stopped. Call it from the main thread,
+    outside [Affect_unix.Unix.main].
+
+    @raise Unix.Unix_error if the address cannot be bound. *)

@@ -179,4 +179,84 @@ let timeout_tests =
           Flow.close a;
           Flow.close b) ]
 
-let () = exit (run "server" [ integration_tests; timeout_tests ])
+(* Server.run in a child process, stopped with signals: sending signals to
+   the test process itself could kill it. *)
+let signal_tests =
+  let in_main f = Affect_unix.Unix.main ~domain_count f in
+  let program = Filename.concat (Filename.dirname Sys.executable_name) "serve_until_signal.exe" in
+  (* Runs [f pid out] with the program started: its pid, and a reader on its
+     standard output. Kills the program if [f] leaves it running. *)
+  let with_program f =
+    let out_r, out_w = Unix.pipe ~cloexec:true () in
+    let pid = Unix.create_process program [| program |] Unix.stdin out_w Unix.stderr in
+    Unix.close out_w;
+    Unix.set_nonblock out_r;
+    let out = Tcp.flow out_r in
+    let finally () =
+      Flow.close out;
+      match Unix.waitpid [ Unix.WNOHANG ] pid with
+      | 0, _ -> Unix.kill pid Sys.sigkill; ignore (Unix.waitpid [] pid)
+      | _ -> ()
+      | exception Unix.Unix_error (Unix.ECHILD, _, _) -> ()
+    in
+    Fun.protect ~finally (fun () -> f pid (Buf_reader.of_flow out))
+  in
+  let connect out =
+    let port = int_of_string (Buf_reader.read_line out ~max:100) in
+    let flow = Tcp.connect (Unix.ADDR_INET (Unix.inet_addr_loopback, port)) in
+    Flow.set_read_deadline flow (Mtime.add_span (Mtime.now ()) Mtime.Span.(5 * s));
+    (flow, Buf_reader.of_flow flow)
+  in
+  (* The exit status of [pid] and the milliseconds it took, killing it after
+     5s. *)
+  let exited pid =
+    let clock = Mtime.counter () in
+    let rec poll () =
+      match Unix.waitpid [ Unix.WNOHANG ] pid with
+      | 0, _ when Mtime.Span.to_float_ns (Mtime.count clock) > 5e9 ->
+          failwith "the server did not exit"
+      | 0, _ -> Mtime.wait_for Mtime.Span.(10 * ms); poll ()
+      | _, status -> (status, Mtime.Span.to_float_ns (Mtime.count clock) /. 1e6)
+    in
+    poll ()
+  in
+  let exited_ok pid ~within =
+    let status, ms = exited pid in
+    equal bool ~msg:"exit 0" true (status = Unix.WEXITED 0);
+    is_true ~msg:(Printf.sprintf "exited after %.0fms" ms) (ms < within)
+  in
+  group "Server.run and signals"
+    [ test "SIGTERM: the request in progress finishes, then the process exits" (fun () ->
+          in_main @@ fun () ->
+          with_program @@ fun pid out ->
+          let flow, r = connect out in
+          Flow.write_string flow (get "/slow");
+          equal string "started" (Buf_reader.read_line out ~max:100);
+          Unix.kill pid Sys.sigterm;
+          equal string {|200 "done" close|} (read_response ~head:false r);
+          Flow.close flow;
+          exited_ok pid ~within:3000.);
+      test "a second SIGINT aborts the request in progress" (fun () ->
+          in_main @@ fun () ->
+          with_program @@ fun pid out ->
+          let flow, r = connect out in
+          Flow.write_string flow (get "/stuck");
+          equal string "started" (Buf_reader.read_line out ~max:100);
+          Unix.kill pid Sys.sigint;
+          Mtime.wait_for Mtime.Span.(50 * ms);
+          Unix.kill pid Sys.sigint;
+          exited_ok pid ~within:1000.;
+          is_true ~msg:"no response" (Buf_reader.peek_eof r);
+          Flow.close flow);
+      test "SIGTERM with nothing in progress exits at once" (fun () ->
+          in_main @@ fun () ->
+          with_program @@ fun pid out ->
+          let flow, r = connect out in
+          Flow.write_string flow (get "/hello");
+          equal string {|200 "hello"|} (read_response ~head:false r);
+          Unix.kill pid Sys.sigterm;
+          is_true ~msg:"the idle connection is closed" (Buf_reader.peek_eof r);
+          Flow.close flow;
+          exited_ok pid ~within:1000.) ]
+
+let () = exit (run "server" [ integration_tests; timeout_tests; signal_tests ])

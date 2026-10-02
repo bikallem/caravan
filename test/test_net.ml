@@ -298,6 +298,19 @@ let server_tests =
           is_true ~msg:(Printf.sprintf "waited %.0fms" waited) (waited > 90. && waited < 1000.);
           equal string "" (read_all c);
           Flow.close c);
+      test "abort cancels requests in progress without a grace" (fun () ->
+          in_main @@ fun () ->
+          started := Cell.Once.make ();
+          let server = Server.start ~config:quiet handler in
+          let c = Tcp.connect (Server.local_addr server) in
+          Flow.write_string c (get "/sleep");
+          Cell.Once.get !started;
+          let clock = Mtime.counter () in
+          Server.abort server;
+          Server.wait server;
+          is_true ~msg:"well before the 10s grace" (elapsed_ms clock < 1000.);
+          equal string "" (read_all c);
+          Flow.close c);
       test "a request in progress at shutdown finishes, closing its connection" (fun () ->
           in_main @@ fun () ->
           started := Cell.Once.make ();
@@ -438,6 +451,18 @@ let server_tests =
           Flow.close b;
           equal (list string) [ {|Failure("engine")|} ] (Atomic.get errors)) ]
 
+(* Stop_signal. Only installing: delivering a signal to the test process
+   could kill it, see test_server.ml for that. SIGUSR2 is never sent. *)
+
+let stop_signal_tests =
+  group "Stop_signal"
+    [ test "installing again gives the same value, with the same signals only" (fun () ->
+          let t = Stop_signal.install ~signals:[ Sys.sigusr2 ] () in
+          is_true ~msg:"same value" (t == Stop_signal.install ~signals:[ Sys.sigusr2 ] ());
+          raises_match
+            (function Invalid_argument _ -> true | _ -> false)
+            (fun () -> Stop_signal.install ())) ]
+
 (* Date across domains *)
 
 let date_tests =
@@ -457,4 +482,4 @@ let date_tests =
           in
           ignore (Fun.Async.get_all (List.init 8 worker))) ]
 
-let () = exit (run "net" [ tcp_tests; server_tests; date_tests ])
+let () = exit (run "net" [ tcp_tests; server_tests; stop_signal_tests; date_tests ])

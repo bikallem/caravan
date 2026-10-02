@@ -16,4 +16,10 @@
   test_server
   test_server_stateful
   server_support)
- (libraries affect-http affect affect.unix windtrap http-date unix))
+ (libraries affect-http affect affect.unix windtrap http-date unix)
+ (deps serve_until_signal.exe))
+
+(executable
+ (name serve_until_signal)
+ (modules serve_until_signal)
+ (libraries affect-http affect.unix unix))
