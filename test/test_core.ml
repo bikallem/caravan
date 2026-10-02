@@ -349,8 +349,136 @@ let flow_tests =
            in
            equal string input (read_all ~size flow)) ]
 
+(* Body *)
+
+(* A source that returns [s] in pieces of at most [chunk] bytes. *)
+let chunked_reader ?(chunk = max_int) s =
+  let pos = ref 0 in
+  fun buf off len ->
+    let n = Int.min (Int.min len chunk) (String.length s - !pos) in
+    Bytes.blit_string s !pos buf off n;
+    pos := !pos + n;
+    n
+
+(* A sink recording writes and flushes as events. *)
+let recording_writer () =
+  let events = ref [] in
+  let w =
+    Body.Writer.make
+      ~write:(fun buf off len -> events := Bytes.sub_string buf off len :: !events)
+      ~flush:(fun () -> events := "<flush>" :: !events)
+  in
+  (w, fun () -> List.rev !events)
+
+let trailers_x = Headers.of_list [ ("X-Checksum", "abc") ]
+
+let body_tests =
+  group "Body"
+    [ test "empty" (fun () ->
+          equal (option int) (Some 0) (Body.length Body.empty);
+          equal int 0 (Body.read Body.empty (Bytes.create 4) 0 4);
+          Body.close Body.empty;
+          equal string "" (Body.to_string Body.empty));
+      test "of_string reads in pieces; to_string returns the rest" (fun () ->
+          let b = Body.of_string "hello world" in
+          equal (option int) (Some 11) (Body.length b);
+          let buf = Bytes.create 6 in
+          equal int 6 (Body.read b buf 0 6);
+          equal string "hello " (Bytes.to_string buf);
+          equal string "world" (Body.to_string b);
+          equal int 0 (Body.read b buf 0 6);
+          is_true (Headers.is_empty (Body.trailers b)));
+      test "of_source: length, trailers at the end, close once" (fun () ->
+          let closes = ref 0 in
+          let b =
+            Body.of_source ~trailers:(fun () -> trailers_x)
+              ~close:(fun () -> incr closes) (chunked_reader ~chunk:2 "abcde")
+          in
+          equal (option int) None (Body.length b);
+          let buf = Bytes.create 8 in
+          equal int 2 (Body.read b buf 0 8);
+          is_true ~msg:"no trailers before the end" (Headers.is_empty (Body.trailers b));
+          equal string "cde" (Body.to_string b);
+          is_true (Headers.equal trailers_x (Body.trailers b));
+          Body.close b;
+          equal int 1 !closes;
+          Body.close b;
+          equal int 1 !closes;
+          raises_match is_invalid_arg (fun () -> Body.read b buf 0 8));
+      test "invalid lengths and ranges" (fun () ->
+          raises_match is_invalid_arg (fun () -> Body.of_source ~length:(-1) (chunked_reader ""));
+          raises_match is_invalid_arg (fun () -> Body.of_writer ~length:(-1) ignore);
+          (* A source and a sink that never touch the buffer, so only the
+             range checks can raise. *)
+          let b = Body.of_source (fun _ _ _ -> 0) in
+          List.iter
+            (fun (off, len) -> raises_match is_invalid_arg (fun () -> Body.read b (Bytes.create 4) off len))
+            [ (0, 0); (-1, 1); (2, 3); (4, 1) ];
+          let w = Body.Writer.make ~write:(fun _ _ _ -> ()) ~flush:ignore in
+          List.iter
+            (fun (off, len) -> raises_match is_invalid_arg (fun () -> Body.Writer.write w (Bytes.create 2) off len))
+            [ (-1, 1); (0, -1); (1, 2); (3, 0) ]);
+      test "of_writer runs its producer into the sink" (fun () ->
+          let b =
+            Body.of_writer ~length:6 (fun w ->
+                Body.Writer.write_string w "abc";
+                Body.Writer.flush w;
+                Body.Writer.write w (Bytes.of_string "xdefx") 1 3;
+                Body.Writer.write_string w "";
+                Body.Writer.set_trailers w trailers_x)
+          in
+          equal (option int) (Some 6) (Body.length b);
+          raises_match is_invalid_arg (fun () -> Body.read b (Bytes.create 4) 0 4);
+          let w, events = recording_writer () in
+          Body.write_to b w;
+          equal (list string) [ "abc"; "<flush>"; "def" ] (events ());
+          is_true (Headers.equal trailers_x (Body.Writer.trailers w));
+          is_true (Headers.equal trailers_x (Body.trailers b));
+          raises_match is_invalid_arg (fun () -> Body.write_to b w));
+      test "a closed writer body never runs" (fun () ->
+          let ran = ref false in
+          let b = Body.of_writer (fun _ -> ran := true) in
+          Body.close b;
+          let w, _ = recording_writer () in
+          raises_match is_invalid_arg (fun () -> Body.write_to b w);
+          is_true (not !ran));
+      test "write_to flushes a source after each chunk" (fun () ->
+          let b = Body.of_source ~trailers:(fun () -> trailers_x) (chunked_reader ~chunk:2 "abcde") in
+          let w, events = recording_writer () in
+          Body.write_to b w;
+          equal (list string) [ "ab"; "<flush>"; "cd"; "<flush>"; "e"; "<flush>" ] (events ());
+          is_true (Headers.equal trailers_x (Body.Writer.trailers w)));
+      test "to_string ~max" (fun () ->
+          equal string "abc" (Body.to_string ~max:3 (Body.of_string "abc"));
+          raises Body.Too_large (fun () -> Body.to_string ~max:2 (Body.of_string "abc"));
+          raises Body.Too_large (fun () ->
+              Body.to_string ~max:2 (Body.of_writer (fun w -> Body.Writer.write_string w "abc"))));
+      prop "a source returns its bytes however they are split"
+        Gen.(pair string (pair (int_range 1 9) (int_range 1 9))) (fun (s, (chunk, size)) ->
+            let b = Body.of_source (chunked_reader ~chunk s) in
+            let buf = Bytes.create size and out = Buffer.create 16 in
+            let rec loop () =
+              match Body.read b buf 0 size with
+              | 0 -> Buffer.contents out
+              | n -> Buffer.add_subbytes out buf 0 n; loop ()
+            in
+            equal string s (loop ()));
+      prop "write_to and to_string agree for every shape"
+        Gen.(pair string (int_range 1 9)) (fun (s, chunk) ->
+            let shapes () =
+              [ Body.of_string s; Body.of_source (chunked_reader ~chunk s);
+                Body.of_writer (fun w -> Body.Writer.write_string w s) ]
+            in
+            List.iter2
+              (fun b b' ->
+                 let out = Buffer.create 16 in
+                 Body.write_to b
+                   (Body.Writer.make ~write:(Buffer.add_subbytes out) ~flush:ignore);
+                 equal string (Body.to_string b') (Buffer.contents out))
+              (shapes ()) (shapes ())) ]
+
 let () =
   exit
     (run "core"
        [ method_tests; version_tests; status_tests; headers_tests; headers_props;
-         headers_stateful; date_tests; flow_tests ])
+         headers_stateful; date_tests; flow_tests; body_tests ])

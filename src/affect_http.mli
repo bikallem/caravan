@@ -8,6 +8,7 @@ module Version = Version
 module Status = Status
 module Headers = Headers
 module Flow = Flow
+module Body = Body
 
 (**/**)
 
