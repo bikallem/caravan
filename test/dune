@@ -1,3 +1,19 @@
 (tests
- (names test_affect_http test_core test_h1 test_h1_server test_net)
+ (names
+  test_affect_http
+  test_core
+  test_h1
+  test_h1_server
+  test_net
+  test_server
+  test_server_stateful)
+ (modules
+  test_affect_http
+  test_core
+  test_h1
+  test_h1_server
+  test_net
+  test_server
+  test_server_stateful
+  server_support)
  (libraries affect-http affect affect.unix windtrap http-date unix))
