@@ -477,8 +477,155 @@ let body_tests =
                  equal string (Body.to_string b') (Buffer.contents out))
               (shapes ()) (shapes ())) ]
 
+(* Conn_info, Request, Response, Handler *)
+
+let loopback port = Unix.ADDR_INET (Unix.inet_addr_loopback, port)
+
+let conn_info_tests =
+  group "Conn_info"
+    [ test "accessors and pp" (fun () ->
+          let c = Conn_info.make ~id:7 ~peer:(loopback 51000) ~local:(loopback 8080) () in
+          equal int 7 (Conn_info.id c);
+          is_true (Conn_info.peer c = loopback 51000);
+          is_true (Conn_info.local c = loopback 8080);
+          is_true (Conn_info.scheme c = `Http);
+          equal (option string) None (Conn_info.alpn c);
+          expect (Format.asprintf "%a" Conn_info.pp c)
+          @@ __POS_OF__ {|#7 127.0.0.1:51000 -> 127.0.0.1:8080|};
+          let c6 =
+            Conn_info.make ~id:1 ~peer:(Unix.ADDR_INET (Unix.inet6_addr_loopback, 1))
+              ~local:(Unix.ADDR_UNIX "/run/s.sock") ~scheme:`Https ~alpn:"h2" ()
+          in
+          is_true (Conn_info.scheme c6 = `Https);
+          equal (option string) (Some "h2") (Conn_info.alpn c6);
+          expect (Format.asprintf "%a" Conn_info.pp c6) @@ __POS_OF__ {|#1 [::1]:1 -> /run/s.sock|}) ]
+
+let request_tests =
+  group "Request"
+    [ test "defaults" (fun () ->
+          let r = Request.make Method.GET "/" in
+          equal meth Method.GET (Request.meth r);
+          equal version Version.Http_1_1 (Request.version r);
+          equal string "http" (Request.scheme r);
+          equal (option string) None (Request.authority r);
+          is_true (Headers.is_empty (Request.headers r));
+          equal (option int) (Some 0) (Body.length (Request.body r));
+          is_true (Request.conn r = None));
+      test "path_only and query" (fun () ->
+          let split p =
+            let r = Request.make Method.GET p in
+            (Request.path_only r, Request.query r)
+          in
+          let pq = pair string (option string) in
+          equal pq ("/a", Some "b=1&c=?") (split "/a?b=1&c=?");
+          equal pq ("/a", None) (split "/a");
+          equal pq ("/a", Some "") (split "/a?");
+          equal pq ("*", None) (split "*"));
+      test "with_* derive new requests" (fun () ->
+          let r = Request.make ~authority:"a.example" Method.POST "/x" in
+          let h = Headers.of_list [ ("X-A", "1") ] in
+          let r' =
+            r |> Request.with_path "/y" |> Request.with_authority (Some "b.example:8080")
+            |> Request.with_headers h |> Request.with_body (Body.of_string "hi")
+          in
+          equal string "/x" (Request.path r);
+          equal (option string) (Some "a.example") (Request.authority r);
+          equal string "/y" (Request.path r');
+          equal (option string) (Some "b.example:8080") (Request.authority r');
+          is_true (Headers.equal h (Request.headers r'));
+          equal string "hi" (Body.to_string (Request.body r'));
+          equal (option string) None (Request.authority (Request.with_authority None r')));
+      test "rejects paths and authorities that would corrupt a request line" (fun () ->
+          List.iter
+            (fun bad ->
+               raises_match is_invalid_arg (fun () -> Request.make Method.GET bad);
+               raises_match is_invalid_arg (fun () -> Request.make ~authority:bad Method.GET "/");
+               let r = Request.make Method.GET "/" in
+               raises_match is_invalid_arg (fun () -> Request.with_path bad r);
+               raises_match is_invalid_arg (fun () -> Request.with_authority (Some bad) r))
+            [ "/a b"; "/a\r\nX: y"; "/a\n"; "/\000"; "/\127"; "/\t" ]);
+      test "pp" (fun () ->
+          let r =
+            Request.make ~authority:"example.com"
+              ~headers:(Headers.of_list [ ("Accept", "*/*") ]) Method.GET "/a?b"
+          in
+          expect (Format.asprintf "%a" Request.pp r)
+          @@ __POS_OF__ {|GET http://example.com/a?b HTTP/1.1
+Accept: */*|}) ]
+
+let content_type r = Headers.find "content-type" (Response.headers r)
+
+let body_of r =
+  match Response.kind r with
+  | Response.Body b -> b
+  | Response.Upgrade _ -> fail "expected a body"
+
+let response_tests =
+  group "Response"
+    [ test "make defaults to 200" (fun () ->
+          let r = Response.make Body.empty in
+          equal status Status.ok (Response.status r);
+          is_true (Headers.is_empty (Response.headers r)));
+      test "string sets a Content-Type" (fun () ->
+          let r = Response.string "hello" in
+          equal (option string) (Some "text/plain; charset=utf-8") (content_type r);
+          equal (option int) (Some 5) (Body.length (body_of r));
+          equal string "hello" (Body.to_string (body_of r));
+          equal (option string) (Some "application/json")
+            (content_type (Response.string ~content_type:"application/json" "{}"));
+          let h = Headers.of_list [ ("Content-Type", "text/html") ] in
+          equal (option string) (Some "text/html") (content_type (Response.string ~headers:h "<p>"));
+          equal (option string) (Some "text/csv")
+            (content_type (Response.string ~headers:h ~content_type:"text/csv" "a,b")));
+      test "empty is 204 with no body" (fun () ->
+          let r = Response.empty () in
+          equal status Status.no_content (Response.status r);
+          equal (option int) (Some 0) (Body.length (body_of r)));
+      test "stream keeps its length and producer" (fun () ->
+          let r = Response.stream ~length:3 (fun w -> Body.Writer.write_string w "abc") in
+          equal (option int) (Some 3) (Body.length (body_of r));
+          equal string "abc" (Body.to_string (body_of r)));
+      test "upgrade accepts 101 and 2xx only" (fun () ->
+          let r = Response.upgrade ignore in
+          equal status Status.switching_protocols (Response.status r);
+          is_true (match Response.kind r with Response.Upgrade _ -> true | _ -> false);
+          equal status Status.ok (Response.status (Response.upgrade ~status:Status.ok ignore));
+          List.iter
+            (fun s -> raises_match is_invalid_arg (fun () -> Response.upgrade ~status:s ignore))
+            Status.[ continue; not_found; moved_permanently ]);
+      test "with_status and with_headers" (fun () ->
+          let r = Response.string "x" in
+          let r' = Response.with_status Status.created (Response.with_headers Headers.empty r) in
+          equal status Status.ok (Response.status r);
+          equal status Status.created (Response.status r');
+          is_true (Headers.is_empty (Response.headers r')));
+      test "pp" (fun () ->
+          expect (Format.asprintf "%a" Response.pp (Response.string "x")) @@ __POS_OF__ {|200 OK
+Content-Type: text/plain; charset=utf-8|};
+          expect (Format.asprintf "%a" Response.pp (Response.upgrade ignore))
+          @@ __POS_OF__ {|101 Switching Protocols (upgrade)|}) ]
+
+let handler_tests =
+  group "Handler"
+    [ test "compose runs the first middleware outermost" (fun () ->
+          let log = Buffer.create 32 in
+          let note s = Buffer.add_string log s in
+          let mw name : Handler.middleware =
+            fun h req ->
+            note ("<" ^ name);
+            let r = h req in
+            note (name ^ ">");
+            r
+          in
+          let h = Handler.compose [ mw "a"; mw "b" ] (fun _ -> note "h"; Response.empty ()) in
+          ignore (h (Request.make Method.GET "/"));
+          expect (Buffer.contents log) @@ __POS_OF__ {|<a<bhb>a>|};
+          let r = Handler.compose [] Handler.not_found (Request.make Method.GET "/") in
+          equal status Status.not_found (Response.status r)) ]
+
 let () =
   exit
     (run "core"
        [ method_tests; version_tests; status_tests; headers_tests; headers_props;
-         headers_stateful; date_tests; flow_tests; body_tests ])
+         headers_stateful; date_tests; flow_tests; body_tests;
+         conn_info_tests; request_tests; response_tests; handler_tests ])
