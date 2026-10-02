@@ -8,6 +8,7 @@ module Conn_info = Conn_info
 module Request = Request
 module Response = Response
 module Handler = Handler
+module Tcp = Tcp
 
 module Private = struct
   module Date = Date

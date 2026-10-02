@@ -14,6 +14,10 @@ module Request = Request
 module Response = Response
 module Handler = Handler
 
+(** {1:transport Transport} *)
+
+module Tcp = Tcp
+
 (**/**)
 
 (** Internal modules, exposed for tests. Not part of the public API. *)
