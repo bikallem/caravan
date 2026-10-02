@@ -97,3 +97,123 @@ let request_head limits r =
     field_lines ~max_bytes:limits.max_header_bytes ~max_count:limits.max_header_count r
   in
   { meth; target; version; headers }
+
+(* Framing, RFC 9112 §6 *)
+
+type framing = No_body | Fixed of int | Chunked
+
+(* The non-empty elements of comma-separated field values (RFC 9110 §5.6.1). *)
+let elements values =
+  List.concat_map (String.split_on_char ',') values
+  |> List.map trim_ows
+  |> List.filter (fun e -> e <> "")
+
+(* At most 18 digits: always fits in an OCaml int. *)
+let length_value s =
+  if s = "" || String.length s > 18 || not (String.for_all is_digit s)
+  then bad "invalid Content-Length %S" s;
+  int_of_string s
+
+let content_length h =
+  match Headers.find_all "content-length" h.headers with
+  | [] -> None
+  | values ->
+      match List.map length_value (elements values) with
+      | [] -> bad "empty Content-Length"
+      | n :: rest ->
+          if List.exists (fun m -> m <> n) rest then bad "conflicting Content-Length";
+          Some n
+
+let request_framing h =
+  let length = content_length h in
+  match Headers.find_all "transfer-encoding" h.headers with
+  | [] -> (match length with None -> No_body | Some n -> Fixed n)
+  | codings ->
+      if h.version = Version.Http_1_0 then bad "Transfer-Encoding in HTTP/1.0";
+      if length <> None then bad "both Transfer-Encoding and Content-Length";
+      match List.rev_map String.lowercase_ascii (elements codings) with
+      | [ "chunked" ] -> Chunked
+      | "chunked" :: rest when List.mem "chunked" rest -> bad "chunked applied twice"
+      | "chunked" :: _ ->
+          fail (H1_error.Not_implemented "transfer codings other than chunked")
+      | _ -> bad "chunked is not the final transfer coding"
+
+(* Request target, RFC 9112 §3.2 *)
+
+type target = { scheme : string; authority : string option; path : string }
+
+(* RFC 3986: reg-name = *( unreserved / pct-encoded / sub-delims ) *)
+let is_reg_name_char = function
+| 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '-' | '.' | '_' | '~' | '%' | '!' | '$'
+| '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '=' -> true
+| _ -> false
+
+let is_ip_literal_char = function
+| '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' | ':' | '.' -> true
+| _ -> false
+
+(* host [ ":" port ], with a non-empty host; [port] says whether a non-empty
+   port is required. *)
+let is_authority ?(port = false) s =
+  let n = String.length s in
+  let host_end =
+    if n > 0 && s.[0] = '['
+    then match String.index_opt s ']' with
+    | Some i when i > 1 && String.for_all is_ip_literal_char (String.sub s 1 (i - 1)) ->
+        Some (i + 1)
+    | _ -> None
+    else
+    let i = Option.value (String.index_opt s ':') ~default:n in
+    if i > 0 && String.for_all is_reg_name_char (String.sub s 0 i) then Some i else None
+  in
+  match host_end with
+  | None -> false
+  | Some i when i = n -> not port
+  | Some i ->
+      let digits = String.sub s (i + 1) (n - i - 1) in
+      s.[i] = ':' && String.for_all is_digit digits && not (port && digits = "")
+
+let host h =
+  match Headers.find_all "host" h.headers with
+  | [] -> if h.version = Version.Http_1_1 then bad "missing Host" else None
+  | [ "" ] -> None
+  | [ v ] -> if is_authority v then Some v else bad "invalid Host %S" v
+  | _ -> bad "more than one Host"
+
+let absolute_form t =
+  let bad_target () = bad "invalid request target %S" t in
+  match String.index_opt t ':' with
+  | None -> bad_target ()
+  | Some i ->
+      let scheme = String.lowercase_ascii (String.sub t 0 i) in
+      let n = String.length t in
+      if not ((scheme = "http" || scheme = "https") && n > i + 2 && t.[i + 1] = '/' && t.[i + 2] = '/')
+      then bad_target ();
+      let start = i + 3 in
+      let rec end_of_authority j =
+        if j < n && t.[j] <> '/' && t.[j] <> '?' then end_of_authority (j + 1) else j
+      in
+      let j = end_of_authority start in
+      let authority = String.sub t start (j - start) in
+      if String.contains authority '@' then bad "userinfo in request target";
+      if not (is_authority authority) then bad_target ();
+      let path =
+        match String.sub t j (n - j) with
+        | "" -> "/"
+        | p when p.[0] = '?' -> "/" ^ p
+        | p -> p
+      in
+      { scheme; authority = Some authority; path }
+
+let request_target ~scheme h =
+  let authority = host h in
+  let t = h.target in
+  match h.meth with
+  | Method.CONNECT ->
+      if is_authority ~port:true t
+      then { scheme; authority = Some t; path = "" }
+      else bad "CONNECT needs a host:port target"
+  | Method.OPTIONS when t = "*" -> { scheme; authority; path = "*" }
+  | _ when t = "*" -> bad "* is only for OPTIONS"
+  | _ when t.[0] = '/' -> { scheme; authority; path = t }
+  | _ -> absolute_form t

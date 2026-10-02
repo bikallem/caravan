@@ -355,5 +355,204 @@ let head_props =
             (List.map (fun (n, (v, _)) -> (n, v)) fields)
             (Headers.to_list h.headers)) ]
 
+(* H1_parse.request_framing and request_target *)
+
+(* [req ~v fields target] is a head with method [meth]. *)
+let req ?(meth = "GET") ?(v = "HTTP/1.1") ?(target = "/") fields =
+  parse
+    (Printf.sprintf "%s %s %s\r\n%s\r\n" meth target v
+       (String.concat "" (List.map (fun (n, v) -> n ^ ": " ^ v ^ "\r\n") fields)))
+
+let errors f = match f () with s -> s | exception H1_error.E e -> Format.asprintf "%a" H1_error.pp e
+
+let show_framing (label, h) =
+  Printf.sprintf "%s => %s" label
+    (errors (fun () ->
+         match H1_parse.request_framing (Lazy.force h) with
+         | H1_parse.No_body -> "no body"
+         | Fixed n -> Printf.sprintf "fixed %d" n
+         | Chunked -> "chunked"))
+
+let show_target (label, h) =
+  Printf.sprintf "%s => %s" label
+    (errors (fun () ->
+         let t = H1_parse.request_target ~scheme:"http" (Lazy.force h) in
+         Printf.sprintf "%s %s %S" t.scheme (Option.value ~default:"-" t.authority) t.path))
+
+let cl v = ("Content-Length", v)
+let te v = ("Transfer-Encoding", v)
+
+let framing_tests =
+  group "H1_parse.request_framing"
+    [ test "framing table" (fun () ->
+          expect
+            (String.concat "\n"
+               (List.map show_framing
+                  [ ("none", lazy (req []));
+                    ("CL 0", lazy (req [ cl "0" ]));
+                    ("CL 42", lazy (req [ cl "42" ]));
+                    ("CL 007", lazy (req [ cl "007" ]));
+                    ("CL 5, 5 in one field", lazy (req [ cl "5, 5" ]));
+                    ("CL 5 in two fields", lazy (req [ cl "5"; cl "5" ]));
+                    ("CL 5 and 05", lazy (req [ cl "5"; cl "05" ]));
+                    ("CL 5 and 6", lazy (req [ cl "5"; cl "6" ]));
+                    ("CL 5, 6", lazy (req [ cl "5, 6" ]));
+                    ("CL empty", lazy (req [ cl "" ]));
+                    ("CL ,", lazy (req [ cl "," ]));
+                    ("CL -1", lazy (req [ cl "-1" ]));
+                    ("CL +1", lazy (req [ cl "+1" ]));
+                    ("CL 1.0", lazy (req [ cl "1.0" ]));
+                    ("CL 0x10", lazy (req [ cl "0x10" ]));
+                    ("CL 18 digits", lazy (req [ cl "999999999999999999" ]));
+                    ("CL 19 digits", lazy (req [ cl "9999999999999999999" ]));
+                    ("TE chunked", lazy (req [ te "chunked" ]));
+                    ("TE Chunked", lazy (req [ te "Chunked" ]));
+                    ("TE in two fields", lazy (req [ te ""; te "chunked" ]));
+                    ("TE gzip, chunked", lazy (req [ te "gzip, chunked" ]));
+                    ("TE gzip", lazy (req [ te "gzip" ]));
+                    ("TE chunked, gzip", lazy (req [ te "chunked, gzip" ]));
+                    ("TE chunked, chunked", lazy (req [ te "chunked, chunked" ]));
+                    ("TE chunked;x=1", lazy (req [ te "chunked;x=1" ]));
+                    ("TE empty", lazy (req [ te "" ]));
+                    ("TE and CL", lazy (req [ te "chunked"; cl "5" ]));
+                    ("TE in HTTP/1.0", lazy (req ~v:"HTTP/1.0" [ te "chunked" ])) ]))
+          @@ __POS_OF__ {|
+            none => no body
+            CL 0 => fixed 0
+            CL 42 => fixed 42
+            CL 007 => fixed 7
+            CL 5, 5 in one field => fixed 5
+            CL 5 in two fields => fixed 5
+            CL 5 and 05 => fixed 5
+            CL 5 and 6 => 400 Bad Request (conflicting Content-Length)
+            CL 5, 6 => 400 Bad Request (conflicting Content-Length)
+            CL empty => 400 Bad Request (empty Content-Length)
+            CL , => 400 Bad Request (empty Content-Length)
+            CL -1 => 400 Bad Request (invalid Content-Length "-1")
+            CL +1 => 400 Bad Request (invalid Content-Length "+1")
+            CL 1.0 => 400 Bad Request (invalid Content-Length "1.0")
+            CL 0x10 => 400 Bad Request (invalid Content-Length "0x10")
+            CL 18 digits => fixed 999999999999999999
+            CL 19 digits => 400 Bad Request (invalid Content-Length "9999999999999999999")
+            TE chunked => chunked
+            TE Chunked => chunked
+            TE in two fields => chunked
+            TE gzip, chunked => 501 Not Implemented (transfer codings other than chunked)
+            TE gzip => 400 Bad Request (chunked is not the final transfer coding)
+            TE chunked, gzip => 400 Bad Request (chunked is not the final transfer coding)
+            TE chunked, chunked => 400 Bad Request (chunked applied twice)
+            TE chunked;x=1 => 400 Bad Request (chunked is not the final transfer coding)
+            TE empty => 400 Bad Request (chunked is not the final transfer coding)
+            TE and CL => 400 Bad Request (both Transfer-Encoding and Content-Length)
+            TE in HTTP/1.0 => 400 Bad Request (Transfer-Encoding in HTTP/1.0)
+            |}) ]
+
+let host v = ("Host", v)
+
+let target_tests =
+  group "H1_parse.request_target"
+    [ test "target and Host table" (fun () ->
+          expect
+            (String.concat "\n"
+               (List.map show_target
+                  [ ("origin", lazy (req ~target:"/a?b" [ host "a.example" ]));
+                    ("origin, port", lazy (req [ host "a.example:8080" ]));
+                    ("origin, IPv6", lazy (req [ host "[::1]:8080" ]));
+                    ("origin, IPv4", lazy (req [ host "127.0.0.1" ]));
+                    ("origin, empty Host", lazy (req [ host "" ]));
+                    ("1.1 without Host", lazy (req []));
+                    ("1.0 without Host", lazy (req ~v:"HTTP/1.0" []));
+                    ("two Host", lazy (req [ host "a"; host "a" ]));
+                    ("two Host in 1.0", lazy (req ~v:"HTTP/1.0" [ host "a"; host "b" ]));
+                    ("Host with path", lazy (req [ host "a/b" ]));
+                    ("Host with userinfo", lazy (req [ host "u@a" ]));
+                    ("Host with bad port", lazy (req [ host "a:8x" ]));
+                    ("Host empty IPv6", lazy (req [ host "[]" ]));
+                    ("Host port only", lazy (req [ host ":80" ]));
+                    ("absolute", lazy (req ~target:"http://b.example:81/p?q" [ host "a.example" ]));
+                    ("absolute https", lazy (req ~target:"HTTPS://b.example" [ host "b.example" ]));
+                    ("absolute query only", lazy (req ~target:"http://b.example?q" [ host "x" ]));
+                    ("absolute userinfo", lazy (req ~target:"http://u:p@b.example/" [ host "b.example" ]));
+                    ("absolute ftp", lazy (req ~target:"ftp://b.example/" [ host "b.example" ]));
+                    ("absolute no //", lazy (req ~target:"http:b.example/" [ host "b.example" ]));
+                    ("absolute http:", lazy (req ~target:"http:" [ host "b" ]));
+                    ("absolute http:/", lazy (req ~target:"http:/" [ host "b" ]));
+                    ("absolute one slash", lazy (req ~target:"http:/b.example/" [ host "b" ]));
+                    ("absolute second slash only", lazy (req ~target:"http:x/b.example/" [ host "b" ]));
+                    ("absolute no host", lazy (req ~target:"http:///p" [ host "b.example" ]));
+                    ("absolute, still two Host", lazy (req ~target:"http://b/" [ host "a"; host "b" ]));
+                    ("CONNECT", lazy (req ~meth:"CONNECT" ~target:"b.example:443" [ host "b.example:443" ]));
+                    ("CONNECT no port", lazy (req ~meth:"CONNECT" ~target:"b.example" [ host "b.example" ]));
+                    ("CONNECT empty port", lazy (req ~meth:"CONNECT" ~target:"b.example:" [ host "b" ]));
+                    ("CONNECT origin-form", lazy (req ~meth:"CONNECT" ~target:"/" [ host "b" ]));
+                    ("OPTIONS *", lazy (req ~meth:"OPTIONS" ~target:"*" [ host "a" ]));
+                    ("GET *", lazy (req ~target:"*" [ host "a" ]));
+                    ("OPTIONS origin", lazy (req ~meth:"OPTIONS" ~target:"/x" [ host "a" ]));
+                    ("GET authority-form", lazy (req ~target:"b.example:443" [ host "b" ])) ]))
+          @@ __POS_OF__ {|
+            origin => http a.example "/a?b"
+            origin, port => http a.example:8080 "/"
+            origin, IPv6 => http [::1]:8080 "/"
+            origin, IPv4 => http 127.0.0.1 "/"
+            origin, empty Host => http - "/"
+            1.1 without Host => 400 Bad Request (missing Host)
+            1.0 without Host => http - "/"
+            two Host => 400 Bad Request (more than one Host)
+            two Host in 1.0 => 400 Bad Request (more than one Host)
+            Host with path => 400 Bad Request (invalid Host "a/b")
+            Host with userinfo => 400 Bad Request (invalid Host "u@a")
+            Host with bad port => 400 Bad Request (invalid Host "a:8x")
+            Host empty IPv6 => 400 Bad Request (invalid Host "[]")
+            Host port only => 400 Bad Request (invalid Host ":80")
+            absolute => http b.example:81 "/p?q"
+            absolute https => https b.example "/"
+            absolute query only => http b.example "/?q"
+            absolute userinfo => 400 Bad Request (userinfo in request target)
+            absolute ftp => 400 Bad Request (invalid request target "ftp://b.example/")
+            absolute no // => 400 Bad Request (invalid request target "http:b.example/")
+            absolute http: => 400 Bad Request (invalid request target "http:")
+            absolute http:/ => 400 Bad Request (invalid request target "http:/")
+            absolute one slash => 400 Bad Request (invalid request target "http:/b.example/")
+            absolute second slash only => 400 Bad Request (invalid request target "http:x/b.example/")
+            absolute no host => 400 Bad Request (invalid request target "http:///p")
+            absolute, still two Host => 400 Bad Request (more than one Host)
+            CONNECT => http b.example:443 ""
+            CONNECT no port => 400 Bad Request (CONNECT needs a host:port target)
+            CONNECT empty port => 400 Bad Request (CONNECT needs a host:port target)
+            CONNECT origin-form => 400 Bad Request (CONNECT needs a host:port target)
+            OPTIONS * => http a "*"
+            GET * => 400 Bad Request (* is only for OPTIONS)
+            OPTIONS origin => http a "/x"
+            GET authority-form => 400 Bad Request (invalid request target "b.example:443")
+            |}) ]
+
+let host_gen =
+  Gen.(
+    map
+      (fun (h, p) -> match p with None -> h | Some p -> h ^ ":" ^ string_of_int p)
+      (pair (string_of ~size:(int_range 1 12) (of_list (List.of_seq (String.to_seq "abcz09-._~"))))
+         (option (int_range 0 65535))))
+
+let framing_props =
+  group "H1_parse framing and target properties"
+    [ prop "Content-Length round trips, however it is repeated"
+        Gen.(pair (int_range 0 1_000_000_000_000) (pair (int_range 1 3) bool))
+        (fun (n, (copies, one_field)) ->
+           let v = string_of_int n in
+           let fields =
+             if one_field
+             then [ cl (String.concat ", " (List.init copies (fun _ -> v))) ]
+             else List.init copies (fun _ -> cl v)
+           in
+           is_true (H1_parse.request_framing (req fields) = H1_parse.Fixed n));
+      prop "origin-form takes its authority from Host" (Gen.pair host_gen head_gen)
+        (fun (h, (((_, target, _), _, _))) ->
+           let t = H1_parse.request_target ~scheme:"http" (req ~target [ host h ]) in
+           equal (option string) (Some h) t.authority;
+           equal string target t.path) ]
+
 let () =
-  exit (run "h1" [ buf_reader_tests; buf_reader_model; request_head_tests; head_props ])
+  exit
+    (run "h1"
+       [ buf_reader_tests; buf_reader_model; request_head_tests; head_props; framing_tests;
+         target_tests; framing_props ])

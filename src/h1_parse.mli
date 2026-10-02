@@ -38,3 +38,47 @@ val field_lines : max_bytes:int -> max_count:int -> Buf_reader.t -> Headers.t
     @raise H1_error.E on an invalid line, or with {!H1_error.Header_fields_too_large}
     past the limits.
     @raise Buf_reader.Eof if the input ends first. *)
+
+(** {1:framing Message framing} *)
+
+type framing =
+| No_body
+| Fixed of int (** A body of exactly this many bytes. *)
+| Chunked (** A chunked body (RFC 9112 §7.1). *)
+(** The type for how a request body is delimited. *)
+
+val request_framing : head -> framing
+(** [request_framing h] is how the body of the request [h] is delimited, by its
+    [Transfer-Encoding] and [Content-Length] fields (RFC 9112 §6). The rules
+    are strict, against request smuggling:
+    - [Transfer-Encoding] must be exactly [chunked]. A request with both
+      fields, or with [Transfer-Encoding] in HTTP/1.0, is rejected.
+    - All [Content-Length] values, across fields and lists, must be the same
+      number.
+
+    @raise H1_error.E with {!H1_error.Bad_request}, or
+    {!H1_error.Not_implemented} for a transfer coding other than [chunked]. *)
+
+(** {1:target Request target} *)
+
+type target = {
+  scheme : string;
+  authority : string option; (** [host[:port]], if known. *)
+  path : string; (** Path and query, ["*"], or [""] for [CONNECT]. *)
+}
+(** The type for request targets, in the parts of a {!Request.t}. *)
+
+val request_target : scheme:string -> head -> target
+(** [request_target ~scheme h] is the target of [h] (RFC 9112 §3.2), where
+    [scheme] is the connection's scheme:
+    - Origin-form ["/p?q"] takes its authority from the [Host] field.
+    - Absolute-form ["http://a.example/p"] takes its scheme and authority from
+      the target and ignores [Host].
+    - Authority-form ["a.example:443"] is only for [CONNECT].
+    - Asterisk-form ["*"] is only for [OPTIONS].
+
+    An HTTP/1.1 request must have exactly one [Host] field, any request at
+    most one, and its value must be a valid [host[:port]]. An empty [Host]
+    means no authority.
+
+    @raise H1_error.E with {!H1_error.Bad_request} otherwise. *)
