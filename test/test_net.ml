@@ -270,7 +270,21 @@ let server_tests =
           with_server ~engine @@ fun server ->
           let c = Tcp.connect (Server.local_addr server) in
           equal string "custom engine" (read_all c);
-          Flow.close c) ]
+          Flow.close c);
+      test "an engine that raises is reported and the server goes on" (fun () ->
+          let errors = Atomic.make [] and calls = Atomic.make 0 in
+          let on_error e _ = Atomic.set errors (Printexc.to_string e :: Atomic.get errors) in
+          let engine _ctx flow _handler =
+            if Atomic.fetch_and_add calls 1 = 0 then failwith "engine" else Flow.write_string flow "ok"
+          in
+          with_server ~config:{ quiet with on_error } ~engine @@ fun server ->
+          let a = Tcp.connect (Server.local_addr server) in
+          equal string "" (read_all a);
+          Flow.close a;
+          let b = Tcp.connect (Server.local_addr server) in
+          equal string "ok" (read_all b);
+          Flow.close b;
+          equal (list string) [ {|Failure("engine")|} ] (Atomic.get errors)) ]
 
 (* Date across domains *)
 
