@@ -17,7 +17,9 @@ let now_at t =
   if second = cached_second
   then cached
   else begin
-    let date = Http_date.encode (of_unix_time t) in
+    (* Not Http_date.encode: it formats through the global
+       Format.str_formatter, which domains must not share. *)
+    let date = Format.asprintf "%a" Http_date.pp (of_unix_time t) in
     Atomic.set cache (second, date);
     date
   end

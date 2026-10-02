@@ -158,4 +158,23 @@ let tcp_tests =
           Flow.close client;
           Tcp.Listener.close l) ]
 
-let () = exit (run "net" [ tcp_tests ])
+(* Date across domains *)
+
+let date_tests =
+  group "Date"
+    [ test "dates are computed safely on several domains at once" (fun () ->
+          in_main @@ fun () ->
+          let expected t = Format.asprintf "%a" Http_date.pp (Private.Date.of_unix_time t) in
+          let worker k =
+            Fun.Async.call (fun () ->
+                for i = 0 to 20_000 do
+                  (* A new second each time, so that every call formats. *)
+                  let t = Float.of_int ((i * 8) + k) in
+                  if Private.Date.now_at t <> expected t
+                  then failwith (Printf.sprintf "wrong date for %.0f" t);
+                  if i mod 1000 = 0 then Fun.Async.yield ()
+                done)
+          in
+          ignore (Fun.Async.get_all (List.init 8 worker))) ]
+
+let () = exit (run "net" [ tcp_tests; date_tests ])
