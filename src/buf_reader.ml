@@ -4,16 +4,17 @@ exception Bad_line_ending
 
 type t = {
   read : bytes -> int -> int -> int;
-  mutable buf : bytes;
+  size : int; (* of [buf] once allocated *)
+  mutable buf : bytes; (* empty until the first fill *)
   mutable pos : int; (* first buffered byte *)
   mutable len : int; (* number of buffered bytes *)
   mutable eof : bool; (* [read] returned 0 *)
   mutable consumed : int;
 }
 
-let make ?(size = 16384) read =
+let make ?(size = 4096) read =
   if size <= 0 then invalid_arg "Buf_reader.make: size must be positive";
-  { read; buf = Bytes.create size; pos = 0; len = 0; eof = false; consumed = 0 }
+  { read; size; buf = Bytes.empty; pos = 0; len = 0; eof = false; consumed = 0 }
 
 let of_flow ?size flow = make ?size (Flow.read flow)
 
@@ -27,6 +28,7 @@ let of_string ?size ?(chunk = max_int) s =
       n)
 
 let buffered r = r.len
+let capacity r = Bytes.length r.buf
 let consumed r = r.consumed
 
 let consume r n =
@@ -35,14 +37,17 @@ let consume r n =
   r.consumed <- r.consumed + n;
   if r.len = 0 then r.pos <- 0
 
-(* Reads more input after the buffered bytes, making room first: double a full
-   buffer, or move the buffered bytes to the front. [false] at end of input. *)
+(* Reads more input after the buffered bytes, making room first: allocate the
+   buffer, double a full one, or move the buffered bytes to the front. [false]
+   at end of input. *)
 let fill r =
   if r.eof
   then false
   else begin
     let cap = Bytes.length r.buf in
-    if r.len = cap
+    if cap = 0
+    then r.buf <- Bytes.create r.size
+    else if r.len = cap
     then begin
       let buf = Bytes.create (2 * cap) in
       Bytes.blit r.buf r.pos buf 0 r.len;

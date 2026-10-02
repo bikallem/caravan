@@ -90,9 +90,11 @@ let write_to b w =
   match b.kind with
   | Empty -> ()
   | Source _ ->
-      let buf = Bytes.create chunk_size in
+      (* No larger than the body, if its length is known. *)
+      let size = match b.length with Some n -> Int.max 1 (Int.min n chunk_size) | None -> chunk_size in
+      let buf = Bytes.create size in
       let rec copy () =
-        match read b buf 0 chunk_size with
+        match read b buf 0 size with
         | 0 -> ()
         | n -> Writer.write w buf 0 n; Writer.flush w; copy ()
       in

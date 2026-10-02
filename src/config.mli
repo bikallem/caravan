@@ -12,7 +12,9 @@ type t = {
   max_connections : int;
   (** Connections served at once; more wait to be accepted. *)
   buffer_size : int;
-  (** Initial read and write buffer size per connection, in bytes. *)
+  (** Read and write buffer size per connection, in bytes. Each buffer is
+      allocated when first needed; the read buffer grows to hold a long
+      request line or header section. *)
   max_request_line : int; (** Longer request lines get 414. *)
   max_header_bytes : int; (** Larger header sections get 431. *)
   max_header_count : int; (** More header fields get 431. *)
@@ -46,7 +48,7 @@ type t = {
 
 val default : t
 (** [default] listens on [127.0.0.1:8080] with a backlog of 1024 and at most
-    1024 connections, 16 KiB buffers, default limits (8 KiB request
+    1024 connections, 4 KiB buffers, default limits (8 KiB request
     line, 16 KiB and 100 header fields), no body limit, 64 KiB drains,
     timeouts of 10s (head), 30s (idle, read, write), 2s lingering, a 10s
     shutdown grace, a [Date] field, and errors printed on [stderr]. *)

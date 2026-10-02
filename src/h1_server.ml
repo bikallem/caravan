@@ -45,7 +45,8 @@ let linger (config : Config.t) flow =
   Flow.set_read_deadline flow
     (Mtime.add_span (Mtime.now ()) config.linger_timeout);
   Flow.shutdown_send flow;
-  let buf = Bytes.create 4096 in
+  (* Small: the first read usually finds the client's FIN. *)
+  let buf = Bytes.create 512 in
   let rec discard left =
     if left > 0
     then match Flow.read flow buf 0 (Int.min left (Bytes.length buf)) with

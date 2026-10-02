@@ -16,7 +16,9 @@ exception Bad_line_ending
 val make : ?size:int -> (bytes -> int -> int -> int) -> t
 (** [make ~size read] reads from [read buf off len], which returns the number
     of bytes it read, at most [len > 0], and [0] at the end of the input.
-    [size] is the initial buffer size, 16 KiB by default.
+    [size] is the initial buffer size, 4 KiB by default. The buffer is
+    allocated by the first read that needs it, and grows to hold long
+    lines.
 
     @raise Invalid_argument if [size <= 0]. *)
 
@@ -59,6 +61,9 @@ val buffered : t -> int
 
 val take_buffered : t -> string
 (** [take_buffered r] consumes and returns the buffered bytes. *)
+
+val capacity : t -> int
+(** [capacity r] is the size of [r]'s buffer, [0] until it is allocated. *)
 
 val consumed : t -> int
 (** [consumed r] is the number of bytes consumed from [r] so far. *)

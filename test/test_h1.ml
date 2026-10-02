@@ -30,7 +30,15 @@ let read_n r n =
 
 let buf_reader_tests =
   group "Buf_reader"
-    [ test "lines without their CRLF" (fun () ->
+    [ test "the buffer is allocated by the first read that needs it" (fun () ->
+          let r = Buf_reader.of_string ~size:8 "0123456789abcdefghij\r\nrest" in
+          equal int 0 (Buf_reader.capacity r);
+          let buf = Bytes.create 4 in
+          ignore (Buf_reader.read_into r buf 0 4);
+          equal int ~msg:"read_into reads past an empty buffer" 0 (Buf_reader.capacity r);
+          equal string "456789abcdefghij" (Buf_reader.read_line r ~max:100);
+          equal int ~msg:"grown for a long line" 32 (Buf_reader.capacity r));
+      test "lines without their CRLF" (fun () ->
           equal (list string) [ "GET / HTTP/1.1"; "Host: x"; "" ]
             (lines ~max:100 "GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
       test "bare LF and CR are rejected" (fun () ->
@@ -904,7 +912,18 @@ let recorded ?size () =
 
 let buf_writer_tests =
   group "Buf_writer"
-    [ test "writes are buffered until flush" (fun () ->
+    [ test "the buffer is allocated by the first write that needs it" (fun () ->
+          let w, calls = recorded ~size:8 () in
+          equal int 0 (Buf_writer.capacity w);
+          Buf_writer.write_string w "12345678";
+          equal int ~msg:"large writes go through" 0 (Buf_writer.capacity w);
+          Buf_writer.write_char w 'a';
+          equal int 8 (Buf_writer.capacity w);
+          let w, _ = recorded ~size:8 () in
+          Buf_writer.write_string w "abc";
+          equal int 8 (Buf_writer.capacity w);
+          equal (list string) [ "12345678" ] (calls ()));
+      test "writes are buffered until flush" (fun () ->
           let w, calls = recorded () in
           Buf_writer.write_string w "HTTP/1.1 200 OK\r\n";
           Buf_writer.write_char w 'X';

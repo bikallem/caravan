@@ -5,8 +5,8 @@ type t
 
 val make : ?size:int -> (bytes -> int -> int -> unit) -> t
 (** [make ~size write] writes its output with [write buf off len], which
-    writes all [len] bytes or raises. [size] is the buffer size, 16 KiB by
-    default.
+    writes all [len] bytes or raises. [size] is the buffer size, 4 KiB by
+    default. The buffer is allocated by the first write that needs it.
 
     @raise Invalid_argument if [size <= 0]. *)
 
@@ -32,6 +32,9 @@ val flush : t -> unit
 
 val buffered : t -> int
 (** [buffered w] is the number of bytes written to [w] but not yet flushed. *)
+
+val capacity : t -> int
+(** [capacity w] is the size of [w]'s buffer, [0] until it is allocated. *)
 
 val written : t -> int
 (** [written w] is the number of bytes written to [w] so far, flushed or not. *)
