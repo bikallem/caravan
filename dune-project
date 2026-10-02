@@ -23,6 +23,8 @@
    (>= 5.5.0))
   (affect
    (>= 0.0.0))
+  (http-date
+   (>= 0.2))
   (windtrap
    (and
     :with-test

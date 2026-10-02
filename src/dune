@@ -1,7 +1,7 @@
 (library
  (name affect_http)
  (public_name affect-http)
- (libraries affect affect.unix threads.posix)
+ (libraries affect affect.unix threads.posix http-date)
  (instrumentation
   (backend ppx_windtrap.mutate))
  (instrumentation

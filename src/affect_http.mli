@@ -7,3 +7,10 @@ module Method = Method
 module Version = Version
 module Status = Status
 module Headers = Headers
+
+(**/**)
+
+(** Internal modules, exposed for tests. Not part of the public API. *)
+module Private : sig
+  module Date = Date
+end

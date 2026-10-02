@@ -198,8 +198,45 @@ let headers_commands =
 let headers_stateful =
   group "Headers model" [ stateful "behaves like an association list" headers_commands ]
 
+(* Date *)
+
+module Date = Private.Date
+
+let http_date = Testable.structural ~pp:Http_date.pp
+let max_time = 253402300799 (* 9999-12-31T23:59:59Z *)
+
+let date_tests =
+  group "Date"
+    [ test "known dates" (fun () ->
+          let enc t = Http_date.encode (Date.of_unix_time t) in
+          expect (enc 0.) @@ __POS_OF__ {|Thu, 01 Jan 1970 00:00:00 GMT|};
+          expect (enc 784111777.) @@ __POS_OF__ {|Sun, 06 Nov 1994 08:49:37 GMT|};
+          expect (enc 951782400.) @@ __POS_OF__ {|Tue, 29 Feb 2000 00:00:00 GMT|};
+          expect (enc (Float.of_int max_time)) @@ __POS_OF__ {|Fri, 31 Dec 9999 23:59:59 GMT|});
+      test "fractions of a second are dropped" (fun () ->
+          equal http_date (Date.of_unix_time 784111777.) (Date.of_unix_time 784111777.9));
+      prop "encoding decodes to the same date" (Gen.int_range 0 max_time) (fun t ->
+          let d = Date.of_unix_time (Float.of_int t) in
+          equal http_date d (Http_date.decode (Http_date.encode d)));
+      test "now_at caches one string per second" (fun () ->
+          let enc t = Http_date.encode (Date.of_unix_time t) in
+          let a = Date.now_at 1000. in
+          let b = Date.now_at 1000.5 in
+          equal string (enc 1000.) a;
+          is_true ~msg:"same second reuses the string" (a == b);
+          equal string (enc 1001.) (Date.now_at 1001.);
+          equal string (enc 1000.) (Date.now_at 1000.));
+      test "now is the current IMF date" (fun () ->
+          let before = Unix.time () in
+          let s = Date.now () in
+          let after = Unix.time () in
+          let candidates = List.map (fun t -> Http_date.encode (Date.of_unix_time t)) [ before; after ] in
+          is_true ~msg:"matches the clock" (List.mem s candidates);
+          is_true ~msg:"decodes as IMF"
+            (match Http_date.decode s with `IMF _ -> true | _ -> false)) ]
+
 let () =
   exit
     (run "core"
        [ method_tests; version_tests; status_tests; headers_tests; headers_props;
-         headers_stateful ])
+         headers_stateful; date_tests ])

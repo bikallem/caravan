@@ -32,6 +32,16 @@
                 license = pkgs.lib.licenses.isc;
               };
             };
+            # http-date's pinned commit declares (lang dune 3.24), so it is
+            # built with this dune and the dev shell uses it too. Other
+            # packages keep nixpkgs' dune.
+            dune_3_24 = pkgs.ocaml-ng.ocamlPackages_5_5.dune_3.overrideAttrs (_: rec {
+              version = "3.24.2";
+              src = pkgs.fetchurl {
+                url = "https://github.com/ocaml/dune/releases/download/${version}/dune-${version}.tbz";
+                hash = "sha256-RyeYaRsCFtr1OHCfD0cDs2F+8krQhmyQlgaLqrpNdio=";
+              };
+            });
             ocamlPackages = pkgs.ocaml-ng.ocamlPackages_5_5.overrideScope (
               final: prev: {
                 # Not packaged in nixpkgs yet: https://ocaml.org/p/affect/latest
@@ -94,10 +104,31 @@
                     description = "Inline tests, coverage and mutation testing for windtrap";
                   };
                 };
+
+                # Not packaged in nixpkgs yet: https://ocaml.org/p/http-date/latest
+                # Pinned to an untagged commit (after v0.2) until v0.3 is
+                # released. It declares (lang dune 3.24) and nixpkgs has dune
+                # 3.23.1, so only this package builds with a newer dune.
+                http-date = (final.buildDunePackage.override { dune_3 = dune_3_24; }) {
+                  pname = "http-date";
+                  version = "0.2-unstable-2026-09-30";
+                  minimalOCamlVersion = "4.11";
+                  src = pkgs.fetchFromGitHub {
+                    owner = "bikallem";
+                    repo = "http-date";
+                    rev = "8924a84d249a2773f12d79c442bf133eff5d549f";
+                    hash = "sha256-6TsG2TvD7z+HRpLRwXq+m+p9ouAHOIvZpsIRMkD52qA=";
+                  };
+                  meta = {
+                    description = "RFC 9110 HTTP date decoder and encoder";
+                    homepage = "https://github.com/bikallem/http-date";
+                    license = pkgs.lib.licenses.mpl20;
+                  };
+                };
               }
             );
           in
-          f { inherit pkgs ocamlPackages; }
+          f { inherit pkgs ocamlPackages dune_3_24; }
         );
     in
     {
@@ -110,17 +141,22 @@
       );
 
       devShells = forAllSystems (
-        { pkgs, ocamlPackages }:
+        {
+          pkgs,
+          ocamlPackages,
+          dune_3_24,
+        }:
         {
           default = pkgs.mkShell {
             packages = with ocamlPackages; [
-              # Toolchain
+              # Toolchain (http-date at its pinned commit needs dune 3.24)
               ocaml
-              dune_3
+              dune_3_24
               findlib
 
               # Dependencies
               affect
+              http-date
 
               # Test dependencies
               windtrap
