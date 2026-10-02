@@ -19,4 +19,5 @@ module Handler = Handler
 (** Internal modules, exposed for tests. Not part of the public API. *)
 module Private : sig
   module Date = Date
+  module Buf_reader = Buf_reader
 end

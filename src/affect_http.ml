@@ -11,4 +11,5 @@ module Handler = Handler
 
 module Private = struct
   module Date = Date
+  module Buf_reader = Buf_reader
 end
