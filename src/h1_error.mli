@@ -6,6 +6,7 @@ type t =
 | Header_fields_too_large (** 431 *)
 | Content_too_large (** 413 *)
 | Request_timeout (** 408: the request did not arrive in time. *)
+| Expectation_failed (** 417: an [Expect] other than [100-continue]. *)
 | Not_implemented of string (** 501, for example an unknown transfer coding. *)
 | Version_not_supported (** 505 *)
 (** The type for request errors. *)

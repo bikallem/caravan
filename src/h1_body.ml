@@ -2,10 +2,12 @@ let fail e = raise (H1_error.E e)
 let bad s = fail (H1_error.Bad_request s)
 
 (* A body as read from the connection: [read] has [Body.of_source]'s
-   contract, [finished ()] is true once the body was read to its end. *)
+   contract, [finished ()] is true once the body was read to its end, and
+   [unread ()] is the number of bytes left, if known. *)
 type source = {
   read : bytes -> int -> int -> int;
   finished : unit -> bool;
+  unread : unit -> int option;
   trailers : unit -> Headers.t;
   length : int option;
 }
@@ -21,8 +23,8 @@ let fixed_source r n =
       | k -> remaining := !remaining - k; k
     end
   in
-  { read; finished = (fun () -> !remaining = 0); trailers = (fun () -> Headers.empty);
-    length = Some n }
+  { read; finished = (fun () -> !remaining = 0); unread = (fun () -> Some !remaining);
+    trailers = (fun () -> Headers.empty); length = Some n }
 
 
 (* Chunk size line, RFC 9112 §7.1.1:
@@ -113,8 +115,9 @@ let chunked_source ?(max_body = max_int) ~(limits : H1_parse.limits) r =
         else state := `Data (n - k);
         k
   in
-  { read; finished = (fun () -> !state = `Done); trailers = (fun () -> !trailers);
-    length = None }
+  let finished () = !state = `Done in
+  { read; finished; unread = (fun () -> if finished () then Some 0 else None);
+    trailers = (fun () -> !trailers); length = None }
 
 let to_body src = Body.of_source ?length:src.length ~trailers:src.trailers src.read
 let fixed r n = to_body (fixed_source r n)
@@ -156,12 +159,14 @@ let make ?max_body ?expect_continue ~limits r (framing : H1_parse.framing) =
 
 let body t = t.body
 let is_complete t = match t.src with None -> true | Some src -> src.finished ()
+let unread t = match t.src with None -> Some 0 | Some src -> src.unread ()
 
 let drain t ~max =
   match t.src, t.continue with
   | None, _ -> true
   | Some src, _ when src.finished () -> true
   | Some _, Expected _ -> false (* the client may be holding the body back *)
+  | Some src, _ when Option.fold ~none:false ~some:(fun n -> n > max) (src.unread ()) -> false
   | Some src, (No_expectation | Sent) ->
       let buf = Bytes.create 4096 in
       let rec discard left =

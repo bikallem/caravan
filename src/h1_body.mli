@@ -50,11 +50,15 @@ val is_complete : t -> bool
 (** [is_complete t] is [true] iff the body was read to its end, or there is
     none. A [Content-Length] body is complete once its last byte is read. *)
 
+val unread : t -> int option
+(** [unread t] is the number of bytes of the body left to read, if known: for
+    a [Content-Length] body, or a body read to its end. *)
+
 val drain : t -> max:int -> bool
 (** [drain t ~max] reads and discards what remains of the body, so that the
     next request on the connection can be read. It is [true] iff the
     connection can be reused: the body ended within [max] more bytes. It is
     [false], and the connection must close, if more remains, if the framing
     is malformed or truncated, or if [100-continue] was expected but never
-    sent, because the client may still be holding the body back; nothing is
-    read in that case. *)
+    sent, because the client may still be holding the body back. Nothing is
+    read in that case, or if more than [max] bytes are known to remain. *)

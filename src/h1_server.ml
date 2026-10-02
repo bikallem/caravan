@@ -25,12 +25,16 @@ let request_keep_alive (h : H1_parse.head) =
   | Version.Http_1_0 -> Headers.has_token "connection" "keep-alive" h.headers
   | _ -> not (Headers.has_token "connection" "close" h.headers)
 
-(* RFC 9110 §10.1.1: 100 Continue only to HTTP/1.1 clients. *)
-let expects_continue (h : H1_parse.head) =
-  h.version = Version.Http_1_1
-  && (match Headers.find "expect" h.headers with
-    | Some v -> String.lowercase_ascii v = "100-continue"
-    | None -> false)
+(* RFC 9110 §10.1.1: [100-continue] is the only expectation, and HTTP/1.0
+   clients' is ignored. *)
+let expectation (h : H1_parse.head) =
+  match Headers.tokens "expect" h.headers with
+  | [] -> `None
+  | ts when List.for_all (fun t -> String.lowercase_ascii t = "100-continue") ts ->
+      if h.version = Version.Http_1_1 then `Continue else `None
+  | _ -> `Unknown
+
+let expects_continue h = expectation h = `Continue
 
 (* RFC 9112 §9.6: a connection the server ends is closed in stages. Closing
    it over unread input makes the kernel reset it, and a reset can destroy the
@@ -87,7 +91,10 @@ let serve : Engine.t =
     read_deadline := (fun () -> head_deadline);
     match
       let head = H1_parse.request_head limits r in
-      (head, H1_parse.request_framing head, H1_parse.request_target ~scheme head)
+      let framing = H1_parse.request_framing head in
+      let target = H1_parse.request_target ~scheme head in
+      if expectation head = `Unknown then raise (H1_error.E H1_error.Expectation_failed);
+      (head, framing, target)
     with
     | exception Buf_reader.Eof -> `Close (* the client left in the middle of a request *)
     | exception Flow.Timeout -> error_response w H1_error.Request_timeout
@@ -133,6 +140,8 @@ let serve : Engine.t =
             let continue_owed =
               expects_continue head && (not !continue_sent) && not (H1_body.is_complete body)
             in
+            (* Whether an unread body can be drained is only known once the
+               response is written: streamed responses may read it. *)
             let keep_alive =
               request_keep_alive head
               && (not (H1_write.wants_close response))

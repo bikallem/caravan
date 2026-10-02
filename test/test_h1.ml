@@ -828,8 +828,9 @@ let handle_tests =
           is_true (not (H1_body.drain t ~max:(11 - read - 1)));
           let _, t = handle "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n" Chunked in
           is_true (not (H1_body.drain t ~max:10));
-          (* [max] at the size of drain's scratch buffer *)
-          let _, t = handle (String.make 5000 'x') (Fixed 5000) in
+          (* [max] at the size of drain's scratch buffer, with a body whose
+             size is not known up front *)
+          let _, t = handle (encode_chunked [ String.make 5000 'x' ] "" []) Chunked in
           is_true (not (H1_body.drain t ~max:4096));
           let _, t = handle (String.make 4096 'x') (Fixed 4096) in
           is_true (H1_body.drain t ~max:4096));
@@ -871,7 +872,25 @@ let handle_tests =
            read_some read;
            is_true (H1_body.drain t ~max:max_int);
            is_true (H1_body.is_complete t);
-           equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100)) ]
+           equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100));
+      test "unread" (fun () ->
+          let _, t = handle "" No_body in
+          equal (option int) (Some 0) (H1_body.unread t);
+          let _, t = handle "hello" (Fixed 5) in
+          equal (option int) (Some 5) (H1_body.unread t);
+          ignore (Body.read (H1_body.body t) (Bytes.create 2) 0 2);
+          equal (option int) (Some 3) (H1_body.unread t);
+          let _, t = handle "5\r\nhello\r\n0\r\n\r\n" Chunked in
+          equal (option int) None (H1_body.unread t);
+          ignore (Body.to_string (H1_body.body t));
+          equal (option int) (Some 0) (H1_body.unread t));
+      test "drain reads nothing when more than max is known to remain" (fun () ->
+          let r, t = handle ("hello world" ^ next) (Fixed 11) in
+          ignore (Body.read (H1_body.body t) (Bytes.create 4) 0 4);
+          let consumed = Buf_reader.consumed r in
+          is_true (not (H1_body.drain t ~max:6));
+          equal int consumed (Buf_reader.consumed r);
+          is_true (H1_body.drain t ~max:7)) ]
 
 (* Buf_writer *)
 

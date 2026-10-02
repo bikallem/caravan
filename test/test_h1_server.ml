@@ -271,6 +271,67 @@ let connection_tests =
             \r\n
             ignored
             |});
+      test "an expectation other than 100-continue gets 417, without the handler" (fun () ->
+          expect
+            (String.concat "--"
+               (List.map
+                  (fun e -> show (get ~headers:[ ("Expect", e) ] "/fail"))
+                  [ "foo"; "100-continue, foo"; "100-continue=1" ]))
+          @@ __POS_OF__ {|
+            HTTP/1.1 417 Expectation Failed\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 19\r\n
+            Connection: close\r\n
+            \r\n
+            Expectation Failed
+            [FIN]--HTTP/1.1 417 Expectation Failed\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 19\r\n
+            Connection: close\r\n
+            \r\n
+            Expectation Failed
+            [FIN]--HTTP/1.1 417 Expectation Failed\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 19\r\n
+            Connection: close\r\n
+            \r\n
+            Expectation Failed
+            [FIN]
+            |});
+      test "100-continue is case-insensitive" (fun () ->
+          expect (show (post ~headers:[ ("Expect", "100-Continue") ] "/echo" "hi"))
+          @@ __POS_OF__ {|
+            HTTP/1.1 100 Continue\r\n
+            \r\n
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 2\r\n
+            \r\n
+            hi
+            |});
+      test "100-continue from HTTP/1.0 is ignored" (fun () ->
+          expect (show (get ~v:"HTTP/1.0" ~headers:[ ("Expect", "100-continue") ] "/"))
+          @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 5\r\n
+            Connection: close\r\n
+            \r\n
+            hello[FIN]
+            |});
+      test "an unread chunked body over max_drain closes after the response" (fun () ->
+          let config = { Config.default with date_header = false; max_drain = 10 } in
+          let body = Printf.sprintf "64\r\n%s\r\n0\r\n\r\n" (String.make 100 'x') in
+          expect
+            (show ~config
+               ("POST /ignore HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n" ^ body))
+          @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 7\r\n
+            \r\n
+            ignored[FIN]
+            |});
       test "100-continue owed and never sent closes the connection" (fun () ->
           expect
             (show (post ~headers:[ ("Expect", "100-continue") ] "/ignore" "hello" ^ get "/"))
@@ -374,7 +435,7 @@ let connection_tests =
             Content-Type: text/plain; charset=utf-8\r\n
             Content-Length: 7\r\n
             \r\n
-            ignored[FIN][unread 79]
+            ignored[FIN][unread 89]
             |});
       test "a client that leaves is not lingered on" (fun () ->
           expect (show (get "/" ^ "GET / HT")) @@ __POS_OF__ {|
