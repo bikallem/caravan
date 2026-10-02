@@ -53,6 +53,9 @@ let version_tests =
           List.iter
             (fun s -> is_none ~pp:Version.pp (Version.of_string s))
             [ ""; "HTTP/1.2"; "http/1.1"; "HTTP/2.0"; "HTTP/1.1 " ]);
+      test "equal" (fun () ->
+          is_true (Version.equal Version.Http_2 Version.Http_2);
+          is_true (not (Version.equal Version.Http_1_0 Version.Http_1_1)));
       test "ordered oldest to newest" (fun () ->
           is_true (Version.compare Version.Http_1_0 Version.Http_1_1 < 0);
           is_true (Version.compare Version.Http_2 Version.Http_3 < 0)) ]
@@ -69,6 +72,65 @@ let status_tests =
       test "pp" (fun () ->
           expect (Format.asprintf "%a" Status.pp Status.ok) @@ __POS_OF__ {|200 OK|};
           expect (Format.asprintf "%a" Status.pp (Status.v 299)) @@ __POS_OF__ {|299|});
+      test "registered reason phrases" (fun () ->
+          let registered =
+            List.filter_map
+              (fun n ->
+                 let s = Status.v n in
+                 if Status.reason s = "" then None else Some (Format.asprintf "%a" Status.pp s))
+              (List.init 500 (fun i -> i + 100))
+          in
+          expect (String.concat "\n" registered) @@ __POS_OF__ {|
+            100 Continue
+            101 Switching Protocols
+            103 Early Hints
+            200 OK
+            201 Created
+            202 Accepted
+            203 Non-Authoritative Information
+            204 No Content
+            205 Reset Content
+            206 Partial Content
+            300 Multiple Choices
+            301 Moved Permanently
+            302 Found
+            303 See Other
+            304 Not Modified
+            307 Temporary Redirect
+            308 Permanent Redirect
+            400 Bad Request
+            401 Unauthorized
+            402 Payment Required
+            403 Forbidden
+            404 Not Found
+            405 Method Not Allowed
+            406 Not Acceptable
+            407 Proxy Authentication Required
+            408 Request Timeout
+            409 Conflict
+            410 Gone
+            411 Length Required
+            412 Precondition Failed
+            413 Content Too Large
+            414 URI Too Long
+            415 Unsupported Media Type
+            416 Range Not Satisfiable
+            417 Expectation Failed
+            421 Misdirected Request
+            422 Unprocessable Content
+            426 Upgrade Required
+            428 Precondition Required
+            429 Too Many Requests
+            431 Request Header Fields Too Large
+            451 Unavailable For Legal Reasons
+            500 Internal Server Error
+            501 Not Implemented
+            502 Bad Gateway
+            503 Service Unavailable
+            504 Gateway Timeout
+            505 HTTP Version Not Supported
+            511 Network Authentication Required
+            |});
       prop "v and code round trip" (Gen.int_range 100 599) (fun n ->
           equal int n (Status.code (Status.v n)));
       prop "kind follows the first digit" (Gen.int_range 100 599) (fun n ->
@@ -139,6 +201,13 @@ let headers_tests =
           is_true (not (Headers.equal a (h [ ("Accept", "*/*"); ("Host", "x") ])));
           is_true (not (Headers.equal a (h [ ("Host", "X"); ("Accept", "*/*") ])));
           is_true (not (Headers.equal a (h [ ("Host", "x") ]))));
+      test "fold and iter visit fields in order" (fun () ->
+          let h = h [ ("A", "1"); ("b", "2"); ("A", "3") ] in
+          equal (list string) [ "A=1"; "b=2"; "A=3" ]
+            (List.rev (Headers.fold (fun n v acc -> (n ^ "=" ^ v) :: acc) h []));
+          let seen = ref [] in
+          Headers.iter (fun n _ -> seen := n :: !seen) h;
+          equal (list string) [ "A"; "b"; "A" ] (List.rev !seen));
       test "pp" (fun () ->
           expect (Format.asprintf "%a" Headers.pp (h [ ("Host", "x"); ("Accept", "*/*") ]))
           @@ __POS_OF__ {|Host: x
@@ -326,6 +395,24 @@ let flow_tests =
           equal string "w" (Buffer.contents out);
           equal string "xyz"
             (read_all (Flow.prepend "x" (Flow.prepend "y" (Flow.of_string "z" out)))));
+      test "prepend passes shutdown and close to the flow" (fun () ->
+          let log = ref [] in
+          let flow =
+            Flow.make ~read:(fun _ _ _ -> 0) ~write:(fun _ _ _ -> ())
+              ~readable:(Affect.Action.always ())
+              ~shutdown_send:(fun () -> log := "shutdown" :: !log)
+              ~close:(fun () -> log := "close" :: !log)
+              ~set_read_deadline:ignore ~set_write_deadline:ignore
+          in
+          let p = Flow.prepend "x" flow in
+          Flow.shutdown_send p;
+          Flow.close p;
+          equal (list string) [ "shutdown"; "close" ] (List.rev !log);
+          let f = Flow.of_string "" (Buffer.create 0) in
+          Flow.set_read_deadline f (Some (Affect_unix.Mtime.now ()));
+          Flow.set_write_deadline f None;
+          Flow.shutdown_send f;
+          equal int 0 (Flow.read f (Bytes.create 1) 0 1));
       test "prepend is readable while its bytes remain" (fun () ->
           let never =
             Flow.make ~read:(fun _ _ _ -> 0) ~write:(fun _ _ _ -> ())

@@ -222,7 +222,7 @@ let request_head_tests =
                [ "GET  / HTTP/1.1\r\n\r\n"; "GET / HTTP/1.1 \r\n\r\n"; "GET /\r\n\r\n";
                  " GET / HTTP/1.1\r\n\r\n"; "G(T / HTTP/1.1\r\n\r\n"; "GET /a\tb HTTP/1.1\r\n\r\n";
                  "GET /\x80 HTTP/1.1\r\n\r\n"; "GET / HTTP/1\r\n\r\n"; "GET / http/1.1\r\n\r\n";
-                 "GET / HTTP/1.x\r\n\r\n"; "GET / HTTP/0.9\r\n\r\n"; "GET / HTTP/2.0\r\n\r\n";
+                 "GET / HTTP/1.x\r\n\r\n"; "GET / HTTP/1-1\r\n\r\n"; "GET  HTTP/1.1\r\n\r\n"; "GET / HTTP/0.9\r\n\r\n"; "GET / HTTP/2.0\r\n\r\n";
                  "GET / HTTP/1.1\n\n"; "\r\n\r\n\r\n\r\n\r\nGET / HTTP/1.1\r\n\r\n" ])
           @@ __POS_OF__ {|
             "GET  / HTTP/1.1\r\n\r\n"
@@ -245,6 +245,10 @@ let request_head_tests =
             => 400 Bad Request (invalid HTTP version "http/1.1")
             "GET / HTTP/1.x\r\n\r\n"
             => 400 Bad Request (invalid HTTP version "HTTP/1.x")
+            "GET / HTTP/1-1\r\n\r\n"
+            => 400 Bad Request (invalid HTTP version "HTTP/1-1")
+            "GET  HTTP/1.1\r\n\r\n"
+            => 400 Bad Request (invalid request target "")
             "GET / HTTP/0.9\r\n\r\n"
             => 400 Bad Request (unsupported HTTP version "HTTP/0.9")
             "GET / HTTP/2.0\r\n\r\n"
@@ -470,6 +474,7 @@ let target_tests =
                     ("Host with bad port", lazy (req [ host "a:8x" ]));
                     ("Host empty IPv6", lazy (req [ host "[]" ]));
                     ("Host port only", lazy (req [ host ":80" ]));
+                    ("Host bad IPv6 literal", lazy (req [ host "[::g]" ]));
                     ("absolute", lazy (req ~target:"http://b.example:81/p?q" [ host "a.example" ]));
                     ("absolute https", lazy (req ~target:"HTTPS://b.example" [ host "b.example" ]));
                     ("absolute query only", lazy (req ~target:"http://b.example?q" [ host "x" ]));
@@ -489,7 +494,8 @@ let target_tests =
                     ("OPTIONS *", lazy (req ~meth:"OPTIONS" ~target:"*" [ host "a" ]));
                     ("GET *", lazy (req ~target:"*" [ host "a" ]));
                     ("OPTIONS origin", lazy (req ~meth:"OPTIONS" ~target:"/x" [ host "a" ]));
-                    ("GET authority-form", lazy (req ~target:"b.example:443" [ host "b" ])) ]))
+                    ("GET authority-form", lazy (req ~target:"b.example:443" [ host "b" ]));
+                    ("GET relative path", lazy (req ~target:"index.html" [ host "b" ])) ]))
           @@ __POS_OF__ {|
             origin => http a.example "/a?b"
             origin, port => http a.example:8080 "/"
@@ -505,6 +511,7 @@ let target_tests =
             Host with bad port => 400 Bad Request (invalid Host "a:8x")
             Host empty IPv6 => 400 Bad Request (invalid Host "[]")
             Host port only => 400 Bad Request (invalid Host ":80")
+            Host bad IPv6 literal => 400 Bad Request (invalid Host "[::g]")
             absolute => http b.example:81 "/p?q"
             absolute https => https b.example "/"
             absolute query only => http b.example "/?q"
@@ -525,6 +532,7 @@ let target_tests =
             GET * => 400 Bad Request (* is only for OPTIONS)
             OPTIONS origin => http a "/x"
             GET authority-form => 400 Bad Request (invalid request target "b.example:443")
+            GET relative path => 400 Bad Request (invalid request target "index.html")
             |}) ]
 
 let host_gen =
@@ -634,7 +642,7 @@ let chunked_tests =
                  "A\r\n0123456789\r\na\r\nabcdefghij\r\n000\r\n\r\n";
                  "0005\r\nhello\r\n0\r\n\r\n";
                  "5;name\r\nhello\r\n0;last=1\r\n\r\n";
-                 "5 ; a = b ;c\r\nhello\r\n0\r\n\r\n";
+                 "5 ; a = b ;c\r\nhello\r\n0\r\n\r\n"; "5\t;\ta\t=\tb\r\nhello\r\n0\r\n\r\n";
                  "5;q=\"a \\\"b;\"\r\nhello\r\n0\r\n\r\n";
                  "5\r\nhello\r\n0\r\nX-Checksum: abc\r\nX-Other:  v \r\n\r\nNEXT";
                  "5;a=\"\\x\"\r\nhello\r\n0\r\n\r\n";
@@ -652,6 +660,8 @@ let chunked_tests =
             "5;name\r\nhello\r\n0;last=1\r\n\r\n"
             => "hello" rest ""
             "5 ; a = b ;c\r\nhello\r\n0\r\n\r\n"
+            => "hello" rest ""
+            "5\t;\ta\t=\tb\r\nhello\r\n0\r\n\r\n"
             => "hello" rest ""
             "5;q=\"a \\\"b;\"\r\nhello\r\n0\r\n\r\n"
             => "hello" rest ""

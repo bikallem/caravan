@@ -108,9 +108,10 @@ let elements values =
   |> List.map trim_ows
   |> List.filter (fun e -> e <> "")
 
-(* At most 18 digits: always fits in an OCaml int. *)
+(* At most 18 digits: always fits in an OCaml int. [s] is never empty:
+   [elements] drops empty list elements. *)
 let length_value s =
-  if s = "" || String.length s > 18 || not (String.for_all is_digit s)
+  if String.length s > 18 || not (String.for_all is_digit s)
   then bad "invalid Content-Length %S" s;
   int_of_string s
 
