@@ -222,6 +222,18 @@ let server_tests =
           equal string "HTTP/1.1 200 OK" status;
           equal string id1 id2;
           Flow.close c);
+      test "connections are numbered in order from 0" (fun () ->
+          with_server @@ fun server ->
+          let id () =
+            let c = Tcp.connect (Server.local_addr server) in
+            Flow.write_string c (get ~close:true "/id");
+            let _, id = read_response c in
+            Flow.close c;
+            id
+          in
+          let first = id () in
+          let second = id () in
+          equal (list string) [ "0"; "1" ] [ first; second ]);
       test "serves 20 clients at once" (fun () ->
           with_server @@ fun server ->
           let clients =
@@ -260,6 +272,39 @@ let server_tests =
           is_true ~msg:"wait returned promptly" (elapsed_ms clock < 1000.);
           equal string "" (read_all c);
           Flow.close c);
+      test "after shutdown, new clients are refused" (fun () ->
+          in_main @@ fun () ->
+          let server = Server.start ~config:quiet handler in
+          let addr = Server.local_addr server in
+          Server.shutdown server;
+          Server.wait server;
+          raises_match
+            (function Unix.Unix_error (Unix.ECONNREFUSED, _, _) -> true | _ -> false)
+            (fun () -> Tcp.connect addr));
+      test "clients arriving during shutdown leave no descriptor behind" (fun () ->
+          in_main @@ fun () ->
+          let fds () = Array.length (Sys.readdir "/proc/self/fd") in
+          let before = fds () in
+          let server = Server.start ~config:{ quiet with max_connections = 8 } handler in
+          let addr = Server.local_addr server in
+          (* Over 10ms, clients connect, send a request and read until the
+             server closes; some arrive after it stopped. *)
+          let client i () =
+            let delay = i * 200 in
+            Mtime.wait_for Mtime.Span.(delay * us);
+            match Tcp.connect addr with
+            | exception Unix.Unix_error _ -> ()
+            | c ->
+                Fun.protect ~finally:(fun () -> Flow.close c) @@ fun () ->
+                Flow.set_read_deadline c (Some (deadline_in 2000));
+                try Flow.write_string c (get "/"); ignore (read_all c) with Flow.Closed -> ()
+          in
+          let clients = List.init 50 (fun i -> Fun.Async.call (client i)) in
+          Mtime.wait_for Mtime.Span.(5 * ms);
+          Server.shutdown server;
+          Server.wait server;
+          ignore (Fun.Async.get_all clients);
+          equal int before (fds ()));
       test "an address in use is an error" (fun () ->
           with_server @@ fun server ->
           raises_match
