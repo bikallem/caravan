@@ -3,18 +3,15 @@ type t = {
   size : int; (* of [buf] once allocated *)
   mutable buf : bytes; (* empty until the first buffered byte *)
   mutable len : int; (* buffered bytes, from 0 *)
-  mutable written : int;
 }
 
 let make ?(size = 4096) write =
   if size <= 0 then invalid_arg "Buf_writer.make: size must be positive";
-  { write; size; buf = Bytes.empty; len = 0; written = 0 }
+  { write; size; buf = Bytes.empty; len = 0 }
 
 let ensure_buffer w = if Bytes.length w.buf = 0 then w.buf <- Bytes.create w.size
 
-let of_flow ?size flow = make ?size (Flow.write flow)
 let buffered w = w.len
-let written w = w.written
 let capacity w = Bytes.length w.buf
 
 let flush w =
@@ -36,8 +33,7 @@ let write_bytes w buf off len =
     ensure_buffer w;
     Bytes.blit buf off w.buf w.len len;
     w.len <- w.len + len
-  end;
-  w.written <- w.written + len
+  end
 
 let write_string w s = write_bytes w (Bytes.unsafe_of_string s) 0 (String.length s)
 
@@ -45,5 +41,4 @@ let write_char w c =
   if w.len = w.size then flush w;
   ensure_buffer w;
   Bytes.set w.buf w.len c;
-  w.len <- w.len + 1;
-  w.written <- w.written + 1
+  w.len <- w.len + 1

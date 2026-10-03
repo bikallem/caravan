@@ -1013,8 +1013,7 @@ let buf_writer_tests =
           equal (list string) [ "HTTP/1.1 200 OK\r\nXabc" ] (calls ());
           equal int 0 (Buf_writer.buffered w);
           Buf_writer.flush w;
-          equal int 1 (List.length (calls ()));
-          equal int 21 (Buf_writer.written w));
+          equal int 1 (List.length (calls ())));
       test "a write that does not fit flushes first" (fun () ->
           let w, calls = recorded ~size:4 () in
           Buf_writer.write_string w "abc";
@@ -1026,8 +1025,7 @@ let buf_writer_tests =
           let w, calls = recorded ~size:2 () in
           String.iter (Buf_writer.write_char w) "abcde";
           Buf_writer.flush w;
-          equal (list string) [ "ab"; "cd"; "e" ] (calls ());
-          equal int 5 (Buf_writer.written w));
+          equal (list string) [ "ab"; "cd"; "e" ] (calls ()));
       test "large writes go straight to the output" (fun () ->
           let w, calls = recorded ~size:4 () in
           Buf_writer.write_string w "ab";
@@ -1035,8 +1033,7 @@ let buf_writer_tests =
           Buf_writer.write_string w "abcd";
           Buf_writer.write_string w "";
           equal (list string) [ "ab"; "0123456789"; "abcd" ] (calls ());
-          equal int 0 (Buf_writer.buffered w);
-          equal int 16 (Buf_writer.written w));
+          equal int 0 (Buf_writer.buffered w));
       test "invalid arguments" (fun () ->
           (* Large writes skip the copy, so only the range check can raise. *)
           let w = Buf_writer.make ~size:2 ignore3 in
@@ -1045,13 +1042,6 @@ let buf_writer_tests =
                raises_match is_invalid_arg (fun () -> Buf_writer.write_bytes w (Bytes.create 4) off len))
             [ (-1, 1); (0, -1); (2, 3); (5, 0) ];
           raises_match is_invalid_arg (fun () -> Buf_writer.make ~size:0 ignore3));
-      test "of_flow writes to the flow" (fun () ->
-          let out = Buffer.create 8 in
-          let w = Buf_writer.of_flow (Flow.of_string "" out) in
-          Buf_writer.write_string w "hi";
-          equal string "" (Buffer.contents out);
-          Buf_writer.flush w;
-          equal string "hi" (Buffer.contents out));
       prop "output is the writes in order; calls are bounded"
         Gen.(pair (list ~size:(int_range 0 12) (string_of ~size:(int_range 0 12) (char_range 'a' 'z'))) (int_range 1 8))
         (fun (writes, size) ->
@@ -1059,7 +1049,6 @@ let buf_writer_tests =
            List.iter (Buf_writer.write_string w) writes;
            Buf_writer.flush w;
            equal string (String.concat "" writes) (String.concat "" (calls ()));
-           equal int (String.length (String.concat "" writes)) (Buf_writer.written w);
            List.iter
              (fun c ->
                 is_true ~msg:"a call is at most size bytes, or one large write"
