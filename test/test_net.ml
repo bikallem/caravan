@@ -528,7 +528,15 @@ let stop_signal_tests =
           is_true ~msg:"same value" (t == Stop_signal.install ~signals:[ Sys.sigusr2 ] ());
           raises_match
             (function Invalid_argument _ -> true | _ -> false)
-            (fun () -> Stop_signal.install ())) ]
+            (fun () -> Stop_signal.install ()));
+      test "release unblocks the signals, and installing again blocks them" (fun () ->
+          let blocked () = List.mem Sys.sigusr2 (Thread.sigmask Unix.SIG_BLOCK []) in
+          let t = Stop_signal.install ~signals:[ Sys.sigusr2 ] () in
+          is_true ~msg:"installed" (blocked ());
+          Stop_signal.release t;
+          is_true ~msg:"released" (not (blocked ()));
+          is_true ~msg:"same value" (t == Stop_signal.install ~signals:[ Sys.sigusr2 ] ());
+          is_true ~msg:"installed again" (blocked ())) ]
 
 (* Date across domains *)
 

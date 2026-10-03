@@ -134,14 +134,15 @@ let wait s =
 
 let run ?config ?engine ?domain_count ?(on_start = ignore) handler =
   let signals = Stop_signal.install () in
+  Stdlib.Fun.protect ~finally:(fun () -> Stop_signal.release signals) @@ fun () ->
   Affect_unix.Unix.main ?domain_count @@ fun () ->
   let server = start ?config ?engine handler in
   on_start server;
   let stopper =
     Fun.Async.call (fun () ->
-        Stop_signal.wait signals;
+        ignore (Stop_signal.wait signals);
         shutdown server;
-        Stop_signal.wait signals;
+        ignore (Stop_signal.wait signals);
         abort server)
   in
   Fun.Async.protect ~finally:(fun () -> Fun.Async.cancel stopper) (fun () -> wait server)

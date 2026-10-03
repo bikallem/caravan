@@ -354,9 +354,11 @@ let signal_tests =
   let program = Filename.concat (Filename.dirname Sys.executable_name) "serve_until_signal.exe" in
   (* Runs [f pid out] with the program started: its pid, and a reader on its
      standard output. Kills the program if [f] leaves it running. *)
-  let with_program f =
+  let with_program ?(args = []) f =
     let out_r, out_w = Unix.pipe ~cloexec:true () in
-    let pid = Unix.create_process program [| program |] Unix.stdin out_w Unix.stderr in
+    let pid =
+      Unix.create_process program (Array.of_list (program :: args)) Unix.stdin out_w Unix.stderr
+    in
     Unix.close out_w;
     Unix.set_nonblock out_r;
     let out = Tcp.flow out_r in
@@ -425,6 +427,30 @@ let signal_tests =
           Unix.kill pid Sys.sigterm;
           is_true ~msg:"the idle connection is closed" (Buf_reader.peek_eof r);
           Flow.close flow;
-          exited_ok pid ~within:1000.) ]
+          exited_ok pid ~within:1000.);
+      test "a third signal ends a server stuck in a handler deaf to cancellation" (fun () ->
+          in_main @@ fun () ->
+          with_program @@ fun pid out ->
+          let flow, _ = connect out in
+          Flow.write_string flow (get "/deaf");
+          equal string "started" (Buf_reader.read_line out ~max:100);
+          for _ = 1 to 3 do
+            Unix.kill pid Sys.sigint;
+            Mtime.wait_for Mtime.Span.(50 * ms)
+          done;
+          let status, ms = exited pid in
+          equal bool ~msg:"killed by SIGINT" true (status = Unix.WSIGNALED Sys.sigint);
+          is_true ~msg:(Printf.sprintf "after %.0fms" ms) (ms < 2000.);
+          Flow.close flow);
+      test "once run returned, the signals act as before" (fun () ->
+          in_main @@ fun () ->
+          with_program ~args:[ "after-run" ] @@ fun pid out ->
+          ignore (Buf_reader.read_line out ~max:100);
+          Unix.kill pid Sys.sigterm;
+          equal string "stopped" (Buf_reader.read_line out ~max:100);
+          Unix.kill pid Sys.sigterm;
+          let status, ms = exited pid in
+          equal bool ~msg:"killed by SIGTERM" true (status = Unix.WSIGNALED Sys.sigterm);
+          is_true ~msg:(Printf.sprintf "after %.0fms" ms) (ms < 2000.)) ]
 
 let () = exit (run "server" [ integration_tests; timeout_tests; upgrade_tests; disconnect_tests; signal_tests ])

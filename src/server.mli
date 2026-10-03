@@ -59,8 +59,10 @@ val run :
        [domain_count].}
     {- It {!start}s the server and calls [on_start] with it, for example to
        print its address.}
-    {- On the first signal it calls {!shutdown}, on a second one {!abort}.}}
-    It returns once the server has stopped. Call it from the main thread,
-    outside [Affect_unix.Unix.main].
+    {- On the first signal it calls {!shutdown}, on a second one {!abort}.
+       A third one ends the process as the signal would, for handlers that
+       ignore cancellation.}}
+    It returns once the server has stopped, the signals {!Stop_signal.release}d.
+    Call it from the main thread, outside [Affect_unix.Unix.main].
 
     @raise Unix.Unix_error if the address cannot be bound. *)
