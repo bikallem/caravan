@@ -11,12 +11,12 @@ let is_fatal = function Fun.Async.Cancelled -> true | _ -> false
 (* The response to a malformed request; the connection closes after it. A
    client that already left makes the write raise Flow.Closed, which ends the
    connection like any other network failure. *)
-let error_response w (e : H1_error.t) =
+let error_response ?date w (e : H1_error.t) =
   let status = H1_error.status e in
   let body = Body.of_string (Status.reason status ^ "\n") in
   let r = Response.make ~status ~headers:(Headers.of_list [ ("Content-Type", "text/plain; charset=utf-8") ]) body in
   let framing = H1_write.framing ~meth:Method.GET ~version:Version.Http_1_1 r in
-  H1_write.head w ~version:Version.Http_1_1 ~keep_alive:false framing r;
+  H1_write.head w ?date ~version:Version.Http_1_1 ~keep_alive:false framing r;
   H1_write.body w framing body;
   `Linger
 
@@ -97,6 +97,7 @@ let serve : Engine.t =
   in
   let scheme = match Conn_info.scheme ctx.conn with `Http -> "http" | `Https -> "https" in
   let report e = config.on_error e (Printexc.get_raw_backtrace ()) in
+  let date () = if config.date_header then Some (Date.now ()) else None in
   (* Waits at most [idle] for the next request. A stopping server takes no
      new request, even one already received. *)
   let rec next_request ~idle =
@@ -120,8 +121,8 @@ let serve : Engine.t =
       (head, framing, target)
     with
     | exception Buf_reader.Eof -> `Close (* the client left in the middle of a request *)
-    | exception Flow.Timeout -> error_response w H1_error.Request_timeout
-    | exception H1_error.E e -> error_response w e
+    | exception Flow.Timeout -> error_response ?date:(date ()) w H1_error.Request_timeout
+    | exception H1_error.E e -> error_response ?date:(date ()) w e
     | head, framing, target -> (
         read_deadline := after config.read_timeout;
         let committed = ref false and continue_sent = ref false in
@@ -139,7 +140,7 @@ let serve : Engine.t =
                end)
         in
         match H1_body.make ?max_body:config.max_body ?expect_continue ~limits r framing with
-        | exception H1_error.E e -> error_response w e
+        | exception H1_error.E e -> error_response ?date:(date ()) w e
         | body -> respond head target body ~committed ~continue_sent)
   and respond (head : H1_parse.head) (target : H1_parse.target) body ~committed ~continue_sent =
     let req =
@@ -147,7 +148,7 @@ let serve : Engine.t =
         ~headers:head.headers ~body:(H1_body.body body) ~conn:ctx.conn head.meth target.path
     in
     match await (Fun.Async.call (fun () -> handler req)) body with
-    | exception H1_error.E e -> error_response w e (* a malformed request body *)
+    | exception H1_error.E e -> error_response ?date:(date ()) w e (* a malformed request body *)
     | exception Body.Truncated -> `Close (* the client left *)
     | exception e when not (is_fatal e) ->
         report e;
@@ -243,8 +244,7 @@ let serve : Engine.t =
     let write_head () =
       committed := true;
       kept_alive := keep_alive () && framing <> H1_write.Close_delimited;
-      let date = if config.date_header then Some (Date.now ()) else None in
-      H1_write.head w ?date ~version:head.version ~keep_alive:!kept_alive framing response
+      H1_write.head w ?date:(date ()) ~version:head.version ~keep_alive:!kept_alive framing response
     in
     match Response.kind response with
     | Response.Upgrade _ -> write_head (); Buf_writer.flush w; true
@@ -256,7 +256,7 @@ let serve : Engine.t =
            malformed: the client's fault, not the server's. *)
         | exception Body.Truncated -> false
         | exception H1_error.E e ->
-            if not !committed then ignore (error_response w e);
+            if not !committed then ignore (error_response ?date:(date ()) w e);
             false
         | exception e when not (is_fatal e) ->
             report e;

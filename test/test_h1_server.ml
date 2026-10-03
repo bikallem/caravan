@@ -559,6 +559,14 @@ let connection_tests =
           (* An IMF-fixdate, such as "Sun, 06 Nov 1994 08:49:37 GMT", then CR. *)
           equal int (6 + 29 + 1) (String.length date);
           is_true ~msg:date (String.ends_with ~suffix:" GMT\r" date));
+      test "error responses get a Date field too" (fun () ->
+          (* RFC 9110 §6.6.1: a 4xx must have one when the server has a clock. *)
+          let out, _ = serve ~config:Config.default "GET / HTTP/1.1\r\n\r\n" in
+          is_true ~msg:out (String.starts_with ~prefix:"HTTP/1.1 400" out);
+          let date =
+            List.find (String.starts_with ~prefix:"Date: ") (String.split_on_char '\n' out)
+          in
+          equal int (6 + 29 + 1) (String.length date));
       test "a request cut short gets no response" (fun () ->
           expect
             (show "GET / HTTP/1.1\r\nHost: a"
