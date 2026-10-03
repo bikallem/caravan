@@ -397,6 +397,24 @@ let connection_tests =
             Expectation Failed
             [FIN]
             |});
+      test "error responses to HEAD have no body" (fun () ->
+          expect
+            (String.concat "--"
+               [ show "HEAD / HTTP/1.1\r\nHost: a\r\nExpect: foo\r\n\r\n";
+                 show "HEAD / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n" ])
+          @@ __POS_OF__ {|
+            HTTP/1.1 417 Expectation Failed\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 19\r\n
+            Connection: close\r\n
+            \r\n
+            [FIN]--HTTP/1.1 501 Not Implemented\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 16\r\n
+            Connection: close\r\n
+            \r\n
+            [FIN]
+            |});
       test "100-continue is case-insensitive" (fun () ->
           expect (show (post ~headers:[ ("Expect", "100-Continue") ] "/echo" "hi"))
           @@ __POS_OF__ {|

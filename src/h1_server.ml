@@ -11,11 +11,12 @@ let is_fatal = function Fun.Async.Cancelled -> true | _ -> false
 (* The response to a malformed request; the connection closes after it. A
    client that already left makes the write raise Flow.Closed, which ends the
    connection like any other network failure. *)
-let error_response ?date w (e : H1_error.t) =
+let error_response ?date ?(meth = Method.GET) w (e : H1_error.t) =
   let status = H1_error.status e in
   let body = Body.of_string (Status.reason status ^ "\n") in
   let r = Response.make ~status ~headers:(Headers.of_list [ ("Content-Type", "text/plain; charset=utf-8") ]) body in
-  let framing = H1_write.framing ~meth:Method.GET ~version:Version.Http_1_1 r in
+  (* A HEAD request gets the head only. *)
+  let framing = H1_write.framing ~meth ~version:Version.Http_1_1 r in
   H1_write.head w ?date ~version:Version.Http_1_1 ~keep_alive:false framing r;
   H1_write.body w framing body;
   `Linger
@@ -121,38 +122,40 @@ let serve : Engine.t =
   and exchange () =
     let head_deadline = after config.header_timeout () in
     read_deadline := (fun () -> head_deadline);
-    match
-      let head = H1_parse.request_head limits r in
-      let framing = H1_parse.request_framing head in
-      let target = H1_parse.request_target ~scheme head in
-      if expectation head = `Unknown then raise (H1_error.E H1_error.Expectation_failed);
-      (head, framing, target)
-    with
+    match H1_parse.request_head limits r with
     | exception Buf_reader.Eof -> `Close (* the client left in the middle of a request *)
     | exception Flow.Timeout -> error_response ?date:(date ()) w H1_error.Request_timeout
     | exception H1_error.E e -> error_response ?date:(date ()) w e
-    | head, framing, target -> (
-        read_deadline := after config.read_timeout;
-        let committed = ref false and continue_sent = ref false in
-        let expect_continue =
-          if not (expects_continue head)
-          then None
-          else
-          Some
-            (fun () ->
-               if not !committed
-               then begin
-                 continue_sent := true;
-                 (* A client that cannot take it left. *)
-                 try
-                   Buf_writer.write_string w "HTTP/1.1 100 Continue\r\n\r\n";
-                   Buf_writer.flush w
-                 with Flow.Closed | Flow.Timeout -> raise Body.Truncated
-               end)
-        in
-        match H1_body.make ?max_body:config.max_body ?expect_continue ~limits r framing with
-        | exception H1_error.E e -> error_response ?date:(date ()) w e
-        | body -> respond head target body ~committed ~continue_sent)
+    | head -> (
+        match
+          let framing = H1_parse.request_framing head in
+          let target = H1_parse.request_target ~scheme head in
+          if expectation head = `Unknown then raise (H1_error.E H1_error.Expectation_failed);
+          (framing, target)
+        with
+        | exception H1_error.E e -> error_response ?date:(date ()) ~meth:head.meth w e
+        | framing, target -> (
+            read_deadline := after config.read_timeout;
+            let committed = ref false and continue_sent = ref false in
+            let expect_continue =
+              if not (expects_continue head)
+              then None
+              else
+              Some
+                (fun () ->
+                   if not !committed
+                   then begin
+                     continue_sent := true;
+                     (* A client that cannot take it left. *)
+                     try
+                       Buf_writer.write_string w "HTTP/1.1 100 Continue\r\n\r\n";
+                       Buf_writer.flush w
+                     with Flow.Closed | Flow.Timeout -> raise Body.Truncated
+                   end)
+            in
+            match H1_body.make ?max_body:config.max_body ?expect_continue ~limits r framing with
+            | exception H1_error.E e -> error_response ?date:(date ()) ~meth:head.meth w e
+            | body -> respond head target body ~committed ~continue_sent))
   and respond (head : H1_parse.head) (target : H1_parse.target) body ~committed ~continue_sent =
     let req =
       Request.make ~version:head.version ~scheme:target.scheme ?authority:target.authority
@@ -161,7 +164,8 @@ let serve : Engine.t =
     match await (Fun.Async.call (fun () -> handler req)) body with
     (* Only the request's own body failing is the client's doing: the same
        exceptions from the handler's other flows, an upstream, are errors. *)
-    | exception H1_error.E e when H1_body.failed body -> error_response ?date:(date ()) w e
+    | exception H1_error.E e when H1_body.failed body ->
+        error_response ?date:(date ()) ~meth:head.meth w e
     | exception Body.Truncated when H1_body.failed body -> `Close (* the client left *)
     | exception e when not (is_fatal e) ->
         report e;
@@ -279,7 +283,7 @@ let serve : Engine.t =
                malformed: the client's fault, not the server's. *)
             | Body.Truncated when request_failed () -> false
             | H1_error.E e when request_failed () ->
-                if not !committed then ignore (error_response ?date:(date ()) w e);
+                if not !committed then ignore (error_response ?date:(date ()) ~meth:head.meth w e);
                 false
             | e ->
                 config.on_error e bt;
