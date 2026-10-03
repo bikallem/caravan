@@ -98,8 +98,10 @@ val shutdown_send : t -> unit
 (** {1:lifetime Deadlines and closing} *)
 
 val set_read_deadline : t -> Affect_unix.Mtime.t option -> unit
-(** [set_read_deadline flow d] makes reads that are still blocked at time [d]
-    raise {!Timeout}. [None] removes the deadline. *)
+(** [set_read_deadline flow d] makes reads that are blocked at time [d]
+    raise {!Timeout}. [None] removes the deadline. The deadline applies also
+    to a read that waits at the time of the call, for example in a
+    different fiber. *)
 
 val set_write_deadline : t -> Affect_unix.Mtime.t option -> unit
 (** [set_write_deadline flow d] is like {!set_read_deadline} for writes. *)
