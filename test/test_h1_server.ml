@@ -65,6 +65,11 @@ let handler req =
       | exception _ -> Response.string ~status:Status.bad_request "unreadable body\n")
   | "/early-hints" -> Response.make ~status:(Status.v 103) Body.empty
   | "/stream-fail" -> Response.stream (fun _ -> failwith "producer")
+  | "/endless" ->
+      Response.stream (fun w ->
+          Body.Writer.write_string w "first";
+          Body.Writer.flush w;
+          Affect_unix.Mtime.wait_for Affect_unix.Mtime.Span.(10 * s))
   | "/partial" ->
       Response.stream (fun w ->
           Body.Writer.write_string w "partial";
@@ -109,9 +114,11 @@ let handler req =
    errors reported. At the end of [input] the client closes; with
    [~stall:true] it goes quiet instead (the flow is no longer readable and
    reads time out), and with [~reset:true] it resets the connection. With
-   [~unwritable:true] every write fails as on a reset connection. *)
+   [~unwritable:true] every write fails as on a reset connection. With
+   [~cancel_after] the connection is cancelled after that time, as by a
+   server shutdown. *)
 let serve ?(config = { Config.default with date_header = false }) ?chunk ?(stall = false)
-    ?(reset = false) ?(unwritable = false) ?(watch = false) input =
+    ?(reset = false) ?(unwritable = false) ?(watch = false) ?cancel_after input =
   let errors = ref [] in
   (* The input's end looks like a client leaving: only watched for if asked. *)
   let config =
@@ -143,13 +150,19 @@ let serve ?(config = { Config.default with date_header = false }) ?chunk ?(stall
       let ctx =
         { Engine.config; conn; stopping = Action.never; is_stopping = (fun () -> !stopping) }
       in
-      Private.H1_server.serve ctx flow handler);
+      match cancel_after with
+      | None -> Private.H1_server.serve ctx flow handler
+      | Some span ->
+          let c = Fun.Async.call (fun () -> Private.H1_server.serve ctx flow handler) in
+          Affect_unix.Mtime.wait_for span;
+          Fun.Async.cancel c;
+          (try Fun.Async.get c with Fun.Async.Cancelled -> ()));
   let unread = String.length input - !consumed in
   if unread > 0 then Printf.bprintf out "[unread %d]" unread;
   (Buffer.contents out, List.rev !errors)
 
-let show ?config ?chunk ?stall ?reset ?unwritable ?watch input =
-  let out, errors = serve ?config ?chunk ?stall ?reset ?unwritable ?watch input in
+let show ?config ?chunk ?stall ?reset ?unwritable ?watch ?cancel_after input =
+  let out, errors = serve ?config ?chunk ?stall ?reset ?unwritable ?watch ?cancel_after input in
   show_crlf out
   ^ String.concat "" (List.map (fun e -> "\n! " ^ e) errors)
   ^ if !slow_outcome = "" then "" else "\n" ^ !slow_outcome
@@ -441,6 +454,17 @@ let connection_tests =
             Connection: close\r\n
             \r\n
             hel[RST]
+            |});
+      test "a close-delimited body cut short by a failed write resets the connection" (fun () ->
+          expect (show ~unwritable:true (get ~v:"HTTP/1.0" "/stream")) @@ __POS_OF__ {| [RST] |});
+      test "a close-delimited body cut short by cancellation resets the connection" (fun () ->
+          expect
+            (show ~cancel_after:Affect_unix.Mtime.Span.(20 * ms) (get ~v:"HTTP/1.0" "/endless"))
+          @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Connection: close\r\n
+            \r\n
+            first[RST]
             |});
       test "a chunked body cut short ends without a last chunk" (fun () ->
           expect (show (get "/partial")) @@ __POS_OF__ {|

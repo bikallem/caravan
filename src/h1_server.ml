@@ -260,25 +260,28 @@ let serve : Engine.t =
     (* A response cut short after its head. Chunked and Content-Length
        framings show it, but a close-delimited body would look complete
        after a clean close: reset the connection instead. *)
-    let cut_short () = if framing = H1_write.Close_delimited then Flow.reset flow in
     match Response.kind response with
     | Response.Upgrade _ -> write_head (); Buf_writer.flush w; true
     | Response.Body b -> (
         match H1_write.body ~before:write_head w framing b with
         | () -> !kept_alive
-        | exception ((Flow.Closed | Flow.Timeout) as e) -> raise e
-        (* A request body that the response streams was cut short or is
-           malformed: the client's fault, not the server's. *)
-        | exception Body.Truncated -> if !committed then cut_short (); false
-        | exception H1_error.E e ->
-            if !committed then cut_short () else ignore (error_response ?date:(date ()) w e);
-            false
-        | exception e when not (is_fatal e) ->
-            report e;
-            if !committed
-            then cut_short ()
-            else ignore (write ~keep_alive:never head (internal_error ()));
-            false)
+        | exception e -> (
+            let bt = Printexc.get_raw_backtrace () in
+            (* Cut short after its head, whatever the cause: a failing
+               body, a write timeout, a cancellation. *)
+            if !committed && framing = H1_write.Close_delimited then Flow.reset flow;
+            match e with
+            | Flow.Closed | Flow.Timeout | Fun.Async.Cancelled -> Printexc.raise_with_backtrace e bt
+            (* A request body that the response streams was cut short or is
+               malformed: the client's fault, not the server's. *)
+            | Body.Truncated -> false
+            | H1_error.E e ->
+                if not !committed then ignore (error_response ?date:(date ()) w e);
+                false
+            | e ->
+                config.on_error e bt;
+                if not !committed then ignore (write ~keep_alive:never head (internal_error ()));
+                false))
   in
   try
     match next_request ~idle:config.header_timeout with
