@@ -2,7 +2,7 @@
 
     Start from {!default} and change what you need:
     {[
-      let config = { Config.default with max_body = Some (1024 * 1024) }
+      let config = { Config.default with max_body = Some (64 * 1024 * 1024) }
     ]} *)
 
 type t = {
@@ -21,7 +21,8 @@ type t = {
   max_body : int option;
   (** Larger request bodies get 413 (or end the connection once the response
       has started). A chunked body counts as sent, framing included.
-      [None] for no limit. *)
+      [None] for no limit, which lets any client fill the memory of a handler
+      that reads whole bodies. *)
   max_drain : int;
   (** At most this many bytes of a request body that the handler did not read
       are discarded to keep the connection open, chunk framing included;
@@ -57,7 +58,7 @@ type t = {
 val default : t
 (** [default] listens on [127.0.0.1:8080] with a backlog of 1024 and at most
     1024 connections, 4 KiB buffers, default limits (8 KiB request
-    line, 16 KiB and 100 header fields), no body limit, 64 KiB drains,
+    line, 16 KiB and 100 header fields), 8 MiB bodies, 64 KiB drains,
     timeouts of 10s (head), 30s (idle, read, write), 2s lingering, a 10s
     shutdown grace, a [Date] field, handlers cancelled when their client
     leaves, and errors printed on [stderr]. *)
