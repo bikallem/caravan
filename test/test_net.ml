@@ -53,6 +53,20 @@ let tcp_tests =
           equal string "ping" (read_exactly server 4);
           Flow.write_string server "pong";
           equal string "pong" (read_exactly client 4));
+      test "read_now does not wait for input" (fun () ->
+          with_pair @@ fun client server ->
+          let buf = Bytes.create 8 in
+          let now () = Flow.read_now server buf 0 8 in
+          (* A wakeup may come without input. *)
+          let rec next () =
+            Action.invoke (Flow.readable' server ());
+            match now () with None -> next () | r -> r
+          in
+          let before = now () in
+          Flow.write_string client "hi";
+          let data = next () in
+          Flow.shutdown_send client;
+          equal (list (option int)) [ None; Some 2; Some 0 ] [ before; data; next () ]);
       test "half-close: the peer reads the end and can still answer" (fun () ->
           with_pair @@ fun client server ->
           Flow.write_string client "request";

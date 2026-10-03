@@ -13,12 +13,14 @@ exception Bad_line_ending
 (** Raised by {!read_line} on a bare CR or LF, which RFC 9112 §2.2 lets
     recipients reject. *)
 
-val make : ?size:int -> (bytes -> int -> int -> int) -> t
-(** [make ~size read] reads from [read buf off len], which returns the number
-    of bytes it read, at most [len > 0], and [0] at the end of the input.
-    [size] is the initial buffer size, 4 KiB by default. The buffer is
-    allocated by the first read that needs it, and grows to hold long
-    lines.
+val make :
+  ?size:int -> ?read_now:(bytes -> int -> int -> int option) -> (bytes -> int -> int -> int) -> t
+(** [make ~size ~read_now read] reads from [read buf off len], which returns
+    the number of bytes it read, at most [len > 0], and [0] at the end of the
+    input. [read_now] is like [read] but returns [None] rather than block, for
+    {!fill_now}; by default [read] is taken never to block. [size] is the
+    initial buffer size, 4 KiB by default. The buffer is allocated by the
+    first read that needs it, and grows to hold long lines.
 
     @raise Invalid_argument if [size <= 0]. *)
 
@@ -50,6 +52,11 @@ val read_into : t -> bytes -> int -> int -> int
     come first; when there are none, it reads directly into [buf].
 
     @raise Invalid_argument if [len <= 0] or the range is not valid in [buf]. *)
+
+val fill_now : t -> [ `Bytes | `Eof | `Would_block ]
+(** [fill_now r] is [`Bytes] if [r] has buffered bytes. If it has none, it
+    reads what its input has without blocking, and is [`Bytes] if that was
+    something, [`Eof] if the input has ended, [`Would_block] otherwise. *)
 
 val peek_eof : t -> bool
 (** [peek_eof r] is [true] iff [r] has no buffered bytes and its input has

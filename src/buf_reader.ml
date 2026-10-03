@@ -4,6 +4,7 @@ exception Bad_line_ending
 
 type t = {
   read : bytes -> int -> int -> int;
+  read_now : bytes -> int -> int -> int option;
   size : int; (* of [buf] once allocated *)
   mutable buf : bytes; (* empty until the first fill *)
   mutable pos : int; (* first buffered byte *)
@@ -12,11 +13,14 @@ type t = {
   mutable consumed : int;
 }
 
-let make ?(size = 4096) read =
+let make ?(size = 4096) ?read_now read =
   if size <= 0 then invalid_arg "Buf_reader.make: size must be positive";
-  { read; size; buf = Bytes.empty; pos = 0; len = 0; eof = false; consumed = 0 }
+  let read_now =
+    match read_now with Some f -> f | None -> fun buf off len -> Some (read buf off len)
+  in
+  { read; read_now; size; buf = Bytes.empty; pos = 0; len = 0; eof = false; consumed = 0 }
 
-let of_flow ?size flow = make ?size (Flow.read flow)
+let of_flow ?size flow = make ?size ~read_now:(Flow.read_now flow) (Flow.read flow)
 
 let of_string ?size ?(chunk = max_int) s =
   if chunk <= 0 then invalid_arg "Buf_reader.of_string: chunk must be positive";
@@ -113,6 +117,20 @@ let read_into r buf off len =
     if n = 0 then r.eof <- true;
     r.consumed <- r.consumed + n;
     n
+  end
+
+let fill_now r =
+  if r.len > 0
+  then `Bytes
+  else if r.eof
+  then `Eof
+  else begin
+    if Bytes.length r.buf = 0 then r.buf <- Bytes.create r.size;
+    r.pos <- 0;
+    match r.read_now r.buf 0 (Bytes.length r.buf) with
+    | None -> `Would_block
+    | Some 0 -> r.eof <- true; `Eof
+    | Some n -> r.len <- n; `Bytes
   end
 
 let peek_eof r = r.len = 0 && not (fill r)
