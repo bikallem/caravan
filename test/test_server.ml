@@ -45,6 +45,27 @@ let integration_tests =
           equal string "partial" (Bytes.to_string buf);
           raises Flow.Closed (fun () -> Buf_reader.read_into r (Bytes.create 1) 0 1);
           Flow.close flow);
+      test ~timeout:30. "concurrent clients on four domains are all answered" (fun () ->
+          (* The disconnect watcher once waited on the handler's call and the
+             connection in one choice, and under several domains affect
+             could miss the call's return: about one round in 30 hung. *)
+          let domains = if domain_count = 1 then 1 else 4 in
+          for _ = 1 to 100 do
+            Affect_unix.Unix.main ~domain_count:domains @@ fun () ->
+            let server = Server.start ~config handler in
+            let client () =
+              let flow, r = connect server in
+              Flow.set_read_deadline flow (Mtime.add_span (Mtime.now ()) Mtime.Span.(2 * s));
+              Flow.write_string flow (get ~conn:(Some "close") "/hello");
+              let response = read_response ~head:false r in
+              Flow.close flow;
+              response
+            in
+            let responses = Fun.Async.get_all (List.init 20 (fun _ -> Fun.Async.call client)) in
+            Server.shutdown server;
+            Server.wait server;
+            equal (list string) (List.init 20 (fun _ -> {|200 "hello" close|})) responses
+          done);
       test "a chunked upload in small delayed pieces is echoed" (fun () ->
           with_server @@ fun server ->
           let flow, r = connect server in

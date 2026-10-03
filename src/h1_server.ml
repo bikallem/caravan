@@ -207,32 +207,52 @@ let serve : Engine.t =
   (* The handler's response; or [`Disconnected], the exchange cancelled, if
      the client leaves first. The connection is only watched once the request
      body was read: until then the handler may be reading it. Bytes that
-     arrive are a pipelined request, kept for later. *)
+     arrive are a pipelined request, kept for later.
+
+     The watcher is a call of its own that waits on the connection alone.
+     Waiting on the handler's call and the connection in one choice could
+     miss the call's return under several domains, a lost wakeup in affect's
+     scheduler that hung connections. *)
   and await exchange body =
-    let response () = Action.map (fun r -> `Response r) (Fun.Async.get' exchange) in
-    let rec body_pending () =
-      match Action.invoke (Action.choose [ response (); Action.map (fun () -> `Read) (H1_body.completed body) ]) with
-      | `Response r -> `Response r
-      | `Read -> watching ()
-    and watching () =
-      if Buf_reader.buffered r > 0
-      then `Response (Fun.Async.get exchange)
-      else
-      match Action.invoke (Action.choose [ response (); Flow.readable' flow `Readable ]) with
-      | `Response r -> `Response r
-      | `Readable -> (
-          match Buf_reader.peek_eof r with
-          | false -> `Response (Fun.Async.get exchange)
-          | true | (exception (Flow.Closed | Flow.Timeout)) -> disconnected ())
-    and disconnected () =
-      Fun.Async.cancel exchange;
-      (match Fun.Async.get exchange with
-      | _ -> ()
-      | exception Fun.Async.Cancelled when not (Fun.Async.is_current_cancelled ()) -> ()
-      | exception e when not (is_fatal e) -> report e);
-      `Disconnected
-    in
-    if config.cancel_on_disconnect then body_pending () else `Response (Fun.Async.get exchange)
+    let response = Action.map (fun r -> `Response r) (Fun.Async.get' exchange) in
+    let read = Action.map (fun () -> `Read) (H1_body.completed body) in
+    if not config.cancel_on_disconnect
+    then `Response (Fun.Async.get exchange)
+    else
+    match Action.invoke (Action.choose [ response; read ]) with
+    | `Response r -> `Response r
+    | `Read when Buf_reader.buffered r > 0 -> `Response (Fun.Async.get exchange)
+    | `Read -> (
+        let left = Atomic.make false in
+        let watcher =
+          Fun.Async.call (fun () ->
+              Action.invoke (Flow.readable' flow ());
+              match Buf_reader.peek_eof r with
+              | false -> ()
+              | true | (exception (Flow.Closed | Flow.Timeout)) ->
+                  Atomic.set left true;
+                  Fun.Async.cancel exchange)
+        in
+        let outcome =
+          match Fun.Async.get exchange with
+          | r -> Ok r
+          | exception e -> Error (e, Printexc.get_raw_backtrace ())
+        in
+        Fun.Async.cancel watcher;
+        (match Fun.Async.get watcher with
+        | () -> ()
+        | exception Fun.Async.Cancelled when not (Fun.Async.is_current_cancelled ()) -> ());
+        match outcome with
+        | Ok r -> `Response r
+        | Error (e, bt) when Atomic.get left -> (
+            (* Cancelled because the client left, unless we are cancelled
+               too; other failures while it unwound are still errors. *)
+            match e with
+            | Fun.Async.Cancelled when Fun.Async.is_current_cancelled () ->
+                Printexc.raise_with_backtrace e bt
+            | Fun.Async.Cancelled -> `Disconnected
+            | e -> config.on_error e bt; `Disconnected)
+        | Error (e, bt) -> Printexc.raise_with_backtrace e bt)
   (* Hands the connection to [f], with the bytes already received first. The
      new protocol sets its own deadlines. *)
   and switch f =

@@ -132,7 +132,7 @@ let commands =
 
 let stateful_tests =
   group "HTTP/1.1 connections"
-    [ stateful ~count:150 ~steps:25 "behave like the model" commands ]
+    [ stateful ~count:300 ~steps:25 "behave like the model" commands ]
 
 let () =
   let code =
