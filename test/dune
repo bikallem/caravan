@@ -1,3 +1,25 @@
-(test
- (name test_affect_http)
- (libraries affect-http))
+(tests
+ (names
+  test_caravan
+  test_core
+  test_h1
+  test_h1_server
+  test_net
+  test_server
+  test_server_stateful)
+ (modules
+  test_caravan
+  test_core
+  test_h1
+  test_h1_server
+  test_net
+  test_server
+  test_server_stateful
+  server_support)
+ (libraries caravan affect affect.unix windtrap http-date unix)
+ (deps serve_until_signal.exe))
+
+(executable
+ (name serve_until_signal)
+ (modules serve_until_signal)
+ (libraries caravan affect.unix unix))
