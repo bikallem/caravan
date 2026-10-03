@@ -5,14 +5,9 @@ open Affect
 open Caravan
 module Mtime = Affect_unix.Mtime
 
-(* Two domains by default, to exercise parallelism. Mutation testing forks a
-   process per mutant, which OCaml forbids once a domain was spawned: run it
-   with TEST_DOMAINS=1. *)
-let domain_count =
-  Option.value ~default:2 (Option.bind (Sys.getenv_opt "TEST_DOMAINS") int_of_string_opt)
-
+let domain_count = Server_support.domain_count
 let in_main f = Affect_unix.Unix.main ~domain_count f
-let loopback = Unix.ADDR_INET (Unix.inet_addr_loopback, 0)
+let loopback = Server_support.loopback
 
 (* A connected (client, server) pair of flows. *)
 let with_pair f =
@@ -181,7 +176,7 @@ let tcp_tests =
 
 (* Server *)
 
-let quiet = { Config.default with addr = loopback; date_header = false }
+let quiet = Server_support.config
 
 (* Set when /sleep or /pause starts, so that a test can stop the server
    while it is in progress. *)
@@ -220,17 +215,18 @@ let read_response_from r =
   in
   let len = headers 0 in
   let buf = Bytes.create len in
-  let rec body got = if got < len then body (got + Private.Buf_reader.read_into r buf got (len - got)) in
+  let rec body got =
+    if got < len
+    then match Private.Buf_reader.read_into r buf got (len - got) with
+    | 0 -> failwith "the response ended early"
+    | n -> body (got + n)
+  in
   body 0;
   (status, Bytes.to_string buf)
 
 let read_response flow = read_response_from (Private.Buf_reader.of_flow flow)
 
-let with_server ?(config = quiet) ?engine f =
-  in_main @@ fun () ->
-  let server = Server.start ~config ?engine handler in
-  Fun.protect ~finally:(fun () -> Server.shutdown server; Server.wait server) @@ fun () ->
-  f server
+let with_server ?(config = quiet) ?engine f = Server_support.with_server ~config ?engine ~handler f
 
 let server_tests =
   group "Server"
