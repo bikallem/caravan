@@ -14,7 +14,12 @@ type kind =
 val make : ?status:Status.t -> ?headers:Headers.t -> Body.t -> t
 (** [make ~status ~headers body] is a response with [body]. [status] defaults
     to {!Status.ok}, [headers] to {!Headers.empty}. The protocol engine adds
-    framing fields such as [Content-Length]; handlers do not set them. *)
+    framing fields such as [Content-Length]; handlers do not set them.
+
+    @raise Invalid_argument if [status] is [1xx]: interim responses such as
+    [100 Continue] are the protocol engine's to send, and a protocol switch
+    is an {!upgrade}. The same holds for {!string}, {!empty} and
+    {!stream}. *)
 
 val string :
   ?status:Status.t -> ?headers:Headers.t -> ?content_type:string -> string -> t
@@ -61,7 +66,10 @@ val kind : t -> kind
 (** [kind r] is what follows the head of [r]. *)
 
 val with_status : Status.t -> t -> t
-(** [with_status s r] is [r] with status [s]. *)
+(** [with_status s r] is [r] with status [s].
+
+    @raise Invalid_argument if [s] is not allowed for [r]'s {!kind}: [1xx]
+    for a body, anything but [101] or [2xx] for an upgrade. *)
 
 val with_headers : Headers.t -> t -> t
 (** [with_headers h r] is [r] with headers [h]. *)

@@ -1056,7 +1056,6 @@ let response_framing_tests =
                       ("GET 200 stream 1.1", GET, Http_1_1, stream_body);
                       ("GET 200 stream 1.0", GET, Http_1_0, stream_body);
                       ("GET 200 sized 1.0", GET, Http_1_0, sized "hello");
-                      ("GET 100", GET, Http_1_1, st 100 (sized "x"));
                       ("GET 101 upgrade", GET, Http_1_1, Response.upgrade ignore);
                       ("GET 204", GET, Http_1_1, Response.empty ());
                       ("GET 204 with a body", GET, Http_1_1, st 204 (sized "x"));
@@ -1076,7 +1075,6 @@ let response_framing_tests =
             GET 200 stream 1.1         => chunked
             GET 200 stream 1.0         => close-delimited
             GET 200 sized 1.0          => length 5
-            GET 100                    => no body
             GET 101 upgrade            => no body
             GET 204                    => no body
             GET 204 with a body        => no body

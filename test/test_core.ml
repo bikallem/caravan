@@ -680,6 +680,20 @@ let response_tests =
           List.iter
             (fun s -> raises_match is_invalid_arg (fun () -> Response.upgrade ~status:s ignore))
             Status.[ continue; not_found; moved_permanently ]);
+      test "statuses must suit the response" (fun () ->
+          let early = Status.v 103 in
+          List.iter
+            (fun (label, f) -> raises_match ~msg:label is_invalid_arg f)
+            [ ("make 103", fun () -> ignore (Response.make ~status:early Body.empty));
+              ("string 101", fun () -> ignore (Response.string ~status:Status.switching_protocols "x"));
+              ("empty 100", fun () -> ignore (Response.empty ~status:Status.continue ()));
+              ("stream 103", fun () -> ignore (Response.stream ~status:early ignore));
+              ("with_status 103 on a body",
+               fun () -> ignore (Response.with_status early (Response.string "x")));
+              ("with_status 404 on an upgrade",
+               fun () -> ignore (Response.with_status Status.not_found (Response.upgrade ignore))) ];
+          let tunnel = Response.with_status Status.ok (Response.upgrade ignore) in
+          equal status Status.ok (Response.status tunnel));
       test "with_status and with_headers" (fun () ->
           let r = Response.string "x" in
           let r' = Response.with_status Status.created (Response.with_headers Headers.empty r) in

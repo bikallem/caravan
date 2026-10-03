@@ -164,6 +164,13 @@ let serve : Engine.t =
                 committed := true;
                 ignore (write ~keep_alive:true head response);
                 switch f)
+        (* RFC 9110 §9.3.6: a 2xx to CONNECT opens a tunnel. *)
+        | Response.Body _
+          when Method.equal head.meth Method.CONNECT
+            && Status.kind (Response.status response) = `Success ->
+            report (Failure "a 2xx response to CONNECT must be a Response.upgrade");
+            ignore (write ~keep_alive:false head (internal_error ()));
+            `Linger
         | Response.Body _ ->
             let continue_owed =
               expects_continue head && (not !continue_sent) && not (H1_body.is_complete body)

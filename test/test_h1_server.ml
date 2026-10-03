@@ -51,7 +51,11 @@ let stopping = ref false
 
 let handler req =
   if Method.equal (Request.meth req) Method.CONNECT
-  then Response.upgrade ~status:Status.ok echo_upgraded
+  then
+    match Request.authority req with
+    | Some "plain.example:443" -> Response.string "not a tunnel"
+    | Some "denied.example:443" -> Response.string ~status:Status.forbidden "denied"
+    | _ -> Response.upgrade ~status:Status.ok echo_upgraded
   else
   match Request.path_only req with
   | "/swallow" -> (
@@ -59,6 +63,7 @@ let handler req =
       match Body.to_string (Request.body req) with
       | s -> Response.string s
       | exception _ -> Response.string ~status:Status.bad_request "unreadable body\n")
+  | "/early-hints" -> Response.make ~status:(Status.v 103) Body.empty
   | "/slow" -> slowly ~read:false req
   | "/read-slow" -> slowly ~read:true req
   | "/slow-cleanup-fails" -> (
@@ -664,6 +669,48 @@ let upgrade_tests =
             Internal Server Error
             [FIN]
             ! Failure("Response.upgrade: 2xx upgrade to a GET request")
+            |});
+      test "a 2xx to CONNECT that is not an upgrade gets 500, and no tunnel" (fun () ->
+          expect
+            (show
+               "CONNECT plain.example:443 HTTP/1.1\r\nHost: plain.example:443\r\n\r\n\
+                GET /inside HTTP/1.1\r\nHost: a\r\n\r\n")
+          @@ __POS_OF__ {|
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Failure("a 2xx response to CONNECT must be a Response.upgrade")
+            |});
+      test "a CONNECT refused with 403 is an ordinary response" (fun () ->
+          expect
+            (show
+               ("CONNECT denied.example:443 HTTP/1.1\r\nHost: denied.example:443\r\n\r\n"
+                ^ get "/"))
+          @@ __POS_OF__ {|
+            HTTP/1.1 403 Forbidden\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 6\r\n
+            \r\n
+            deniedHTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 5\r\n
+            \r\n
+            hello
+            |});
+      test "a handler answering with a 1xx gets 500" (fun () ->
+          expect (show (get "/early-hints")) @@ __POS_OF__ {|
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Invalid_argument("Response.make: 103 is not a final status")
             |});
       test "an upgrade with a body too large to drain gets 500" (fun () ->
           let config = { Config.default with date_header = false; max_drain = 2 } in
