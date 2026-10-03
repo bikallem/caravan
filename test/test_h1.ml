@@ -1321,6 +1321,16 @@ let response_body_tests =
             HEAD; [head]
             HEAD; [head]
             |});
+      test "trailers that may not follow the content are dropped" (fun () ->
+          let b =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "x";
+                Body.Writer.set_trailers w
+                  (Headers.of_list
+                     [ ("X-Sum", "1"); ("Content-Length", "99"); ("Set-Cookie", "a=b");
+                       ("transfer-encoding", "chunked"); ("Server-Timing", "db;dur=5") ]))
+          in
+          expect (String.escaped (fst (write_body Chunked b))) @@ __POS_OF__ {| 1\r\nx\r\n0\r\nX-Sum: 1\r\nServer-Timing: db;dur=5\r\n\r\n |});
       test "golden bodies" (fun () ->
           let producer =
             Body.of_writer (fun w ->
