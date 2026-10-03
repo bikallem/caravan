@@ -174,6 +174,30 @@ let timeout_tests =
           equal string {|200 "hello"|} (read_response ~head:false r);
           eof r;
           Flow.close flow);
+      test "a body trickled after the response is not drained forever" (fun () ->
+          with_server ~config @@ fun server ->
+          let flow, r = connect server in
+          Flow.write_string flow
+            ("POST /ignore HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n" ^ String.make 10 'x');
+          equal string {|200 "ignored"|} (read_response ~head:false r);
+          (* A byte every 60ms, within the 100ms read timeout, for 2s. *)
+          let trickle =
+            Fun.Async.call (fun () ->
+                try
+                  for _ = 1 to 33 do
+                    Mtime.wait_for Mtime.Span.(60 * ms);
+                    Flow.write_string flow "x"
+                  done
+                with Flow.Closed -> ())
+          in
+          let clock = Mtime.counter () in
+          (match Buf_reader.read_into r (Bytes.create 1) 0 1 with
+          | 0 | (exception Flow.Closed) -> ()
+          | _ -> fail "unexpected bytes");
+          let waited = Mtime.Span.to_float_ns (Mtime.count clock) /. 1e6 in
+          is_true ~msg:(Printf.sprintf "ended after %.0fms" waited) (waited < 1000.);
+          Fun.Async.cancel trickle;
+          Flow.close flow);
       test "a stalled upload gets 408" (fun () ->
           with_server ~config @@ fun server ->
           let flow, r = connect server in

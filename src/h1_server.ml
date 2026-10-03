@@ -90,6 +90,14 @@ let serve : Engine.t =
         Flow.set_read_deadline flow (!read_deadline ());
         Flow.read flow buf off len)
   in
+  (* Discarding a request body the handler left unread gets one deadline for
+     all of it, as lingering does: renewed per read, a client trickling bytes
+     could keep the connection for days. *)
+  let drain body =
+    let deadline = after config.read_timeout () in
+    read_deadline := (fun () -> deadline);
+    H1_body.drain body ~max:config.max_drain
+  in
   let w =
     Buf_writer.make ~size:config.buffer_size (fun buf off len ->
         Flow.set_write_deadline flow (after config.write_timeout ());
@@ -165,7 +173,7 @@ let serve : Engine.t =
             match upgrade_error head response with
             | Some e -> report (Failure ("Response.upgrade: " ^ e)); fail (); `Linger
             (* What follows the request body is the new protocol's. *)
-            | None when not (H1_body.drain body ~max:config.max_drain) -> fail (); `Linger
+            | None when not (drain body) -> fail (); `Linger
             | None ->
                 ignore (write ~committed ~keep_alive:(fun () -> true) head response);
                 switch f)
@@ -193,7 +201,7 @@ let serve : Engine.t =
               && not (ctx.is_stopping ())
             in
             if write ~committed ~keep_alive head response
-            && H1_body.drain body ~max:config.max_drain
+            && drain body
             then begin
               Fun.Async.yield ();
               next_request ~idle:config.idle_timeout

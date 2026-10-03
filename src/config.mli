@@ -32,8 +32,9 @@ type t = {
   idle_timeout : Affect_unix.Mtime.Span.t;
   (** Time a kept-alive connection may wait for its next request. *)
   read_timeout : Affect_unix.Mtime.Span.t;
-  (** Time allowed for each read of a request body. A late read gets 408 if
-      the response has not started yet. *)
+  (** Time allowed for each read of a request body, and for all of discarding
+      a body the handler left unread. A late read gets 408 if the response
+      has not started yet. *)
   write_timeout : Affect_unix.Mtime.Span.t;
   (** Time allowed for each write of a response. *)
   linger_timeout : Affect_unix.Mtime.Span.t;
