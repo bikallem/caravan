@@ -144,14 +144,15 @@ let serve : Engine.t =
       Request.make ~version:head.version ~scheme:target.scheme ?authority:target.authority
         ~headers:head.headers ~body:(H1_body.body body) ~conn:ctx.conn head.meth target.path
     in
-    match Fun.Async.get (Fun.Async.call (fun () -> handler req)) with
+    match await (Fun.Async.call (fun () -> handler req)) body with
     | exception H1_error.E e -> error_response w e (* a malformed request body *)
     | exception Body.Truncated -> `Close (* the client left *)
     | exception e when not (is_fatal e) ->
         report e;
         ignore (write ~keep_alive:false head (internal_error ()));
         `Linger
-    | response -> (
+    | `Disconnected -> `Close
+    | `Response response -> (
         match Response.kind response with
         | Response.Upgrade f -> (
             let fail () = ignore (write ~keep_alive:false head (internal_error ())) in
@@ -181,6 +182,35 @@ let serve : Engine.t =
               next_request ~idle:config.idle_timeout
             end
             else `Linger)
+  (* The handler's response; or [`Disconnected], the exchange cancelled, if
+     the client leaves first. The connection is only watched once the request
+     body was read: until then the handler may be reading it. Bytes that
+     arrive are a pipelined request, kept for later. *)
+  and await exchange body =
+    let response () = Action.map (fun r -> `Response r) (Fun.Async.get' exchange) in
+    let rec body_pending () =
+      match Action.invoke (Action.choose [ response (); Action.map (fun () -> `Read) (H1_body.completed body) ]) with
+      | `Response r -> `Response r
+      | `Read -> watching ()
+    and watching () =
+      if Buf_reader.buffered r > 0
+      then `Response (Fun.Async.get exchange)
+      else
+      match Action.invoke (Action.choose [ response (); Flow.readable' flow `Readable ]) with
+      | `Response r -> `Response r
+      | `Readable -> (
+          match Buf_reader.peek_eof r with
+          | false -> `Response (Fun.Async.get exchange)
+          | true | (exception (Flow.Closed | Flow.Timeout)) -> disconnected ())
+    and disconnected () =
+      Fun.Async.cancel exchange;
+      (match Fun.Async.get exchange with
+      | _ -> ()
+      | exception Fun.Async.Cancelled when not (Fun.Async.is_current_cancelled ()) -> ()
+      | exception e when not (is_fatal e) -> report e);
+      `Disconnected
+    in
+    if config.cancel_on_disconnect then body_pending () else `Response (Fun.Async.get exchange)
   (* Hands the connection to [f], with the bytes already received first. The
      new protocol sets its own deadlines. *)
   and switch f =

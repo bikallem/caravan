@@ -32,6 +32,20 @@ let echo_upgraded flow =
 
 let upgrade_echo = Headers.of_list [ ("Upgrade", "echo") ]
 
+(* How the last slow handler ended: finished or cancelled. *)
+let slow_outcome = ref ""
+
+(* Answers "late" after 50ms, having read the request body or not. *)
+let slowly ~read req =
+  match
+    if read then ignore (Body.to_string (Request.body req));
+    Affect_unix.Mtime.wait_for Affect_unix.Mtime.Span.(50 * ms)
+  with
+  | () -> slow_outcome := "[handler finished]"; Response.string "late"
+  | exception Fun.Async.Cancelled ->
+      slow_outcome := "[handler cancelled]";
+      raise Fun.Async.Cancelled
+
 (* Set by /stop, as a server stopping while its response is written. *)
 let stopping = ref false
 
@@ -40,6 +54,10 @@ let handler req =
   then Response.upgrade ~status:Status.ok echo_upgraded
   else
   match Request.path_only req with
+  | "/slow" -> slowly ~read:false req
+  | "/read-slow" -> slowly ~read:true req
+  | "/slow-cleanup-fails" -> (
+      try slowly ~read:false req with Fun.Async.Cancelled -> failwith "cleanup failed")
   | "/ws" -> Response.upgrade ~headers:upgrade_echo echo_upgraded
   | "/ws-bare" -> Response.upgrade echo_upgraded
   | "/ws-fail" -> Response.upgrade ~headers:upgrade_echo (fun _ -> failwith "ws")
@@ -73,10 +91,15 @@ let handler req =
    errors reported. With [~stall:true] the client goes quiet at the end of
    [input] instead of closing: the flow is no longer readable and reads time
    out. *)
-let serve ?(config = { Config.default with date_header = false }) ?chunk ?(stall = false) input
-  =
+let serve ?(config = { Config.default with date_header = false }) ?chunk ?(stall = false)
+    ?(watch = false) input =
   let errors = ref [] in
-  let config = { config with on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) } in
+  (* The input's end looks like a client leaving: only watched for if asked. *)
+  let config =
+    { config with on_error = (fun e _ -> errors := Printexc.to_string e :: !errors);
+                  cancel_on_disconnect = watch }
+  in
+  slow_outcome := "";
   let out = Buffer.create 256 and consumed = ref 0 in
   let inner = Flow.of_string ?chunk input out in
   let stalled () = stall && !consumed = String.length input in
@@ -102,9 +125,11 @@ let serve ?(config = { Config.default with date_header = false }) ?chunk ?(stall
   if unread > 0 then Printf.bprintf out "[unread %d]" unread;
   (Buffer.contents out, List.rev !errors)
 
-let show ?config ?chunk ?stall input =
-  let out, errors = serve ?config ?chunk ?stall input in
-  show_crlf out ^ String.concat "" (List.map (fun e -> "\n! " ^ e) errors)
+let show ?config ?chunk ?stall ?watch input =
+  let out, errors = serve ?config ?chunk ?stall ?watch input in
+  show_crlf out
+  ^ String.concat "" (List.map (fun e -> "\n! " ^ e) errors)
+  ^ if !slow_outcome = "" then "" else "\n" ^ !slow_outcome
 
 let get ?(v = "HTTP/1.1") ?(headers = []) path =
   Printf.sprintf "GET %s %s\r\nHost: a.example\r\n%s\r\n" path v
@@ -660,4 +685,55 @@ let upgrade_tests =
             ! Failure("ws")
             |}) ]
 
-let () = exit (run "h1_server" [ connection_tests; timeout_tests; upgrade_tests ])
+let disconnect_tests =
+  let quick =
+    { Config.default with date_header = false; idle_timeout = Affect_unix.Mtime.Span.(10 * ms) }
+  in
+  group "H1_server client disconnects"
+    [ test "a client that leaves cancels its handler" (fun () ->
+          expect (show ~watch:true (get "/slow")) @@ __POS_OF__ {| [handler cancelled] |});
+      test "without cancel_on_disconnect the handler finishes" (fun () ->
+          expect (show (get "/slow")) @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 4\r\n
+            \r\n
+            late
+            [handler finished]
+            |});
+      test "a request arriving during the handler is not a disconnect" (fun () ->
+          let first = get "/slow" in
+          expect
+            (show ~watch:true ~stall:true ~config:quick ~chunk:(String.length first)
+               (first ^ get "/"))
+          @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 4\r\n
+            \r\n
+            lateHTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 5\r\n
+            \r\n
+            hello
+            [handler finished]
+            |});
+      test "nothing is watched while the request body is unread" (fun () ->
+          expect (show ~watch:true (post "/slow" "hello")) @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 4\r\n
+            \r\n
+            late
+            [handler finished]
+            |});
+      test "a handler that fails while cancelled is reported" (fun () ->
+          expect (show ~watch:true (get "/slow-cleanup-fails")) @@ __POS_OF__ {|
+            ! Failure("cleanup failed")
+            [handler cancelled]
+            |});
+      test "a client that leaves after its body was read cancels its handler" (fun () ->
+          expect (show ~watch:true (post "/read-slow" "hello")) @@ __POS_OF__ {| [handler cancelled] |}) ]
+
+let () =
+  exit (run "h1_server" [ connection_tests; timeout_tests; upgrade_tests; disconnect_tests ])

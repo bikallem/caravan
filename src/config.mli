@@ -40,6 +40,11 @@ type t = {
   shutdown_grace : Affect_unix.Mtime.Span.t;
   (** Time in-flight requests get to finish when the server stops. *)
   date_header : bool; (** Whether responses get a [Date] field. *)
+  cancel_on_disconnect : bool;
+  (** Whether a handler is cancelled when its client closes the connection
+      before the response, once the request body has been read. A client
+      that only half-closes, sending its request and then ending its side of
+      the stream, looks the same: turn this off to serve such clients. *)
   on_error : exn -> Printexc.raw_backtrace -> unit;
   (** Called with exceptions raised by handlers and response bodies. It may
       be called from several domains at once. *)
@@ -51,4 +56,5 @@ val default : t
     1024 connections, 4 KiB buffers, default limits (8 KiB request
     line, 16 KiB and 100 header fields), no body limit, 64 KiB drains,
     timeouts of 10s (head), 30s (idle, read, write), 2s lingering, a 10s
-    shutdown grace, a [Date] field, and errors printed on [stderr]. *)
+    shutdown grace, a [Date] field, handlers cancelled when their client
+    leaves, and errors printed on [stderr]. *)

@@ -29,6 +29,26 @@ let tunnel authority client =
   copy upstream client;
   Fun.Async.get up
 
+(* For the disconnect tests: /wait sets [waiting] and then waits 10s, setting
+   [cancelled] if it is cancelled. /fetch does the same while waiting for an
+   answer from [upstream]. *)
+let waiting = ref (Cell.Once.make ())
+let cancelled = ref (Cell.Once.make ())
+let upstream = ref loopback
+
+let until_cancelled f =
+  Cell.Once.try_set !waiting ();
+  match f () with
+  | r -> r
+  | exception Fun.Async.Cancelled -> Cell.Once.try_set !cancelled (); raise Fun.Async.Cancelled
+
+let fetch () =
+  let flow = Tcp.connect !upstream in
+  Fun.Async.protect ~finally:(fun () -> Flow.close flow) @@ fun () ->
+  Flow.write_string flow "question";
+  until_cancelled (fun () -> ignore (Flow.read flow (Bytes.create 1) 0 1));
+  Response.string "answer"
+
 (* Handlers read request bodies, except /ignore, which leaves its body to be
    drained or lingered over. /ws-echo upgrades to echoing what it gets, and
    CONNECT opens a tunnel. *)
@@ -39,6 +59,10 @@ let handler req =
   then Response.upgrade ~status:Status.ok (tunnel (Option.get (Request.authority req)))
   else
   match Request.path_only req with
+  | "/wait" ->
+      until_cancelled (fun () -> Mtime.wait_for Mtime.Span.(10 * s));
+      Response.string "late"
+  | "/fetch" -> fetch ()
   | "/ws-echo" ->
       Response.upgrade ~headers:(Headers.of_list [ ("Upgrade", "echo") ]) (fun flow -> copy flow flow)
   | "/hello" -> read (); Response.string "hello"

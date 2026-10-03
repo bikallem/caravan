@@ -251,6 +251,53 @@ let upgrade_tests =
           Tcp.Listener.close upstream;
           Flow.close flow) ]
 
+(* Clients that leave while their handler runs *)
+
+let disconnect_tests =
+  let within limit cell =
+    Action.invoke
+      (Action.choose
+         [ Action.map (fun () -> true) (Cell.Once.get' cell);
+           Mtime.wait_for' Mtime.Span.(limit * ms) false ])
+  in
+  let reset () =
+    waiting := Cell.Once.make ();
+    cancelled := Cell.Once.make ()
+  in
+  group "Client disconnects"
+    [ test "a client that closes cancels its handler" (fun () ->
+          reset ();
+          with_server @@ fun server ->
+          let flow, _ = connect server in
+          Flow.write_string flow (get "/wait");
+          Cell.Once.get !waiting;
+          let clock = Mtime.counter () in
+          Flow.close flow;
+          is_true ~msg:"cancelled" (within 1000 !cancelled);
+          let ms = Mtime.Span.to_float_ns (Mtime.count clock) /. 1e6 in
+          is_true ~msg:(Printf.sprintf "after %.0fms" ms) (ms < 500.));
+      test "the cancellation reaches the handler's upstream connection" (fun () ->
+          reset ();
+          with_server @@ fun server ->
+          let l = Tcp.Listener.listen loopback in
+          upstream := Tcp.Listener.addr l;
+          let flow, _ = connect server in
+          Flow.write_string flow (get "/fetch");
+          let fd, _ = Tcp.Listener.accept l in
+          let up = Tcp.flow fd in
+          Flow.set_read_deadline up (Mtime.add_span (Mtime.now ()) Mtime.Span.(5 * s));
+          let buf = Bytes.create 8 in
+          let rec read_question got =
+            if got < 8 then read_question (got + Flow.read up buf got (8 - got))
+          in
+          read_question 0;
+          Flow.close flow;
+          (* The upstream never answers: the proxy side closes it. *)
+          equal int ~msg:"upstream closed by the server" 0 (Flow.read up buf 0 1);
+          is_true ~msg:"cancelled" (Cell.Once.is_set !cancelled);
+          Flow.close up;
+          Tcp.Listener.close l) ]
+
 (* Server.run in a child process, stopped with signals: sending signals to
    the test process itself could kill it. *)
 let signal_tests =
@@ -331,4 +378,4 @@ let signal_tests =
           Flow.close flow;
           exited_ok pid ~within:1000.) ]
 
-let () = exit (run "server" [ integration_tests; timeout_tests; upgrade_tests; signal_tests ])
+let () = exit (run "server" [ integration_tests; timeout_tests; upgrade_tests; disconnect_tests; signal_tests ])

@@ -810,6 +810,27 @@ let handle_tests =
           equal string "" (Body.to_string (H1_body.body t));
           is_true (H1_body.drain t ~max:0);
           is_true (not !ran));
+      test "completed is enabled once the handler has read the body" (fun () ->
+          (* Enabled now, or not within 5ms. *)
+          let completed t =
+            Affect_unix.Unix.main ~domain_count:1 (fun () ->
+                let soon = Affect_unix.Mtime.wait_for' Affect_unix.Mtime.Span.(5 * ms) () in
+                Either.is_left (Affect.Action.invoke (Affect.Action.either (H1_body.completed t) soon)))
+          in
+          let _, t = handle "" No_body in
+          is_true ~msg:"no body" (completed t);
+          let _, t = handle ("hello" ^ next) (Fixed 5) in
+          let b = H1_body.body t in
+          ignore (Body.read b (Bytes.create 4) 0 4);
+          is_true ~msg:"one byte left" (not (completed t));
+          ignore (Body.read b (Bytes.create 4) 0 4);
+          is_true ~msg:"at its last byte" (completed t);
+          let _, t = handle "5\r\nhello\r\n0\r\n\r\n" Chunked in
+          let b = H1_body.body t in
+          ignore (Body.read b (Bytes.create 5) 0 5);
+          is_true ~msg:"before the last chunk" (not (completed t));
+          ignore (Body.to_string b);
+          is_true ~msg:"after the last chunk" (completed t));
       test "is_complete" (fun () ->
           let _, t = handle "" No_body in
           is_true (H1_body.is_complete t);

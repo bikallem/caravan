@@ -46,6 +46,10 @@ val make :
 val body : t -> Body.t
 (** [body t] is the body for the handler. *)
 
+val completed : t -> unit Affect.Action.t
+(** [completed t] is enabled once the handler has read the body to its end,
+    at once if there is none. *)
+
 val is_complete : t -> bool
 (** [is_complete t] is [true] iff the body was read to its end, or there is
     none. A [Content-Length] body is complete once its last byte is read. *)

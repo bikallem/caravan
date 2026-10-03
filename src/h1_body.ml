@@ -127,7 +127,12 @@ let chunked ?max_body ~limits r = to_body (chunked_source ?max_body ~limits r)
 
 type continue = No_expectation | Expected of (unit -> unit) | Sent
 
-type t = { mutable body : Body.t; src : source option; mutable continue : continue }
+type t = {
+  mutable body : Body.t;
+  src : source option;
+  mutable continue : continue;
+  completed : unit Affect.Cell.Once.t; (* set when the handler's reads reach the end *)
+}
 
 let make ?max_body ?expect_continue ~limits r (framing : H1_parse.framing) =
   let src =
@@ -142,9 +147,9 @@ let make ?max_body ?expect_continue ~limits r (framing : H1_parse.framing) =
   let continue =
     match expect_continue with None -> No_expectation | Some f -> Expected f
   in
-  let t = { body = Body.empty; src; continue } in
+  let t = { body = Body.empty; src; continue; completed = Affect.Cell.Once.make () } in
   match src with
-  | None -> t
+  | None -> Affect.Cell.Once.try_set t.completed (); t
   | Some src ->
       (* The handler's reads send 100 Continue first, if it is expected. A
          read that times out is the client's fault: 408. *)
@@ -152,12 +157,15 @@ let make ?max_body ?expect_continue ~limits r (framing : H1_parse.framing) =
         (match t.continue with
         | Expected f -> t.continue <- Sent; f ()
         | No_expectation | Sent -> ());
-        try src.read buf off len with Flow.Timeout -> fail H1_error.Request_timeout
+        let n = try src.read buf off len with Flow.Timeout -> fail H1_error.Request_timeout in
+        if src.finished () then Affect.Cell.Once.try_set t.completed ();
+        n
       in
       t.body <- to_body { src with read };
       t
 
 let body t = t.body
+let completed t = Affect.Cell.Once.get' t.completed
 let is_complete t = match t.src with None -> true | Some src -> src.finished ()
 let unread t = match t.src with None -> Some 0 | Some src -> src.unread ()
 
