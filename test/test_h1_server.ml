@@ -928,6 +928,18 @@ let disconnect_tests =
             late
             [handler finished]
             |});
+      test "a failing handler is still answered while the connection is watched" (fun () ->
+          let config = { Config.default with date_header = false; idle_timeout = Affect_unix.Mtime.Span.(10 * ms) } in
+          expect (show ~watch:true ~stall:true ~config (get "/fail")) @@ __POS_OF__ {|
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Failure("boom")
+            |});
       test "a request arriving during the handler is not a disconnect" (fun () ->
           let first = get "/slow" in
           expect
