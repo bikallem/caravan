@@ -1,6 +1,7 @@
 (library
  (name caravan_websocket)
  (public_name caravan.websocket)
+ (libraries caravan)
  (instrumentation
   (backend ppx_windtrap.mutate))
  (instrumentation

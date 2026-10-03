@@ -16,4 +16,5 @@ val accept_key : string -> string
 module Private : sig
   module Sha1 = Sha1
   module Base64 = Base64
+  module Frame = Frame
 end
