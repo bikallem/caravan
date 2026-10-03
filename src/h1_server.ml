@@ -55,6 +55,23 @@ let linger (config : Config.t) flow =
   in
   try discard config.max_drain with Flow.Closed | Flow.Timeout -> ()
 
+(* Why [response], an upgrade, cannot answer the request [head], if it
+   cannot: RFC 9110 §7.8, §9.3.6 and §15.2.2. *)
+let upgrade_error (head : H1_parse.head) response =
+  if Status.code (Response.status response) = 101
+  then
+    if head.version <> Version.Http_1_1
+    then Some "101 to an HTTP/1.0 request"
+    else if not (Headers.mem "upgrade" head.headers
+                 && Headers.has_token "connection" "upgrade" head.headers)
+    then Some "101 to a request that did not ask for an upgrade"
+    else if not (Headers.mem "upgrade" (Response.headers response))
+    then Some "101 without an Upgrade field"
+    else None
+  else if not (Method.equal head.meth Method.CONNECT)
+  then Some (Format.asprintf "2xx upgrade to a %a request" Method.pp head.meth)
+  else None
+
 let internal_error () =
   Response.string ~status:Status.internal_server_error "Internal Server Error\n"
 
@@ -136,10 +153,16 @@ let serve : Engine.t =
         `Linger
     | response -> (
         match Response.kind response with
-        | Response.Upgrade _ ->
-            report (Failure "Response.upgrade is not supported yet");
-            ignore (write ~keep_alive:false head (internal_error ()));
-            `Linger
+        | Response.Upgrade f -> (
+            let fail () = ignore (write ~keep_alive:false head (internal_error ())) in
+            match upgrade_error head response with
+            | Some e -> report (Failure ("Response.upgrade: " ^ e)); fail (); `Linger
+            (* What follows the request body is the new protocol's. *)
+            | None when not (H1_body.drain body ~max:config.max_drain) -> fail (); `Linger
+            | None ->
+                committed := true;
+                ignore (write ~keep_alive:true head response);
+                switch f)
         | Response.Body _ ->
             let continue_owed =
               expects_continue head && (not !continue_sent) && not (H1_body.is_complete body)
@@ -158,15 +181,24 @@ let serve : Engine.t =
               next_request ~idle:config.idle_timeout
             end
             else `Linger)
+  (* Hands the connection to [f], with the bytes already received first. The
+     new protocol sets its own deadlines. *)
+  and switch f =
+    Flow.set_read_deadline flow None;
+    Flow.set_write_deadline flow None;
+    (match f (Flow.prepend (Buf_reader.take_buffered r) flow) with
+    | () | (exception (Flow.Closed | Flow.Timeout)) -> ()
+    | exception e when not (is_fatal e) -> report e);
+    `Close
   (* Writes [response]; [true] iff it was written in full and the connection
-     can stay open. *)
+     can stay open, or switch protocols. *)
   and write ~keep_alive (head : H1_parse.head) response =
     let framing = H1_write.framing ~meth:head.meth ~version:head.version response in
     let keep_alive = keep_alive && framing <> H1_write.Close_delimited in
     let date = if config.date_header then Some (Date.now ()) else None in
     H1_write.head w ?date ~version:head.version ~keep_alive framing response;
     match Response.kind response with
-    | Response.Upgrade _ -> false
+    | Response.Upgrade _ -> Buf_writer.flush w; true
     | Response.Body b -> (
         match H1_write.body w framing b with
         | () -> keep_alive

@@ -19,11 +19,31 @@ let show_crlf s =
 let loopback port = Unix.ADDR_INET (Unix.inet_addr_loopback, port)
 let conn = Conn_info.make ~id:7 ~peer:(loopback 50000) ~local:(loopback 8080) ()
 
+(* After an upgrade: what the client sends, until it ends. *)
+let echo_upgraded flow =
+  let buf = Bytes.create 64 and got = Buffer.create 64 in
+  let rec loop () =
+    match Flow.read flow buf 0 64 with
+    | 0 -> ()
+    | n -> Buffer.add_subbytes got buf 0 n; loop ()
+  in
+  loop ();
+  Flow.write_string flow ("got " ^ Buffer.contents got)
+
+let upgrade_echo = Headers.of_list [ ("Upgrade", "echo") ]
+
 (* Set by /stop, as a server stopping while its response is written. *)
 let stopping = ref false
 
 let handler req =
+  if Method.equal (Request.meth req) Method.CONNECT
+  then Response.upgrade ~status:Status.ok echo_upgraded
+  else
   match Request.path_only req with
+  | "/ws" -> Response.upgrade ~headers:upgrade_echo echo_upgraded
+  | "/ws-bare" -> Response.upgrade echo_upgraded
+  | "/ws-fail" -> Response.upgrade ~headers:upgrade_echo (fun _ -> failwith "ws")
+  | "/tunnel" -> Response.upgrade ~status:Status.ok echo_upgraded
   | "/stop" ->
       Response.stream (fun w ->
           stopping := true;
@@ -39,7 +59,6 @@ let handler req =
   | "/fail" -> failwith "boom"
   | "/short" -> Response.stream ~length:5 (fun w -> Body.Writer.write_string w "abc")
   | "/close" -> Response.string ~headers:(Headers.of_list [ ("Connection", "close") ]) "bye"
-  | "/upgrade" -> Response.upgrade ignore
   | "/empty" -> Response.empty ()
   | "/info" ->
       Response.string
@@ -422,17 +441,6 @@ let connection_tests =
             abc[FIN]
             ! response body length differs from its Content-Length
             |});
-      test "upgrades are not supported yet" (fun () ->
-          expect (show (get "/upgrade")) @@ __POS_OF__ {|
-            HTTP/1.1 500 Internal Server Error\r\n
-            Content-Type: text/plain; charset=utf-8\r\n
-            Content-Length: 22\r\n
-            Connection: close\r\n
-            \r\n
-            Internal Server Error
-            [FIN]
-            ! Failure("Response.upgrade is not supported yet")
-            |});
       test "a closing response is followed by a half-close, and input is read to its end"
         (fun () ->
            expect
@@ -546,4 +554,110 @@ let timeout_tests =
             hello
             |}) ]
 
-let () = exit (run "h1_server" [ connection_tests; timeout_tests ])
+let upgrade_tests =
+  let ws ?(v = "HTTP/1.1") ?(headers = [ ("Upgrade", "echo"); ("Connection", "Upgrade") ]) path =
+    get ~v ~headers path
+  in
+  group "H1_server upgrades"
+    [ test "101 hands over the connection, with the bytes already received" (fun () ->
+          expect (show (ws "/ws" ^ "early bytes, " ^ "then more")) @@ __POS_OF__ {|
+            HTTP/1.1 101 Switching Protocols\r\n
+            Upgrade: echo\r\n
+            Connection: Upgrade\r\n
+            \r\n
+            got early bytes, then more
+            |});
+      test "the bytes after the head are the same however the input is split" (fun () ->
+          let input = ws "/ws" ^ String.init 300 (fun i -> Char.chr (97 + (i mod 26))) in
+          equal string (show input) (show ~chunk:7 input));
+      test "a request body is read before switching" (fun () ->
+          expect
+            (show
+               ("GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\
+                 Content-Length: 4\r\n\r\nbodyafter"))
+          @@ __POS_OF__ {|
+            HTTP/1.1 101 Switching Protocols\r\n
+            Upgrade: echo\r\n
+            Connection: Upgrade\r\n
+            \r\n
+            got after
+            |});
+      test "CONNECT 2xx opens a tunnel" (fun () ->
+          expect (show "CONNECT a.example:443 HTTP/1.1\r\nHost: a.example:443\r\n\r\nhello")
+          @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            \r\n
+            got hello
+            |});
+      test "upgrades that break the rules get 500 and are reported" (fun () ->
+          expect
+            (String.concat "--"
+               [ show (get "/ws");
+                 show (ws ~v:"HTTP/1.0" "/ws");
+                 show (ws ~headers:[ ("Upgrade", "echo") ] "/ws");
+                 show (ws "/ws-bare");
+                 show (get "/tunnel") ])
+          @@ __POS_OF__ {|
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Failure("Response.upgrade: 101 to a request that did not ask for an upgrade")--HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Failure("Response.upgrade: 101 to an HTTP/1.0 request")--HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Failure("Response.upgrade: 101 to a request that did not ask for an upgrade")--HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Failure("Response.upgrade: 101 without an Upgrade field")--HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Failure("Response.upgrade: 2xx upgrade to a GET request")
+            |});
+      test "an upgrade with a body too large to drain gets 500" (fun () ->
+          let config = { Config.default with date_header = false; max_drain = 2 } in
+          expect
+            (show ~config
+               ("GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\
+                 Content-Length: 4\r\n\r\nbody"))
+          @@ __POS_OF__ {|
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            |});
+      test "an upgrade callback that raises is reported" (fun () ->
+          expect (show (ws "/ws-fail")) @@ __POS_OF__ {|
+            HTTP/1.1 101 Switching Protocols\r\n
+            Upgrade: echo\r\n
+            Connection: Upgrade\r\n
+            \r\n
+
+            ! Failure("ws")
+            |}) ]
+
+let () = exit (run "h1_server" [ connection_tests; timeout_tests; upgrade_tests ])

@@ -40,6 +40,15 @@ val upgrade : ?status:Status.t -> ?headers:Headers.t -> (Flow.t -> unit) -> t
     once its head is sent. [status] defaults to {!Status.switching_protocols};
     a [2xx] status is for accepting a [CONNECT] tunnel.
 
+    [f] gets the connection's flow, starting with any bytes the client sent
+    after its request, and without deadlines. The connection closes when [f]
+    returns.
+
+    A [101] must name the new protocol in an [Upgrade] field and answer an
+    HTTP/1.1 request that asked for an upgrade; a [2xx] must answer a
+    [CONNECT] request. Otherwise the client gets a [500] and the error is
+    reported, as for a handler that raises.
+
     @raise Invalid_argument if [status] is neither [101] nor [2xx]. *)
 
 val status : t -> Status.t

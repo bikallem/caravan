@@ -179,6 +179,78 @@ let timeout_tests =
           Flow.close a;
           Flow.close b) ]
 
+(* Upgrades over sockets *)
+
+let upgrade_tests =
+  let connect server =
+    let flow, r = connect server in
+    Flow.set_read_deadline flow (Mtime.add_span (Mtime.now ()) Mtime.Span.(5 * s));
+    (flow, r)
+  in
+  let read_head r =
+    let status = Buf_reader.read_line r ~max:1000 in
+    let rec fields () = if Buf_reader.read_line r ~max:1000 <> "" then fields () in
+    fields ();
+    status
+  in
+  let read_n r n =
+    let buf = Bytes.create n in
+    let rec fill got =
+      if got < n
+      then match Buf_reader.read_into r buf got (n - got) with
+      | 0 -> failwith "end of stream"
+      | k -> fill (got + k)
+    in
+    fill 0;
+    Bytes.to_string buf
+  in
+  let eof r = equal int ~msg:"end of stream" 0 (Buf_reader.read_into r (Bytes.create 1) 0 1) in
+  group "Upgrades over sockets"
+    [ test "after a 101, bytes are echoed as they arrive, without HTTP's timeouts" (fun () ->
+          let short = Mtime.Span.(100 * ms) in
+          let config =
+            { config with header_timeout = short; read_timeout = short; write_timeout = short }
+          in
+          with_server ~config @@ fun server ->
+          let flow, r = connect server in
+          (* In two parts, so that the server reads the second under its head
+             deadline. *)
+          Flow.write_string flow "GET /ws-echo HTTP/1.1\r\nHost: x\r\n";
+          Mtime.wait_for Mtime.Span.(20 * ms);
+          Flow.write_string flow "Upgrade: echo\r\nConnection: Upgrade\r\n\r\n";
+          equal string "HTTP/1.1 101 Switching Protocols" (read_head r);
+          List.iter
+            (fun msg -> Flow.write_string flow msg; equal string msg (read_n r (String.length msg)))
+            [ "ping"; "pong"; String.make 10_000 'x' ];
+          (* Quiet for longer than the server's HTTP timeouts. *)
+          Mtime.wait_for Mtime.Span.(250 * ms);
+          Flow.write_string flow "still there";
+          equal string "still there" (read_n r 11);
+          Flow.shutdown_send flow;
+          eof r;
+          Flow.close flow);
+      test "a CONNECT tunnel reaches another server" (fun () ->
+          with_server @@ fun server ->
+          let upstream = Tcp.Listener.listen loopback in
+          let echo =
+            Fun.Async.call (fun () ->
+                let fd, _ = Tcp.Listener.accept upstream in
+                let flow = Tcp.flow fd in
+                Fun.protect ~finally:(fun () -> Flow.close flow) (fun () -> copy flow flow))
+          in
+          let target = Format.asprintf "%a" Conn_info.pp_addr (Tcp.Listener.addr upstream) in
+          let flow, r = connect server in
+          Flow.write_string flow (Printf.sprintf "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n" target target);
+          equal string "HTTP/1.1 200 OK" (read_head r);
+          let msg = "through the tunnel and back" in
+          Flow.write_string flow msg;
+          equal string msg (read_n r (String.length msg));
+          Flow.shutdown_send flow;
+          eof r;
+          Fun.Async.get echo;
+          Tcp.Listener.close upstream;
+          Flow.close flow) ]
+
 (* Server.run in a child process, stopped with signals: sending signals to
    the test process itself could kill it. *)
 let signal_tests =
@@ -259,4 +331,4 @@ let signal_tests =
           Flow.close flow;
           exited_ok pid ~within:1000.) ]
 
-let () = exit (run "server" [ integration_tests; timeout_tests; signal_tests ])
+let () = exit (run "server" [ integration_tests; timeout_tests; upgrade_tests; signal_tests ])

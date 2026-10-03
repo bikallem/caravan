@@ -8,12 +8,39 @@ module Buf_reader = Private.Buf_reader
 
 let loopback = Unix.ADDR_INET (Unix.inet_addr_loopback, 0)
 
+(* Copies [src] to [dst] until [src] ends, then ends [dst]. *)
+let copy src dst =
+  let buf = Bytes.create 4096 in
+  let rec loop () =
+    match Flow.read src buf 0 4096 with
+    | 0 -> Flow.shutdown_send dst
+    | n -> Flow.write dst buf 0 n; loop ()
+  in
+  loop ()
+
+(* A CONNECT tunnel to [authority], an "ip:port", bridging both ways. *)
+let tunnel authority client =
+  let i = String.rindex authority ':' in
+  let host = String.sub authority 0 i in
+  let port = int_of_string (String.sub authority (i + 1) (String.length authority - i - 1)) in
+  let upstream = Tcp.connect (Unix.ADDR_INET (Unix.inet_addr_of_string host, port)) in
+  Fun.Async.protect ~finally:(fun () -> Flow.close upstream) @@ fun () ->
+  let up = Fun.Async.call (fun () -> copy client upstream) in
+  copy upstream client;
+  Fun.Async.get up
+
 (* Handlers read request bodies, except /ignore, which leaves its body to be
-   drained or lingered over. *)
+   drained or lingered over. /ws-echo upgrades to echoing what it gets, and
+   CONNECT opens a tunnel. *)
 let handler req =
   let body = Request.body req in
   let read () = ignore (Body.to_string body) in
+  if Method.equal (Request.meth req) Method.CONNECT
+  then Response.upgrade ~status:Status.ok (tunnel (Option.get (Request.authority req)))
+  else
   match Request.path_only req with
+  | "/ws-echo" ->
+      Response.upgrade ~headers:(Headers.of_list [ ("Upgrade", "echo") ]) (fun flow -> copy flow flow)
   | "/hello" -> read (); Response.string "hello"
   | "/echo" -> Response.stream ?length:(Body.length body) (fun w -> Body.write_to body w)
   | "/empty" -> read (); Response.empty ()
