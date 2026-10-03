@@ -249,6 +249,10 @@ let serve : Engine.t =
       kept_alive := keep_alive () && framing <> H1_write.Close_delimited;
       H1_write.head w ?date:(date ()) ~version:head.version ~keep_alive:!kept_alive framing response
     in
+    (* A response cut short after its head. Chunked and Content-Length
+       framings show it, but a close-delimited body would look complete
+       after a clean close: reset the connection instead. *)
+    let cut_short () = if framing = H1_write.Close_delimited then Flow.reset flow in
     match Response.kind response with
     | Response.Upgrade _ -> write_head (); Buf_writer.flush w; true
     | Response.Body b -> (
@@ -257,13 +261,15 @@ let serve : Engine.t =
         | exception ((Flow.Closed | Flow.Timeout) as e) -> raise e
         (* A request body that the response streams was cut short or is
            malformed: the client's fault, not the server's. *)
-        | exception Body.Truncated -> false
+        | exception Body.Truncated -> if !committed then cut_short (); false
         | exception H1_error.E e ->
-            if not !committed then ignore (error_response ?date:(date ()) w e);
+            if !committed then cut_short () else ignore (error_response ?date:(date ()) w e);
             false
         | exception e when not (is_fatal e) ->
             report e;
-            if not !committed then ignore (write ~keep_alive:never head (internal_error ()));
+            if !committed
+            then cut_short ()
+            else ignore (write ~keep_alive:never head (internal_error ()));
             false)
   in
   try

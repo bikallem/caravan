@@ -32,6 +32,19 @@ let integration_tests =
           Flow.write_string flow "hello";
           equal string {|200 "hello"|} (read_response ~head:false r);
           Flow.close flow);
+      test "an HTTP/1.0 client sees a body cut short as a reset" (fun () ->
+          with_server ~config:{ config with on_error = (fun _ _ -> ()) } @@ fun server ->
+          let flow, r = connect server in
+          Flow.set_read_deadline flow (Mtime.add_span (Mtime.now ()) Mtime.Span.(5 * s));
+          Flow.write_string flow "GET /partial HTTP/1.0\r\n\r\n";
+          let rec head () = if Buf_reader.read_line r ~max:1000 <> "" then head () in
+          head ();
+          let buf = Bytes.create 7 in
+          let rec fill got = if got < 7 then fill (got + Buf_reader.read_into r buf got (7 - got)) in
+          fill 0;
+          equal string "partial" (Bytes.to_string buf);
+          raises Flow.Closed (fun () -> Buf_reader.read_into r (Bytes.create 1) 0 1);
+          Flow.close flow);
       test "a chunked upload in small delayed pieces is echoed" (fun () ->
           with_server @@ fun server ->
           let flow, r = connect server in

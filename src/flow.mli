@@ -26,11 +26,14 @@ val make :
   readable:unit Action.t ->
   shutdown_send:(unit -> unit) ->
   close:(unit -> unit) ->
+  ?reset:(unit -> unit) ->
   set_read_deadline:(Affect_unix.Mtime.t option -> unit) ->
   set_write_deadline:(Affect_unix.Mtime.t option -> unit) ->
+  unit ->
   t
-(** [make ~read ~write ~readable ~shutdown_send ~close ~set_read_deadline
-    ~set_write_deadline] is a flow implemented by the given functions:
+(** [make ~read ~write ~readable ~shutdown_send ~close ~reset
+    ~set_read_deadline ~set_write_deadline ()] is a flow implemented by the
+    given functions:
     - [read buf off len] reads at most [len > 0] bytes into [buf] from [off]
       and returns how many it read, [0] at the end of the stream. It may block
       cooperatively.
@@ -41,6 +44,9 @@ val make :
     - [shutdown_send ()] signals the end of the stream to the peer.
     - [close ()] releases the flow's resources. The resulting flow calls it at
       most once.
+    - [reset ()] releases them abortively, so that the peer sees the stream
+      fail rather than end (default: [close]). The resulting flow calls at
+      most one of [close] and [reset], once.
     - [set_read_deadline d] and [set_write_deadline d] set or clear the time
       after which a blocked read or write raises {!Timeout}. *)
 
@@ -89,6 +95,11 @@ val set_write_deadline : t -> Affect_unix.Mtime.t option -> unit
 val close : t -> unit
 (** [close flow] closes [flow]. Closing is idempotent. Reads and writes on a
     closed flow raise {!Closed}. *)
+
+val reset : t -> unit
+(** [reset flow] closes [flow] abortively: a TCP peer gets a reset instead
+    of the end of the stream, so it can tell that what it received was cut
+    short. It does nothing on a closed flow. *)
 
 (** {1:derived Derived flows} *)
 

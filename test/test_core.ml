@@ -351,13 +351,30 @@ let flow_tests =
             [ (0, 0); (-1, 2); (0, 5); (3, 2) ];
           raises_match is_invalid_arg (fun () -> Flow.write flow buf 2 3);
           raises_match is_invalid_arg (fun () -> Flow.of_string ~chunk:0 "" (Buffer.create 0)));
+      test "reset closes once, abortively, and close falls back to it" (fun () ->
+          let log = ref [] in
+          let flow ?reset () =
+            Flow.make ~read:(fun _ _ _ -> 0) ~write:(fun _ _ _ -> ())
+              ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
+              ~close:(fun () -> log := "close" :: !log)
+              ?reset ~set_read_deadline:ignore ~set_write_deadline:ignore ()
+          in
+          let f = flow ~reset:(fun () -> log := "reset" :: !log) () in
+          Flow.reset f;
+          Flow.reset f;
+          Flow.close f;
+          equal (list string) [ "reset" ] !log;
+          raises Flow.Closed (fun () -> Flow.read f (Bytes.create 1) 0 1);
+          log := [];
+          Flow.reset (flow ());
+          equal (list string) ~msg:"without reset, close" [ "close" ] !log);
       test "close is idempotent and later use raises Closed" (fun () ->
           let closes = ref 0 in
           let flow =
             Flow.make ~read:(fun _ _ _ -> 0) ~write:(fun _ _ _ -> ())
               ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
               ~close:(fun () -> incr closes)
-              ~set_read_deadline:ignore ~set_write_deadline:ignore
+              ~set_read_deadline:ignore ~set_write_deadline:ignore ()
           in
           Flow.close flow;
           Flow.close flow;
@@ -375,7 +392,7 @@ let flow_tests =
               ~shutdown_send:(fun () -> note "shutdown")
               ~close:(fun () -> note "close")
               ~set_read_deadline:(fun d -> note (if d = None then "rd none" else "rd"))
-              ~set_write_deadline:(fun d -> note (if d = None then "wd none" else "wd"))
+              ~set_write_deadline:(fun d -> note (if d = None then "wd none" else "wd")) ()
           in
           equal int 1 (Flow.read flow (Bytes.create 1) 0 1);
           Flow.write_string flow "abc";
@@ -402,7 +419,7 @@ let flow_tests =
               ~readable:(Affect.Action.always ())
               ~shutdown_send:(fun () -> log := "shutdown" :: !log)
               ~close:(fun () -> log := "close" :: !log)
-              ~set_read_deadline:ignore ~set_write_deadline:ignore
+              ~set_read_deadline:ignore ~set_write_deadline:ignore ()
           in
           let p = Flow.prepend "x" flow in
           Flow.shutdown_send p;
@@ -417,7 +434,7 @@ let flow_tests =
           let never =
             Flow.make ~read:(fun _ _ _ -> 0) ~write:(fun _ _ _ -> ())
               ~readable:Affect.Action.never ~shutdown_send:ignore ~close:ignore
-              ~set_read_deadline:ignore ~set_write_deadline:ignore
+              ~set_read_deadline:ignore ~set_write_deadline:ignore ()
           in
           let flow = Flow.prepend "a" never in
           is_true ~msg:"readable before the prefix is read" (readable_within_20ms flow);

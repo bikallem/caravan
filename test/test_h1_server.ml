@@ -65,6 +65,11 @@ let handler req =
       | exception _ -> Response.string ~status:Status.bad_request "unreadable body\n")
   | "/early-hints" -> Response.make ~status:(Status.v 103) Body.empty
   | "/stream-fail" -> Response.stream (fun _ -> failwith "producer")
+  | "/partial" ->
+      Response.stream (fun w ->
+          Body.Writer.write_string w "partial";
+          Body.Writer.flush w;
+          failwith "cut short")
   | "/slow" -> slowly ~read:false req
   | "/read-slow" -> slowly ~read:true req
   | "/slow-cleanup-fails" -> (
@@ -129,7 +134,9 @@ let serve ?(config = { Config.default with date_header = false }) ?chunk ?(stall
     let write buf off len = if unwritable then raise Flow.Closed else Flow.write inner buf off len in
     Flow.make ~read ~write ~readable
       ~shutdown_send:(fun () -> Buffer.add_string out "[FIN]")
-      ~close:ignore ~set_read_deadline:ignore ~set_write_deadline:ignore
+      ~close:ignore
+      ~reset:(fun () -> Buffer.add_string out "[RST]")
+      ~set_read_deadline:ignore ~set_write_deadline:ignore ()
   in
   stopping := false;
   Affect_unix.Unix.main ~domain_count:1 (fun () ->
@@ -419,6 +426,32 @@ let connection_tests =
             \r\n
             hello
             |});
+      test "a close-delimited body cut short resets the connection" (fun () ->
+          expect (show (get ~v:"HTTP/1.0" "/partial")) @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Connection: close\r\n
+            \r\n
+            partial[RST]
+            ! Failure("cut short")
+            |});
+      test "a close-delimited echo of a request body cut short resets the connection" (fun () ->
+          expect (show "POST /stream-echo HTTP/1.0\r\nContent-Length: 10\r\n\r\nhel")
+          @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Connection: close\r\n
+            \r\n
+            hel[RST]
+            |});
+      test "a chunked body cut short ends without a last chunk" (fun () ->
+          expect (show (get "/partial")) @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Transfer-Encoding: chunked\r\n
+            \r\n
+            7\r\n
+            partial\r\n
+            [FIN]
+            ! Failure("cut short")
+            |});
       test "a streamed body that fails before any output gets 500" (fun () ->
           expect (show (get "/stream-fail" ^ get "/")) @@ __POS_OF__ {|
             HTTP/1.1 500 Internal Server Error\r\n
@@ -471,7 +504,7 @@ let connection_tests =
             Flow.make
               ~read:(fun _ _ _ -> failwith "read while stopping")
               ~write:(fun _ _ _ -> ()) ~readable:Action.never ~shutdown_send:ignore ~close:ignore
-              ~set_read_deadline:ignore ~set_write_deadline:ignore
+              ~set_read_deadline:ignore ~set_write_deadline:ignore ()
           in
           Affect_unix.Unix.main ~domain_count:1 (fun () ->
               let ctx =
@@ -485,7 +518,7 @@ let connection_tests =
             Flow.make ~read:(Flow.read input)
               ~write:(fun _ _ _ -> raise Flow.Closed)
               ~readable:(Flow.readable' input ()) ~shutdown_send:ignore ~close:ignore
-              ~set_read_deadline:ignore ~set_write_deadline:ignore
+              ~set_read_deadline:ignore ~set_write_deadline:ignore ()
           in
           Affect_unix.Unix.main ~domain_count:1 (fun () ->
               let ctx =

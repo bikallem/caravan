@@ -50,8 +50,12 @@ let flow fd =
   in
   Flow.make ~read ~write ~readable:(Aunix.wait_readable fd ()) ~shutdown_send
     ~close:(fun () -> Aunix.close_noerr fd)
+    ~reset:(fun () ->
+        (* A zero linger time makes close send a reset. *)
+        (try Unix.setsockopt_optint fd Unix.SO_LINGER (Some 0) with Unix.Unix_error _ -> ());
+        Aunix.close_noerr fd)
     ~set_read_deadline:(Atomic.set read_deadline)
-    ~set_write_deadline:(Atomic.set write_deadline)
+    ~set_write_deadline:(Atomic.set write_deadline) ()
 
 let set_nodelay fd = function
 | Unix.ADDR_INET _ -> Unix.setsockopt fd Unix.TCP_NODELAY true

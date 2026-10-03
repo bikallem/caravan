@@ -126,6 +126,13 @@ let tcp_tests =
           Flow.shutdown_send server;
           Flow.close server;
           Tcp.Listener.close l);
+      test "reset makes the peer see a reset, not the end of the stream" (fun () ->
+          with_pair @@ fun client server ->
+          Flow.write_string server "cut";
+          Flow.reset server;
+          equal string "cut" (read_exactly client 3);
+          raises Flow.Closed (fun () -> Flow.read client (Bytes.create 1) 0 1);
+          Flow.close client);
       test "cancelling a blocked read" (fun () ->
           with_pair @@ fun _client server ->
           let reader = Fun.Async.call (fun () -> Flow.read server (Bytes.create 1) 0 1) in

@@ -9,14 +9,15 @@ type t = {
   readable : unit Action.t;
   shutdown_send : unit -> unit;
   close : unit -> unit;
+  reset : unit -> unit;
   set_read_deadline : Affect_unix.Mtime.t option -> unit;
   set_write_deadline : Affect_unix.Mtime.t option -> unit;
   closed : bool Atomic.t;
 }
 
-let make ~read ~write ~readable ~shutdown_send ~close ~set_read_deadline
-    ~set_write_deadline =
-  { read; write; readable; shutdown_send; close; set_read_deadline;
+let make ~read ~write ~readable ~shutdown_send ~close ?(reset = close) ~set_read_deadline
+    ~set_write_deadline () =
+  { read; write; readable; shutdown_send; close; reset; set_read_deadline;
     set_write_deadline; closed = Atomic.make false }
 
 let check_range fn buf off len =
@@ -43,6 +44,7 @@ let shutdown_send flow = if not (Atomic.get flow.closed) then flow.shutdown_send
 let set_read_deadline flow d = flow.set_read_deadline d
 let set_write_deadline flow d = flow.set_write_deadline d
 let close flow = if not (Atomic.exchange flow.closed true) then flow.close ()
+let reset flow = if not (Atomic.exchange flow.closed true) then flow.reset ()
 
 let prepend s flow =
   if s = ""
@@ -67,8 +69,9 @@ let prepend s flow =
     make ~read ~write:(write flow) ~readable
       ~shutdown_send:(fun () -> shutdown_send flow)
       ~close:(fun () -> close flow)
+      ~reset:(fun () -> reset flow)
       ~set_read_deadline:(set_read_deadline flow)
-      ~set_write_deadline:(set_write_deadline flow)
+      ~set_write_deadline:(set_write_deadline flow) ()
   end
 
 let of_string ?(chunk = max_int) input output =
@@ -84,4 +87,4 @@ let of_string ?(chunk = max_int) input output =
   let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
   make ~read ~write ~readable:(Action.always ()) ~shutdown_send:ignore
     ~close:ignore ~set_read_deadline:ignore_deadline
-    ~set_write_deadline:ignore_deadline
+    ~set_write_deadline:ignore_deadline ()

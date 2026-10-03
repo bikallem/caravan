@@ -63,6 +63,11 @@ let handler req =
       until_cancelled (fun () -> Mtime.wait_for Mtime.Span.(10 * s));
       Response.string "late"
   | "/fetch" -> fetch ()
+  | "/partial" ->
+      Response.stream (fun w ->
+          Body.Writer.write_string w "partial";
+          Body.Writer.flush w;
+          failwith "cut short")
   | "/ws-echo" ->
       Response.upgrade ~headers:(Headers.of_list [ ("Upgrade", "echo") ]) (fun flow -> copy flow flow)
   | "/hello" -> read (); Response.string "hello"
