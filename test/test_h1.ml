@@ -1259,7 +1259,34 @@ let pieces_source ?close pieces =
 
 let response_body_tests =
   group "H1_write.body"
-    [ test "golden bodies" (fun () ->
+    [ test "before runs once, ahead of the body's first output" (fun () ->
+          let show framing b =
+            let w, calls = recorded () in
+            let log = ref [] in
+            let before () = log := "[head]" :: !log; Buf_writer.write_string w "HEAD;" in
+            H1_write.body ~before w framing b;
+            String.escaped (String.concat "" (calls ())) ^ " " ^ String.concat "," !log
+          in
+          let quiet_then_data =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "";
+                Body.Writer.write_string w "ab";
+                Body.Writer.flush w;
+                Body.Writer.write_string w "c")
+          in
+          expect
+            (String.concat "\n"
+               [ show Chunked quiet_then_data;
+                 show (Length 3) (Body.of_string "abc");
+                 show Close_delimited (Body.of_writer ignore);
+                 show No_body (Body.of_string "ignored") ])
+          @@ __POS_OF__ {|
+            HEAD;2\r\nab\r\n1\r\nc\r\n0\r\n\r\n [head]
+            HEAD;abc [head]
+            HEAD; [head]
+            HEAD; [head]
+            |});
+      test "golden bodies" (fun () ->
           let producer =
             Body.of_writer (fun w ->
                 Body.Writer.write_string w "data: 1\n\n";

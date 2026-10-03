@@ -63,11 +63,13 @@ let () =
     | Length_mismatch -> Some "response body length differs from its Content-Length"
     | _ -> None)
 
-let body w framing b =
+let body ?(before = ignore) w framing b =
   Fun.protect ~finally:(fun () -> Body.close b) @@ fun () ->
-  let flush () = Buf_writer.flush w in
+  let started = ref false in
+  let start () = if not !started then (started := true; before ()) in
+  let flush () = start (); Buf_writer.flush w in
   let write_all write =
-    Body.write_to b (Body.Writer.make ~write ~flush);
+    Body.write_to b (Body.Writer.make ~write:(fun buf off len -> start (); write buf off len) ~flush);
     flush ()
   in
   match framing with
@@ -82,12 +84,14 @@ let body w framing b =
       if !count <> n then raise Length_mismatch
   | Chunked ->
       let chunk buf off len =
+        start ();
         Buf_writer.write_string w (Printf.sprintf "%x\r\n" len);
         Buf_writer.write_bytes w buf off len;
         Buf_writer.write_string w "\r\n"
       in
       let sink = Body.Writer.make ~write:chunk ~flush in
       Body.write_to b sink;
+      start ();
       Buf_writer.write_string w "0\r\n";
       Headers.iter (field w) (Body.Writer.trailers sink);
       Buf_writer.write_string w "\r\n";

@@ -20,6 +20,18 @@ let integration_tests =
           let responses = List.init 3 (fun _ -> read_response ~head:false r) in
           equal (list string) [ {|200 "hello"|}; {|204 ""|}; {|200 "abcd" close|} ] responses;
           Flow.close flow);
+      test "a client that waits for 100 Continue gets it from a streaming echo" (fun () ->
+          with_server @@ fun server ->
+          let flow, r = connect server in
+          Flow.set_read_deadline flow (Mtime.add_span (Mtime.now ()) Mtime.Span.(5 * s));
+          Flow.write_string flow
+            "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n";
+          (* Like curl: the body only goes once the server asked for it. *)
+          equal string "HTTP/1.1 100 Continue" (Buf_reader.read_line r ~max:100);
+          equal string "" (Buf_reader.read_line r ~max:100);
+          Flow.write_string flow "hello";
+          equal string {|200 "hello"|} (read_response ~head:false r);
+          Flow.close flow);
       test "a chunked upload in small delayed pieces is echoed" (fun () ->
           with_server @@ fun server ->
           let flow, r = connect server in

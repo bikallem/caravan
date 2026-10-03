@@ -64,6 +64,7 @@ let handler req =
       | s -> Response.string s
       | exception _ -> Response.string ~status:Status.bad_request "unreadable body\n")
   | "/early-hints" -> Response.make ~status:(Status.v 103) Body.empty
+  | "/stream-fail" -> Response.stream (fun _ -> failwith "producer")
   | "/slow" -> slowly ~read:false req
   | "/read-slow" -> slowly ~read:true req
   | "/slow-cleanup-fails" -> (
@@ -74,8 +75,10 @@ let handler req =
   | "/tunnel" -> Response.upgrade ~status:Status.ok echo_upgraded
   | "/stop" ->
       Response.stream (fun w ->
-          stopping := true;
-          Body.Writer.write_string w "bye")
+          Body.Writer.write_string w "bye";
+          (* After the head went out as keep-alive. *)
+          Body.Writer.flush w;
+          stopping := true)
   | "/echo" -> Response.string (Body.to_string (Request.body req))
   | "/stream-echo" -> Response.stream (Body.write_to (Request.body req))
   | "/ignore" -> Response.string "ignored"
@@ -393,6 +396,36 @@ let connection_tests =
             Content-Length: 7\r\n
             \r\n
             ignored[FIN]
+            |});
+      test "100-continue is sent before the head of a response that streams the body" (fun () ->
+          expect
+            (show (post ~headers:[ ("Expect", "100-continue") ] "/stream-echo" "hello" ^ get "/"))
+          @@ __POS_OF__ {|
+            HTTP/1.1 100 Continue\r\n
+            \r\n
+            HTTP/1.1 200 OK\r\n
+            Transfer-Encoding: chunked\r\n
+            \r\n
+            5\r\n
+            hello\r\n
+            0\r\n
+            \r\n
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 5\r\n
+            \r\n
+            hello
+            |});
+      test "a streamed body that fails before any output gets 500" (fun () ->
+          expect (show (get "/stream-fail" ^ get "/")) @@ __POS_OF__ {|
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Failure("producer")
             |});
       test "100-continue owed and never sent closes the connection" (fun () ->
           expect

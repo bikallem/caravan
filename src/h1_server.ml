@@ -72,6 +72,8 @@ let upgrade_error (head : H1_parse.head) response =
   then Some (Format.asprintf "2xx upgrade to a %a request" Method.pp head.meth)
   else None
 
+let never () = false
+
 let internal_error () =
   Response.string ~status:Status.internal_server_error "Internal Server Error\n"
 
@@ -149,35 +151,36 @@ let serve : Engine.t =
     | exception Body.Truncated -> `Close (* the client left *)
     | exception e when not (is_fatal e) ->
         report e;
-        ignore (write ~keep_alive:false head (internal_error ()));
+        ignore (write ~keep_alive:never head (internal_error ()));
         `Linger
     | `Disconnected -> `Close
     | `Response response -> (
         match Response.kind response with
         | Response.Upgrade f -> (
-            let fail () = ignore (write ~keep_alive:false head (internal_error ())) in
+            let fail () = ignore (write ~keep_alive:never head (internal_error ())) in
             match upgrade_error head response with
             | Some e -> report (Failure ("Response.upgrade: " ^ e)); fail (); `Linger
             (* What follows the request body is the new protocol's. *)
             | None when not (H1_body.drain body ~max:config.max_drain) -> fail (); `Linger
             | None ->
-                committed := true;
-                ignore (write ~keep_alive:true head response);
+                ignore (write ~committed ~keep_alive:(fun () -> true) head response);
                 switch f)
         (* RFC 9110 §9.3.6: a 2xx to CONNECT opens a tunnel. *)
         | Response.Body _
           when Method.equal head.meth Method.CONNECT
             && Status.kind (Response.status response) = `Success ->
             report (Failure "a 2xx response to CONNECT must be a Response.upgrade");
-            ignore (write ~keep_alive:false head (internal_error ()));
+            ignore (write ~keep_alive:never head (internal_error ()));
             `Linger
         | Response.Body _ ->
-            let continue_owed =
-              expects_continue head && (not !continue_sent) && not (H1_body.is_complete body)
-            in
-            (* Whether an unread body can be drained is only known once the
-               response is written: streamed responses may read it. *)
-            let keep_alive =
+            (* Decided when the head is written, which a streamed response
+               delays until its first output: it may read the request body
+               first, and get a 100 Continue sent. Whether an unread body
+               can be drained is only known once the response is written. *)
+            let keep_alive () =
+              let continue_owed =
+                expects_continue head && (not !continue_sent) && not (H1_body.is_complete body)
+              in
               request_keep_alive head
               && (not (H1_write.wants_close response))
               && (not continue_owed)
@@ -185,8 +188,8 @@ let serve : Engine.t =
               && (not (H1_body.failed body))
               && not (ctx.is_stopping ())
             in
-            committed := true;
-            if write ~keep_alive head response && H1_body.drain body ~max:config.max_drain
+            if write ~committed ~keep_alive head response
+            && H1_body.drain body ~max:config.max_drain
             then begin
               Fun.Async.yield ();
               next_request ~idle:config.idle_timeout
@@ -231,22 +234,34 @@ let serve : Engine.t =
     | exception e when not (is_fatal e) -> report e);
     `Close
   (* Writes [response]; [true] iff it was written in full and the connection
-     can stay open, or switch protocols. *)
-  and write ~keep_alive (head : H1_parse.head) response =
+     can stay open, or switch protocols. The head is written, and [committed]
+     set, just before the body's first output; [keep_alive ()] is asked
+     then. Until that point a failing body can still be answered properly. *)
+  and write ?(committed = ref false) ~keep_alive (head : H1_parse.head) response =
     let framing = H1_write.framing ~meth:head.meth ~version:head.version response in
-    let keep_alive = keep_alive && framing <> H1_write.Close_delimited in
-    let date = if config.date_header then Some (Date.now ()) else None in
-    H1_write.head w ?date ~version:head.version ~keep_alive framing response;
+    let kept_alive = ref false in
+    let write_head () =
+      committed := true;
+      kept_alive := keep_alive () && framing <> H1_write.Close_delimited;
+      let date = if config.date_header then Some (Date.now ()) else None in
+      H1_write.head w ?date ~version:head.version ~keep_alive:!kept_alive framing response
+    in
     match Response.kind response with
-    | Response.Upgrade _ -> Buf_writer.flush w; true
+    | Response.Upgrade _ -> write_head (); Buf_writer.flush w; true
     | Response.Body b -> (
-        match H1_write.body w framing b with
-        | () -> keep_alive
+        match H1_write.body ~before:write_head w framing b with
+        | () -> !kept_alive
         | exception ((Flow.Closed | Flow.Timeout) as e) -> raise e
         (* A request body that the response streams was cut short or is
            malformed: the client's fault, not the server's. *)
-        | exception (Body.Truncated | H1_error.E _) -> false
-        | exception e when not (is_fatal e) -> report e; false)
+        | exception Body.Truncated -> false
+        | exception H1_error.E e ->
+            if not !committed then ignore (error_response w e);
+            false
+        | exception e when not (is_fatal e) ->
+            report e;
+            if not !committed then ignore (write ~keep_alive:never head (internal_error ()));
+            false)
   in
   try
     match next_request ~idle:config.header_timeout with

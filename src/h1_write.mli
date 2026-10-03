@@ -48,8 +48,12 @@ exception Length_mismatch
 (** Raised by {!body} when a body produces fewer or more bytes than its
     [Content-Length]. The response is broken: the connection must close. *)
 
-val body : Buf_writer.t -> framing -> Body.t -> unit
-(** [body w framing b] writes [b] to [w] as [framing] says, and flushes [w]:
+val body : ?before:(unit -> unit) -> Buf_writer.t -> framing -> Body.t -> unit
+(** [body ~before w framing b] writes [b] to [w] as [framing] says, and
+    flushes [w]. [before ()] runs once, just before the first byte or flush
+    of the body reaches [w]: the engine writes the head from it, so that
+    the response stays uncommitted while [b] has produced nothing.
+    Framings:
     - {!No_body} and {!Head_length} write nothing; a writer body never runs.
     - [Length n] writes exactly [n] bytes. It raises {!Length_mismatch}
       before writing a byte past [n], or at the end if [b] was shorter.
