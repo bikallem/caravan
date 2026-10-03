@@ -58,7 +58,9 @@ val body : ?before:(unit -> unit) -> Buf_writer.t -> framing -> Body.t -> unit
     - [Length n] writes exactly [n] bytes. It raises {!Length_mismatch}
       before writing a byte past [n], or at the end if [b] was shorter.
     - {!Chunked} writes each write of [b] as a chunk, then the last chunk,
-      the trailers of [b] and the final CRLF.
+      the trailers of [b] and the final CRLF. Trailers that RFC 9110 §6.5.1
+      does not allow, such as [Content-Length] or [Set-Cookie], are
+      dropped.
     - {!Close_delimited} writes the bytes of [b] as they are.
 
     Each chunk of a source body, and each {!Body.Writer.flush} of a writer

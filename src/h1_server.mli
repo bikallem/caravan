@@ -1,5 +1,8 @@
 (* Internal. The HTTP/1.1 engine (RFC 9112). *)
 
+val limits : Config.t -> H1_parse.limits
+(** [limits c] are the parser limits of [c]. *)
+
 val serve : Engine.t
 (** [serve ctx flow handler] serves HTTP/1.1 requests on [flow]: one at a
     time, kept alive and pipelined, each handled in its own asynchronous

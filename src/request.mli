@@ -38,7 +38,9 @@ val version : t -> Version.t
 (** [version r] is the HTTP version [r] was received with. *)
 
 val scheme : t -> string
-(** [scheme r] is the scheme of [r], ["http"] or ["https"]. *)
+(** [scheme r] is the scheme of [r], ["http"] or ["https"]. For a request
+    received by a server it is the connection's scheme: a request whose
+    target names another one is refused with [421]. *)
 
 val authority : t -> string option
 (** [authority r] is the [host[:port]] that [r] targets, if known. *)

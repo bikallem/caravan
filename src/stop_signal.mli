@@ -10,13 +10,22 @@ type t
 
 val install : ?signals:int list -> unit -> t
 (** [install ~signals ()] starts taking [signals] (default [Sys.sigint] and
-    [Sys.sigterm]) for {!wait}. Call it before [Affect_unix.Unix.main], in the
+    [Sys.sigterm]) for {!wait}. The first two signals are taken; a third one
+    gets its default action, usually ending the process, so that a program
+    stuck despite them can still be stopped. Call it before [Affect_unix.Unix.main], in the
     main thread: only domains and threads created afterwards have the signals
-    blocked. Installing again returns the same value.
+    blocked. Installing again returns the same value, taking the signals
+    again if they were {!release}d.
 
     @raise Invalid_argument if signals were already installed with a different
     [signals]. *)
 
-val wait : t -> unit
-(** [wait t] waits for the next signal received since the last [wait]. Like
-    any affect wait, it can be cancelled. *)
+val wait : t -> int
+(** [wait t] waits for the next signal received since the last [wait] and is
+    that signal. Like any affect wait, it can be cancelled. *)
+
+val release : t -> unit
+(** [release t] stops taking the signals: they get their default action
+    again, usually ending the process, and signals not yet waited for are
+    forgotten. Call it from the thread that called {!install}, after
+    [Affect_unix.Unix.main] has returned. *)

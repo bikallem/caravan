@@ -10,9 +10,6 @@ val make : ?size:int -> (bytes -> int -> int -> unit) -> t
 
     @raise Invalid_argument if [size <= 0]. *)
 
-val of_flow : ?size:int -> Flow.t -> t
-(** [of_flow ~size flow] writes to [flow]. *)
-
 val write_string : t -> string -> unit
 (** [write_string w s] writes [s]. *)
 
@@ -36,5 +33,3 @@ val buffered : t -> int
 val capacity : t -> int
 (** [capacity w] is the size of [w]'s buffer, [0] until it is allocated. *)
 
-val written : t -> int
-(** [written w] is the number of bytes written to [w] so far, flushed or not. *)

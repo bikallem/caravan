@@ -10,8 +10,6 @@ type limits = {
 }
 (** The type for parsing limits. *)
 
-val default_limits : limits
-(** [default_limits] are 8 KiB, 16 KiB and 100 fields. *)
 
 type head = {
   meth : Method.t;
@@ -72,8 +70,8 @@ val request_target : scheme:string -> head -> target
 (** [request_target ~scheme h] is the target of [h] (RFC 9112 §3.2), where
     [scheme] is the connection's scheme:
     - Origin-form ["/p?q"] takes its authority from the [Host] field.
-    - Absolute-form ["http://a.example/p"] takes its scheme and authority from
-      the target and ignores [Host].
+    - Absolute-form ["http://a.example/p"] takes its authority from the
+      target and ignores [Host]. Its scheme must be the connection's.
     - Authority-form ["a.example:443"] is only for [CONNECT].
     - Asterisk-form ["*"] is only for [OPTIONS].
 
@@ -81,4 +79,6 @@ val request_target : scheme:string -> head -> target
     most one, and its value must be a valid [host[:port]]. An empty [Host]
     means no authority.
 
-    @raise H1_error.E with {!H1_error.Bad_request} otherwise. *)
+    @raise H1_error.E with {!H1_error.Misdirected_request} for an
+    absolute-form target with another scheme, {!H1_error.Bad_request}
+    otherwise. *)

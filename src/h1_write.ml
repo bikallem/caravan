@@ -56,6 +56,17 @@ let head w ?date ~version ~keep_alive framing r =
   then field w "Connection" "keep-alive";
   Buf_writer.write_string w "\r\n"
 
+(* RFC 9110 §6.5.1: fields that framing, routing, request modifiers,
+   authentication, response control or content processing depend on cannot
+   come after the content. A proxied body may carry them as trailers. *)
+let not_trailers =
+  [ "content-length"; "transfer-encoding"; "trailer"; "te"; "host"; "cache-control"; "expect";
+    "max-forwards"; "pragma"; "range"; "if-match"; "if-none-match"; "if-modified-since";
+    "if-unmodified-since"; "if-range"; "authorization"; "proxy-authorization";
+    "www-authenticate"; "proxy-authenticate"; "cookie"; "set-cookie"; "age"; "date";
+    "expires"; "location"; "retry-after"; "vary"; "content-encoding"; "content-type";
+    "content-range"; "connection"; "keep-alive"; "proxy-connection"; "upgrade" ]
+
 exception Length_mismatch
 
 let () =
@@ -93,6 +104,8 @@ let body ?(before = ignore) w framing b =
       Body.write_to b sink;
       start ();
       Buf_writer.write_string w "0\r\n";
-      Headers.iter (field w) (Body.Writer.trailers sink);
+      Headers.iter
+        (fun n v -> if not (List.mem (String.lowercase_ascii n) not_trailers) then field w n v)
+        (Body.Writer.trailers sink);
       Buf_writer.write_string w "\r\n";
       flush ()

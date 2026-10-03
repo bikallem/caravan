@@ -67,6 +67,11 @@ val failed : t -> bool
     malformed or truncated, or the connection failed. Later reads raise the
     same error again, and the connection cannot be reused. *)
 
+val continue_owed : t -> bool
+(** [continue_owed t] is [true] iff the request expects [100-continue], the
+    body has not been read yet, so [100 Continue] was not sent, and is not
+    complete: the client may be holding the body back. *)
+
 val drain : t -> max:int -> bool
 (** [drain t ~max] reads and discards what remains of the body, so that the
     next request on the connection can be read. It is [true] iff the

@@ -163,7 +163,7 @@ let read_response ~head r =
     if head || code = 204 || code = 304
     then ""
     else if find "transfer-encoding" = Some "chunked"
-    then Body.to_string (Private.H1_body.chunked ~limits:Private.H1_parse.default_limits r)
+    then Body.to_string (Private.H1_body.chunked ~limits:(Private.H1_server.limits Config.default) r)
     else
     match find "content-length" with
     | Some n ->
@@ -182,8 +182,8 @@ let read_response ~head r =
 let domain_count =
   Option.value ~default:2 (Option.bind (Sys.getenv_opt "TEST_DOMAINS") int_of_string_opt)
 
-let with_server ?(config = config) f =
+let with_server ?(config = config) ?engine ?(handler = handler) f =
   Affect_unix.Unix.main ~domain_count @@ fun () ->
-  let server = Server.start ~config handler in
+  let server = Server.start ~config ?engine handler in
   Fun.protect ~finally:(fun () -> Server.shutdown server; Server.wait server) (fun () -> f server)
 

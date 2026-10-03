@@ -1,5 +1,7 @@
 (* Server.run for the signal tests: prints its port, then "started" when a
-   request to /slow (300ms) or /stuck (10s) starts, in CRLF lines. *)
+   request to /slow (300ms), /stuck (10s) or /deaf (10s, deaf to
+   cancellation) starts, in CRLF lines. With the argument "after-run", it
+   prints "stopped" once run returned and lives on for 10s. *)
 
 open Caravan
 module Mtime = Affect_unix.Mtime
@@ -14,6 +16,11 @@ let handler req =
   match Request.path_only req with
   | "/slow" -> pause Mtime.Span.(300 * ms)
   | "/stuck" -> pause Mtime.Span.(10 * s)
+  | "/deaf" ->
+      print_string "started\r\n";
+      flush stdout;
+      Unix.sleepf 10.;
+      Response.string "done"
   | _ -> Response.string "hello"
 
 let () =
@@ -24,3 +31,11 @@ let () =
       match Server.local_addr server with
       | Unix.ADDR_INET (_, port) -> Printf.printf "%d\r\n%!" port
       | Unix.ADDR_UNIX _ -> assert false)
+
+let () =
+  if Array.length Sys.argv > 1 && Sys.argv.(1) = "after-run"
+  then begin
+    print_string "stopped\r\n";
+    flush stdout;
+    Unix.sleepf 10.
+  end

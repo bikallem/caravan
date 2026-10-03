@@ -182,7 +182,9 @@ let pp_head ppf (h : H1_parse.head) =
   Format.fprintf ppf "%a %s %a" Method.pp h.meth h.target Version.pp h.version;
   Headers.iter (fun n v -> Format.fprintf ppf "@\n  %s: %S" n v) h.headers
 
-let parse ?(limits = H1_parse.default_limits) ?size ?chunk s =
+let default_limits = Private.H1_server.limits Config.default
+
+let parse ?(limits = default_limits) ?size ?chunk s =
   H1_parse.request_head limits (Buf_reader.of_string ?size ?chunk s)
 
 let show ?limits s =
@@ -464,7 +466,16 @@ let host v = ("Host", v)
 
 let target_tests =
   group "H1_parse.request_target"
-    [ test "target and Host table" (fun () ->
+    [ test "an absolute target's scheme must be the connection's" (fun () ->
+          let target scheme t =
+            errors (fun () ->
+                (H1_parse.request_target ~scheme (req ~target:t [ host "b.example" ])).scheme)
+          in
+          equal (list string)
+            [ "https"; "http"; "421 Misdirected Request"; "421 Misdirected Request" ]
+            [ target "https" "https://b.example/"; target "http" "HTTP://b.example/";
+              target "http" "https://b.example/"; target "https" "http://b.example/" ]);
+      test "target and Host table" (fun () ->
           expect
             (String.concat "\n"
                (List.map show_target
@@ -521,7 +532,7 @@ let target_tests =
             Host port only => 400 Bad Request (invalid Host ":80")
             Host bad IPv6 literal => 400 Bad Request (invalid Host "[::g]")
             absolute => http b.example:81 "/p?q"
-            absolute https => https b.example "/"
+            absolute https => 421 Misdirected Request
             absolute query only => http b.example "/?q"
             absolute userinfo => 400 Bad Request (userinfo in request target)
             absolute ftp => 400 Bad Request (invalid request target "ftp://b.example/")
@@ -622,7 +633,7 @@ let h1_body_tests =
 
 (* Chunked bodies *)
 
-let limits = H1_parse.default_limits
+let limits = default_limits
 
 (* The decoded body, its trailers and what follows it, or the error. *)
 let show_chunked ?max_body input =
@@ -915,11 +926,15 @@ let handle_tests =
           is_true (not (H1_body.drain t ~max:100)));
       test "drain refuses while 100 Continue is owed" (fun () ->
           let r, t = handle ~expect_continue:ignore ("hello" ^ next) (Fixed 5) in
+          is_true ~msg:"owed before the first read" (H1_body.continue_owed t);
           is_true (not (H1_body.drain t ~max:100));
           equal int 0 (Buf_reader.consumed r);
           let r, t = handle ~expect_continue:ignore ("hello" ^ next) (Fixed 5) in
           ignore (Body.read (H1_body.body t) (Bytes.create 1) 0 1);
+          is_true ~msg:"sent on the first read" (not (H1_body.continue_owed t));
           is_true (H1_body.drain t ~max:100);
+          let _, t = handle ~expect_continue:ignore "" (Fixed 0) in
+          is_true ~msg:"not owed for an empty body" (not (H1_body.continue_owed t));
           equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100));
       test "drain works after the handler closed the body" (fun () ->
           let r, t = handle ("hello" ^ next) (Fixed 5) in
@@ -998,8 +1013,7 @@ let buf_writer_tests =
           equal (list string) [ "HTTP/1.1 200 OK\r\nXabc" ] (calls ());
           equal int 0 (Buf_writer.buffered w);
           Buf_writer.flush w;
-          equal int 1 (List.length (calls ()));
-          equal int 21 (Buf_writer.written w));
+          equal int 1 (List.length (calls ())));
       test "a write that does not fit flushes first" (fun () ->
           let w, calls = recorded ~size:4 () in
           Buf_writer.write_string w "abc";
@@ -1011,8 +1025,7 @@ let buf_writer_tests =
           let w, calls = recorded ~size:2 () in
           String.iter (Buf_writer.write_char w) "abcde";
           Buf_writer.flush w;
-          equal (list string) [ "ab"; "cd"; "e" ] (calls ());
-          equal int 5 (Buf_writer.written w));
+          equal (list string) [ "ab"; "cd"; "e" ] (calls ()));
       test "large writes go straight to the output" (fun () ->
           let w, calls = recorded ~size:4 () in
           Buf_writer.write_string w "ab";
@@ -1020,8 +1033,7 @@ let buf_writer_tests =
           Buf_writer.write_string w "abcd";
           Buf_writer.write_string w "";
           equal (list string) [ "ab"; "0123456789"; "abcd" ] (calls ());
-          equal int 0 (Buf_writer.buffered w);
-          equal int 16 (Buf_writer.written w));
+          equal int 0 (Buf_writer.buffered w));
       test "invalid arguments" (fun () ->
           (* Large writes skip the copy, so only the range check can raise. *)
           let w = Buf_writer.make ~size:2 ignore3 in
@@ -1030,13 +1042,6 @@ let buf_writer_tests =
                raises_match is_invalid_arg (fun () -> Buf_writer.write_bytes w (Bytes.create 4) off len))
             [ (-1, 1); (0, -1); (2, 3); (5, 0) ];
           raises_match is_invalid_arg (fun () -> Buf_writer.make ~size:0 ignore3));
-      test "of_flow writes to the flow" (fun () ->
-          let out = Buffer.create 8 in
-          let w = Buf_writer.of_flow (Flow.of_string "" out) in
-          Buf_writer.write_string w "hi";
-          equal string "" (Buffer.contents out);
-          Buf_writer.flush w;
-          equal string "hi" (Buffer.contents out));
       prop "output is the writes in order; calls are bounded"
         Gen.(pair (list ~size:(int_range 0 12) (string_of ~size:(int_range 0 12) (char_range 'a' 'z'))) (int_range 1 8))
         (fun (writes, size) ->
@@ -1044,7 +1049,6 @@ let buf_writer_tests =
            List.iter (Buf_writer.write_string w) writes;
            Buf_writer.flush w;
            equal string (String.concat "" writes) (String.concat "" (calls ()));
-           equal int (String.length (String.concat "" writes)) (Buf_writer.written w);
            List.iter
              (fun c ->
                 is_true ~msg:"a call is at most size bytes, or one large write"
@@ -1312,6 +1316,16 @@ let response_body_tests =
             HEAD; [head]
             HEAD; [head]
             |});
+      test "trailers that may not follow the content are dropped" (fun () ->
+          let b =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "x";
+                Body.Writer.set_trailers w
+                  (Headers.of_list
+                     [ ("X-Sum", "1"); ("Content-Length", "99"); ("Set-Cookie", "a=b");
+                       ("transfer-encoding", "chunked"); ("Server-Timing", "db;dur=5") ]))
+          in
+          expect (String.escaped (fst (write_body Chunked b))) @@ __POS_OF__ {| 1\r\nx\r\n0\r\nX-Sum: 1\r\nServer-Timing: db;dur=5\r\n\r\n |});
       test "golden bodies" (fun () ->
           let producer =
             Body.of_writer (fun w ->

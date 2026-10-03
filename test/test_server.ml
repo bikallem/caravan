@@ -162,17 +162,36 @@ let timeout_tests =
           equal string {|408 "Request Timeout\n" close|} (read_response ~head:false r);
           eof r;
           Flow.close flow);
-      test "a connection that sends nothing is closed" (fun () ->
-          with_server ~config @@ fun server ->
-          let flow, r = connect server in
-          eof r;
-          Flow.close flow);
       test "an idle connection is closed" (fun () ->
           with_server ~config @@ fun server ->
           let flow, r = connect server in
           Flow.write_string flow (get "/hello");
           equal string {|200 "hello"|} (read_response ~head:false r);
           eof r;
+          Flow.close flow);
+      test "a body trickled after the response is not drained forever" (fun () ->
+          with_server ~config @@ fun server ->
+          let flow, r = connect server in
+          Flow.write_string flow
+            ("POST /ignore HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n" ^ String.make 10 'x');
+          equal string {|200 "ignored"|} (read_response ~head:false r);
+          (* A byte every 60ms, within the 100ms read timeout, for 2s. *)
+          let trickle =
+            Fun.Async.call (fun () ->
+                try
+                  for _ = 1 to 33 do
+                    Mtime.wait_for Mtime.Span.(60 * ms);
+                    Flow.write_string flow "x"
+                  done
+                with Flow.Closed -> ())
+          in
+          let clock = Mtime.counter () in
+          (match Buf_reader.read_into r (Bytes.create 1) 0 1 with
+          | 0 | (exception Flow.Closed) -> ()
+          | _ -> fail "unexpected bytes");
+          let waited = Mtime.Span.to_float_ns (Mtime.count clock) /. 1e6 in
+          is_true ~msg:(Printf.sprintf "ended after %.0fms" waited) (waited < 1000.);
+          Fun.Async.cancel trickle;
           Flow.close flow);
       test "a stalled upload gets 408" (fun () ->
           with_server ~config @@ fun server ->
@@ -330,9 +349,11 @@ let signal_tests =
   let program = Filename.concat (Filename.dirname Sys.executable_name) "serve_until_signal.exe" in
   (* Runs [f pid out] with the program started: its pid, and a reader on its
      standard output. Kills the program if [f] leaves it running. *)
-  let with_program f =
+  let with_program ?(args = []) f =
     let out_r, out_w = Unix.pipe ~cloexec:true () in
-    let pid = Unix.create_process program [| program |] Unix.stdin out_w Unix.stderr in
+    let pid =
+      Unix.create_process program (Array.of_list (program :: args)) Unix.stdin out_w Unix.stderr
+    in
     Unix.close out_w;
     Unix.set_nonblock out_r;
     let out = Tcp.flow out_r in
@@ -401,6 +422,30 @@ let signal_tests =
           Unix.kill pid Sys.sigterm;
           is_true ~msg:"the idle connection is closed" (Buf_reader.peek_eof r);
           Flow.close flow;
-          exited_ok pid ~within:1000.) ]
+          exited_ok pid ~within:1000.);
+      test "a third signal ends a server stuck in a handler deaf to cancellation" (fun () ->
+          in_main @@ fun () ->
+          with_program @@ fun pid out ->
+          let flow, _ = connect out in
+          Flow.write_string flow (get "/deaf");
+          equal string "started" (Buf_reader.read_line out ~max:100);
+          for _ = 1 to 3 do
+            Unix.kill pid Sys.sigint;
+            Mtime.wait_for Mtime.Span.(50 * ms)
+          done;
+          let status, ms = exited pid in
+          equal bool ~msg:"killed by SIGINT" true (status = Unix.WSIGNALED Sys.sigint);
+          is_true ~msg:(Printf.sprintf "after %.0fms" ms) (ms < 2000.);
+          Flow.close flow);
+      test "once run returned, the signals act as before" (fun () ->
+          in_main @@ fun () ->
+          with_program ~args:[ "after-run" ] @@ fun pid out ->
+          ignore (Buf_reader.read_line out ~max:100);
+          Unix.kill pid Sys.sigterm;
+          equal string "stopped" (Buf_reader.read_line out ~max:100);
+          Unix.kill pid Sys.sigterm;
+          let status, ms = exited pid in
+          equal bool ~msg:"killed by SIGTERM" true (status = Unix.WSIGNALED Sys.sigterm);
+          is_true ~msg:(Printf.sprintf "after %.0fms" ms) (ms < 2000.)) ]
 
 let () = exit (run "server" [ integration_tests; timeout_tests; upgrade_tests; disconnect_tests; signal_tests ])

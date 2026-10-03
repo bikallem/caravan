@@ -11,11 +11,12 @@ let is_fatal = function Fun.Async.Cancelled -> true | _ -> false
 (* The response to a malformed request; the connection closes after it. A
    client that already left makes the write raise Flow.Closed, which ends the
    connection like any other network failure. *)
-let error_response ?date w (e : H1_error.t) =
+let error_response ?date ?(meth = Method.GET) w (e : H1_error.t) =
   let status = H1_error.status e in
   let body = Body.of_string (Status.reason status ^ "\n") in
   let r = Response.make ~status ~headers:(Headers.of_list [ ("Content-Type", "text/plain; charset=utf-8") ]) body in
-  let framing = H1_write.framing ~meth:Method.GET ~version:Version.Http_1_1 r in
+  (* A HEAD request gets the head only. *)
+  let framing = H1_write.framing ~meth ~version:Version.Http_1_1 r in
   H1_write.head w ?date ~version:Version.Http_1_1 ~keep_alive:false framing r;
   H1_write.body w framing body;
   `Linger
@@ -72,8 +73,6 @@ let upgrade_error (head : H1_parse.head) response =
   then Some (Format.asprintf "2xx upgrade to a %a request" Method.pp head.meth)
   else None
 
-let never () = false
-
 let internal_error () =
   Response.string ~status:Status.internal_server_error "Internal Server Error\n"
 
@@ -90,6 +89,14 @@ let serve : Engine.t =
         Flow.set_read_deadline flow (!read_deadline ());
         Flow.read flow buf off len)
   in
+  (* Discarding a request body the handler left unread gets one deadline for
+     all of it, as lingering does: renewed per read, a client trickling bytes
+     could keep the connection for days. *)
+  let drain body =
+    let deadline = after config.read_timeout () in
+    read_deadline := (fun () -> deadline);
+    H1_body.drain body ~max:config.max_drain
+  in
   let w =
     Buf_writer.make ~size:config.buffer_size (fun buf off len ->
         Flow.set_write_deadline flow (after config.write_timeout ());
@@ -98,6 +105,7 @@ let serve : Engine.t =
   let scheme = match Conn_info.scheme ctx.conn with `Http -> "http" | `Https -> "https" in
   let report e = config.on_error e (Printexc.get_raw_backtrace ()) in
   let date () = if config.date_header then Some (Date.now ()) else None in
+  let error ?meth e = error_response ?date:(date ()) ?meth w e in
   (* Waits at most [idle] for the next request. A stopping server takes no
      new request, even one already received. *)
   let rec next_request ~idle =
@@ -113,87 +121,84 @@ let serve : Engine.t =
   and exchange () =
     let head_deadline = after config.header_timeout () in
     read_deadline := (fun () -> head_deadline);
-    match
-      let head = H1_parse.request_head limits r in
-      let framing = H1_parse.request_framing head in
-      let target = H1_parse.request_target ~scheme head in
-      if expectation head = `Unknown then raise (H1_error.E H1_error.Expectation_failed);
-      (head, framing, target)
-    with
+    match H1_parse.request_head limits r with
     | exception Buf_reader.Eof -> `Close (* the client left in the middle of a request *)
-    | exception Flow.Timeout -> error_response ?date:(date ()) w H1_error.Request_timeout
-    | exception H1_error.E e -> error_response ?date:(date ()) w e
-    | head, framing, target -> (
-        read_deadline := after config.read_timeout;
-        let committed = ref false and continue_sent = ref false in
-        let expect_continue =
-          if not (expects_continue head)
-          then None
-          else
-          Some
-            (fun () ->
-               if not !committed
-               then begin
-                 continue_sent := true;
-                 (* A client that cannot take it left. *)
-                 try
-                   Buf_writer.write_string w "HTTP/1.1 100 Continue\r\n\r\n";
-                   Buf_writer.flush w
-                 with Flow.Closed | Flow.Timeout -> raise Body.Truncated
-               end)
-        in
-        match H1_body.make ?max_body:config.max_body ?expect_continue ~limits r framing with
-        | exception H1_error.E e -> error_response ?date:(date ()) w e
-        | body -> respond head target body ~committed ~continue_sent)
-  and respond (head : H1_parse.head) (target : H1_parse.target) body ~committed ~continue_sent =
+    | exception Flow.Timeout -> error H1_error.Request_timeout
+    | exception H1_error.E e -> error e
+    | head -> (
+        match
+          let framing = H1_parse.request_framing head in
+          let target = H1_parse.request_target ~scheme head in
+          if expectation head = `Unknown then raise (H1_error.E H1_error.Expectation_failed);
+          (framing, target)
+        with
+        | exception H1_error.E e -> error ~meth:head.meth e
+        | framing, target -> (
+            read_deadline := after config.read_timeout;
+            let committed = ref false in
+            let expect_continue =
+              if not (expects_continue head)
+              then None
+              else
+              Some
+                (fun () ->
+                   (* A client that cannot take it left. *)
+                   if not !committed
+                   then
+                     try
+                       Buf_writer.write_string w "HTTP/1.1 100 Continue\r\n\r\n";
+                       Buf_writer.flush w
+                     with Flow.Closed | Flow.Timeout -> raise Body.Truncated)
+            in
+            match H1_body.make ?max_body:config.max_body ?expect_continue ~limits r framing with
+            | exception H1_error.E e -> error ~meth:head.meth e
+            | body -> respond head target body ~committed))
+  and respond (head : H1_parse.head) (target : H1_parse.target) body ~committed =
     let req =
       Request.make ~version:head.version ~scheme:target.scheme ?authority:target.authority
         ~headers:head.headers ~body:(H1_body.body body) ~conn:ctx.conn head.meth target.path
     in
     match await (Fun.Async.call (fun () -> handler req)) body with
-    | exception H1_error.E e -> error_response ?date:(date ()) w e (* a malformed request body *)
-    | exception Body.Truncated -> `Close (* the client left *)
+    (* Only the request's own body failing is the client's doing: the same
+       exceptions from the handler's other flows, an upstream, are errors. *)
+    | exception H1_error.E e when H1_body.failed body ->
+        error ~meth:head.meth e
+    | exception Body.Truncated when H1_body.failed body -> `Close (* the client left *)
     | exception e when not (is_fatal e) ->
         report e;
-        ignore (write ~keep_alive:never head (internal_error ()));
-        `Linger
+        fail_500 head
     | `Disconnected -> `Close
     | `Response response -> (
         match Response.kind response with
         | Response.Upgrade f -> (
-            let fail () = ignore (write ~keep_alive:never head (internal_error ())) in
             match upgrade_error head response with
-            | Some e -> report (Failure ("Response.upgrade: " ^ e)); fail (); `Linger
+            | Some e -> report (Failure ("Response.upgrade: " ^ e)); fail_500 head
             (* What follows the request body is the new protocol's. *)
-            | None when not (H1_body.drain body ~max:config.max_drain) -> fail (); `Linger
+            | None when not (drain body) -> fail_500 head
             | None ->
-                ignore (write ~committed ~keep_alive:(fun () -> true) head response);
+                ignore (write ~committed ~body ~keep_alive:(fun () -> true) head response);
                 switch f)
         (* RFC 9110 §9.3.6: a 2xx to CONNECT opens a tunnel. *)
         | Response.Body _
           when Method.equal head.meth Method.CONNECT
             && Status.kind (Response.status response) = `Success ->
             report (Failure "a 2xx response to CONNECT must be a Response.upgrade");
-            ignore (write ~keep_alive:never head (internal_error ()));
-            `Linger
+            fail_500 head
         | Response.Body _ ->
             (* Decided when the head is written, which a streamed response
                delays until its first output: it may read the request body
                first, and get a 100 Continue sent. Whether an unread body
                can be drained is only known once the response is written. *)
             let keep_alive () =
-              let continue_owed =
-                expects_continue head && (not !continue_sent) && not (H1_body.is_complete body)
-              in
               request_keep_alive head
               && (not (H1_write.wants_close response))
-              && (not continue_owed)
+              && (not (H1_body.continue_owed body))
               (* Its framing cannot be trusted any more. *)
               && (not (H1_body.failed body))
               && not (ctx.is_stopping ())
             in
-            if write ~committed ~keep_alive head response
-            && H1_body.drain body ~max:config.max_drain
+            if write ~committed ~body ~keep_alive head response
+            && drain body
             then begin
               Fun.Async.yield ();
               next_request ~idle:config.idle_timeout
@@ -237,11 +242,16 @@ let serve : Engine.t =
     | () | (exception (Flow.Closed | Flow.Timeout)) -> ()
     | exception e when not (is_fatal e) -> report e);
     `Close
+  (* A 500, and the connection ends. *)
+  and fail_500 head =
+    ignore (write ~keep_alive:(fun () -> false) head (internal_error ()));
+    `Linger
   (* Writes [response]; [true] iff it was written in full and the connection
      can stay open, or switch protocols. The head is written, and [committed]
      set, just before the body's first output; [keep_alive ()] is asked
      then. Until that point a failing body can still be answered properly. *)
-  and write ?(committed = ref false) ~keep_alive (head : H1_parse.head) response =
+  and write ?(committed = ref false) ?body ~keep_alive (head : H1_parse.head) response =
+    let request_failed () = Option.fold ~none:false ~some:H1_body.failed body in
     let framing = H1_write.framing ~meth:head.meth ~version:head.version response in
     let kept_alive = ref false in
     let write_head () =
@@ -252,25 +262,28 @@ let serve : Engine.t =
     (* A response cut short after its head. Chunked and Content-Length
        framings show it, but a close-delimited body would look complete
        after a clean close: reset the connection instead. *)
-    let cut_short () = if framing = H1_write.Close_delimited then Flow.reset flow in
     match Response.kind response with
     | Response.Upgrade _ -> write_head (); Buf_writer.flush w; true
     | Response.Body b -> (
         match H1_write.body ~before:write_head w framing b with
         | () -> !kept_alive
-        | exception ((Flow.Closed | Flow.Timeout) as e) -> raise e
-        (* A request body that the response streams was cut short or is
-           malformed: the client's fault, not the server's. *)
-        | exception Body.Truncated -> if !committed then cut_short (); false
-        | exception H1_error.E e ->
-            if !committed then cut_short () else ignore (error_response ?date:(date ()) w e);
-            false
-        | exception e when not (is_fatal e) ->
-            report e;
-            if !committed
-            then cut_short ()
-            else ignore (write ~keep_alive:never head (internal_error ()));
-            false)
+        | exception e -> (
+            let bt = Printexc.get_raw_backtrace () in
+            (* Cut short after its head, whatever the cause: a failing
+               body, a write timeout, a cancellation. *)
+            if !committed && framing = H1_write.Close_delimited then Flow.reset flow;
+            match e with
+            | Flow.Closed | Flow.Timeout | Fun.Async.Cancelled -> Printexc.raise_with_backtrace e bt
+            (* A request body that the response streams was cut short or is
+               malformed: the client's fault, not the server's. *)
+            | Body.Truncated when request_failed () -> false
+            | H1_error.E e when request_failed () ->
+                if not !committed then ignore (error ~meth:head.meth e);
+                false
+            | e ->
+                config.on_error e bt;
+                if not !committed then ignore (fail_500 head);
+                false))
   in
   try
     match next_request ~idle:config.header_timeout with
