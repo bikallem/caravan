@@ -206,14 +206,17 @@ let is_complete t = match t.src with None -> true | Some src -> src.finished ()
 let unread t = match t.src with None -> Some 0 | Some src -> src.unread ()
 let failed t = match t.src with None -> false | Some src -> src.failed ()
 
+let continue_owed t =
+  match !(t.continue) with Expected _ -> not (is_complete t) | No_expectation | Sent -> false
+
 let drain t ~max =
-  match t.src, !(t.continue) with
-  | None, _ -> true
-  | Some src, _ when src.failed () -> false
-  | Some src, _ when src.finished () -> true
-  | Some _, Expected _ -> false (* the client may be holding the body back *)
-  | Some src, _ when Option.fold ~none:false ~some:(fun n -> n > max) (src.unread ()) -> false
-  | Some src, (No_expectation | Sent) ->
+  match t.src with
+  | None -> true
+  | Some src when src.failed () -> false
+  | Some src when src.finished () -> true
+  | Some _ when continue_owed t -> false (* the client may be holding the body back *)
+  | Some src when Option.fold ~none:false ~some:(fun n -> n > max) (src.unread ()) -> false
+  | Some src ->
       (* [max] bounds the bytes taken from the connection, framing
          included, so that chunk extensions cannot stretch it. *)
       let buf = Bytes.create 4096 and start = Buf_reader.consumed t.r in

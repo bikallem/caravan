@@ -136,27 +136,25 @@ let serve : Engine.t =
         | exception H1_error.E e -> error_response ?date:(date ()) ~meth:head.meth w e
         | framing, target -> (
             read_deadline := after config.read_timeout;
-            let committed = ref false and continue_sent = ref false in
+            let committed = ref false in
             let expect_continue =
               if not (expects_continue head)
               then None
               else
               Some
                 (fun () ->
+                   (* A client that cannot take it left. *)
                    if not !committed
-                   then begin
-                     continue_sent := true;
-                     (* A client that cannot take it left. *)
+                   then
                      try
                        Buf_writer.write_string w "HTTP/1.1 100 Continue\r\n\r\n";
                        Buf_writer.flush w
-                     with Flow.Closed | Flow.Timeout -> raise Body.Truncated
-                   end)
+                     with Flow.Closed | Flow.Timeout -> raise Body.Truncated)
             in
             match H1_body.make ?max_body:config.max_body ?expect_continue ~limits r framing with
             | exception H1_error.E e -> error_response ?date:(date ()) ~meth:head.meth w e
-            | body -> respond head target body ~committed ~continue_sent))
-  and respond (head : H1_parse.head) (target : H1_parse.target) body ~committed ~continue_sent =
+            | body -> respond head target body ~committed))
+  and respond (head : H1_parse.head) (target : H1_parse.target) body ~committed =
     let req =
       Request.make ~version:head.version ~scheme:target.scheme ?authority:target.authority
         ~headers:head.headers ~body:(H1_body.body body) ~conn:ctx.conn head.meth target.path
@@ -196,12 +194,9 @@ let serve : Engine.t =
                first, and get a 100 Continue sent. Whether an unread body
                can be drained is only known once the response is written. *)
             let keep_alive () =
-              let continue_owed =
-                expects_continue head && (not !continue_sent) && not (H1_body.is_complete body)
-              in
               request_keep_alive head
               && (not (H1_write.wants_close response))
-              && (not continue_owed)
+              && (not (H1_body.continue_owed body))
               (* Its framing cannot be trusted any more. *)
               && (not (H1_body.failed body))
               && not (ctx.is_stopping ())

@@ -924,11 +924,15 @@ let handle_tests =
           is_true (not (H1_body.drain t ~max:100)));
       test "drain refuses while 100 Continue is owed" (fun () ->
           let r, t = handle ~expect_continue:ignore ("hello" ^ next) (Fixed 5) in
+          is_true ~msg:"owed before the first read" (H1_body.continue_owed t);
           is_true (not (H1_body.drain t ~max:100));
           equal int 0 (Buf_reader.consumed r);
           let r, t = handle ~expect_continue:ignore ("hello" ^ next) (Fixed 5) in
           ignore (Body.read (H1_body.body t) (Bytes.create 1) 0 1);
+          is_true ~msg:"sent on the first read" (not (H1_body.continue_owed t));
           is_true (H1_body.drain t ~max:100);
+          let _, t = handle ~expect_continue:ignore "" (Fixed 0) in
+          is_true ~msg:"not owed for an empty body" (not (H1_body.continue_owed t));
           equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100));
       test "drain works after the handler closed the body" (fun () ->
           let r, t = handle ("hello" ^ next) (Fixed 5) in
