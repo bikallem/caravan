@@ -73,8 +73,6 @@ let upgrade_error (head : H1_parse.head) response =
   then Some (Format.asprintf "2xx upgrade to a %a request" Method.pp head.meth)
   else None
 
-let never () = false
-
 let internal_error () =
   Response.string ~status:Status.internal_server_error "Internal Server Error\n"
 
@@ -107,6 +105,7 @@ let serve : Engine.t =
   let scheme = match Conn_info.scheme ctx.conn with `Http -> "http" | `Https -> "https" in
   let report e = config.on_error e (Printexc.get_raw_backtrace ()) in
   let date () = if config.date_header then Some (Date.now ()) else None in
+  let error ?meth e = error_response ?date:(date ()) ?meth w e in
   (* Waits at most [idle] for the next request. A stopping server takes no
      new request, even one already received. *)
   let rec next_request ~idle =
@@ -124,8 +123,8 @@ let serve : Engine.t =
     read_deadline := (fun () -> head_deadline);
     match H1_parse.request_head limits r with
     | exception Buf_reader.Eof -> `Close (* the client left in the middle of a request *)
-    | exception Flow.Timeout -> error_response ?date:(date ()) w H1_error.Request_timeout
-    | exception H1_error.E e -> error_response ?date:(date ()) w e
+    | exception Flow.Timeout -> error H1_error.Request_timeout
+    | exception H1_error.E e -> error e
     | head -> (
         match
           let framing = H1_parse.request_framing head in
@@ -133,7 +132,7 @@ let serve : Engine.t =
           if expectation head = `Unknown then raise (H1_error.E H1_error.Expectation_failed);
           (framing, target)
         with
-        | exception H1_error.E e -> error_response ?date:(date ()) ~meth:head.meth w e
+        | exception H1_error.E e -> error ~meth:head.meth e
         | framing, target -> (
             read_deadline := after config.read_timeout;
             let committed = ref false in
@@ -152,7 +151,7 @@ let serve : Engine.t =
                      with Flow.Closed | Flow.Timeout -> raise Body.Truncated)
             in
             match H1_body.make ?max_body:config.max_body ?expect_continue ~limits r framing with
-            | exception H1_error.E e -> error_response ?date:(date ()) ~meth:head.meth w e
+            | exception H1_error.E e -> error ~meth:head.meth e
             | body -> respond head target body ~committed))
   and respond (head : H1_parse.head) (target : H1_parse.target) body ~committed =
     let req =
@@ -163,21 +162,19 @@ let serve : Engine.t =
     (* Only the request's own body failing is the client's doing: the same
        exceptions from the handler's other flows, an upstream, are errors. *)
     | exception H1_error.E e when H1_body.failed body ->
-        error_response ?date:(date ()) ~meth:head.meth w e
+        error ~meth:head.meth e
     | exception Body.Truncated when H1_body.failed body -> `Close (* the client left *)
     | exception e when not (is_fatal e) ->
         report e;
-        ignore (write ~keep_alive:never head (internal_error ()));
-        `Linger
+        fail_500 head
     | `Disconnected -> `Close
     | `Response response -> (
         match Response.kind response with
         | Response.Upgrade f -> (
-            let fail () = ignore (write ~keep_alive:never head (internal_error ())) in
             match upgrade_error head response with
-            | Some e -> report (Failure ("Response.upgrade: " ^ e)); fail (); `Linger
+            | Some e -> report (Failure ("Response.upgrade: " ^ e)); fail_500 head
             (* What follows the request body is the new protocol's. *)
-            | None when not (drain body) -> fail (); `Linger
+            | None when not (drain body) -> fail_500 head
             | None ->
                 ignore (write ~committed ~body ~keep_alive:(fun () -> true) head response);
                 switch f)
@@ -186,8 +183,7 @@ let serve : Engine.t =
           when Method.equal head.meth Method.CONNECT
             && Status.kind (Response.status response) = `Success ->
             report (Failure "a 2xx response to CONNECT must be a Response.upgrade");
-            ignore (write ~keep_alive:never head (internal_error ()));
-            `Linger
+            fail_500 head
         | Response.Body _ ->
             (* Decided when the head is written, which a streamed response
                delays until its first output: it may read the request body
@@ -246,6 +242,10 @@ let serve : Engine.t =
     | () | (exception (Flow.Closed | Flow.Timeout)) -> ()
     | exception e when not (is_fatal e) -> report e);
     `Close
+  (* A 500, and the connection ends. *)
+  and fail_500 head =
+    ignore (write ~keep_alive:(fun () -> false) head (internal_error ()));
+    `Linger
   (* Writes [response]; [true] iff it was written in full and the connection
      can stay open, or switch protocols. The head is written, and [committed]
      set, just before the body's first output; [keep_alive ()] is asked
@@ -278,11 +278,11 @@ let serve : Engine.t =
                malformed: the client's fault, not the server's. *)
             | Body.Truncated when request_failed () -> false
             | H1_error.E e when request_failed () ->
-                if not !committed then ignore (error_response ?date:(date ()) ~meth:head.meth w e);
+                if not !committed then ignore (error ~meth:head.meth e);
                 false
             | e ->
                 config.on_error e bt;
-                if not !committed then ignore (write ~keep_alive:never head (internal_error ()));
+                if not !committed then ignore (fail_500 head);
                 false))
   in
   try
