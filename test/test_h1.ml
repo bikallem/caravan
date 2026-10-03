@@ -729,19 +729,30 @@ let chunked_tests =
             "5\r\nhello"
             => truncated
             |});
-      test "max_body" (fun () ->
+      test "max_body counts the body as sent, framing included" (fun () ->
+          (* 18 bytes: two 5-byte chunks fit with their framing (3 + 7 + 3 +
+             5), a 6-byte one does not. *)
           expect
-            (chunked_table ~max_body:10
+            (chunked_table ~max_body:18
                [ "5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n"; "5\r\nhello\r\n6\r\nworld!\r\n0\r\n\r\n";
-                 "b\r\n" ])
+                 "10\r\n";
+                 (* Two bytes of data, but a long chunk extension. *)
+                 "1;aaaaaaaaaaaa\r\nx\r\n1\r\ny\r\n0\r\n\r\n" ])
           @@ __POS_OF__ {|
             "5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n"
             => "helloworld" rest ""
             "5\r\nhello\r\n6\r\nworld!\r\n0\r\n\r\n"
             => 413 Content Too Large
-            "b\r\n"
+            "10\r\n"
+            => 413 Content Too Large
+            "1;aaaaaaaaaaaa\r\nx\r\n1\r\ny\r\n0\r\n\r\n"
             => 413 Content Too Large
             |});
+      test "max_body counts from the body's start, not the connection's" (fun () ->
+          (* A request head comes first on a real connection. *)
+          let r = Buf_reader.of_string ("GET / HTTP/1.1\r\n" ^ "5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n") in
+          ignore (Buf_reader.read_line r ~max:100);
+          equal string "helloworld" (Body.to_string (H1_body.chunked ~max_body:18 ~limits r)));
       test "make: framing and max_body" (fun () ->
           let reads = ref 0 in
           let r = Buf_reader.make (fun _ _ _ -> incr reads; 0) in
@@ -850,8 +861,21 @@ let handle_tests =
           let read = Body.read (H1_body.body t) (Bytes.create 4) 0 4 in
           is_true (H1_body.drain t ~max:(11 - read));
           equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100);
+          (* 32 bytes as sent, framing and trailer included. *)
           let r, t = handle ("5\r\nhello\r\n6\r\n world\r\n0\r\nX: y\r\n\r\n" ^ next) Chunked in
-          is_true (H1_body.drain t ~max:11);
+          is_true (H1_body.drain t ~max:32);
+          equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100));
+      test "drain counts chunk extensions" (fun () ->
+          (* Ten bytes of data in 1-byte chunks, each with a 100-byte
+             extension: about 1.1 KiB as sent. *)
+          let ext = ";" ^ String.make 99 'e' in
+          let body =
+            String.concat "" (List.init 10 (fun _ -> "1" ^ ext ^ "\r\nx\r\n")) ^ "0\r\n\r\n"
+          in
+          let _, t = handle (body ^ next) Chunked in
+          is_true ~msg:"500 bytes are not enough" (not (H1_body.drain t ~max:500));
+          let r, t = handle (body ^ next) Chunked in
+          is_true ~msg:"2000 are" (H1_body.drain t ~max:2000);
           equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100));
       test "drain gives up past max" (fun () ->
           let _, t = handle ~chunk:3 ("hello world" ^ next) (Fixed 11) in

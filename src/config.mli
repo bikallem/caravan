@@ -20,10 +20,12 @@ type t = {
   max_header_count : int; (** More header fields get 431. *)
   max_body : int option;
   (** Larger request bodies get 413 (or end the connection once the response
-      has started). [None] for no limit. *)
+      has started). A chunked body counts as sent, framing included.
+      [None] for no limit. *)
   max_drain : int;
   (** At most this many bytes of a request body that the handler did not read
-      are discarded to keep the connection open; larger ones close it. *)
+      are discarded to keep the connection open, chunk framing included;
+      larger ones close it. *)
   header_timeout : Affect_unix.Mtime.Span.t;
   (** Time allowed to receive a request head, and for a new connection to
       start its first one. A head that is late gets 408. *)

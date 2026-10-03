@@ -100,8 +100,12 @@ let chunk_size line =
 
 let max_chunk_line = 4096
 
+(* [max_body] bounds the body's bytes as sent, framing included: chunk
+   extensions could otherwise carry any amount of bytes in tiny chunks. *)
 let chunked_source ?(max_body = max_int) ~(limits : H1_parse.limits) r =
-  let state = ref `Size and total = ref 0 and trailers = ref Headers.empty in
+  let state = ref `Size and trailers = ref Headers.empty in
+  let start = Buf_reader.consumed r in
+  let sent () = Buf_reader.consumed r - start in
   let no_eof f = try f () with Buf_reader.Eof -> raise Body.Truncated in
   let line ~max ~error =
     no_eof (fun () ->
@@ -123,14 +127,13 @@ let chunked_source ?(max_body = max_int) ~(limits : H1_parse.limits) r =
           0
         end
         else begin
-          if n > max_body - !total then fail H1_error.Content_too_large;
+          if n > max_body - sent () then fail H1_error.Content_too_large;
           state := `Data n;
           read buf off len
         end
     | `Data n ->
         let k = Buf_reader.read_into r buf off (Int.min len n) in
         if k = 0 then raise Body.Truncated;
-        total := !total + k;
         if k = n
         then begin
           ignore (line ~max:0 ~error:"missing CRLF after chunk data");
@@ -153,6 +156,7 @@ let chunked ?max_body ~limits r = to_body (chunked_source ?max_body ~limits r)
 type continue = No_expectation | Expected of (unit -> unit) | Sent
 
 type t = {
+  r : Buf_reader.t;
   mutable body : Body.t;
   src : source option;
   mutable continue : continue;
@@ -172,7 +176,7 @@ let make ?max_body ?expect_continue ~limits r (framing : H1_parse.framing) =
   let continue =
     match expect_continue with None -> No_expectation | Some f -> Expected f
   in
-  let t = { body = Body.empty; src; continue; completed = Affect.Cell.Once.make () } in
+  let t = { r; body = Body.empty; src; continue; completed = Affect.Cell.Once.make () } in
   match src with
   | None -> Affect.Cell.Once.try_set t.completed (); t
   | Some src ->
@@ -210,11 +214,14 @@ let drain t ~max =
   | Some _, Expected _ -> false (* the client may be holding the body back *)
   | Some src, _ when Option.fold ~none:false ~some:(fun n -> n > max) (src.unread ()) -> false
   | Some src, (No_expectation | Sent) ->
-      let buf = Bytes.create 4096 in
-      let rec discard left =
-        match src.read buf 0 (if left < Bytes.length buf then left + 1 else Bytes.length buf) with
+      (* [max] bounds the bytes taken from the connection, framing
+         included, so that chunk extensions cannot stretch it. *)
+      let buf = Bytes.create 4096 and start = Buf_reader.consumed t.r in
+      let rec discard () =
+        let left = max - (Buf_reader.consumed t.r - start) in
+        left >= 0
+        && match src.read buf 0 (1 + Int.min (Bytes.length buf - 1) left) with
         | 0 -> true
-        | n when n > left -> false
-        | n -> discard (left - n)
+        | _ -> discard ()
       in
-      (try discard max with Body.Truncated | H1_error.E _ -> false)
+      (try discard () with Body.Truncated | H1_error.E _ -> false)

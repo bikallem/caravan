@@ -18,8 +18,8 @@ val chunked : ?max_body:int -> limits:H1_parse.limits -> Buf_reader.t -> Body.t
 
     Reads raise {!H1_error.E} with {!H1_error.Bad_request} on malformed
     framing, with {!H1_error.Content_too_large} when a chunk would take the
-    body past [max_body] bytes (default: no limit), and {!Body.Truncated} if
-    [r] ends first. *)
+    body past [max_body] bytes as sent, chunk framing included (default: no
+    limit), and {!Body.Truncated} if [r] ends first. *)
 
 (** {1:handle Request body handles} *)
 
@@ -70,7 +70,8 @@ val failed : t -> bool
 val drain : t -> max:int -> bool
 (** [drain t ~max] reads and discards what remains of the body, so that the
     next request on the connection can be read. It is [true] iff the
-    connection can be reused: the body ended within [max] more bytes. It is
+    connection can be reused: the body ended within [max] more bytes, counted
+    as sent, chunk framing included. It is
     [false], and the connection must close, if more remains, if the framing
     is malformed or truncated, if a read already {!failed}, or if
     [100-continue] was expected but never
