@@ -173,7 +173,10 @@ let serve : Engine.t =
             let keep_alive =
               request_keep_alive head
               && (not (H1_write.wants_close response))
-              && (not continue_owed) && not (ctx.is_stopping ())
+              && (not continue_owed)
+              (* Its framing cannot be trusted any more. *)
+              && (not (H1_body.failed body))
+              && not (ctx.is_stopping ())
             in
             committed := true;
             if write ~keep_alive head response && H1_body.drain body ~max:config.max_drain

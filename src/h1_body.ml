@@ -2,15 +2,38 @@ let fail e = raise (H1_error.E e)
 let bad s = fail (H1_error.Bad_request s)
 
 (* A body as read from the connection: [read] has [Body.of_source]'s
-   contract, [finished ()] is true once the body was read to its end, and
-   [unread ()] is the number of bytes left, if known. *)
+   contract, [finished ()] is true once the body was read to its end,
+   [unread ()] is the number of bytes left, if known, and [failed ()] is true
+   once a read raised. *)
 type source = {
   read : bytes -> int -> int -> int;
   finished : unit -> bool;
   unread : unit -> int option;
+  failed : unit -> bool;
   trailers : unit -> Headers.t;
   length : int option;
 }
+
+(* A read that raised can leave the framing half consumed: reading on would
+   take the rest of a malformed body as framing, and what follows it as the
+   next request. So the first error is final: later reads raise it again, and
+   the body never counts as finished. *)
+let fail_for_good src =
+  let error = ref None in
+  let read buf off len =
+    match !error with
+    | Some (e, bt) -> Printexc.raise_with_backtrace e bt
+    | None -> (
+        try src.read buf off len
+        with e ->
+          let bt = Printexc.get_raw_backtrace () in
+          error := Some (e, bt);
+          Printexc.raise_with_backtrace e bt)
+  in
+  let ok () = Option.is_none !error in
+  { src with read; finished = (fun () -> ok () && src.finished ());
+             unread = (fun () -> if ok () then src.unread () else None);
+             failed = (fun () -> not (ok ())) }
 
 let fixed_source r n =
   let remaining = ref n in
@@ -23,8 +46,9 @@ let fixed_source r n =
       | k -> remaining := !remaining - k; k
     end
   in
-  { read; finished = (fun () -> !remaining = 0); unread = (fun () -> Some !remaining);
-    trailers = (fun () -> Headers.empty); length = Some n }
+  fail_for_good
+    { read; finished = (fun () -> !remaining = 0); unread = (fun () -> Some !remaining);
+      failed = (fun () -> false); trailers = (fun () -> Headers.empty); length = Some n }
 
 
 (* Chunk size line, RFC 9112 §7.1.1:
@@ -116,8 +140,9 @@ let chunked_source ?(max_body = max_int) ~(limits : H1_parse.limits) r =
         k
   in
   let finished () = !state = `Done in
-  { read; finished; unread = (fun () -> if finished () then Some 0 else None);
-    trailers = (fun () -> !trailers); length = None }
+  fail_for_good
+    { read; finished; unread = (fun () -> if finished () then Some 0 else None);
+      failed = (fun () -> false); trailers = (fun () -> !trailers); length = None }
 
 let to_body src = Body.of_source ?length:src.length ~trailers:src.trailers src.read
 let fixed r n = to_body (fixed_source r n)
@@ -168,10 +193,12 @@ let body t = t.body
 let completed t = Affect.Cell.Once.get' t.completed
 let is_complete t = match t.src with None -> true | Some src -> src.finished ()
 let unread t = match t.src with None -> Some 0 | Some src -> src.unread ()
+let failed t = match t.src with None -> false | Some src -> src.failed ()
 
 let drain t ~max =
   match t.src, t.continue with
   | None, _ -> true
+  | Some src, _ when src.failed () -> false
   | Some src, _ when src.finished () -> true
   | Some _, Expected _ -> false (* the client may be holding the body back *)
   | Some src, _ when Option.fold ~none:false ~some:(fun n -> n > max) (src.unread ()) -> false

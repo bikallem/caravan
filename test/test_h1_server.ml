@@ -54,6 +54,11 @@ let handler req =
   then Response.upgrade ~status:Status.ok echo_upgraded
   else
   match Request.path_only req with
+  | "/swallow" -> (
+      (* A handler that answers a body it cannot read itself. *)
+      match Body.to_string (Request.body req) with
+      | s -> Response.string s
+      | exception _ -> Response.string ~status:Status.bad_request "unreadable body\n")
   | "/slow" -> slowly ~read:false req
   | "/read-slow" -> slowly ~read:true req
   | "/slow-cleanup-fails" -> (
@@ -735,5 +740,69 @@ let disconnect_tests =
       test "a client that leaves after its body was read cancels its handler" (fun () ->
           expect (show ~watch:true (post "/read-slow" "hello")) @@ __POS_OF__ {| [handler cancelled] |}) ]
 
+(* A request smuggled in a malformed chunked body must never be served, even
+   when the handler swallows the body error and answers. *)
+let smuggling_tests =
+  let chunked_post body =
+    "POST /swallow HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n" ^ body
+  in
+  let smuggled = "GET /smuggled HTTP/1.1\r\nHost: a\r\n\r\n" in
+  let config = { Config.default with date_header = false; max_body = Some 100 } in
+  let contains s sub =
+    let n = String.length s and m = String.length sub in
+    let rec at i = i + m <= n && (String.sub s i m = sub || at (i + 1)) in
+    at 0
+  in
+  (* The ways a chunked body can go wrong in the middle, each followed by
+     what an attacker wants read as the next request. *)
+  let malformed =
+    Gen.of_list
+      ~pp:(fun ppf s -> Format.fprintf ppf "%S" s)
+      [ "zz\r\n0\r\n\r\n" ^ smuggled;
+        "-1\r\n0\r\n\r\n" ^ smuggled;
+        "3\r\nabcX0\r\n\r\n" ^ smuggled;
+        "3;=\r\nabc\r\n0\r\n\r\n" ^ smuggled;
+        "1000000000000000\r\n0\r\n\r\n" ^ smuggled;
+        (* Over max_body: the data is the smuggled request. *)
+        Printf.sprintf "%x\r\n0\r\n\r\n%s%s\r\n0\r\n\r\n" 200 smuggled
+          (String.make (200 - 5 - String.length smuggled) 'x') ]
+  in
+  group "H1_server smuggling"
+    [ test "a bad chunk size line ends the connection after the handler's answer" (fun () ->
+          expect (show (chunked_post ("zz\r\n0\r\n\r\n" ^ smuggled))) @@ __POS_OF__ {|
+            HTTP/1.1 400 Bad Request\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 16\r\n
+            Connection: close\r\n
+            \r\n
+            unreadable body
+            [FIN]
+            |});
+      test "a chunk over max_body ends the connection after the handler's answer" (fun () ->
+          let data = "0\r\n\r\n" ^ smuggled in
+          let body =
+            Printf.sprintf "c8\r\n%s%s\r\n0\r\n\r\n" data (String.make (200 - String.length data) 'x')
+          in
+          expect (show ~config (chunked_post body)) @@ __POS_OF__ {|
+            HTTP/1.1 400 Bad Request\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 16\r\n
+            Connection: close\r\n
+            \r\n
+            unreadable body
+            [FIN]
+            |});
+      prop "no request smuggled in a malformed chunked body is ever served"
+        Gen.(triple (list ~size:(int_range 0 3) (int_range 1 9)) malformed (int_range 1 64))
+        (fun (sizes, bad, chunk) ->
+           let valid =
+             String.concat "" (List.map (fun n -> Printf.sprintf "%x\r\n%s\r\n" n (String.make n 'x')) sizes)
+           in
+           let out, _ = serve ~config ~chunk (chunked_post (valid ^ bad)) in
+           (* The default handler would answer /smuggled with "hello". *)
+           is_true ~msg:out (not (contains out "hello"))) ]
+
 let () =
-  exit (run "h1_server" [ connection_tests; timeout_tests; upgrade_tests; disconnect_tests ])
+  exit
+    (run "h1_server"
+       [ connection_tests; timeout_tests; upgrade_tests; disconnect_tests; smuggling_tests ])

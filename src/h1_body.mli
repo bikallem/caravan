@@ -58,11 +58,17 @@ val unread : t -> int option
 (** [unread t] is the number of bytes of the body left to read, if known: for
     a [Content-Length] body, or a body read to its end. *)
 
+val failed : t -> bool
+(** [failed t] is [true] once a read of the body raised: the framing was
+    malformed or truncated, or the connection failed. Later reads raise the
+    same error again, and the connection cannot be reused. *)
+
 val drain : t -> max:int -> bool
 (** [drain t ~max] reads and discards what remains of the body, so that the
     next request on the connection can be read. It is [true] iff the
     connection can be reused: the body ended within [max] more bytes. It is
     [false], and the connection must close, if more remains, if the framing
-    is malformed or truncated, or if [100-continue] was expected but never
+    is malformed or truncated, if a read already {!failed}, or if
+    [100-continue] was expected but never
     sent, because the client may still be holding the body back. Nothing is
     read in that case, or if more than [max] bytes are known to remain. *)

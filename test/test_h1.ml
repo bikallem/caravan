@@ -863,6 +863,23 @@ let handle_tests =
           is_true (not (H1_body.drain t ~max:4096));
           let _, t = handle (String.make 4096 'x') (Fixed 4096) in
           is_true (H1_body.drain t ~max:4096));
+      test "a body whose read failed stays failed" (fun () ->
+          let r, t = handle ("zz\r\n0\r\n\r\n" ^ next) Chunked in
+          let b = H1_body.body t and buf = Bytes.create 8 in
+          let bad () =
+            raises_match (function H1_error.E (Bad_request _) -> true | _ -> false) (fun () ->
+                Body.read b buf 0 8)
+          in
+          bad ();
+          let consumed = Buf_reader.consumed r in
+          bad ();
+          equal int ~msg:"nothing more read" consumed (Buf_reader.consumed r);
+          is_true ~msg:"failed" (H1_body.failed t);
+          is_true ~msg:"not complete" (not (H1_body.is_complete t));
+          is_true ~msg:"not drained" (not (H1_body.drain t ~max:100));
+          equal (option int) ~msg:"unread unknown" None (H1_body.unread t);
+          let _, t = handle "hello" (Fixed 5) in
+          is_true ~msg:"a sound body has not failed" (not (H1_body.failed t)));
       test "drain fails on bad or truncated bodies" (fun () ->
           let _, t = handle "5\r\nhelloX" Chunked in
           is_true (not (H1_body.drain t ~max:100));
