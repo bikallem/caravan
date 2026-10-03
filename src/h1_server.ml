@@ -159,8 +159,10 @@ let serve : Engine.t =
         ~headers:head.headers ~body:(H1_body.body body) ~conn:ctx.conn head.meth target.path
     in
     match await (Fun.Async.call (fun () -> handler req)) body with
-    | exception H1_error.E e -> error_response ?date:(date ()) w e (* a malformed request body *)
-    | exception Body.Truncated -> `Close (* the client left *)
+    (* Only the request's own body failing is the client's doing: the same
+       exceptions from the handler's other flows, an upstream, are errors. *)
+    | exception H1_error.E e when H1_body.failed body -> error_response ?date:(date ()) w e
+    | exception Body.Truncated when H1_body.failed body -> `Close (* the client left *)
     | exception e when not (is_fatal e) ->
         report e;
         ignore (write ~keep_alive:never head (internal_error ()));
@@ -175,7 +177,7 @@ let serve : Engine.t =
             (* What follows the request body is the new protocol's. *)
             | None when not (drain body) -> fail (); `Linger
             | None ->
-                ignore (write ~committed ~keep_alive:(fun () -> true) head response);
+                ignore (write ~committed ~body ~keep_alive:(fun () -> true) head response);
                 switch f)
         (* RFC 9110 §9.3.6: a 2xx to CONNECT opens a tunnel. *)
         | Response.Body _
@@ -200,7 +202,7 @@ let serve : Engine.t =
               && (not (H1_body.failed body))
               && not (ctx.is_stopping ())
             in
-            if write ~committed ~keep_alive head response
+            if write ~committed ~body ~keep_alive head response
             && drain body
             then begin
               Fun.Async.yield ();
@@ -249,7 +251,8 @@ let serve : Engine.t =
      can stay open, or switch protocols. The head is written, and [committed]
      set, just before the body's first output; [keep_alive ()] is asked
      then. Until that point a failing body can still be answered properly. *)
-  and write ?(committed = ref false) ~keep_alive (head : H1_parse.head) response =
+  and write ?(committed = ref false) ?body ~keep_alive (head : H1_parse.head) response =
+    let request_failed () = Option.fold ~none:false ~some:H1_body.failed body in
     let framing = H1_write.framing ~meth:head.meth ~version:head.version response in
     let kept_alive = ref false in
     let write_head () =
@@ -274,8 +277,8 @@ let serve : Engine.t =
             | Flow.Closed | Flow.Timeout | Fun.Async.Cancelled -> Printexc.raise_with_backtrace e bt
             (* A request body that the response streams was cut short or is
                malformed: the client's fault, not the server's. *)
-            | Body.Truncated -> false
-            | H1_error.E e ->
+            | Body.Truncated when request_failed () -> false
+            | H1_error.E e when request_failed () ->
                 if not !committed then ignore (error_response ?date:(date ()) w e);
                 false
             | e ->

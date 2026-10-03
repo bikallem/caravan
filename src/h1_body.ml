@@ -46,9 +46,8 @@ let fixed_source r n =
       | k -> remaining := !remaining - k; k
     end
   in
-  fail_for_good
-    { read; finished = (fun () -> !remaining = 0); unread = (fun () -> Some !remaining);
-      failed = (fun () -> false); trailers = (fun () -> Headers.empty); length = Some n }
+  { read; finished = (fun () -> !remaining = 0); unread = (fun () -> Some !remaining);
+    failed = (fun () -> false); trailers = (fun () -> Headers.empty); length = Some n }
 
 
 (* Chunk size line, RFC 9112 §7.1.1:
@@ -143,13 +142,12 @@ let chunked_source ?(max_body = max_int) ~(limits : H1_parse.limits) r =
         k
   in
   let finished () = !state = `Done in
-  fail_for_good
-    { read; finished; unread = (fun () -> if finished () then Some 0 else None);
-      failed = (fun () -> false); trailers = (fun () -> !trailers); length = None }
+  { read; finished; unread = (fun () -> if finished () then Some 0 else None);
+    failed = (fun () -> false); trailers = (fun () -> !trailers); length = None }
 
 let to_body src = Body.of_source ?length:src.length ~trailers:src.trailers src.read
-let fixed r n = to_body (fixed_source r n)
-let chunked ?max_body ~limits r = to_body (chunked_source ?max_body ~limits r)
+let fixed r n = to_body (fail_for_good (fixed_source r n))
+let chunked ?max_body ~limits r = to_body (fail_for_good (chunked_source ?max_body ~limits r))
 
 (* The request body handle *)
 
@@ -157,14 +155,14 @@ type continue = No_expectation | Expected of (unit -> unit) | Sent
 
 type t = {
   r : Buf_reader.t;
-  mutable body : Body.t;
+  body : Body.t;
   src : source option;
-  mutable continue : continue;
+  continue : continue ref;
   completed : unit Affect.Cell.Once.t; (* set when the handler's reads reach the end *)
 }
 
 let make ?max_body ?expect_continue ~limits r (framing : H1_parse.framing) =
-  let src =
+  let raw =
     match framing with
     | No_body -> None
     | Fixed n ->
@@ -174,31 +172,33 @@ let make ?max_body ?expect_continue ~limits r (framing : H1_parse.framing) =
     | Chunked -> Some (chunked_source ?max_body ~limits r)
   in
   let continue =
-    match expect_continue with None -> No_expectation | Some f -> Expected f
+    ref (match expect_continue with None -> No_expectation | Some f -> Expected f)
   in
-  let t = { r; body = Body.empty; src; continue; completed = Affect.Cell.Once.make () } in
-  match src with
-  | None -> Affect.Cell.Once.try_set t.completed (); t
-  | Some src ->
-      (* The handler's reads send 100 Continue first, if it is expected. A
-         read that times out is the client's fault: 408. A reset connection
-         is a client that left. *)
-      let read buf off len =
-        (match t.continue with
-        | Expected f -> t.continue <- Sent; f ()
-        | No_expectation | Sent -> ());
-        let n =
-          try src.read buf off len with
-          | Flow.Timeout -> fail H1_error.Request_timeout
-          | Flow.Closed -> raise Body.Truncated
-        in
-        if src.finished () then Affect.Cell.Once.try_set t.completed ();
-        n
+  let completed = Affect.Cell.Once.make () in
+  (* Reads send 100 Continue first, if it is expected. A read that times out
+     is the client's fault: 408. A reset connection is a client that left.
+     Whatever fails, fails for good: [failed] then tells that the request is
+     to blame. *)
+  let wrap raw =
+    let read buf off len =
+      (match !continue with
+      | Expected f -> continue := Sent; f ()
+      | No_expectation | Sent -> ());
+      let n =
+        try raw.read buf off len with
+        | Flow.Timeout -> fail H1_error.Request_timeout
+        | Flow.Closed -> raise Body.Truncated
       in
-      t.body <- to_body { src with read };
-      (* [Content-Length: 0]: nothing to read. *)
-      if src.finished () then Affect.Cell.Once.try_set t.completed ();
-      t
+      if raw.finished () then Affect.Cell.Once.try_set completed ();
+      n
+    in
+    fail_for_good { raw with read }
+  in
+  let src = Option.map wrap raw in
+  (* No body, or [Content-Length: 0]: nothing to read. *)
+  if Option.fold ~none:true ~some:(fun src -> src.finished ()) src
+  then Affect.Cell.Once.try_set completed ();
+  { r; body = Option.fold ~none:Body.empty ~some:to_body src; src; continue; completed }
 
 let body t = t.body
 let completed t = Affect.Cell.Once.get' t.completed
@@ -207,7 +207,7 @@ let unread t = match t.src with None -> Some 0 | Some src -> src.unread ()
 let failed t = match t.src with None -> false | Some src -> src.failed ()
 
 let drain t ~max =
-  match t.src, t.continue with
+  match t.src, !(t.continue) with
   | None, _ -> true
   | Some src, _ when src.failed () -> false
   | Some src, _ when src.finished () -> true

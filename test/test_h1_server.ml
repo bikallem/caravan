@@ -65,6 +65,17 @@ let handler req =
       | exception _ -> Response.string ~status:Status.bad_request "unreadable body\n")
   | "/early-hints" -> Response.make ~status:(Status.v 103) Body.empty
   | "/stream-fail" -> Response.stream (fun _ -> failwith "producer")
+  (* Failures of the handler's own upstream, not of the request. *)
+  | "/upstream-truncated" -> raise Body.Truncated
+  | "/upstream-malformed" -> raise (Private.H1_error.E (Bad_request "upstream"))
+  | "/upstream-body-truncated" ->
+      let sent = ref false in
+      Response.make
+        (Body.of_source ~length:10 (fun buf off _ ->
+             if !sent then raise Body.Truncated;
+             sent := true;
+             Bytes.blit_string "abc" 0 buf off 3;
+             3))
   | "/endless" ->
       Response.stream (fun w ->
           Body.Writer.write_string w "first";
@@ -476,6 +487,33 @@ let connection_tests =
             [FIN]
             ! Failure("cut short")
             |});
+      test "the handler's own body errors are server errors, not the client's" (fun () ->
+          expect
+            (String.concat "--"
+               (List.map
+                  (fun p -> show (get p))
+                  [ "/upstream-truncated"; "/upstream-malformed"; "/upstream-body-truncated" ]))
+          @@ __POS_OF__ {|
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Caravan__Body.Truncated--HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! H1_error.E (400 Bad Request (upstream))--HTTP/1.1 200 OK\r\n
+            Content-Length: 10\r\n
+            \r\n
+            abc[FIN]
+            ! Caravan__Body.Truncated
+            |});
       test "a streamed body that fails before any output gets 500" (fun () ->
           expect (show (get "/stream-fail" ^ get "/")) @@ __POS_OF__ {|
             HTTP/1.1 500 Internal Server Error\r\n
@@ -684,7 +722,7 @@ let timeout_tests =
             Content-Type: text/plain; charset=utf-8\r\n
             Content-Length: 7\r\n
             \r\n
-            ignored
+            ignored[FIN]
             |});
       test "a new connection that sends nothing is closed" (fun () ->
           expect (show ~config:quick ~stall:true "") @@ __POS_OF__ {||});
