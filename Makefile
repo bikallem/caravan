@@ -2,7 +2,8 @@ ML_FILES = $(shell find . \( -path ./_build -o -path ./.direnv -o -path ./.git \
 	-o \( -name '*.ml' -o -name '*.mli' \) -print)
 
 # Test suites with mutation results to merge.
-SUITES = test_core test_h1 test_h1_server test_net test_server test_server_stateful
+SUITES = test_core test_h1 test_h1_server test_net test_server test_server_stateful \
+  test_websocket
 
 .PHONY: build fmt test mutate coverage
 
