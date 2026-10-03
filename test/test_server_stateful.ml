@@ -4,7 +4,7 @@
 
 open Windtrap
 open Affect
-open Affect_http
+open Caravan
 open Server_support
 
 (* Request kinds. Chunked bodies are HTTP/1.1 only. /ignore also gets a body

@@ -1,4 +1,4 @@
-(* A small affect-http server.
+(* A small caravan server.
 
    dune exec examples/hello.exe, then try:
      curl -i localhost:8080/hello
@@ -6,12 +6,12 @@
      curl -N localhost:8080/stream
      curl -i localhost:8080/slow *)
 
-open Affect_http
+open Caravan
 module Mtime = Affect_unix.Mtime
 
 let handler req =
   match Request.path_only req with
-  | "/hello" -> Response.string "Hello from affect-http!\n"
+  | "/hello" -> Response.string "Hello from caravan!\n"
   | "/echo" ->
       (* Streams the request body back as it arrives. *)
       let body = Request.body req in

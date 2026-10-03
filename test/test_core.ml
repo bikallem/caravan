@@ -1,5 +1,5 @@
 open Windtrap
-open Affect_http
+open Caravan
 
 let meth = Testable.make ~pp:Method.pp ~equal:Method.equal
 let version = Testable.structural ~pp:Version.pp

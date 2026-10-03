@@ -2,7 +2,7 @@
 
 open Windtrap
 open Affect
-open Affect_http
+open Caravan
 module Mtime = Affect_unix.Mtime
 
 (* Two domains by default, to exercise parallelism. Mutation testing forks a

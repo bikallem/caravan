@@ -1,6 +1,6 @@
 (library
- (name affect_http)
- (public_name affect-http)
+ (name caravan)
+ (public_name caravan)
  (libraries affect affect.unix threads.posix http-date)
  (instrumentation
   (backend ppx_windtrap.mutate))

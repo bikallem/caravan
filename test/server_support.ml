@@ -2,7 +2,7 @@
    client that parses responses. *)
 
 open Affect
-open Affect_http
+open Caravan
 module Mtime = Affect_unix.Mtime
 module Buf_reader = Private.Buf_reader
 

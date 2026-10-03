@@ -1,7 +1,7 @@
 (* Server.run for the signal tests: prints its port, then "started" when a
    request to /slow (300ms) or /stuck (10s) starts, in CRLF lines. *)
 
-open Affect_http
+open Caravan
 module Mtime = Affect_unix.Mtime
 
 let handler req =

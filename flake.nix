@@ -1,5 +1,5 @@
 {
-  description = "affect-http: OCaml 5.5 development environment";
+  description = "caravan: OCaml 5.5 development environment";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

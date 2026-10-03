@@ -22,7 +22,7 @@ type t = {
 }
 
 let print_error exn bt =
-  Printf.eprintf "affect-http: %s\n%s%!" (Printexc.to_string exn)
+  Printf.eprintf "caravan: %s\n%s%!" (Printexc.to_string exn)
     (Printexc.raw_backtrace_to_string bt)
 
 let default =
