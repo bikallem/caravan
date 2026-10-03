@@ -56,6 +56,16 @@ let linger (config : Config.t) flow =
   in
   try discard config.max_drain with Flow.Closed | Flow.Timeout -> ()
 
+(* An action enabled with [tag] at [deadline], at once if it has passed;
+   never for [None]. *)
+let at deadline tag =
+  match deadline with
+  | None -> Action.never
+  | Some d ->
+      let now = Mtime.now () in
+      if Mtime.is_earlier now ~than:d then Mtime.wait_for' (Mtime.span now d) tag
+      else Action.always tag
+
 (* Why [response], an upgrade, cannot answer the request [head], if it
    cannot: RFC 9110 §7.8, §9.3.6 and §15.2.2. *)
 let upgrade_error (head : H1_parse.head) response =
@@ -85,7 +95,7 @@ let serve : Engine.t =
      each read of a body. Each write gets its own. *)
   let read_deadline = ref (fun () -> None) in
   let r =
-    Buf_reader.make ~size:config.buffer_size (fun buf off len ->
+    Buf_reader.make ~size:config.buffer_size ~read_now:(Flow.read_now flow) (fun buf off len ->
         Flow.set_read_deadline flow (!read_deadline ());
         Flow.read flow buf off len)
   in
@@ -113,11 +123,19 @@ let serve : Engine.t =
     then (if Buf_reader.buffered r > 0 then `Linger else `Close)
     else if Buf_reader.buffered r > 0
     then exchange ()
-    else
+    else wait_for_input (after idle ())
+  (* A wakeup can find nothing to read: readiness can be stale, or a TLS
+     record incomplete. Then the wait goes on, to the same deadline; a
+     blocking read would ignore both it and a stopping server. *)
+  and wait_for_input deadline =
     let input = Flow.readable' flow `Input and stop = Action.map (fun () -> `Stop) ctx.stopping in
-    match Action.invoke (Action.choose [ stop; input; Mtime.wait_for' idle `Idle ]) with
+    match Action.invoke (Action.choose [ stop; input; at deadline `Idle ]) with
     | `Stop | `Idle -> `Close
-    | `Input -> if Buf_reader.peek_eof r then `Close else exchange ()
+    | `Input -> (
+        match Buf_reader.fill_now r with
+        | `Bytes -> exchange ()
+        | `Eof -> `Close
+        | `Would_block -> wait_for_input deadline)
   and exchange () =
     let head_deadline = after config.header_timeout () in
     read_deadline := (fun () -> head_deadline);
@@ -207,52 +225,36 @@ let serve : Engine.t =
   (* The handler's response; or [`Disconnected], the exchange cancelled, if
      the client leaves first. The connection is only watched once the request
      body was read: until then the handler may be reading it. Bytes that
-     arrive are a pipelined request, kept for later.
-
-     The watcher is a call of its own that waits on the connection alone.
-     Waiting on the handler's call and the connection in one choice could
-     miss the call's return under several domains, a lost wakeup in affect's
-     scheduler that hung connections. *)
+     arrive are a pipelined request, kept for later. *)
   and await exchange body =
     let response = Action.map (fun r -> `Response r) (Fun.Async.get' exchange) in
     let read = Action.map (fun () -> `Read) (H1_body.completed body) in
+    (* A wakeup can find nothing to read, as in [wait_for_input]. *)
+    let rec watch () =
+      match Action.invoke (Action.choose [ response; Flow.readable' flow `Readable ]) with
+      | `Response r -> `Response r
+      | `Readable -> (
+          match Buf_reader.fill_now r with
+          | `Bytes -> `Response (Fun.Async.get exchange)
+          | `Would_block -> watch ()
+          | `Eof | (exception Flow.Closed) -> left ())
+    (* Cancelled because the client left, unless we are cancelled too; other
+       failures while it unwound are still errors. A response that came
+       anyway is sent. *)
+    and left () =
+      Fun.Async.cancel exchange;
+      match Fun.Async.get exchange with
+      | r -> `Response r
+      | exception Fun.Async.Cancelled when not (Fun.Async.is_current_cancelled ()) -> `Disconnected
+      | exception e when not (is_fatal e) -> report e; `Disconnected
+    in
     if not config.cancel_on_disconnect
     then `Response (Fun.Async.get exchange)
     else
     match Action.invoke (Action.choose [ response; read ]) with
     | `Response r -> `Response r
     | `Read when Buf_reader.buffered r > 0 -> `Response (Fun.Async.get exchange)
-    | `Read -> (
-        let left = Atomic.make false in
-        let watcher =
-          Fun.Async.call (fun () ->
-              Action.invoke (Flow.readable' flow ());
-              match Buf_reader.peek_eof r with
-              | false -> ()
-              | true | (exception (Flow.Closed | Flow.Timeout)) ->
-                  Atomic.set left true;
-                  Fun.Async.cancel exchange)
-        in
-        let outcome =
-          match Fun.Async.get exchange with
-          | r -> Ok r
-          | exception e -> Error (e, Printexc.get_raw_backtrace ())
-        in
-        Fun.Async.cancel watcher;
-        (match Fun.Async.get watcher with
-        | () -> ()
-        | exception Fun.Async.Cancelled when not (Fun.Async.is_current_cancelled ()) -> ());
-        match outcome with
-        | Ok r -> `Response r
-        | Error (e, bt) when Atomic.get left -> (
-            (* Cancelled because the client left, unless we are cancelled
-               too; other failures while it unwound are still errors. *)
-            match e with
-            | Fun.Async.Cancelled when Fun.Async.is_current_cancelled () ->
-                Printexc.raise_with_backtrace e bt
-            | Fun.Async.Cancelled -> `Disconnected
-            | e -> config.on_error e bt; `Disconnected)
-        | Error (e, bt) -> Printexc.raise_with_backtrace e bt)
+    | `Read -> watch ()
   (* Hands the connection to [f], with the bytes already received first. The
      new protocol sets its own deadlines. *)
   and switch f =

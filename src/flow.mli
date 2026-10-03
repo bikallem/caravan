@@ -22,6 +22,7 @@ exception Closed
 
 val make :
   read:(bytes -> int -> int -> int) ->
+  read_now:(bytes -> int -> int -> int option) ->
   write:(bytes -> int -> int -> unit) ->
   readable:unit Action.t ->
   shutdown_send:(unit -> unit) ->
@@ -31,12 +32,14 @@ val make :
   set_write_deadline:(Affect_unix.Mtime.t option -> unit) ->
   unit ->
   t
-(** [make ~read ~write ~readable ~shutdown_send ~close ~reset
+(** [make ~read ~read_now ~write ~readable ~shutdown_send ~close ~reset
     ~set_read_deadline ~set_write_deadline ()] is a flow implemented by the
     given functions:
     - [read buf off len] reads at most [len > 0] bytes into [buf] from [off]
       and returns how many it read, [0] at the end of the stream. It may block
       cooperatively.
+    - [read_now buf off len] is like [read] but never blocks: it is [None]
+      when [read] would.
     - [write buf off len] writes all [len] bytes of [buf] from [off], or
       raises.
     - [readable] is an action enabled when [read] can return without blocking,
@@ -59,6 +62,15 @@ val read : t -> bytes -> int -> int -> int
 
     @raise Invalid_argument if [len <= 0] or [off] and [len] do not designate a
     valid range of [buf].
+    @raise Closed if [flow] is closed. *)
+
+val read_now : t -> bytes -> int -> int -> int option
+(** [read_now flow buf off len] is like {!read} but does not block: it is
+    [None] if no byte is available yet. A flow can be {!readable'} and still
+    have none: readiness can be stale, and under TLS the bytes that arrived
+    may not complete a record.
+
+    @raise Invalid_argument as {!read} does.
     @raise Closed if [flow] is closed. *)
 
 val readable' : t -> 'tag -> 'tag Action.t

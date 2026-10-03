@@ -21,15 +21,20 @@ let is_closed = function
 
 let flow fd =
   let read_deadline = Atomic.make None and write_deadline = Atomic.make None in
+  let rec read_now buf off len =
+    match Unix.read fd buf off len with
+    | n -> Some n
+    | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK), _, _) -> None
+    | exception Unix.Unix_error (EINTR, _, _) -> read_now buf off len
+    | exception Unix.Unix_error (e, _, _) when is_closed e -> raise Flow.Closed
+  in
   let rec read buf off len =
     Fun.Async.check_cancellation ();
-    match Unix.read fd buf off len with
-    | n -> n
-    | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK), _, _) ->
+    match read_now buf off len with
+    | Some n -> n
+    | None ->
         wait (Aunix.wait_readable fd ()) (Atomic.get read_deadline);
         read buf off len
-    | exception Unix.Unix_error (EINTR, _, _) -> read buf off len
-    | exception Unix.Unix_error (e, _, _) when is_closed e -> raise Flow.Closed
   in
   let rec write buf off len =
     if len > 0
@@ -48,7 +53,7 @@ let flow fd =
     try Unix.shutdown fd Unix.SHUTDOWN_SEND
     with Unix.Unix_error (e, _, _) when is_closed e -> ()
   in
-  Flow.make ~read ~write ~readable:(Aunix.wait_readable fd ()) ~shutdown_send
+  Flow.make ~read ~read_now ~write ~readable:(Aunix.wait_readable fd ()) ~shutdown_send
     ~close:(fun () -> Aunix.close_noerr fd)
     ~reset:(fun () ->
         (* A zero linger time makes close send a reset. *)

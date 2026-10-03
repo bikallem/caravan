@@ -104,6 +104,27 @@ let buf_reader_tests =
           is_true (Buf_reader.peek_eof (Buf_reader.of_string ""));
           raises_match is_invalid_arg (fun () -> Buf_reader.make ~size:0 (fun _ _ _ -> 0));
           raises_match is_invalid_arg (fun () -> Buf_reader.of_string ~chunk:0 ""));
+      test "fill_now reads what is there without blocking" (fun () ->
+          (* Each read takes the next answer; one too many fails. *)
+          let script = ref [ None; Some "ab"; None; Some "" ] in
+          let read_now buf off _ =
+            match !script with
+            | [] -> failwith "read after the end"
+            | x :: rest ->
+                script := rest;
+                Option.map (fun s -> Bytes.blit_string s 0 buf off (String.length s); String.length s) x
+          in
+          let r = Buf_reader.make ~size:4 ~read_now (fun _ _ _ -> failwith "blocking read") in
+          let fill () =
+            match Buf_reader.fill_now r with
+            | `Bytes -> "bytes" | `Eof -> "eof" | `Would_block -> "would block"
+          in
+          let first = List.init 3 (fun _ -> fill ()) in
+          let taken = Buf_reader.take_buffered r in
+          equal (list string)
+            [ "would block"; "bytes"; "bytes"; "ab"; "would block"; "eof"; "eof" ]
+            (first @ [ taken ] @ List.init 3 (fun _ -> fill ()));
+          is_true (Buf_reader.peek_eof r));
       test "of_flow reads the flow" (fun () ->
           let r = Buf_reader.of_flow (Flow.of_string ~chunk:1 "a\r\nb" (Buffer.create 0)) in
           equal string "a" (Buf_reader.read_line r ~max:5);
@@ -150,6 +171,7 @@ module Model = struct
 
   let consumed m = m.pos
   let peek_eof m = m.pos = String.length m.s
+  let fill_now m = if peek_eof m then "eof" else "bytes"
 end
 
 let reader = abstract "r" ~pp:(fun ppf m -> Format.fprintf ppf "%S@%d" m.Model.s m.Model.pos)
@@ -167,7 +189,10 @@ let buf_reader_commands =
       (fun r max -> Buf_reader.read_line r ~max);
     command "read_n" (reader ^-> Gen.int_range 1 8 @-> returns string) Model.read_n read_n;
     command "consumed" (reader ^-> returns int) Model.consumed Buf_reader.consumed;
-    command "peek_eof" (reader ^-> returns bool) Model.peek_eof Buf_reader.peek_eof ]
+    command "peek_eof" (reader ^-> returns bool) Model.peek_eof Buf_reader.peek_eof;
+    command "fill_now" (reader ^-> returns string) Model.fill_now (fun r ->
+        match Buf_reader.fill_now r with
+        | `Bytes -> "bytes" | `Eof -> "eof" | `Would_block -> "would block") ]
 
 let buf_reader_model =
   group "Buf_reader model"

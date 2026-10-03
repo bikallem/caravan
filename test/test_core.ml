@@ -351,10 +351,30 @@ let flow_tests =
             [ (0, 0); (-1, 2); (0, 5); (3, 2) ];
           raises_match is_invalid_arg (fun () -> Flow.write flow buf 2 3);
           raises_match is_invalid_arg (fun () -> Flow.of_string ~chunk:0 "" (Buffer.create 0)));
+      test "read_now reads what is there without blocking" (fun () ->
+          let buf = Bytes.create 4 in
+          let f = Flow.of_string ~chunk:2 "abc" (Buffer.create 0) in
+          equal (list (option int)) [ Some 2; Some 1; Some 0 ]
+            (List.init 3 (fun _ -> Flow.read_now f buf 0 4));
+          let nothing =
+            Flow.make ~read:(fun _ _ _ -> failwith "blocking read")
+              ~read_now:(fun _ _ _ -> None) ~write:(fun _ _ _ -> ())
+              ~readable:Affect.Action.never ~shutdown_send:ignore ~close:ignore
+              ~set_read_deadline:ignore ~set_write_deadline:ignore ()
+          in
+          let p = Flow.prepend "x" nothing in
+          equal (list (option int)) [ Some 1; None ]
+            (List.init 2 (fun _ -> Flow.read_now p buf 0 4));
+          List.iter
+            (fun (off, len) -> raises_match is_invalid_arg (fun () -> Flow.read_now f buf off len))
+            [ (0, 0); (-1, 2); (3, 2) ];
+          Flow.close f;
+          raises Flow.Closed (fun () -> Flow.read_now f buf 0 1));
       test "reset closes once, abortively, and close falls back to it" (fun () ->
           let log = ref [] in
           let flow ?reset () =
-            Flow.make ~read:(fun _ _ _ -> 0) ~write:(fun _ _ _ -> ())
+            Flow.make ~read:(fun _ _ _ -> 0) ~read_now:(fun _ _ _ -> Some 0)
+              ~write:(fun _ _ _ -> ())
               ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
               ~close:(fun () -> log := "close" :: !log)
               ?reset ~set_read_deadline:ignore ~set_write_deadline:ignore ()
@@ -371,7 +391,8 @@ let flow_tests =
       test "close is idempotent and later use raises Closed" (fun () ->
           let closes = ref 0 in
           let flow =
-            Flow.make ~read:(fun _ _ _ -> 0) ~write:(fun _ _ _ -> ())
+            Flow.make ~read:(fun _ _ _ -> 0) ~read_now:(fun _ _ _ -> Some 0)
+              ~write:(fun _ _ _ -> ())
               ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
               ~close:(fun () -> incr closes)
               ~set_read_deadline:ignore ~set_write_deadline:ignore ()
@@ -387,6 +408,7 @@ let flow_tests =
           let flow =
             Flow.make
               ~read:(fun buf off _ -> note "read"; Bytes.set buf off 'a'; 1)
+              ~read_now:(fun _ _ _ -> note "read_now"; None)
               ~write:(fun _ _ len -> note (Printf.sprintf "write %d" len))
               ~readable:(Affect.Action.always ())
               ~shutdown_send:(fun () -> note "shutdown")
@@ -395,6 +417,7 @@ let flow_tests =
               ~set_write_deadline:(fun d -> note (if d = None then "wd none" else "wd")) ()
           in
           equal int 1 (Flow.read flow (Bytes.create 1) 0 1);
+          equal (option int) None (Flow.read_now flow (Bytes.create 1) 0 1);
           Flow.write_string flow "abc";
           Flow.write_string flow "";
           Flow.shutdown_send flow;
@@ -402,7 +425,7 @@ let flow_tests =
           Flow.set_write_deadline flow None;
           Flow.close flow;
           equal (list string)
-            [ "read"; "write 3"; "shutdown"; "rd none"; "wd none"; "close" ]
+            [ "read"; "read_now"; "write 3"; "shutdown"; "rd none"; "wd none"; "close" ]
             (List.rev !log));
       test "prepend reads its bytes first" (fun () ->
           let out = Buffer.create 8 in
@@ -415,7 +438,8 @@ let flow_tests =
       test "prepend passes shutdown and close to the flow" (fun () ->
           let log = ref [] in
           let flow =
-            Flow.make ~read:(fun _ _ _ -> 0) ~write:(fun _ _ _ -> ())
+            Flow.make ~read:(fun _ _ _ -> 0) ~read_now:(fun _ _ _ -> Some 0)
+              ~write:(fun _ _ _ -> ())
               ~readable:(Affect.Action.always ())
               ~shutdown_send:(fun () -> log := "shutdown" :: !log)
               ~close:(fun () -> log := "close" :: !log)
@@ -432,7 +456,8 @@ let flow_tests =
           equal int 0 (Flow.read f (Bytes.create 1) 0 1));
       test "prepend is readable while its bytes remain" (fun () ->
           let never =
-            Flow.make ~read:(fun _ _ _ -> 0) ~write:(fun _ _ _ -> ())
+            Flow.make ~read:(fun _ _ _ -> 0) ~read_now:(fun _ _ _ -> Some 0)
+              ~write:(fun _ _ _ -> ())
               ~readable:Affect.Action.never ~shutdown_send:ignore ~close:ignore
               ~set_read_deadline:ignore ~set_write_deadline:ignore ()
           in

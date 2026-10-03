@@ -127,9 +127,11 @@ let handler req =
    reads time out), and with [~reset:true] it resets the connection. With
    [~unwritable:true] every write fails as on a reset connection. With
    [~cancel_after] the connection is cancelled after that time, as by a
-   server shutdown. *)
+   server shutdown. With [~false_wakes:n] the flow is first readable [n]
+   times with nothing to read yet, and a read that would block then fails. *)
 let serve ?(config = { Config.default with date_header = false }) ?chunk ?(stall = false)
-    ?(reset = false) ?(unwritable = false) ?(watch = false) ?cancel_after input =
+    ?(reset = false) ?(unwritable = false) ?(watch = false) ?cancel_after ?(false_wakes = 0)
+    input =
   let errors = ref [] in
   (* The input's end looks like a client leaving: only watched for if asked. *)
   let config =
@@ -140,17 +142,27 @@ let serve ?(config = { Config.default with date_header = false }) ?chunk ?(stall
   let out = Buffer.create 256 and consumed = ref 0 in
   let inner = Flow.of_string ?chunk input out in
   let stalled () = stall && !consumed = String.length input in
+  let false_wakes = ref false_wakes in
   let read buf off len =
+    if !false_wakes > 0 then failwith "blocking read after a false wakeup";
     if stalled () then raise Flow.Timeout;
     if reset && !consumed = String.length input then raise Flow.Closed;
     let n = Flow.read inner buf off len in
     consumed := !consumed + n;
     n
   in
-  let readable = Action.guard (fun () -> if stalled () then Action.never else Action.always ()) in
+  let read_now buf off len =
+    if !false_wakes > 0 then (decr false_wakes; None)
+    else if stalled () then None
+    else Some (read buf off len)
+  in
+  let readable =
+    Action.guard (fun () ->
+        if !false_wakes = 0 && stalled () then Action.never else Action.always ())
+  in
   let flow =
     let write buf off len = if unwritable then raise Flow.Closed else Flow.write inner buf off len in
-    Flow.make ~read ~write ~readable
+    Flow.make ~read ~read_now ~write ~readable
       ~shutdown_send:(fun () -> Buffer.add_string out "[FIN]")
       ~close:ignore
       ~reset:(fun () -> Buffer.add_string out "[RST]")
@@ -172,8 +184,10 @@ let serve ?(config = { Config.default with date_header = false }) ?chunk ?(stall
   if unread > 0 then Printf.bprintf out "[unread %d]" unread;
   (Buffer.contents out, List.rev !errors)
 
-let show ?config ?chunk ?stall ?reset ?unwritable ?watch ?cancel_after input =
-  let out, errors = serve ?config ?chunk ?stall ?reset ?unwritable ?watch ?cancel_after input in
+let show ?config ?chunk ?stall ?reset ?unwritable ?watch ?cancel_after ?false_wakes input =
+  let out, errors =
+    serve ?config ?chunk ?stall ?reset ?unwritable ?watch ?cancel_after ?false_wakes input
+  in
   show_crlf out
   ^ String.concat "" (List.map (fun e -> "\n! " ^ e) errors)
   ^ if !slow_outcome = "" then "" else "\n" ^ !slow_outcome
@@ -583,6 +597,7 @@ let connection_tests =
           let flow =
             Flow.make
               ~read:(fun _ _ _ -> failwith "read while stopping")
+              ~read_now:(fun _ _ _ -> failwith "read while stopping")
               ~write:(fun _ _ _ -> ()) ~readable:Action.never ~shutdown_send:ignore ~close:ignore
               ~set_read_deadline:ignore ~set_write_deadline:ignore ()
           in
@@ -595,7 +610,7 @@ let connection_tests =
       test "an error response to a client that left is dropped" (fun () ->
           let input = Flow.of_string "GET / HTTP/1.1\r\n\r\n" (Buffer.create 0) in
           let flow =
-            Flow.make ~read:(Flow.read input)
+            Flow.make ~read:(Flow.read input) ~read_now:(Flow.read_now input)
               ~write:(fun _ _ _ -> raise Flow.Closed)
               ~readable:(Flow.readable' input ()) ~shutdown_send:ignore ~close:ignore
               ~set_read_deadline:ignore ~set_write_deadline:ignore ()
@@ -762,7 +777,39 @@ let timeout_tests =
             Content-Length: 5\r\n
             \r\n
             hello
-            |}) ]
+            |});
+      (* Readiness can be stale: waking without input must neither block in a
+         read nor give up on the connection. *)
+      test "a wakeup without input keeps waiting for the request" (fun () ->
+          expect (show ~false_wakes:2 (get "/")) @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 5\r\n
+            \r\n
+            hello
+            |});
+      test "a wakeup without input leaves the timeout running" (fun () ->
+          expect (show ~config:quick ~stall:true ~false_wakes:2 "") @@ __POS_OF__ {||});
+      test ~timeout:5. "a wakeup without input does not hold up a stopping server" (fun () ->
+          let woken = ref false in
+          let flow =
+            Flow.make
+              ~read:(fun _ _ _ -> failwith "blocking read")
+              ~read_now:(fun _ _ _ -> woken := true; None)
+              ~write:(fun _ _ _ -> ())
+              ~readable:(Action.guard (fun () -> if !woken then Action.never else Action.always ()))
+              ~shutdown_send:ignore ~close:ignore ~set_read_deadline:ignore
+              ~set_write_deadline:ignore ()
+          in
+          Affect_unix.Unix.main ~domain_count:1 (fun () ->
+              let ctx =
+                { Engine.config = { Config.default with header_timeout = Affect_unix.Mtime.Span.(60 * s) };
+                  conn;
+                  stopping = Affect_unix.Mtime.wait_for' Affect_unix.Mtime.Span.(20 * ms) ();
+                  is_stopping = (fun () -> false) }
+              in
+              Private.H1_server.serve ctx flow handler);
+          is_true ~msg:"woken" !woken) ]
 
 let upgrade_tests =
   let ws ?(v = "HTTP/1.1") ?(headers = [ ("Upgrade", "echo"); ("Connection", "Upgrade") ]) path =
@@ -974,7 +1021,49 @@ let disconnect_tests =
             [handler cancelled]
             |});
       test "a client that leaves after its body was read cancels its handler" (fun () ->
-          expect (show ~watch:true (post "/read-slow" "hello")) @@ __POS_OF__ {| [handler cancelled] |}) ]
+          expect (show ~watch:true (post "/read-slow" "hello")) @@ __POS_OF__ {| [handler cancelled] |});
+      test "a wakeup without input while the handler runs is not a disconnect" (fun () ->
+          (* Once the request is read the client is quiet: the flow is
+             readable once more with nothing to read, and a read would
+             block, which fails. *)
+          let input = get "/slow" and out = Buffer.create 64 in
+          let pos = ref 0 and woken = ref false in
+          let quiet () = !pos = String.length input in
+          let read buf off len =
+            if quiet () then failwith "blocking read";
+            let n = Int.min len (String.length input - !pos) in
+            Bytes.blit_string input !pos buf off n;
+            pos := !pos + n;
+            n
+          in
+          let read_now buf off len =
+            if quiet () then (woken := true; None) else Some (read buf off len)
+          in
+          let flow =
+            Flow.make ~read ~read_now
+              ~write:(fun b off len -> Buffer.add_subbytes out b off len)
+              ~readable:
+                (Action.guard (fun () ->
+                     if quiet () && !woken then Action.never else Action.always ()))
+              ~shutdown_send:ignore ~close:ignore ~set_read_deadline:ignore
+              ~set_write_deadline:ignore ()
+          in
+          slow_outcome := "";
+          Affect_unix.Unix.main ~domain_count:1 (fun () ->
+              let ctx =
+                { Engine.config = { quick with cancel_on_disconnect = true }; conn;
+                  stopping = Action.never; is_stopping = (fun () -> false) }
+              in
+              Private.H1_server.serve ctx flow handler);
+          is_true ~msg:"woken" !woken;
+          expect (show_crlf (Buffer.contents out) ^ "\n" ^ !slow_outcome) @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 4\r\n
+            \r\n
+            late
+            [handler finished]
+            |}) ]
 
 (* A request smuggled in a malformed chunked body must never be served, even
    when the handler swallows the body error and answers. *)
