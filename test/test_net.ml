@@ -451,6 +451,66 @@ let server_tests =
           Flow.close b;
           equal (list string) [ {|Failure("engine")|} ] (Atomic.get errors)) ]
 
+(* Races between stopping and the supervisor, which show with more than two
+   domains; mutation testing runs with one. *)
+
+let race_tests =
+  let domains = if domain_count = 1 then 1 else 4 in
+  let cycles stop config =
+    for _ = 1 to 200 do
+      Affect_unix.Unix.main ~domain_count:domains (fun () ->
+          let server = Server.start ~config handler in
+          Fun.Async.yield ();
+          stop server;
+          Server.wait server)
+    done
+  in
+  group "Stopping races"
+    [ test "abort right after start never makes wait raise" (fun () -> cycles Server.abort quiet);
+      test "a shutdown with no grace never makes wait raise" (fun () ->
+          cycles Server.shutdown { quiet with shutdown_grace = Mtime.Span.(0 * ms) }) ]
+
+(* accept(2) errors *)
+
+let accept_error_tests =
+  let module A = Private.Accept_error in
+  let show e = match A.classify e with `Connection -> "retry" | `Resources -> "wait" | `Listener -> "stop" in
+  group "Accept_error"
+    [ test "what each accept error is about" (fun () ->
+          expect
+            (String.concat "\n"
+               (List.map
+                  (fun (name, e) -> Printf.sprintf "%-13s %s" name (show e))
+                  Unix.
+                    [ ("ECONNABORTED", ECONNABORTED); ("EINTR", EINTR); ("ENETDOWN", ENETDOWN);
+                      ("ENOPROTOOPT", ENOPROTOOPT); ("EHOSTDOWN", EHOSTDOWN);
+                      ("EHOSTUNREACH", EHOSTUNREACH); ("EOPNOTSUPP", EOPNOTSUPP);
+                      ("ENETUNREACH", ENETUNREACH); ("EPERM", EPERM); ("EPROTO", EUNKNOWNERR 71);
+                      ("ENONET", EUNKNOWNERR 64); ("EMFILE", EMFILE); ("ENFILE", ENFILE);
+                      ("ENOBUFS", ENOBUFS); ("ENOMEM", ENOMEM); ("EBADF", EBADF);
+                      ("EINVAL", EINVAL); ("ENOTSOCK", ENOTSOCK); ("other", EUNKNOWNERR 999) ]))
+          @@ __POS_OF__ {|
+            ECONNABORTED  retry
+            EINTR         retry
+            ENETDOWN      retry
+            ENOPROTOOPT   retry
+            EHOSTDOWN     retry
+            EHOSTUNREACH  retry
+            EOPNOTSUPP    retry
+            ENETUNREACH   retry
+            EPERM         retry
+            EPROTO        retry
+            ENONET        retry
+            EMFILE        wait
+            ENFILE        wait
+            ENOBUFS       wait
+            ENOMEM        wait
+            EBADF         stop
+            EINVAL        stop
+            ENOTSOCK      stop
+            other         stop
+            |}) ]
+
 (* Stop_signal. Only installing: delivering a signal to the test process
    could kill it, see test_server.ml for that. SIGUSR2 is never sent. *)
 
@@ -482,4 +542,4 @@ let date_tests =
           in
           ignore (Fun.Async.get_all (List.init 8 worker))) ]
 
-let () = exit (run "net" [ tcp_tests; server_tests; stop_signal_tests; date_tests ])
+let () = exit (run "net" [ tcp_tests; server_tests; race_tests; accept_error_tests; stop_signal_tests; date_tests ])

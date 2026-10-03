@@ -12,17 +12,20 @@ type t = {
 let report (config : Config.t) e = config.on_error e (Printexc.get_raw_backtrace ())
 
 (* Accepts a pending connection, if there is one: readiness can be spurious.
-   Errors that do not concern the listener are ridden out: a client that gave
-   up while queued, or running out of file descriptors, which is reported and
-   waited out. *)
+   Errors that do not concern the listener are ridden out: a connection that
+   failed while queued, or running out of file descriptors, which is reported
+   and waited out. *)
 let accept config listener =
   match Tcp.Listener.try_accept listener with
   | conn -> conn
-  | exception Unix.Unix_error ((ECONNABORTED | EINTR), _, _) -> None
-  | exception (Unix.Unix_error ((EMFILE | ENFILE | ENOBUFS | ENOMEM), _, _) as e) ->
-      report config e;
-      Mtime.wait_for Mtime.Span.(100 * ms);
-      None
+  | exception (Unix.Unix_error (err, _, _) as e) -> (
+      match Accept_error.classify err with
+      | `Connection -> None
+      | `Resources ->
+          report config e;
+          Mtime.wait_for Mtime.Span.(100 * ms);
+          None
+      | `Listener -> raise e)
 
 let serve_connection (config : Config.t) engine handler ~stopping ~id flow (fd, peer) =
   let local = try Unix.getsockname fd with Unix.Unix_error _ -> peer in
@@ -104,7 +107,9 @@ let start ?(config = Config.default) ?(engine = H1_server.serve) handler =
         let expired = Mtime.wait_for' config.shutdown_grace `Expired in
         match Action.invoke (Action.choose [ finished; expired ]) with
         | `Finished -> ()
-        | `Expired -> Fun.Async.cancel supervisor)
+        | `Expired -> Fun.Async.cancel supervisor
+        (* Aborted: the supervisor was cancelled, see [wait]. *)
+        | exception Fun.Async.Cancelled when not (Fun.Async.is_current_cancelled ()) -> ())
   in
   { listener; acceptor; supervisor; grace; stopping }
 
@@ -116,10 +121,14 @@ let abort s =
   shutdown s;
   Fun.Async.cancel s.supervisor
 
-(* The supervisor returns as soon as it stops, and then waits for its
-   connections; cancelling it cancels those, not its return. *)
+(* The supervisor returns as soon as it sees [stopping], then waits for its
+   connections. Cancelled before it sees it, by [abort] or a grace of zero,
+   it ends with [Cancelled]: a stop too. *)
 let wait s =
-  Fun.Async.get s.supervisor;
+  (match Fun.Async.get s.supervisor with
+  | () -> ()
+  | exception Fun.Async.Cancelled
+    when Cell.Once.is_set s.stopping && not (Fun.Async.is_current_cancelled ()) -> ());
   Fun.Async.get s.grace;
   Fun.Async.get s.acceptor
 

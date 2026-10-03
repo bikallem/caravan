@@ -42,7 +42,11 @@ module Listener : sig
 
   val try_accept : t -> (Unix.file_descr * Unix.sockaddr) option
   (** [try_accept l] is like {!accept} but does not wait: it is [None] if no
-      connection is pending. *)
+      connection is pending, or if the one accepted could not be set up, in
+      which case it is closed.
+
+      @raise Unix.Unix_error as accept(2) does, which includes errors of the
+      pending connection that callers should retry on. *)
 
   val wait_acceptable : t -> 'tag -> 'tag Affect.Action.t
   (** [wait_acceptable l tag] is an action enabled with [tag] when {!accept}

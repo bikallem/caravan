@@ -89,7 +89,8 @@ module Listener = struct
 
   let try_accept l =
     match Unix.accept ~cloexec:true l.fd with
-    | conn -> Some (setup conn)
+    (* A socket that cannot be set up is already broken: drop it. *)
+    | conn -> (try Some (setup conn) with Unix.Unix_error _ -> None)
     | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK), _, _) -> None
 
   let wait_acceptable l tag = Aunix.wait_readable l.fd tag
