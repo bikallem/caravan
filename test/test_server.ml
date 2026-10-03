@@ -162,11 +162,6 @@ let timeout_tests =
           equal string {|408 "Request Timeout\n" close|} (read_response ~head:false r);
           eof r;
           Flow.close flow);
-      test "a connection that sends nothing is closed" (fun () ->
-          with_server ~config @@ fun server ->
-          let flow, r = connect server in
-          eof r;
-          Flow.close flow);
       test "an idle connection is closed" (fun () ->
           with_server ~config @@ fun server ->
           let flow, r = connect server in
