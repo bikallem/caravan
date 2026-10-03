@@ -187,6 +187,8 @@ let make ?max_body ?expect_continue ~limits r (framing : H1_parse.framing) =
         n
       in
       t.body <- to_body { src with read };
+      (* [Content-Length: 0]: nothing to read. *)
+      if src.finished () then Affect.Cell.Once.try_set t.completed ();
       t
 
 let body t = t.body

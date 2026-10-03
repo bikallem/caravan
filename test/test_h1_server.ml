@@ -811,6 +811,8 @@ let disconnect_tests =
             hello
             [handler finished]
             |});
+      test "a request with an empty body is watched at once" (fun () ->
+          expect (show ~watch:true (post "/slow" "")) @@ __POS_OF__ {| [handler cancelled] |});
       test "nothing is watched while the request body is unread" (fun () ->
           expect (show ~watch:true (post "/slow" "hello")) @@ __POS_OF__ {|
             HTTP/1.1 200 OK\r\n

@@ -819,6 +819,8 @@ let handle_tests =
           in
           let _, t = handle "" No_body in
           is_true ~msg:"no body" (completed t);
+          let _, t = handle "" (Fixed 0) in
+          is_true ~msg:"an empty body" (completed t);
           let _, t = handle ("hello" ^ next) (Fixed 5) in
           let b = H1_body.body t in
           ignore (Body.read b (Bytes.create 4) 0 4);
