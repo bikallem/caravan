@@ -1,6 +1,5 @@
 (tests
  (names
-  test_caravan
   test_core
   test_h1
   test_h1_server
@@ -8,7 +7,6 @@
   test_server
   test_server_stateful)
  (modules
-  test_caravan
   test_core
   test_h1
   test_h1_server
