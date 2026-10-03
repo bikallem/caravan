@@ -163,7 +163,7 @@ let read_response ~head r =
     if head || code = 204 || code = 304
     then ""
     else if find "transfer-encoding" = Some "chunked"
-    then Body.to_string (Private.H1_body.chunked ~limits:Private.H1_parse.default_limits r)
+    then Body.to_string (Private.H1_body.chunked ~limits:(Private.H1_server.limits Config.default) r)
     else
     match find "content-length" with
     | Some n ->

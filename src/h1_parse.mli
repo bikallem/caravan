@@ -10,8 +10,6 @@ type limits = {
 }
 (** The type for parsing limits. *)
 
-val default_limits : limits
-(** [default_limits] are 8 KiB, 16 KiB and 100 fields. *)
 
 type head = {
   meth : Method.t;

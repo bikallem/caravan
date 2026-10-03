@@ -4,9 +4,6 @@ type limits = {
   max_header_count : int;
 }
 
-let default_limits =
-  { max_request_line = 8192; max_header_bytes = 16384; max_header_count = 100 }
-
 type head = {
   meth : Method.t;
   target : string;
@@ -102,42 +99,37 @@ let request_head limits r =
 
 type framing = No_body | Fixed of int | Chunked
 
-(* The non-empty elements of comma-separated field values (RFC 9110 §5.6.1). *)
-let elements values =
-  List.concat_map (String.split_on_char ',') values
-  |> List.map trim_ows
-  |> List.filter (fun e -> e <> "")
-
 (* At most 18 digits: always fits in an OCaml int. [s] is never empty:
-   [elements] drops empty list elements. *)
+   [Headers.tokens] drops empty list elements. *)
 let length_value s =
   if String.length s > 18 || not (String.for_all is_digit s)
   then bad "invalid Content-Length %S" s;
   int_of_string s
 
 let content_length h =
-  match Headers.find_all "content-length" h.headers with
-  | [] -> None
-  | values ->
-      match List.map length_value (elements values) with
-      | [] -> bad "empty Content-Length"
-      | n :: rest ->
-          if List.exists (fun m -> m <> n) rest then bad "conflicting Content-Length";
-          Some n
+  if not (Headers.mem "content-length" h.headers)
+  then None
+  else
+  match List.map length_value (Headers.tokens "content-length" h.headers) with
+  | [] -> bad "empty Content-Length"
+  | n :: rest ->
+      if List.exists (fun m -> m <> n) rest then bad "conflicting Content-Length";
+      Some n
 
 let request_framing h =
   let length = content_length h in
-  match Headers.find_all "transfer-encoding" h.headers with
-  | [] -> (match length with None -> No_body | Some n -> Fixed n)
-  | codings ->
-      if h.version = Version.Http_1_0 then bad "Transfer-Encoding in HTTP/1.0";
-      if length <> None then bad "both Transfer-Encoding and Content-Length";
-      match List.rev_map String.lowercase_ascii (elements codings) with
-      | [ "chunked" ] -> Chunked
-      | "chunked" :: rest when List.mem "chunked" rest -> bad "chunked applied twice"
-      | "chunked" :: _ ->
-          fail (H1_error.Not_implemented "transfer codings other than chunked")
-      | _ -> bad "chunked is not the final transfer coding"
+  if not (Headers.mem "transfer-encoding" h.headers)
+  then match length with None -> No_body | Some n -> Fixed n
+  else begin
+    if h.version = Version.Http_1_0 then bad "Transfer-Encoding in HTTP/1.0";
+    if length <> None then bad "both Transfer-Encoding and Content-Length";
+    match List.rev_map String.lowercase_ascii (Headers.tokens "transfer-encoding" h.headers) with
+    | [ "chunked" ] -> Chunked
+    | "chunked" :: rest when List.mem "chunked" rest -> bad "chunked applied twice"
+    | "chunked" :: _ ->
+        fail (H1_error.Not_implemented "transfer codings other than chunked")
+    | _ -> bad "chunked is not the final transfer coding"
+  end
 
 (* Request target, RFC 9112 §3.2 *)
 

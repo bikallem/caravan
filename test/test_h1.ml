@@ -182,7 +182,9 @@ let pp_head ppf (h : H1_parse.head) =
   Format.fprintf ppf "%a %s %a" Method.pp h.meth h.target Version.pp h.version;
   Headers.iter (fun n v -> Format.fprintf ppf "@\n  %s: %S" n v) h.headers
 
-let parse ?(limits = H1_parse.default_limits) ?size ?chunk s =
+let default_limits = Private.H1_server.limits Config.default
+
+let parse ?(limits = default_limits) ?size ?chunk s =
   H1_parse.request_head limits (Buf_reader.of_string ?size ?chunk s)
 
 let show ?limits s =
@@ -631,7 +633,7 @@ let h1_body_tests =
 
 (* Chunked bodies *)
 
-let limits = H1_parse.default_limits
+let limits = default_limits
 
 (* The decoded body, its trailers and what follows it, or the error. *)
 let show_chunked ?max_body input =
