@@ -56,6 +56,16 @@ let linger (config : Config.t) flow =
   in
   try discard config.max_drain with Flow.Closed | Flow.Timeout -> ()
 
+(* An action enabled with [tag] at [deadline], at once if it has passed;
+   never for [None]. *)
+let at deadline tag =
+  match deadline with
+  | None -> Action.never
+  | Some d ->
+      let now = Mtime.now () in
+      if Mtime.is_earlier now ~than:d then Mtime.wait_for' (Mtime.span now d) tag
+      else Action.always tag
+
 (* Why [response], an upgrade, cannot answer the request [head], if it
    cannot: RFC 9110 §7.8, §9.3.6 and §15.2.2. *)
 let upgrade_error (head : H1_parse.head) response =
@@ -85,7 +95,7 @@ let serve : Engine.t =
      each read of a body. Each write gets its own. *)
   let read_deadline = ref (fun () -> None) in
   let r =
-    Buf_reader.make ~size:config.buffer_size (fun buf off len ->
+    Buf_reader.make ~size:config.buffer_size ~read_now:(Flow.read_now flow) (fun buf off len ->
         Flow.set_read_deadline flow (!read_deadline ());
         Flow.read flow buf off len)
   in
@@ -113,11 +123,19 @@ let serve : Engine.t =
     then (if Buf_reader.buffered r > 0 then `Linger else `Close)
     else if Buf_reader.buffered r > 0
     then exchange ()
-    else
+    else wait_for_input (after idle ())
+  (* A wakeup can find nothing to read: readiness can be stale, or a TLS
+     record incomplete. Then the wait goes on, to the same deadline; a
+     blocking read would ignore both it and a stopping server. *)
+  and wait_for_input deadline =
     let input = Flow.readable' flow `Input and stop = Action.map (fun () -> `Stop) ctx.stopping in
-    match Action.invoke (Action.choose [ stop; input; Mtime.wait_for' idle `Idle ]) with
+    match Action.invoke (Action.choose [ stop; input; at deadline `Idle ]) with
     | `Stop | `Idle -> `Close
-    | `Input -> if Buf_reader.peek_eof r then `Close else exchange ()
+    | `Input -> (
+        match Buf_reader.fill_now r with
+        | `Bytes -> exchange ()
+        | `Eof -> `Close
+        | `Would_block -> wait_for_input deadline)
   and exchange () =
     let head_deadline = after config.header_timeout () in
     read_deadline := (fun () -> head_deadline);
