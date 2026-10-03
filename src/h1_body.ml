@@ -177,12 +177,17 @@ let make ?max_body ?expect_continue ~limits r (framing : H1_parse.framing) =
   | None -> Affect.Cell.Once.try_set t.completed (); t
   | Some src ->
       (* The handler's reads send 100 Continue first, if it is expected. A
-         read that times out is the client's fault: 408. *)
+         read that times out is the client's fault: 408. A reset connection
+         is a client that left. *)
       let read buf off len =
         (match t.continue with
         | Expected f -> t.continue <- Sent; f ()
         | No_expectation | Sent -> ());
-        let n = try src.read buf off len with Flow.Timeout -> fail H1_error.Request_timeout in
+        let n =
+          try src.read buf off len with
+          | Flow.Timeout -> fail H1_error.Request_timeout
+          | Flow.Closed -> raise Body.Truncated
+        in
         if src.finished () then Affect.Cell.Once.try_set t.completed ();
         n
       in

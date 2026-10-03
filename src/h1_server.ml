@@ -135,8 +135,11 @@ let serve : Engine.t =
                if not !committed
                then begin
                  continue_sent := true;
-                 Buf_writer.write_string w "HTTP/1.1 100 Continue\r\n\r\n";
-                 Buf_writer.flush w
+                 (* A client that cannot take it left. *)
+                 try
+                   Buf_writer.write_string w "HTTP/1.1 100 Continue\r\n\r\n";
+                   Buf_writer.flush w
+                 with Flow.Closed | Flow.Timeout -> raise Body.Truncated
                end)
         in
         match H1_body.make ?max_body:config.max_body ?expect_continue ~limits r framing with

@@ -40,6 +40,10 @@ val make :
     before the handler's first read of the body; the engine sends
     [100 Continue] from it.
 
+    The handler's reads raise {!H1_error.E} for a malformed body or one that
+    timed out ([408]), and {!Body.Truncated} when the client ended or reset
+    the connection before the body's end.
+
     @raise H1_error.E with {!H1_error.Content_too_large} if the framing
     declares more than [max_body] bytes, before anything is read. *)
 

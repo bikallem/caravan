@@ -101,11 +101,12 @@ let handler req =
 
 (* Serves [input] on one connection. The bytes written, with [[FIN]] where
    the server half-closed and [[unread n]] if it left input unread, and the
-   errors reported. With [~stall:true] the client goes quiet at the end of
-   [input] instead of closing: the flow is no longer readable and reads time
-   out. *)
+   errors reported. At the end of [input] the client closes; with
+   [~stall:true] it goes quiet instead (the flow is no longer readable and
+   reads time out), and with [~reset:true] it resets the connection. With
+   [~unwritable:true] every write fails as on a reset connection. *)
 let serve ?(config = { Config.default with date_header = false }) ?chunk ?(stall = false)
-    ?(watch = false) input =
+    ?(reset = false) ?(unwritable = false) ?(watch = false) input =
   let errors = ref [] in
   (* The input's end looks like a client leaving: only watched for if asked. *)
   let config =
@@ -118,13 +119,15 @@ let serve ?(config = { Config.default with date_header = false }) ?chunk ?(stall
   let stalled () = stall && !consumed = String.length input in
   let read buf off len =
     if stalled () then raise Flow.Timeout;
+    if reset && !consumed = String.length input then raise Flow.Closed;
     let n = Flow.read inner buf off len in
     consumed := !consumed + n;
     n
   in
   let readable = Action.guard (fun () -> if stalled () then Action.never else Action.always ()) in
   let flow =
-    Flow.make ~read ~write:(Flow.write inner) ~readable
+    let write buf off len = if unwritable then raise Flow.Closed else Flow.write inner buf off len in
+    Flow.make ~read ~write ~readable
       ~shutdown_send:(fun () -> Buffer.add_string out "[FIN]")
       ~close:ignore ~set_read_deadline:ignore ~set_write_deadline:ignore
   in
@@ -138,8 +141,8 @@ let serve ?(config = { Config.default with date_header = false }) ?chunk ?(stall
   if unread > 0 then Printf.bprintf out "[unread %d]" unread;
   (Buffer.contents out, List.rev !errors)
 
-let show ?config ?chunk ?stall ?watch input =
-  let out, errors = serve ?config ?chunk ?stall ?watch input in
+let show ?config ?chunk ?stall ?reset ?unwritable ?watch input =
+  let out, errors = serve ?config ?chunk ?stall ?reset ?unwritable ?watch input in
   show_crlf out
   ^ String.concat "" (List.map (fun e -> "\n! " ^ e) errors)
   ^ if !slow_outcome = "" then "" else "\n" ^ !slow_outcome
@@ -567,6 +570,13 @@ let connection_tests =
             List.find (String.starts_with ~prefix:"Date: ") (String.split_on_char '\n' out)
           in
           equal int (6 + 29 + 1) (String.length date));
+      test "a connection reset during the request body is not a handler error" (fun () ->
+          expect
+            (show ~reset:true "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nhel")
+          @@ __POS_OF__ {||});
+      test "a client that cannot take its 100 Continue is not a handler error" (fun () ->
+          expect (show ~unwritable:true (post ~headers:[ ("Expect", "100-continue") ] "/echo" "hello"))
+          @@ __POS_OF__ {||});
       test "a request cut short gets no response" (fun () ->
           expect
             (show "GET / HTTP/1.1\r\nHost: a"
