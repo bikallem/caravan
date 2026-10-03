@@ -1021,7 +1021,49 @@ let disconnect_tests =
             [handler cancelled]
             |});
       test "a client that leaves after its body was read cancels its handler" (fun () ->
-          expect (show ~watch:true (post "/read-slow" "hello")) @@ __POS_OF__ {| [handler cancelled] |}) ]
+          expect (show ~watch:true (post "/read-slow" "hello")) @@ __POS_OF__ {| [handler cancelled] |});
+      test "a wakeup without input while the handler runs is not a disconnect" (fun () ->
+          (* Once the request is read the client is quiet: the flow is
+             readable once more with nothing to read, and a read would
+             block, which fails. *)
+          let input = get "/slow" and out = Buffer.create 64 in
+          let pos = ref 0 and woken = ref false in
+          let quiet () = !pos = String.length input in
+          let read buf off len =
+            if quiet () then failwith "blocking read";
+            let n = Int.min len (String.length input - !pos) in
+            Bytes.blit_string input !pos buf off n;
+            pos := !pos + n;
+            n
+          in
+          let read_now buf off len =
+            if quiet () then (woken := true; None) else Some (read buf off len)
+          in
+          let flow =
+            Flow.make ~read ~read_now
+              ~write:(fun b off len -> Buffer.add_subbytes out b off len)
+              ~readable:
+                (Action.guard (fun () ->
+                     if quiet () && !woken then Action.never else Action.always ()))
+              ~shutdown_send:ignore ~close:ignore ~set_read_deadline:ignore
+              ~set_write_deadline:ignore ()
+          in
+          slow_outcome := "";
+          Affect_unix.Unix.main ~domain_count:1 (fun () ->
+              let ctx =
+                { Engine.config = { quick with cancel_on_disconnect = true }; conn;
+                  stopping = Action.never; is_stopping = (fun () -> false) }
+              in
+              Private.H1_server.serve ctx flow handler);
+          is_true ~msg:"woken" !woken;
+          expect (show_crlf (Buffer.contents out) ^ "\n" ^ !slow_outcome) @@ __POS_OF__ {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 4\r\n
+            \r\n
+            late
+            [handler finished]
+            |}) ]
 
 (* A request smuggled in a malformed chunked body must never be served, even
    when the handler swallows the body error and answers. *)
