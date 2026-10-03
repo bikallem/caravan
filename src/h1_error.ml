@@ -5,6 +5,7 @@ type t =
 | Content_too_large
 | Request_timeout
 | Expectation_failed
+| Misdirected_request
 | Not_implemented of string
 | Version_not_supported
 
@@ -17,6 +18,7 @@ let status = function
 | Content_too_large -> Status.content_too_large
 | Request_timeout -> Status.request_timeout
 | Expectation_failed -> Status.expectation_failed
+| Misdirected_request -> Status.misdirected_request
 | Not_implemented _ -> Status.not_implemented
 | Version_not_supported -> Status.http_version_not_supported
 

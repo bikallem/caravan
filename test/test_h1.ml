@@ -464,7 +464,16 @@ let host v = ("Host", v)
 
 let target_tests =
   group "H1_parse.request_target"
-    [ test "target and Host table" (fun () ->
+    [ test "an absolute target's scheme must be the connection's" (fun () ->
+          let target scheme t =
+            errors (fun () ->
+                (H1_parse.request_target ~scheme (req ~target:t [ host "b.example" ])).scheme)
+          in
+          equal (list string)
+            [ "https"; "http"; "421 Misdirected Request"; "421 Misdirected Request" ]
+            [ target "https" "https://b.example/"; target "http" "HTTP://b.example/";
+              target "http" "https://b.example/"; target "https" "http://b.example/" ]);
+      test "target and Host table" (fun () ->
           expect
             (String.concat "\n"
                (List.map show_target
@@ -521,7 +530,7 @@ let target_tests =
             Host port only => 400 Bad Request (invalid Host ":80")
             Host bad IPv6 literal => 400 Bad Request (invalid Host "[::g]")
             absolute => http b.example:81 "/p?q"
-            absolute https => https b.example "/"
+            absolute https => 421 Misdirected Request
             absolute query only => http b.example "/?q"
             absolute userinfo => 400 Bad Request (userinfo in request target)
             absolute ftp => 400 Bad Request (invalid request target "ftp://b.example/")

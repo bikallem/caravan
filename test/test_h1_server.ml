@@ -672,6 +672,17 @@ let connection_tests =
       test "a client that cannot take its 100 Continue is not a handler error" (fun () ->
           expect (show ~unwritable:true (post ~headers:[ ("Expect", "100-continue") ] "/echo" "hello"))
           @@ __POS_OF__ {||});
+      test "an https target over plain HTTP gets 421" (fun () ->
+          expect (show "GET https://a.example/info HTTP/1.1\r\nHost: a.example\r\n\r\n")
+          @@ __POS_OF__ {|
+            HTTP/1.1 421 Misdirected Request\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 20\r\n
+            Connection: close\r\n
+            \r\n
+            Misdirected Request
+            [FIN]
+            |});
       test "a request cut short gets no response" (fun () ->
           expect
             (show "GET / HTTP/1.1\r\nHost: a"

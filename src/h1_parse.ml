@@ -217,4 +217,9 @@ let request_target ~scheme h =
   | Method.OPTIONS when t = "*" -> { scheme; authority; path = "*" }
   | _ when t = "*" -> bad "* is only for OPTIONS"
   | _ when t.[0] = '/' -> { scheme; authority; path = t }
-  | _ -> absolute_form t
+  | _ ->
+      (* An https target over plain HTTP, or the reverse, would make the
+         request claim a security it does not have. *)
+      let target = absolute_form t in
+      if target.scheme <> scheme then fail H1_error.Misdirected_request;
+      target
