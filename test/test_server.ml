@@ -120,7 +120,7 @@ let integration_tests =
           equal (list string) [ "1"; "2"; "3" ] (List.map fst arrivals);
           let times = List.map snd arrivals in
           is_true ~msg:(String.concat ", " (List.map (Printf.sprintf "%.0fms") times))
-            (List.nth times 1 -. List.nth times 0 > 60. && List.nth times 2 -. List.nth times 1 > 60.);
+            (List.nth times 1 -. List.nth times 0 > 25. && List.nth times 2 -. List.nth times 1 > 25.);
           Flow.close flow);
       test "clients that leave mid-request do not disturb others" (fun () ->
           with_server @@ fun server ->
@@ -145,7 +145,7 @@ let integration_tests =
           Flow.close flow);
       test "a client that never closes is let go after linger_timeout" (fun () ->
           let config =
-            { config with max_connections = 1; linger_timeout = Mtime.Span.(200 * ms) }
+            { config with max_connections = 1; linger_timeout = Mtime.Span.(80 * ms) }
           in
           with_server ~config @@ fun server ->
           let a, ra = connect server in
@@ -159,15 +159,15 @@ let integration_tests =
           Flow.write_string b (get "/hello");
           equal string {|200 "hello"|} (read_response ~head:false rb);
           let waited = Mtime.Span.to_float_ns (Mtime.count clock) /. 1e6 in
-          is_true ~msg:(Printf.sprintf "waited %.0fms" waited) (waited > 150.);
+          is_true ~msg:(Printf.sprintf "waited %.0fms" waited) (waited > 60.);
           Flow.close a;
           Flow.close b) ]
 
-(* Timeouts of 100ms. The clients wait at most 5s for anything. *)
+(* Timeouts of 50ms. The clients wait at most 5s for anything. *)
 let timeout_tests =
   let config =
-    { config with header_timeout = Mtime.Span.(100 * ms); idle_timeout = Mtime.Span.(100 * ms);
-                  read_timeout = Mtime.Span.(100 * ms); write_timeout = Mtime.Span.(100 * ms) }
+    { config with header_timeout = Mtime.Span.(50 * ms); idle_timeout = Mtime.Span.(50 * ms);
+                  read_timeout = Mtime.Span.(50 * ms); write_timeout = Mtime.Span.(50 * ms) }
   in
   let connect server =
     let flow, r = connect server in
@@ -196,12 +196,12 @@ let timeout_tests =
           Flow.write_string flow
             ("POST /ignore HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n" ^ String.make 10 'x');
           equal string {|200 "ignored"|} (read_response ~head:false r);
-          (* A byte every 60ms, within the 100ms read timeout, for 2s. *)
+          (* A byte every 20ms, within the 50ms read timeout, for 2s. *)
           let trickle =
             Fun.Async.call (fun () ->
                 try
-                  for _ = 1 to 33 do
-                    Mtime.wait_for Mtime.Span.(60 * ms);
+                  for _ = 1 to 100 do
+                    Mtime.wait_for Mtime.Span.(20 * ms);
                     Flow.write_string flow "x"
                   done
                 with Flow.Closed -> ())
@@ -225,9 +225,9 @@ let timeout_tests =
           with_server ~config @@ fun server ->
           let flow, r = connect server in
           Flow.write_string flow "POST /hello HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\n\r\n";
-          (* 300ms in all, but never 100ms without a byte. *)
+          (* 120ms in all, but never 50ms without a byte. *)
           for _ = 1 to 6 do
-            Mtime.wait_for Mtime.Span.(50 * ms);
+            Mtime.wait_for Mtime.Span.(20 * ms);
             Flow.write_string flow "x"
           done;
           equal string {|200 "hello"|} (read_response ~head:false r);
@@ -272,7 +272,7 @@ let upgrade_tests =
   let eof r = equal int ~msg:"end of stream" 0 (Buf_reader.read_into r (Bytes.create 1) 0 1) in
   group "Upgrades over sockets"
     [ test "after a 101, bytes are echoed as they arrive, without HTTP's timeouts" (fun () ->
-          let short = Mtime.Span.(100 * ms) in
+          let short = Mtime.Span.(50 * ms) in
           let config =
             { config with header_timeout = short; read_timeout = short; write_timeout = short }
           in
@@ -281,14 +281,14 @@ let upgrade_tests =
           (* In two parts, so that the server reads the second under its head
              deadline. *)
           Flow.write_string flow "GET /ws-echo HTTP/1.1\r\nHost: x\r\n";
-          Mtime.wait_for Mtime.Span.(20 * ms);
+          Mtime.wait_for Mtime.Span.(10 * ms);
           Flow.write_string flow "Upgrade: echo\r\nConnection: Upgrade\r\n\r\n";
           equal string "HTTP/1.1 101 Switching Protocols" (read_head r);
           List.iter
             (fun msg -> Flow.write_string flow msg; equal string msg (read_n r (String.length msg)))
             [ "ping"; "pong"; String.make 10_000 'x' ];
           (* Quiet for longer than the server's HTTP timeouts. *)
-          Mtime.wait_for Mtime.Span.(250 * ms);
+          Mtime.wait_for Mtime.Span.(120 * ms);
           Flow.write_string flow "still there";
           equal string "still there" (read_n r 11);
           Flow.shutdown_send flow;
