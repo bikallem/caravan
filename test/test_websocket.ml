@@ -681,6 +681,16 @@ let with_socket ?close_timeout ?write_timeout ?read_timeout ?idle_timeout f =
 let ms n = Affect_unix.Mtime.Span.(n * ms)
 let elapsed_ms c = Affect_unix.Mtime.Span.to_float_ns (Affect_unix.Mtime.count c) /. 1e6
 
+(* [f ()], in a call that must end in 2 s. If not, the test cancels the
+   call and fails, so that a regression does not stop the suite. *)
+let within_2s f =
+  let open Affect in
+  let call = Fun.Async.call f in
+  let ended = Action.map (fun v -> `Ended v) (Fun.Async.get' call) in
+  match Action.invoke (Action.choose [ ended; Affect_unix.Mtime.wait_for' (ms 2000) `Late ]) with
+  | `Ended v -> v
+  | `Late -> Fun.Async.cancel call; fail "no end after 2 s"
+
 (* The code of the [Closed] exception that [f] raises. *)
 let closed_code f =
   match f () with
@@ -861,15 +871,14 @@ let socket_tests =
           is_true (Ws.recv c = Text "end");
           Fun.Async.get writer);
       test "close stops at a shorter idle timeout" (fun () ->
-          with_socket ~close_timeout:Affect_unix.Mtime.Span.(10 * s) ~idle_timeout:(ms 50)
-          @@ fun c _peer ->
+          with_socket ~close_timeout:(ms 1000) ~idle_timeout:(ms 50) @@ fun c _peer ->
           let t = Affect_unix.Mtime.counter () in
           Ws.close c;
           let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 2000.));
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 500.));
       test "close keeps the shorter write timeout of a send that waits" (fun () ->
           let open Affect in
-          with_socket ~close_timeout:Affect_unix.Mtime.Span.(10 * s) ~write_timeout:(ms 100)
+          with_socket ~close_timeout:(ms 1000) ~write_timeout:(ms 100)
           @@ fun c peer ->
           (* The peer reads only the first bytes: the send waits until its
              write timeout. When the first bytes come, the send is in its
@@ -882,15 +891,14 @@ let socket_tests =
           let closer = Fun.Async.call (fun () -> Ws.close c) in
           equal int 1006 (Fun.Async.get sender);
           let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 90. && took < 2000.);
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 90. && took < 500.);
           Fun.Async.get closer);
       test "close keeps its time limit with a long idle timeout" (fun () ->
-          with_socket ~close_timeout:(ms 50) ~idle_timeout:Affect_unix.Mtime.Span.(10 * s)
-          @@ fun c _peer ->
+          with_socket ~close_timeout:(ms 50) ~idle_timeout:(ms 1000) @@ fun c _peer ->
           let t = Affect_unix.Mtime.counter () in
           Ws.close c;
           let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 2000.));
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 500.));
       test "after a protocol error, the peer gets the Close frame and the end of the stream"
         (fun () ->
            let open Affect in
@@ -907,7 +915,7 @@ let socket_tests =
            equal int 1009 (Fun.Async.get reader));
       test "a cancel in the linger after a protocol error closes the connection" (fun () ->
           let open Affect in
-          with_socket ~close_timeout:Affect_unix.Mtime.Span.(10 * s) @@ fun c peer ->
+          with_socket ~close_timeout:(ms 1000) @@ fun c peer ->
           (* The peer does not close: the linger waits. *)
           let reader = Fun.Async.call (fun () -> Ws.recv c) in
           Caravan.Flow.write_string peer (client Continuation "x");
@@ -915,9 +923,9 @@ let socket_tests =
           Fun.Async.cancel reader;
           raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
           let t = Affect_unix.Mtime.counter () in
-          equal int 1002 (closed_code (fun () -> Ws.recv c));
+          equal int 1002 (within_2s (fun () -> closed_code (fun () -> Ws.recv c)));
           let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 2000.));
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 500.));
       test "the linger after a protocol error discards at most 1 MiB" (fun () ->
           let open Affect in
           with_socket @@ fun c peer ->
