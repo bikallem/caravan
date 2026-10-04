@@ -16,4 +16,6 @@ let handler req = Ws.accept ~origin:(fun _ -> true) ~max_message:(64 * 1024 * 10
 
 let () =
   let config = { Config.default with addr = Unix.ADDR_INET (Unix.inet_addr_loopback, 9001) } in
-  Server.run ~config handler
+  (* make autobahn starts the test suite after this line. *)
+  let on_start _ = print_endline "listening on port 9001" in
+  Server.run ~config ~on_start handler
