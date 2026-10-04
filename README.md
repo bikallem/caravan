@@ -58,6 +58,10 @@ let handler req =
   for each Ping, and examines the UTF-8 of text.
 - Many fibers can send at the same time, and `close` closes the
   connection from any fiber, with a time limit.
+- A write timeout (30 s by default) stops a send to a peer that reads
+  nothing. A read timeout (30 s by default) closes a connection when a
+  frame stops in the middle. An optional idle timeout closes a connection
+  when no frame comes in time.
 - All the cases of the [Autobahn](https://github.com/crossbario/autobahn-testsuite)
   test suite give OK or NON-STRICT, except the compression cases:
   caravan does not accept `permessage-deflate`.

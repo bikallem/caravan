@@ -25,6 +25,9 @@ val accept :
   ?origin:(string -> bool) ->
   ?max_message:int ->
   ?close_timeout:Affect_unix.Mtime.Span.t ->
+  ?write_timeout:Affect_unix.Mtime.Span.t ->
+  ?read_timeout:Affect_unix.Mtime.Span.t ->
+  ?idle_timeout:Affect_unix.Mtime.Span.t ->
   Caravan.Request.t ->
   (t -> unit) ->
   Caravan.Response.t
@@ -51,6 +54,20 @@ val accept :
     - [max_message] is the size limit of a received message, 8 MiB by
       default.
     - [close_timeout] is the time limit of {!close}, 5 s by default.
+    - [write_timeout] is the time limit to send one frame, 30 s by default.
+      If a frame does not go in this time, the connection closes with
+      1006.
+    - [read_timeout] is the time limit of each read inside a frame, 30 s
+      by default. Each read that gets bytes starts a new limit, thus a
+      slow frame with no long pause can take more time. If no byte comes
+      in this time, the connection sends a Close frame with 1001 and
+      closes.
+    - [idle_timeout] is the time limit between two frames: from the time
+      that {!recv} waits for a frame until its first byte. If no byte
+      comes in this time, the connection sends a Close frame with 1001
+      and closes at once, without a wait for the reply of the peer. By
+      default, there is no limit. Use {!ping} to keep a connection open
+      through proxies that close idle connections.
 
     When [f] ends, [accept] closes the connection with 1000. If [f] raises
     {!Closed}, the connection is closed already. If [f] raises a different
@@ -85,6 +102,8 @@ exception Closed of { code : int; reason : string }
     - The code that we sent because the peer did not obey the protocol: 1002
       for a protocol error, 1007 for text that is not UTF-8, 1009 for a
       message that is too large. The reason tells the problem.
+    - 1001 with the reason ["read timeout"] or ["idle timeout"] if no byte
+      came in the [read_timeout] or the [idle_timeout] of {!accept}.
     - 1006 if the connection stopped without a Close frame. *)
 
 val recv : t -> message
@@ -129,7 +148,9 @@ val close : ?code:int -> ?reason:string -> t -> unit
     - If a fiber is in {!recv}, that fiber reads the Close frame of the peer
       and raises {!Closed} with its code. [close] waits for this.
     - At the time limit, the reads and writes on [c] stop, and {!recv}
-      raises {!Closed} with the code 1006.
+      raises {!Closed} with the code 1006. A read or a write with an
+      earlier deadline, from [write_timeout], [read_timeout] or
+      [idle_timeout], stops at that deadline.
     - If we sent a Close frame on [c] before, [close] does nothing.
 
     @raise Invalid_argument if [code] is not a code that a Close frame can
@@ -144,8 +165,13 @@ module Private : sig
   module Frame = Frame
 
   val of_flow :
-    ?max_message:int -> ?close_timeout:Affect_unix.Mtime.Span.t -> Caravan.Flow.t -> t
-    (** [of_flow ~max_message ~close_timeout flow] is a server connection on
-        [flow]. The default of [max_message] is 8 MiB, and the default of
-        [close_timeout] is 5 s. *)
+    ?max_message:int ->
+    ?close_timeout:Affect_unix.Mtime.Span.t ->
+    ?write_timeout:Affect_unix.Mtime.Span.t ->
+    ?read_timeout:Affect_unix.Mtime.Span.t ->
+    ?idle_timeout:Affect_unix.Mtime.Span.t ->
+    Caravan.Flow.t ->
+    t
+    (** [of_flow flow] is a server connection on [flow], with the options
+        of {!accept}. *)
 end

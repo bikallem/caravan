@@ -9,7 +9,14 @@ type message = Text of string | Binary of string
 exception Closed of { code : int; reason : string }
 
 val make :
-  ?protocol:string -> ?max_message:int -> ?close_timeout:Affect_unix.Mtime.Span.t -> Flow.t -> t
+  ?protocol:string ->
+  ?max_message:int ->
+  ?close_timeout:Affect_unix.Mtime.Span.t ->
+  ?write_timeout:Affect_unix.Mtime.Span.t ->
+  ?read_timeout:Affect_unix.Mtime.Span.t ->
+  ?idle_timeout:Affect_unix.Mtime.Span.t ->
+  Flow.t ->
+  t
 
 val protocol : t -> string option
 val recv : t -> message

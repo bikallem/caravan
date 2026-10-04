@@ -29,8 +29,8 @@ let is_key key = match Base64.decode key with Some k -> String.length k = 16 | N
 (* Runs [f] on the connection. If [f] ends, we close the connection. If [f]
    raises, we close with 1011 and give the exception to the server. If the
    server cancels us, we do not close. *)
-let run ?protocol ?max_message ?close_timeout f flow =
-  let c = Connection.make ?protocol ?max_message ?close_timeout flow in
+let run ?protocol ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout f flow =
+  let c = Connection.make ?protocol ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout flow in
   match f c with
   | () -> Connection.close c
   | exception Closed _ -> ()
@@ -40,7 +40,8 @@ let run ?protocol ?max_message ?close_timeout f flow =
       Connection.close ~code:1011 c;
       Printexc.raise_with_backtrace e bt
 
-let accept ?(protocols = []) ?origin ?max_message ?close_timeout req f =
+let accept ?(protocols = []) ?origin ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout req
+    f =
   let h = Request.headers req in
   let refuse ?(status = Status.bad_request) ?headers why =
     Response.string ~status ?headers ("WebSocket handshake: " ^ why ^ "\n")
@@ -73,12 +74,14 @@ let accept ?(protocols = []) ?origin ?max_message ?close_timeout req f =
           ([ ("Upgrade", "websocket"); ("Sec-WebSocket-Accept", accept_key key) ]
            @ Option.fold ~none:[] ~some:(fun p -> [ ("Sec-WebSocket-Protocol", p) ]) protocol)
       in
-      Response.upgrade ~headers (run ?protocol ?max_message ?close_timeout f)
+      Response.upgrade ~headers
+        (run ?protocol ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout f)
 
 module Private = struct
   module Sha1 = Sha1
   module Base64 = Base64
   module Frame = Frame
 
-  let of_flow ?max_message ?close_timeout flow = Connection.make ?max_message ?close_timeout flow
+  let of_flow ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout flow =
+    Connection.make ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout flow
 end

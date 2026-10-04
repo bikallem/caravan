@@ -16,15 +16,18 @@ type t = {
   protocol : string option;
   max_message : int;
   close_timeout : Mtime.Span.t;
+  write_timeout : Mtime.Span.t;
+  read_timeout : Mtime.Span.t;
+  idle_timeout : Mtime.Span.t option;
+  mutable in_frame : bool; (* a byte of the frame came: with [reader] *)
+  deadlines : Mutex.t; (* the deadlines change one at a time *)
+  close_at : Mtime.t option Atomic.t; (* the deadline of [close] *)
+  mutable read_at : Mtime.t option; (* the read deadline, with [deadlines] *)
+  mutable write_at : Mtime.t option; (* the write deadline, with [deadlines] *)
   closing : exn option Atomic.t; (* we sent a Close frame: what [send] raises *)
   closed : exn option Atomic.t; (* the first [Closed] exception *)
   finished : unit Cell.Once.t; (* set with [closed] *)
 }
-
-let make ?protocol ?(max_message = 8 * 1024 * 1024) ?(close_timeout = Mtime.Span.(5 * s)) flow =
-  { flow; r = Buf_reader.of_flow flow; w = Buf_writer.make (Flow.write flow);
-    writer = Semaphore.make 1; reader = Semaphore.make 1; protocol; max_message; close_timeout;
-    closing = Atomic.make None; closed = Atomic.make None; finished = Cell.Once.make () }
 
 (* RFC 6455 §7.4: the codes that a Close frame can contain. *)
 let is_permitted code =
@@ -32,6 +35,67 @@ let is_permitted code =
   || (code >= 3000 && code <= 4999)
 
 let protocol t = t.protocol
+
+let earlier a b =
+  match (a, b) with
+  | Some x, Some y -> if Mtime.is_earlier x ~than:y then a else b
+  | d, None | None, d -> d
+
+(* The deadlines change with [t.deadlines]: thus a deadline from a read or
+   a write and the deadline of [close] cannot replace each other. The
+   critical sections do not suspend the fiber. *)
+
+(* Sets the read deadline to the earlier of the time [span] after the call
+   and the deadline of [close]. With no [span], only the deadline of
+   [close] applies. *)
+let set_read_deadline t span =
+  Mutex.protect t.deadlines (fun () ->
+      let d = Option.bind span (fun span -> Mtime.add_span (Mtime.now ()) span) in
+      t.read_at <- earlier d (Atomic.get t.close_at);
+      Flow.set_read_deadline t.flow t.read_at)
+
+let set_write_deadline t span =
+  Mutex.protect t.deadlines (fun () ->
+      t.write_at <- earlier (Mtime.add_span (Mtime.now ()) span) (Atomic.get t.close_at);
+      Flow.set_write_deadline t.flow t.write_at)
+
+(* The deadline of [close] stops also the reads and writes that wait at
+   this time, but it does not make their deadlines later. *)
+let set_close_deadline t d =
+  Mutex.protect t.deadlines (fun () ->
+      Atomic.set t.close_at d;
+      t.read_at <- earlier t.read_at d;
+      t.write_at <- earlier t.write_at d;
+      Flow.set_read_deadline t.flow t.read_at;
+      Flow.set_write_deadline t.flow t.write_at)
+
+(* The reads of [t.r]. Inside a frame, each read gets the deadline
+   [read_timeout] after its start. Thus a slow frame with no long pause
+   can take more time than [read_timeout]. *)
+let read_bytes t buf off len =
+  if t.in_frame then set_read_deadline t (Some t.read_timeout);
+  let n = Flow.read t.flow buf off len in
+  (* A byte of the frame came, or the input ended: then [Frame.read] stops
+     with End_of_file. *)
+  t.in_frame <- true;
+  n
+
+let make ?protocol ?(max_message = 8 * 1024 * 1024) ?(close_timeout = Mtime.Span.(5 * s))
+    ?(write_timeout = Mtime.Span.(30 * s)) ?(read_timeout = Mtime.Span.(30 * s)) ?idle_timeout
+    flow =
+  (* [read_bytes] is necessary to make [r], and it needs the connection. *)
+  let self = ref None in
+  let read buf off len = read_bytes (Option.get !self) buf off len in
+  let t =
+    { flow; r = Buf_reader.make read; w = Buf_writer.make (Flow.write flow);
+      writer = Semaphore.make 1; reader = Semaphore.make 1; protocol; max_message; close_timeout;
+      write_timeout; read_timeout; idle_timeout; in_frame = false; deadlines = Mutex.create ();
+      close_at = Atomic.make None; read_at = None; write_at = None; closing = Atomic.make None;
+      closed = Atomic.make None; finished = Cell.Once.make () }
+  in
+  self := Some t;
+  t
+
 let check_closed t = Option.iter raise (Atomic.get t.closed)
 
 (* If the connection is open, this function keeps [code] and [reason] as its
@@ -62,6 +126,7 @@ let write_frame t (frame : Frame.t) =
       | (Text | Binary | Continuation | Ping), Some e -> raise e
       | _ -> (
           try
+            set_write_deadline t t.write_timeout;
             Frame.write t.w frame;
             Buf_writer.flush t.w
           with
@@ -130,10 +195,16 @@ let message t (op : Frame.opcode) payload =
    [Closed]. *)
 let rec next t part =
   let size = match part with None -> 0 | Some (_, b) -> Buffer.length b in
+  (* The idle timeout applies until the first byte of the frame. The bytes
+     of the frame can be in [t.r] at this time. *)
+  t.in_frame <- Buf_reader.buffered t.r > 0;
+  if not t.in_frame then set_read_deadline t t.idle_timeout;
   let start = Buf_reader.consumed t.r in
   match Frame.read t.r ~masked:true ~max:(Int.max 125 (t.max_message - size)) with
   | exception Frame.Error (Protocol_error reason) -> fail t 1002 reason
   | exception Frame.Error Too_big -> fail t 1009 "message is too large"
+  | exception Flow.Timeout when Atomic.get t.closing = None ->
+      if t.in_frame then fail t 1001 "read timeout" else fail t 1001 "idle timeout"
   | exception (End_of_file | Flow.Closed | Flow.Timeout) -> raise (shut t 1006 "")
   (* Between two messages, an exception before the first byte of a frame,
      for example a cancel, leaves the stream in step. *)
@@ -174,11 +245,7 @@ let close ?(code = 1000) ?(reason = "") t =
   then invalid_arg "Caravan_websocket.close: reason is not UTF-8 of at most 123 bytes";
   if Atomic.get t.closed = None && claim_close t (Closed { code; reason })
   then begin
-    (* The deadlines reach also the fibers that read or write at this
-       time. *)
-    let deadline = Mtime.add_span (Mtime.now ()) t.close_timeout in
-    Flow.set_write_deadline t.flow deadline;
-    Flow.set_read_deadline t.flow deadline;
+    set_close_deadline t (Mtime.add_span (Mtime.now ()) t.close_timeout);
     write_close t (code_payload code ^ reason);
     (* A fiber in [recv] reads the peer's Close frame. If no fiber reads,
        we read it. *)

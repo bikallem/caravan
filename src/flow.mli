@@ -52,7 +52,9 @@ val make :
       fail rather than end (default: [close]). The resulting flow calls at
       most one of [close] and [reset], once.
     - [set_read_deadline d] and [set_write_deadline d] set or clear the time
-      after which a blocked read or write raises {!Timeout}. *)
+      after which a blocked read or write raises {!Timeout}. They must not
+      suspend the fiber or block: callers can call them while they hold a
+      lock. *)
 
 (** {1:reading Reading} *)
 
