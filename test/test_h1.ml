@@ -1051,16 +1051,17 @@ let buf_writer_tests =
           String.iter (Buf_writer.write_char w) "abcde";
           Buf_writer.flush w;
           equal (list string) [ "ab"; "cd"; "e" ] (calls ()));
-      test "large writes go straight to the output" (fun () ->
+      test "a large write fills the buffer, then the rest goes straight to the output" (fun () ->
           let w, calls = recorded ~size:4 () in
           Buf_writer.write_string w "ab";
           Buf_writer.write_string w "0123456789";
           Buf_writer.write_string w "abcd";
           Buf_writer.write_string w "";
-          equal (list string) [ "ab"; "0123456789"; "abcd" ] (calls ());
+          equal (list string) [ "ab01"; "23456789"; "abcd" ] (calls ());
           equal int 0 (Buf_writer.buffered w));
       test "invalid arguments" (fun () ->
-          (* Large writes skip the copy, so only the range check can raise. *)
+          (* A large write to an empty buffer skips the copy. Thus only the
+             range check can raise. *)
           let w = Buf_writer.make ~size:2 ignore3 in
           List.iter
             (fun (off, len) ->
@@ -1076,8 +1077,8 @@ let buf_writer_tests =
            equal string (String.concat "" writes) (String.concat "" (calls ()));
            List.iter
              (fun c ->
-                is_true ~msg:"a call is at most size bytes, or one large write"
-                  (String.length c <= size || List.mem c writes))
+                is_true ~msg:"a call is at most size bytes, or the end of one large write"
+                  (String.length c <= size || List.exists (fun s -> String.ends_with ~suffix:c s) writes))
              (calls ())) ]
 
 (* H1_write: framing and response heads *)

@@ -14,10 +14,17 @@ val write_string : t -> string -> unit
 (** [write_string w s] writes [s]. *)
 
 val write_bytes : t -> bytes -> int -> int -> unit
-(** [write_bytes w buf off len] writes [len] bytes of [buf] from [off]. Bytes
-    that fit are copied into the buffer. Otherwise the buffer is flushed first,
-    and a write of at least the buffer size then goes directly to the output,
-    without a copy.
+(** [write_bytes w buf off len] writes [len] bytes of [buf] from [off]:
+    - A write that fits goes into the buffer.
+    - A write that is smaller than the buffer but does not fit flushes the
+      buffer first. Then it goes into the buffer.
+    - A write of at least the buffer size first fills the buffer and
+      flushes it, if the buffer holds bytes. Then the rest goes directly
+      to the output, without a copy, if it is at least the buffer size. If
+      not, the rest stays in the buffer. Thus a small head does not go out
+      alone before a large body.
+
+    Bytes that stay in the buffer go out at the next {!flush}.
 
     @raise Invalid_argument if the range is not valid in [buf]. *)
 
