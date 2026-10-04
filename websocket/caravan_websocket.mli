@@ -56,6 +56,24 @@ val ping : t -> string -> unit
     @raise Invalid_argument if [data] has more than 125 bytes.
     @raise Closed if the connection is closed. *)
 
+val close : ?code:int -> ?reason:string -> t -> unit
+(** [close ~code ~reason c] closes [c] with the closing handshake
+    ({{:https://www.rfc-editor.org/rfc/rfc6455#section-7}RFC 6455 §7}). It
+    sends a Close frame with [code] (default 1000) and [reason] (default
+    empty). Then it waits for the Close frame of the peer, for at most the
+    close timeout of [c]. Then the connection closes:
+    - After [close], {!send} and {!ping} raise {!Closed}.
+    - Until the Close frame of the peer comes, the connection discards the
+      messages from the peer and sends no Pong.
+    - If a fiber is in {!recv}, that fiber reads the Close frame of the peer
+      and raises {!Closed} with its code. [close] waits for this.
+    - At the time limit, the reads and writes on [c] stop, and {!recv}
+      raises {!Closed} with the code 1006.
+    - If we sent a Close frame on [c] before, [close] does nothing.
+
+    @raise Invalid_argument if [code] is not a code that a Close frame can
+    contain, or if [reason] is not valid UTF-8 or has more than 123 bytes. *)
+
 (**/**)
 
 (** Internal modules, exposed for tests. Not part of the public API. *)
@@ -64,7 +82,9 @@ module Private : sig
   module Base64 = Base64
   module Frame = Frame
 
-  val of_flow : ?max_message:int -> Caravan.Flow.t -> t
-  (** [of_flow ~max_message flow] is a server connection on [flow]. The
-      default of [max_message] is 8 MiB. *)
+  val of_flow :
+    ?max_message:int -> ?close_timeout:Affect_unix.Mtime.Span.t -> Caravan.Flow.t -> t
+    (** [of_flow ~max_message ~close_timeout flow] is a server connection on
+        [flow]. The default of [max_message] is 8 MiB, and the default of
+        [close_timeout] is 5 s. *)
 end

@@ -9,6 +9,7 @@ exception Closed = Connection.Closed
 let recv = Connection.recv
 let send = Connection.send
 let ping = Connection.ping
+let close = Connection.close
 
 module Private = struct
   module Sha1 = Sha1

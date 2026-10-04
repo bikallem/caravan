@@ -8,7 +8,8 @@ type message = Text of string | Binary of string
 
 exception Closed of { code : int; reason : string }
 
-val make : ?max_message:int -> Flow.t -> t
+val make : ?max_message:int -> ?close_timeout:Affect_unix.Mtime.Span.t -> Flow.t -> t
 val recv : t -> message
 val send : t -> message -> unit
 val ping : t -> string -> unit
+val close : ?code:int -> ?reason:string -> t -> unit
