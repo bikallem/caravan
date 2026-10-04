@@ -49,8 +49,10 @@ val accept :
     - [origin o] is [true] if the [Origin] [o] of a request is permitted.
       By default, the origin must have the host and the port of [req]: a
       page from a different site cannot use the cookies of the user on
-      this server. A request without [Origin] does not come from a browser,
-      and [accept] permits it.
+      this server. A missing port is the default port of the scheme of the
+      origin (80 or 443). If the scheme of [req] is [https], the origin
+      must also be [https]. A request without [Origin] does not come from
+      a browser, and [accept] permits it.
     - [max_message] is the size limit of a received message, 8 MiB by
       default.
     - [close_timeout] is the time limit of {!close}, 5 s by default.

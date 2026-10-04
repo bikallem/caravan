@@ -14,14 +14,26 @@ let ping = Connection.ping
 let close = Connection.close
 let protocol = Connection.protocol
 
+let without_port port s =
+  let suffix = ":" ^ string_of_int port in
+  if String.ends_with ~suffix s then String.sub s 0 (String.length s - String.length suffix) else s
+
 (* An origin is "scheme://host[:port]" (RFC 6454 §7). The default check
-   permits only the host and the port of the request. *)
+   permits only the host and the port of the request. A missing port is
+   the default port of the scheme of the origin. An https request does not
+   permit an http origin. An http request permits the two schemes, because
+   a proxy can terminate TLS in front of the server. *)
 let same_origin req origin =
+  let origin = String.lowercase_ascii origin in
   match (Request.authority req, String.index_opt origin ':') with
   | Some authority, Some i
-    when i + 2 < String.length origin && origin.[i + 1] = '/' && origin.[i + 2] = '/' ->
-      String.lowercase_ascii (String.sub origin (i + 3) (String.length origin - i - 3))
-      = String.lowercase_ascii authority
+    when i + 2 < String.length origin && origin.[i + 1] = '/' && origin.[i + 2] = '/' -> (
+      let host = String.sub origin (i + 3) (String.length origin - i - 3) in
+      let same port = without_port port host = without_port port (String.lowercase_ascii authority) in
+      match String.sub origin 0 i with
+      | "https" -> same 443
+      | "http" -> Request.scheme req <> "https" && same 80
+      | _ -> false)
   | _ -> false
 
 let is_key key = match Base64.decode key with Some k -> String.length k = 16 | None -> false

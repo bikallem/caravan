@@ -942,8 +942,16 @@ let handshake_tests =
             WebSocket handshake: the version must be 13
             |});
       test "accept permits only the origin of the request by default" (fun () ->
-          let status ?origin ?authority o =
-            List.hd (String.split_on_char ' ' (answer ?origin (request ?authority [ ("Origin", o) ])))
+          let status ?origin ?authority ?scheme o =
+            let req = request ?authority [ ("Origin", o) ] in
+            let req =
+              match scheme with
+              | None -> req
+              | Some scheme ->
+                  Caravan.Request.make ~scheme ?authority:(Caravan.Request.authority req)
+                    ~headers:(Caravan.Request.headers req) Caravan.Method.GET "/chat"
+            in
+            List.hd (String.split_on_char ' ' (answer ?origin req))
           in
           expect
             (String.concat " "
@@ -954,7 +962,19 @@ let handshake_tests =
                  status ~authority:"server.example.com:8080" "http://server.example.com:8080";
                  status ~origin:(fun o -> o = "null") "null";
                  status ~origin:(fun _ -> false) "http://server.example.com" ])
-          @@ __POS_OF__ {|101 101 403 403 403 403 403 403 403 101 101 403|});
+          @@ __POS_OF__ {|101 101 403 403 403 403 403 403 403 101 101 403|};
+          (* Default ports, and the scheme of the request. *)
+          expect
+            (String.concat " "
+               [ status ~authority:"server.example.com:443" "https://server.example.com";
+                 status "https://server.example.com:443"; status "http://server.example.com:80";
+                 status ~authority:"server.example.com:80" "http://server.example.com";
+                 status ~authority:"server.example.com:443" "http://server.example.com";
+                 status ~authority:"server.example.com:80" "https://server.example.com";
+                 status "ftp://server.example.com";
+                 status ~scheme:"https" "https://server.example.com";
+                 status ~scheme:"https" "http://server.example.com" ])
+          @@ __POS_OF__ {|101 101 101 101 403 403 403 101 403|});
       test "accept chooses the first subprotocol of the server that the client offers"
         (fun () ->
            let chosen ?protocols offered =
