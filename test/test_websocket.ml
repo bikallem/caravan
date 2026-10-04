@@ -425,6 +425,52 @@ let connection_tests =
             --
             pong "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
             |});
+      test "the size of a message counts all of its fragments" (fun () ->
+          expect
+            (converse ~max_message:10
+               (client ~fin:false Binary "aaaa" ^ client ~fin:false Continuation "bbbb"
+                ^ client Continuation "cccc")
+               (fun note c -> match Ws.recv c with
+                 | Binary s -> note (Printf.sprintf "binary of %d bytes" (String.length s))
+                 | Text _ -> note "text"
+                 | exception e -> note_closed note e))
+          @@ __POS_OF__ {|
+            closed 1009 "message is too large"
+            --
+            close 1009
+            |});
+      test "empty fragments do not make the heap grow" (fun () ->
+          (* 300 000 empty Continuation frames, then the last fragment.
+             The read function records the largest heap. *)
+          let first = client ~fin:false Binary "x" and empty = client ~fin:false Continuation "" in
+          let last = client Continuation "y" and count = 300_000 in
+          let size = String.length empty in
+          let body = count * size in
+          let total = String.length first + body + String.length last in
+          let pos = ref 0 and top = ref 0 in
+          let byte i =
+            if i < String.length first then first.[i]
+            else if i < String.length first + body then empty.[(i - String.length first) mod size]
+            else last.[i - String.length first - body]
+          in
+          let read buf off len =
+            top := Int.max !top (Gc.quick_stat ()).heap_words;
+            let n = Int.min len (total - !pos) in
+            for i = 0 to n - 1 do Bytes.set buf (off + i) (byte (!pos + i)) done;
+            pos := !pos + n;
+            n
+          in
+          let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
+          let flow =
+            Caravan.Flow.make ~read ~read_now:(fun b o l -> Some (read b o l))
+              ~write:(fun _ _ _ -> ()) ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
+              ~close:ignore ~set_read_deadline:ignore_deadline ~set_write_deadline:ignore_deadline ()
+          in
+          let start = (Gc.quick_stat ()).heap_words in
+          Affect_unix.Unix.main ~domain_count:1 (fun () ->
+              is_true (Ws.recv (Ws.Private.of_flow flow) = Binary "xy"));
+          let grew = (!top - start) * (Sys.word_size / 8) in
+          is_true ~msg:(Printf.sprintf "the heap grew by %d bytes" grew) (grew < 4_000_000));
       test "a connection that stops inside a frame" (fun () ->
           expect (converse (String.sub (client Text "Hello") 0 4) echo) @@ __POS_OF__ {|
             closed 1006 ""
