@@ -9,3 +9,6 @@ result-*
 _build/
 *.install
 .vscode/settings.json
+
+# Autobahn test suite reports
+autobahn/reports/
