@@ -43,6 +43,21 @@ let rec really_read r buf off len =
     really_read r buf (off + n) (len - n)
   end
 
+(* Reads [len] bytes. The buffer grows as the bytes arrive, thus a peer that
+   declares a large length and sends no payload does not take that memory. *)
+let read_payload r len =
+  let rec loop buf pos =
+    if pos = len
+    then buf
+    else begin
+      let buf = if pos < Bytes.length buf then buf else Bytes.extend buf 0 (Int.min pos (len - pos)) in
+      let n = Buf_reader.read_into r buf pos (Bytes.length buf - pos) in
+      if n = 0 then raise End_of_file;
+      loop buf (pos + n)
+    end
+  in
+  loop (Bytes.create (Int.min len 65536)) 0
+
 let read r ~masked ~max =
   let hdr = Bytes.create 8 in
   really_read r hdr 0 2;
@@ -68,8 +83,7 @@ let read r ~masked ~max =
   in
   if len > max then raise (Error Too_big);
   let key = if masked then (really_read r hdr 0 4; Bytes.sub_string hdr 0 4) else "" in
-  let payload = Bytes.create len in
-  really_read r payload 0 len;
+  let payload = read_payload r len in
   if masked then apply_mask key payload 0 len;
   { fin; opcode; payload = Bytes.unsafe_to_string payload }
 

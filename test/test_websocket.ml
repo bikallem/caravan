@@ -194,6 +194,13 @@ top bit: protocol error: length with its top bit set
           expect (outcome ~masked:false (of_hex "81 7e 00 02 68 69")) @@ __POS_OF__ {|text "hi"|};
           expect (outcome ~masked:false (of_hex "81 7f 00 00 00 00 00 00 00 00"))
           @@ __POS_OF__ {|text ""|});
+      test "a declared length does not allocate before the payload arrives" (fun () ->
+          let header = of_hex "827f" ^ "\x00\x00\x00\x00\x00\x80\x00\x00" in
+          let r = Buf_reader.of_string (header ^ "short") in
+          let before = Gc.allocated_bytes () in
+          raises End_of_file (fun () -> Frame.read r ~masked:false ~max:max_int);
+          let used = Gc.allocated_bytes () -. before in
+          is_true ~msg:(Printf.sprintf "%.0f bytes" used) (used < 1_000_000.));
       test "truncated input" (fun () ->
           let input = of_hex "81 fe 00 02 37 fa 21 3d 7f 9f" in
           equal (list string)

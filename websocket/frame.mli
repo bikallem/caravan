@@ -28,7 +28,8 @@ val read : Buf_reader.t -> masked:bool -> max:int -> t
     that is fragmented or longer than 125 bytes, is masked otherwise than
     [masked] says, or has a 64-bit length with its top bit set
     ([Protocol_error]), or if its length is over [max] ([Too_big]). Nothing
-    after the length is read then.
+    after the length is read then. The payload buffer grows as the bytes
+    arrive: a declared length does not allocate memory before its payload.
     @raise End_of_file if the input ends before the frame does. *)
 
 val write : ?mask:string -> Buf_writer.t -> t -> unit
