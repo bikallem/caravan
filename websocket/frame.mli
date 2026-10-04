@@ -11,8 +11,8 @@ type t = { fin : bool; opcode : opcode; payload : string }
 
 type error =
 | Protocol_error of string
-(** A frame that breaks the protocol; the connection closes with 1002. *)
-| Too_big  (** A payload over the limit; the connection closes with 1009. *)
+(** A frame that breaks the protocol. The connection closes with 1002. *)
+| Too_big  (** A payload over the limit. The connection closes with 1009. *)
 
 exception Error of error
 
@@ -20,15 +20,18 @@ val is_control : opcode -> bool
 (** [is_control op] is [true] for [Close], [Ping] and [Pong]. *)
 
 val read : Buf_reader.t -> masked:bool -> max:int -> t
-(** [read r ~masked ~max] reads a frame whose payload is at most [max]
-    bytes. A server reads with [~masked:true], a client with
+(** [read r ~masked ~max] reads a frame. The payload of a data frame is at
+    most [max] bytes. The payload of a control frame is at most 125 bytes,
+    whatever [max] is. A server reads with [~masked:true], a client with
     [~masked:false].
 
     @raise Error if the frame has a reserved bit or opcode, is a control frame
     that is fragmented or longer than 125 bytes, is masked otherwise than
     [masked] says, or has a 64-bit length with its top bit set
-    ([Protocol_error]), or if its length is over [max] ([Too_big]). Nothing
-    after the length is read then.
+    ([Protocol_error]), or if it is a data frame with a length over [max]
+    ([Too_big]). [read] reads nothing after the length then. The payload
+    buffer grows as the bytes arrive: before its payload, a declared length
+    allocates at most 64 KiB.
     @raise End_of_file if the input ends before the frame does. *)
 
 val write : ?mask:string -> Buf_writer.t -> t -> unit

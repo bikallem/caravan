@@ -3,8 +3,8 @@
 An HTTP server for OCaml 5, built on
 [affect](https://erratique.ch/software/affect), a concurrency library
 with structured concurrency and cancellation. The HTTP/1.1 server and
-WebSocket work today; the design leaves room for HTTP/2, HTTP/3, a
-client and a Traefik-like reverse proxy.
+WebSocket are available at this time. The design leaves room for HTTP/2,
+HTTP/3, a client and a Traefik-like reverse proxy.
 
 ```ocaml
 let () = Caravan.Server.run (fun _req -> Caravan.Response.string "Hello!\n")
@@ -58,6 +58,10 @@ let handler req =
   for each Ping, and examines the UTF-8 of text.
 - Many fibers can send at the same time, and `close` closes the
   connection from any fiber, with a time limit.
+- A write timeout (30 s by default) stops a send to a peer that reads
+  nothing. A read timeout (30 s by default) closes a connection when a
+  frame stops in the middle. An optional idle timeout closes a connection
+  when no frame comes in time.
 - All the cases of the [Autobahn](https://github.com/crossbario/autobahn-testsuite)
   test suite give OK or NON-STRICT, except the compression cases:
   caravan does not accept `permessage-deflate`.
@@ -97,7 +101,8 @@ Then:
 make build      # dune build
 make test       # all test suites
 make fmt        # indent with ocp-indent
-make mutate     # mutation testing across all suites (slow)
+make mutate     # mutation testing across all suites, in parallel
+make mutate MUTATE=websocket/   # only the mutants of the files under a prefix
 make coverage   # test coverage report
 make autobahn   # the Autobahn WebSocket test suite, with podman or docker
 ```

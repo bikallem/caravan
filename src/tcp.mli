@@ -12,7 +12,9 @@ val flow : Unix.file_descr -> Flow.t
       function is cancelled, and raises {!Affect.Fun.Async.Cancelled} if so:
       a socket that is always ready would otherwise never notice.
     - {!Flow.shutdown_send} half-closes the socket and {!Flow.close} closes
-      it. *)
+      it. A read or a write that waits in a different fiber then raises
+      {!Flow.Closed}. The socket closes when no read or write uses it, thus
+      a fiber cannot use the socket of a different connection. *)
 
 val connect : Unix.sockaddr -> Flow.t
 (** [connect addr] connects to [addr] and is the connection's flow.

@@ -157,7 +157,10 @@ let frame_tests =
       test "the length limit" (fun () ->
           let input = encode (f Binary "0123456789") in
           expect (outcome ~masked:false ~max:10 input) @@ __POS_OF__ {|binary "0123456789"|};
-          expect (outcome ~masked:false ~max:9 input) @@ __POS_OF__ {|too big|});
+          expect (outcome ~masked:false ~max:9 input) @@ __POS_OF__ {|too big|};
+          (* The limit is only for data frames. *)
+          expect (outcome ~masked:false ~max:0 (encode (f Ping "0123456789")))
+          @@ __POS_OF__ {|ping "0123456789"|});
       (* Inputs end right after their length, so reading further would give
          "end of input". *)
       test "bad frames" (fun () ->
@@ -194,6 +197,13 @@ top bit: protocol error: length with its top bit set
           expect (outcome ~masked:false (of_hex "81 7e 00 02 68 69")) @@ __POS_OF__ {|text "hi"|};
           expect (outcome ~masked:false (of_hex "81 7f 00 00 00 00 00 00 00 00"))
           @@ __POS_OF__ {|text ""|});
+      test "a declared length does not allocate before the payload arrives" (fun () ->
+          let header = of_hex "827f" ^ "\x00\x00\x00\x00\x00\x80\x00\x00" in
+          let r = Buf_reader.of_string (header ^ "short") in
+          let before = Gc.allocated_bytes () in
+          raises End_of_file (fun () -> Frame.read r ~masked:false ~max:max_int);
+          let used = Gc.allocated_bytes () -. before in
+          is_true ~msg:(Printf.sprintf "%.0f bytes" used) (used < 1_000_000.));
       test "truncated input" (fun () ->
           let input = of_hex "81 fe 00 02 37 fa 21 3d 7f 9f" in
           equal (list string)
@@ -206,6 +216,15 @@ top bit: protocol error: length with its top bit set
             [ (Some "abc", f Text ""); (Some "abcde", f Text ""); (None, f ~fin:false Ping "");
               (None, f Close (String.make 126 'x')); (None, f Pong (String.make 126 'x')) ];
           is_true (String.length (encode ~mask:key (f Ping (String.make 125 'x'))) = 131));
+      prop "a masked payload is the XOR of each byte with the key"
+        Gen.(pair (string_of ~size:(constant 4) char) (string_of ~size:(int_range 0 300) char))
+        (fun (mask, payload) ->
+           let out = encode ~mask (f Binary payload) in
+           let n = String.length payload in
+           let masked = String.sub out (String.length out - n) n in
+           equal string
+             (String.mapi (fun i c -> Char.chr (Char.code c lxor Char.code mask.[i land 3])) payload)
+             masked);
       prop "read inverts write, however the input is split"
         Gen.(
           quad
@@ -406,6 +425,95 @@ let connection_tests =
             --
             pong "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
             |});
+      test "the size of a message counts all of its fragments" (fun () ->
+          expect
+            (converse ~max_message:10
+               (client ~fin:false Binary "aaaa" ^ client ~fin:false Continuation "bbbb"
+                ^ client Continuation "cccc")
+               (fun note c -> match Ws.recv c with
+                 | Binary s -> note (Printf.sprintf "binary of %d bytes" (String.length s))
+                 | Text _ -> note "text"
+                 | exception e -> note_closed note e))
+          @@ __POS_OF__ {|
+            closed 1009 "message is too large"
+            --
+            close 1009
+            |});
+      test "empty fragments do not make the heap grow" (fun () ->
+          (* 300 000 empty Continuation frames, then the last fragment.
+             The read function records the largest heap. *)
+          let first = client ~fin:false Binary "x" and empty = client ~fin:false Continuation "" in
+          let last = client Continuation "y" and count = 300_000 in
+          let size = String.length empty in
+          let body = count * size in
+          let total = String.length first + body + String.length last in
+          let pos = ref 0 and top = ref 0 in
+          let byte i =
+            if i < String.length first then first.[i]
+            else if i < String.length first + body then empty.[(i - String.length first) mod size]
+            else last.[i - String.length first - body]
+          in
+          let read buf off len =
+            top := Int.max !top (Gc.quick_stat ()).heap_words;
+            let n = Int.min len (total - !pos) in
+            for i = 0 to n - 1 do Bytes.set buf (off + i) (byte (!pos + i)) done;
+            pos := !pos + n;
+            n
+          in
+          let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
+          let flow =
+            Caravan.Flow.make ~read ~read_now:(fun b o l -> Some (read b o l))
+              ~write:(fun _ _ _ -> ()) ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
+              ~close:ignore ~set_read_deadline:ignore_deadline ~set_write_deadline:ignore_deadline ()
+          in
+          let start = (Gc.quick_stat ()).heap_words in
+          Affect_unix.Unix.main ~domain_count:1 (fun () ->
+              is_true (Ws.recv (Ws.Private.of_flow flow) = Binary "xy"));
+          let grew = (!top - start) * (Sys.word_size / 8) in
+          is_true ~msg:(Printf.sprintf "the heap grew by %d bytes" grew) (grew < 4_000_000));
+      test "the buffer of a fragmented message stays within max_message" (fun () ->
+          (* What recv allocates for a message of [m] bytes in fragments of
+             [sizes], more than for the same message in one frame. The
+             expected message is made before the measure. *)
+          let m = 1024 * 1024 in
+          let expected = String.make m 'x' in
+          let allocated frames =
+            let flow = Caravan.Flow.of_string (String.concat "" frames) (Buffer.create 16) in
+            let used = ref 0. in
+            Affect_unix.Unix.main ~domain_count:1 (fun () ->
+                let c = Ws.Private.of_flow ~max_message:m flow in
+                let before = Gc.allocated_bytes () in
+                let msg = Ws.recv c in
+                used := Gc.allocated_bytes () -. before;
+                is_true (msg = Binary expected));
+            !used
+          in
+          let whole = allocated [ client Binary expected ] in
+          let more sizes =
+            let rec frames first = function
+            | [] -> []
+            | [ n ] -> [ client (if first then Binary else Continuation) (String.make n 'x') ]
+            | n :: rest ->
+                client ~fin:false (if first then Binary else Continuation) (String.make n 'x')
+                :: frames false rest
+            in
+            (allocated (frames true sizes) -. whole) /. Float.of_int m
+          in
+          (* At most one buffer of [m] bytes, and the copy when it grows:
+             1.50 m at this time. A buffer of 2 times the first fragment
+             gave 2.00 m to 4.44 m. A full first fragment and an empty last
+             fragment do not cause a copy. In the last three cases, the
+             double size is more than [m]: without the limit, they give
+             2.44 m to 3.00 m. *)
+          List.iter
+            (fun (sizes, limit) ->
+               let r = more sizes in
+               is_true
+                 ~msg:(Printf.sprintf "%s: %.2f m" (String.concat " + " (List.map string_of_int sizes)) r)
+                 (r < limit))
+            [ ([ m; 0 ], 0.5); ([ (m / 2) - 1; (m / 2) + 1 ], 1.75); ([ 3; m - 3 ], 1.75);
+              ([ m - 1; 1 ], 1.75); ([ (m / 2) + 1; (m / 2) - 1 ], 1.75);
+              ([ 6 * m / 10; m / 10; m - (6 * m / 10) - (m / 10) ], 1.75) ]);
       test "a connection that stops inside a frame" (fun () ->
           expect (converse (String.sub (client Text "Hello") 0 4) echo) @@ __POS_OF__ {|
             closed 1006 ""
@@ -518,6 +626,31 @@ let close_tests =
             --
             close 1000
             |});
+      test "close stops at the time limit if the peer sends without a stop" (fun () ->
+          (* A flow that always has bytes: a read never waits for its
+             deadline. The peer sends 100 000 000 frames, then ends. A read
+             of all of them takes many seconds. *)
+          let frame = client Binary "" and count = 100_000_000 in
+          let size = String.length frame in
+          let total = count * size and pos = ref 0 in
+          let read buf off len =
+            let n = Int.min len (total - !pos) in
+            for i = 0 to n - 1 do Bytes.set buf (off + i) frame.[(!pos + i) mod size] done;
+            pos := !pos + n;
+            n
+          in
+          let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
+          let flow =
+            Caravan.Flow.make ~read ~read_now:(fun b o l -> Some (read b o l))
+              ~write:(fun _ _ _ -> ()) ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
+              ~close:ignore ~set_read_deadline:ignore_deadline ~set_write_deadline:ignore_deadline ()
+          in
+          let t = Affect_unix.Mtime.counter () in
+          Affect_unix.Unix.main ~domain_count:1 (fun () ->
+              Ws.close (Ws.Private.of_flow ~close_timeout:Affect_unix.Mtime.Span.(50 * ms) flow));
+          let took = Affect_unix.Mtime.Span.to_float_ns (Affect_unix.Mtime.count t) /. 1e6 in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 2000.);
+          is_true ~msg:(Printf.sprintf "read %d of %d bytes" !pos total) (!pos < total));
       test "close examines its code and its reason" (fun () ->
           (* The largest reason: 123 bytes of UTF-8. *)
           let reason = String.make 120 'x' ^ "\xe2\x82\xac" in
@@ -533,7 +666,7 @@ let close_tests =
 
 (* Runs [f] with a server connection and the flow of its peer, on a TCP
    connection. *)
-let with_socket ?close_timeout f =
+let with_socket ?close_timeout ?write_timeout ?read_timeout ?idle_timeout f =
   let open Affect in
   Affect_unix.Unix.main ~domain_count:Server_support.domain_count @@ fun () ->
   let l = Caravan.Tcp.Listener.listen Server_support.loopback in
@@ -542,10 +675,21 @@ let with_socket ?close_timeout f =
   let fd, _ = Caravan.Tcp.Listener.accept l in
   let server = Caravan.Tcp.flow fd and peer = Fun.Async.get peer in
   Stdlib.Fun.protect ~finally:(fun () -> Caravan.Flow.close peer; Caravan.Flow.close server)
-  @@ fun () -> f (Ws.Private.of_flow ?close_timeout server) peer
+  @@ fun () ->
+  f (Ws.Private.of_flow ?close_timeout ?write_timeout ?read_timeout ?idle_timeout server) peer
 
 let ms n = Affect_unix.Mtime.Span.(n * ms)
 let elapsed_ms c = Affect_unix.Mtime.Span.to_float_ns (Affect_unix.Mtime.count c) /. 1e6
+
+(* [f ()], in a call that must end in 2 s. If not, the test cancels the
+   call and fails, so that a regression does not stop the suite. *)
+let within_2s f =
+  let open Affect in
+  let call = Fun.Async.call f in
+  let ended = Action.map (fun v -> `Ended v) (Fun.Async.get' call) in
+  match Action.invoke (Action.choose [ ended; Affect_unix.Mtime.wait_for' (ms 2000) `Late ]) with
+  | `Ended v -> v
+  | `Late -> Fun.Async.cancel call; fail "no end after 2 s"
 
 (* The code of the [Closed] exception that [f] raises. *)
 let closed_code f =
@@ -623,7 +767,253 @@ let socket_tests =
           Ws.close c;
           let took = elapsed_ms t in
           is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 2000.);
-          equal int 1006 (Fun.Async.get sender)) ]
+          equal int 1006 (Fun.Async.get sender));
+      test "a send that waits for a different send raises Closed after close" (fun () ->
+          let open Affect in
+          with_socket ~close_timeout:(ms 2000) @@ fun c peer ->
+          (* The peer reads nothing: [big] fills the socket buffers. *)
+          let big = Fun.Async.call (fun () -> Ws.send c (Binary (String.make 4_000_000 'x'))) in
+          Affect_unix.Mtime.wait_for (ms 50);
+          let late = Fun.Async.call (fun () -> closed_code (fun () -> Ws.send c (Text "late"))) in
+          Affect_unix.Mtime.wait_for (ms 20);
+          let closer = Fun.Async.call (fun () -> Ws.close c) in
+          Affect_unix.Mtime.wait_for (ms 20);
+          let r = Buf_reader.of_flow peer in
+          let next () = Frame.read r ~masked:false ~max:max_int in
+          equal int 4_000_000 (String.length (next ()).payload);
+          equal string "close 1000" (show_frame (next ()));
+          Caravan.Flow.write_string peer (client Close (code_reason 1000 ""));
+          Fun.Async.get big;
+          equal int 1000 (Fun.Async.get late);
+          Fun.Async.get closer);
+      test "a send to a peer that reads nothing stops at the write timeout" (fun () ->
+          let open Affect in
+          with_socket ~write_timeout:(ms 50) @@ fun c _peer ->
+          let t = Affect_unix.Mtime.counter () in
+          let send () = Ws.send c (Binary (String.make 10_000_000 'x')) in
+          let sender = Fun.Async.call (fun () -> closed_code send) in
+          let ended = Action.map (fun _ -> `Ended) (Fun.Async.get' sender) in
+          (match Action.invoke (Action.choose [ ended; Affect_unix.Mtime.wait_for' (ms 2000) `Late ]) with
+          | `Ended -> equal int 1006 (Fun.Async.get sender)
+          | `Late -> Fun.Async.cancel sender; fail "the send did not stop");
+          let took = elapsed_ms t in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 2000.));
+      test "a peer that sends no frame in the idle timeout gets Close 1001" (fun () ->
+          with_socket ~idle_timeout:(ms 50) @@ fun c peer ->
+          (* The connection does not wait for the reply of the peer. *)
+          let t = Affect_unix.Mtime.counter () in
+          (match Ws.recv c with
+          | _ -> fail "a message"
+          | exception Ws.Closed { code; reason } ->
+              equal int 1001 code;
+              equal string "idle timeout" reason);
+          let took = elapsed_ms t in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 1000.);
+          equal string "close 1001" (show_frame (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125)));
+      test "a frame that stops in the middle gets Close 1001 at the read timeout" (fun () ->
+          let open Affect in
+          with_socket ~read_timeout:(ms 50) ~close_timeout:(ms 50) @@ fun c peer ->
+          Caravan.Flow.write_string peer (String.sub (client Text "hello") 0 3);
+          let reader = Fun.Async.call (fun () -> Ws.recv c) in
+          let ended = Action.map (fun _ -> `Ended) (Fun.Async.get' reader) in
+          (match Action.invoke (Action.choose [ ended; Affect_unix.Mtime.wait_for' (ms 2000) `Late ]) with
+          | `Late -> Fun.Async.cancel reader; fail "no timeout after 2 s"
+          | `Ended -> fail "a message"
+          | exception Ws.Closed { code; reason } ->
+              equal int 1001 code;
+              equal string "read timeout" reason);
+          equal string "close 1001" (show_frame (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125)));
+      test "a slow frame with no long pause gets no timeout" (fun () ->
+          let open Affect in
+          with_socket ~read_timeout:(ms 200) ~idle_timeout:(ms 200) @@ fun c peer ->
+          (* 2 006 bytes, 100 bytes each 20 ms: about 420 ms in all. *)
+          let frame = client Binary (String.make 2000 'x') in
+          let writer =
+            Fun.Async.call (fun () ->
+                let rec loop off =
+                  if off < String.length frame
+                  then begin
+                    let n = Int.min 100 (String.length frame - off) in
+                    Caravan.Flow.write_string peer (String.sub frame off n);
+                    Affect_unix.Mtime.wait_for (ms 20);
+                    loop (off + n)
+                  end
+                in
+                loop 0)
+          in
+          is_true (Ws.recv c = Binary (String.make 2000 'x'));
+          Fun.Async.get writer);
+      test "the read timeout does not apply between frames" (fun () ->
+          with_socket ~read_timeout:(ms 50) @@ fun c peer ->
+          (* A read inside the first frame sets the read timeout. *)
+          let frame = client Text "one" in
+          Caravan.Flow.write_string peer (String.sub frame 0 2);
+          let first = Affect.Fun.Async.call (fun () -> Ws.recv c) in
+          Affect_unix.Mtime.wait_for (ms 20);
+          Caravan.Flow.write_string peer (String.sub frame 2 (String.length frame - 2));
+          is_true (Affect.Fun.Async.get first = Text "one");
+          (* recv waits for 150 ms, more than the read timeout. *)
+          let second = Affect.Fun.Async.call (fun () -> Ws.recv c) in
+          Affect_unix.Mtime.wait_for (ms 150);
+          Caravan.Flow.write_string peer (client Text "two");
+          is_true (Affect.Fun.Async.get second = Text "two"));
+      test "each frame gets a new idle timeout" (fun () ->
+          let open Affect in
+          with_socket ~idle_timeout:(ms 100) @@ fun c peer ->
+          let writer =
+            Fun.Async.call (fun () ->
+                for _ = 1 to 5 do
+                  Affect_unix.Mtime.wait_for (ms 40);
+                  Caravan.Flow.write_string peer (client Ping "")
+                done;
+                Caravan.Flow.write_string peer (client Text "end"))
+          in
+          is_true (Ws.recv c = Text "end");
+          Fun.Async.get writer);
+      test "close stops at a shorter idle timeout" (fun () ->
+          with_socket ~close_timeout:(ms 1000) ~idle_timeout:(ms 50) @@ fun c _peer ->
+          let t = Affect_unix.Mtime.counter () in
+          Ws.close c;
+          let took = elapsed_ms t in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 500.));
+      test "close keeps the shorter write timeout of a send that waits" (fun () ->
+          let open Affect in
+          with_socket ~close_timeout:(ms 1000) ~write_timeout:(ms 100)
+          @@ fun c peer ->
+          (* The peer reads only the first bytes: the send waits until its
+             write timeout. When the first bytes come, the send is in its
+             frame. *)
+          let t = Affect_unix.Mtime.counter () in
+          let sender =
+            Fun.Async.call (fun () -> closed_code (fun () -> Ws.send c (Binary (String.make 10_000_000 'x'))))
+          in
+          is_false (Buf_reader.peek_eof (Buf_reader.of_flow peer));
+          let closer = Fun.Async.call (fun () -> Ws.close c) in
+          equal int 1006 (Fun.Async.get sender);
+          let took = elapsed_ms t in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 90. && took < 500.);
+          Fun.Async.get closer);
+      test "close keeps its time limit with a long idle timeout" (fun () ->
+          with_socket ~close_timeout:(ms 50) ~idle_timeout:(ms 1000) @@ fun c _peer ->
+          let t = Affect_unix.Mtime.counter () in
+          Ws.close c;
+          let took = elapsed_ms t in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 500.));
+      test "after a protocol error, the peer gets the Close frame and the end of the stream"
+        (fun () ->
+           let open Affect in
+           with_socket @@ fun c peer ->
+           let reader = Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c)) in
+           (* A frame of 20 MiB, over the limit of 8 MiB: the server reads
+              only its header, and 1 MiB stays unread. *)
+           let header = of_hex "82ff" ^ "\x00\x00\x00\x00\x01\x40\x00\x00" ^ "\x01\x02\x03\x04" in
+           Caravan.Flow.write_string peer (header ^ String.make 1_000_000 'x');
+           let r = Buf_reader.of_flow peer in
+           equal string "close 1009" (show_frame (Frame.read r ~masked:false ~max:125));
+           raises End_of_file (fun () -> Frame.read r ~masked:false ~max:125);
+           Caravan.Flow.close peer;
+           equal int 1009 (Fun.Async.get reader));
+      test "a cancel in the linger after a protocol error closes the connection" (fun () ->
+          let open Affect in
+          with_socket ~close_timeout:(ms 1000) @@ fun c peer ->
+          (* The peer does not close: the linger waits. *)
+          let reader = Fun.Async.call (fun () -> Ws.recv c) in
+          Caravan.Flow.write_string peer (client Continuation "x");
+          (* The end of the stream comes after the Close frame: the server
+             is in the linger. *)
+          let r = Buf_reader.of_flow peer in
+          equal string "close 1002" (show_frame (Frame.read r ~masked:false ~max:125));
+          is_true (Buf_reader.peek_eof r);
+          Fun.Async.cancel reader;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
+          let t = Affect_unix.Mtime.counter () in
+          equal int 1002 (within_2s (fun () -> closed_code (fun () -> Ws.recv c)));
+          let took = elapsed_ms t in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 500.));
+      test "the linger after a protocol error discards at most 1 MiB" (fun () ->
+          let open Affect in
+          with_socket @@ fun c peer ->
+          let t = Affect_unix.Mtime.counter () in
+          let reader = Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c)) in
+          (* The peer sends 3 MiB after a frame that is too large, and does
+             not close. The server stops before its close timeout of 5 s. *)
+          let header = of_hex "82ff" ^ "\x00\x00\x00\x00\x01\x40\x00\x00" ^ "\x01\x02\x03\x04" in
+          let writer =
+            Fun.Async.call (fun () ->
+                try Caravan.Flow.write_string peer (header ^ String.make (3 * 1024 * 1024) 'x')
+                with Caravan.Flow.Closed -> ())
+          in
+          equal int 1009 (Fun.Async.get reader);
+          let took = elapsed_ms t in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 2000.);
+          Caravan.Flow.close peer;
+          Fun.Async.get writer);
+      (* A cancel in the middle of a frame closes the connection, because
+         the stream is out of step. A cancel between messages does not. *)
+      test "a cancel in the middle of a send closes with 1006" (fun () ->
+          let open Affect in
+          with_socket @@ fun c peer ->
+          let sender = Fun.Async.call (fun () -> Ws.send c (Binary (String.make 10_000_000 'x'))) in
+          (* When the first bytes come, the send is in its frame. *)
+          let r = Buf_reader.of_flow peer in
+          is_false (Buf_reader.peek_eof r);
+          Fun.Async.cancel sender;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get sender);
+          equal int 1006 (closed_code (fun () -> Ws.send c (Text "hello")));
+          raises End_of_file (fun () -> Frame.read r ~masked:false ~max:max_int));
+      test "a cancel between messages does not close" (fun () ->
+          let open Affect in
+          with_socket @@ fun c peer ->
+          let reader = Fun.Async.call (fun () -> Ws.recv c) in
+          Affect_unix.Mtime.wait_for (ms 20);
+          Fun.Async.cancel reader;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
+          Caravan.Flow.write_string peer (client Text "hello");
+          is_true (Ws.recv c = Text "hello"));
+      test "a cancel in the middle of a received frame closes with 1006" (fun () ->
+          let open Affect in
+          with_socket @@ fun c peer ->
+          let reader = Fun.Async.call (fun () -> Ws.recv c) in
+          let frame = client Text "hello" in
+          Caravan.Flow.write_string peer (String.sub frame 0 3);
+          Affect_unix.Mtime.wait_for (ms 20);
+          Fun.Async.cancel reader;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
+          Caravan.Flow.write_string peer (String.sub frame 3 (String.length frame - 3) ^ client Text "next");
+          equal int 1006 (closed_code (fun () -> Ws.recv c)));
+      test "a cancel in the wait to send a Pong inside a fragmented message closes with 1006"
+        (fun () ->
+           let open Affect in
+           (* Without the fix, the next recv waits for the write timeout of
+              [big]: 1 s. *)
+           with_socket ~write_timeout:Affect_unix.Mtime.Span.(1 * s) @@ fun c peer ->
+           (* The peer reads nothing: [big] keeps the writer semaphore. *)
+           let big =
+             Fun.Async.call (fun () ->
+                 try Ws.send c (Binary (String.make 10_000_000 'x')) with Ws.Closed _ -> ())
+           in
+           Affect_unix.Mtime.wait_for (ms 50);
+           let reader = Fun.Async.call (fun () -> Ws.recv c) in
+           Caravan.Flow.write_string peer (client ~fin:false Text "Hel" ^ client Ping "p");
+           Affect_unix.Mtime.wait_for (ms 20);
+           Fun.Async.cancel reader;
+           raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
+           Caravan.Flow.write_string peer (client Continuation "lo");
+           let t = Affect_unix.Mtime.counter () in
+           equal int 1006 (closed_code (fun () -> Ws.recv c));
+           let took = elapsed_ms t in
+           is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 500.);
+           Fun.Async.get big);
+      test "a cancel inside a fragmented message closes with 1006" (fun () ->
+          let open Affect in
+          with_socket @@ fun c peer ->
+          let reader = Fun.Async.call (fun () -> Ws.recv c) in
+          Caravan.Flow.write_string peer (client ~fin:false Text "Hel");
+          Affect_unix.Mtime.wait_for (ms 20);
+          Fun.Async.cancel reader;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
+          Caravan.Flow.write_string peer (client Continuation "lo");
+          equal int 1006 (closed_code (fun () -> Ws.recv c))) ]
 
 (* The fields of the RFC 6455 §1.3 example, without [Origin]. *)
 let request_fields =
@@ -700,6 +1090,12 @@ let handshake_tests =
             key of 5 bytes: 400 Bad Request | WebSocket handshake: the key is not 16 bytes in base64
             key not base64: 400 Bad Request | WebSocket handshake: the key is not 16 bytes in base64
             |});
+      test "a negative max_message is not permitted" (fun () ->
+          raises_match is_invalid_arg (fun () -> Ws.accept ~max_message:(-1) (request []) ignore);
+          raises_match is_invalid_arg (fun () ->
+              Ws.Private.of_flow ~max_message:(-1) (Caravan.Flow.of_string "" (Buffer.create 16)));
+          ignore (Ws.accept ~max_message:0 (request []) ignore);
+          ignore (Ws.Private.of_flow ~max_message:0 (Caravan.Flow.of_string "" (Buffer.create 16))));
       test "accept asks for version 13" (fun () ->
           expect (answer (request [ ("Sec-WebSocket-Version", "8") ])) @@ __POS_OF__ {|
             426 Upgrade Required
@@ -714,8 +1110,16 @@ let handshake_tests =
             WebSocket handshake: the version must be 13
             |});
       test "accept permits only the origin of the request by default" (fun () ->
-          let status ?origin ?authority o =
-            List.hd (String.split_on_char ' ' (answer ?origin (request ?authority [ ("Origin", o) ])))
+          let status ?origin ?authority ?scheme o =
+            let req = request ?authority [ ("Origin", o) ] in
+            let req =
+              match scheme with
+              | None -> req
+              | Some scheme ->
+                  Caravan.Request.make ~scheme ?authority:(Caravan.Request.authority req)
+                    ~headers:(Caravan.Request.headers req) Caravan.Method.GET "/chat"
+            in
+            List.hd (String.split_on_char ' ' (answer ?origin req))
           in
           expect
             (String.concat " "
@@ -726,7 +1130,19 @@ let handshake_tests =
                  status ~authority:"server.example.com:8080" "http://server.example.com:8080";
                  status ~origin:(fun o -> o = "null") "null";
                  status ~origin:(fun _ -> false) "http://server.example.com" ])
-          @@ __POS_OF__ {|101 101 403 403 403 403 403 403 403 101 101 403|});
+          @@ __POS_OF__ {|101 101 403 403 403 403 403 403 403 101 101 403|};
+          (* Default ports, and the scheme of the request. *)
+          expect
+            (String.concat " "
+               [ status ~authority:"server.example.com:443" "https://server.example.com";
+                 status "https://server.example.com:443"; status "http://server.example.com:80";
+                 status ~authority:"server.example.com:80" "http://server.example.com";
+                 status ~authority:"server.example.com:443" "http://server.example.com";
+                 status ~authority:"server.example.com:80" "https://server.example.com";
+                 status "ftp://server.example.com";
+                 status ~scheme:"https" "https://server.example.com";
+                 status ~scheme:"https" "http://server.example.com" ])
+          @@ __POS_OF__ {|101 101 101 101 403 403 403 101 403|});
       test "accept chooses the first subprotocol of the server that the client offers"
         (fun () ->
            let chosen ?protocols offered =
@@ -752,6 +1168,9 @@ let handshake_tests =
              none
              |}) ]
 
+(* What recv raised in the handler of "/record". *)
+let recorded = Atomic.make None
+
 let server_handler req =
   match Caravan.Request.path_only req with
   | "/echo" ->
@@ -765,6 +1184,27 @@ let server_handler req =
       Ws.accept ~protocols:[ "chat"; "echo" ] req (fun c ->
           Ws.send c (Text (Option.value ~default:"none" (Ws.protocol c))))
   | "/boom" -> Ws.accept req (fun _ -> failwith "boom")
+  | "/record" ->
+      Ws.accept req (fun c ->
+          match Ws.recv c with
+          | _ -> ()
+          | exception e ->
+              Atomic.set recorded (Some (Printexc.to_string e));
+              raise e)
+  | "/other" ->
+      (* A Closed of a different connection is an exception of the
+         handler. *)
+      Ws.accept req (fun _ ->
+          let input = client Close (code_reason 1000 "") in
+          let other = Ws.Private.of_flow (Caravan.Flow.of_string input (Buffer.create 16)) in
+          ignore (Ws.recv other))
+  | "/child" ->
+      (* The Cancelled of a child call is not a stop of the server. *)
+      Ws.accept req (fun _ ->
+          let open Affect in
+          let child = Fun.Async.call (fun () -> Affect_unix.Mtime.wait_for (ms 10_000)) in
+          Fun.Async.cancel child;
+          Fun.Async.get child)
   | _ -> Caravan.Handler.not_found req
 
 (* A WebSocket session with a server: the request for [path], with [first]
@@ -772,19 +1212,24 @@ let server_handler req =
    response head, a "--" line, and the frames from the server until it
    closes the connection. If [reply], we answer a Close frame of the
    server. *)
-let session ?(first = "") ?(after = "") ?(during = ignore) ?(reply = true) server path =
-  let flow = Caravan.Tcp.connect (Caravan.Server.local_addr server) in
-  Stdlib.Fun.protect ~finally:(fun () -> Caravan.Flow.close flow) @@ fun () ->
-  Caravan.Flow.write_string flow
-    (String.concat "\r\n"
-       [ "GET " ^ path ^ " HTTP/1.1"; "Host: x"; "Upgrade: websocket"; "Connection: Upgrade";
-         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="; "Sec-WebSocket-Version: 13";
-         "Sec-WebSocket-Protocol: echo"; ""; first ]);
-  let r = Buf_reader.of_flow flow in
+let upgrade_request ?(first = "") path =
+  String.concat "\r\n"
+    [ "GET " ^ path ^ " HTTP/1.1"; "Host: x"; "Upgrade: websocket"; "Connection: Upgrade";
+      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="; "Sec-WebSocket-Version: 13";
+      "Sec-WebSocket-Protocol: echo"; ""; first ]
+
+let response_head r =
   let rec head acc =
     match Buf_reader.read_line r ~max:1000 with "" -> List.rev acc | l -> head (l :: acc)
   in
-  let head = head [] in
+  head []
+
+let session ?first ?(after = "") ?(during = ignore) ?(reply = true) server path =
+  let flow = Caravan.Tcp.connect (Caravan.Server.local_addr server) in
+  Stdlib.Fun.protect ~finally:(fun () -> Caravan.Flow.close flow) @@ fun () ->
+  Caravan.Flow.write_string flow (upgrade_request ?first path);
+  let r = Buf_reader.of_flow flow in
+  let head = response_head r in
   Caravan.Flow.write_string flow after;
   during ();
   let rec frames acc =
@@ -848,6 +1293,69 @@ let server_tests =
             close 1011
             |};
           equal (list string) [ "Failure(\"boom\")" ] !errors);
+      test "a Cancelled from a child call closes with 1011, and the server reports it" (fun () ->
+          let errors = ref [] in
+          let config =
+            { Server_support.config with
+              on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
+          in
+          expect
+            (Server_support.with_server ~config ~handler:server_handler (fun server ->
+                 session server "/child"))
+          @@ __POS_OF__ {|
+            HTTP/1.1 101 Switching Protocols
+            Upgrade: websocket
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+            Connection: Upgrade
+            --
+            close 1011
+            |};
+          equal (list string)
+            [ "Failure(\"Caravan_websocket: a call of the handler was cancelled\")" ]
+            !errors);
+      test "a Closed of a different connection closes with 1011, and the server reports it"
+        (fun () ->
+           let errors = ref [] in
+           let config =
+             { Server_support.config with
+               on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
+           in
+           expect
+             (Server_support.with_server ~config ~handler:server_handler (fun server ->
+                  session server "/other"))
+           @@ __POS_OF__ {|
+            HTTP/1.1 101 Switching Protocols
+            Upgrade: websocket
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+            Connection: Upgrade
+            --
+            close 1011
+            |};
+           equal int 1 (List.length !errors));
+      test "a peer that leaves without a Close frame is not an error" (fun () ->
+          let errors = ref [] in
+          let config =
+            { Server_support.config with
+              on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
+          in
+          Atomic.set recorded None;
+          Server_support.with_server ~config ~handler:server_handler (fun server ->
+              let flow = Caravan.Tcp.connect (Caravan.Server.local_addr server) in
+              Caravan.Flow.write_string flow (upgrade_request "/record");
+              equal string "HTTP/1.1 101 Switching Protocols"
+                (List.hd (response_head (Buf_reader.of_flow flow)));
+              Caravan.Flow.close flow;
+              (* Waits at most 2 s for the handler to get Closed 1006. Then
+                 the server stops: it waits for the end of the handler. *)
+              let rec wait n =
+                if Atomic.get recorded = None && n > 0
+                then (Affect_unix.Mtime.wait_for (ms 10); wait (n - 1))
+              in
+              wait 200);
+          equal (option string)
+            (Some "Caravan_websocket__Connection.Closed(1006, \"\")")
+            (Atomic.get recorded);
+          equal (list string) [] !errors);
       test "a server that stops cancels the handler without a Close frame" (fun () ->
           let errors = ref [] in
           let config =

@@ -9,9 +9,20 @@ type message = Text of string | Binary of string
 exception Closed of { code : int; reason : string }
 
 val make :
-  ?protocol:string -> ?max_message:int -> ?close_timeout:Affect_unix.Mtime.Span.t -> Flow.t -> t
+  ?protocol:string ->
+  ?max_message:int ->
+  ?close_timeout:Affect_unix.Mtime.Span.t ->
+  ?write_timeout:Affect_unix.Mtime.Span.t ->
+  ?read_timeout:Affect_unix.Mtime.Span.t ->
+  ?idle_timeout:Affect_unix.Mtime.Span.t ->
+  Flow.t ->
+  t
 
 val protocol : t -> string option
+
+(* [is_closing c] is [true] if we sent a Close frame on [c] or [c] is
+   closed. *)
+val is_closing : t -> bool
 val recv : t -> message
 val send : t -> message -> unit
 val ping : t -> string -> unit

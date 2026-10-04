@@ -25,6 +25,9 @@ val accept :
   ?origin:(string -> bool) ->
   ?max_message:int ->
   ?close_timeout:Affect_unix.Mtime.Span.t ->
+  ?write_timeout:Affect_unix.Mtime.Span.t ->
+  ?read_timeout:Affect_unix.Mtime.Span.t ->
+  ?idle_timeout:Affect_unix.Mtime.Span.t ->
   Caravan.Request.t ->
   (t -> unit) ->
   Caravan.Response.t
@@ -46,17 +49,39 @@ val accept :
     - [origin o] is [true] if the [Origin] [o] of a request is permitted.
       By default, the origin must have the host and the port of [req]: a
       page from a different site cannot use the cookies of the user on
-      this server. A request without [Origin] does not come from a browser,
-      and [accept] permits it.
+      this server. A missing port is the default port of the scheme of the
+      origin (80 or 443). If the scheme of [req] is [https], the origin
+      must also be [https]. A request without [Origin] does not come from
+      a browser, and [accept] permits it.
     - [max_message] is the size limit of a received message, 8 MiB by
       default.
     - [close_timeout] is the time limit of {!close}, 5 s by default.
+    - [write_timeout] is the time limit to send one frame, 30 s by default.
+      If a frame does not go in this time, the connection closes with
+      1006.
+    - [read_timeout] is the time limit of each read inside a frame, 30 s
+      by default. Each read that gets bytes starts a new limit, thus a
+      slow frame with no long pause can take more time. If no byte comes
+      in this time, the connection sends a Close frame with 1001 and
+      closes.
+    - [idle_timeout] is the time limit between two frames: from the time
+      that {!recv} waits for a frame until its first byte. If no byte
+      comes in this time, the connection sends a Close frame with 1001
+      and closes at once, without a wait for the reply of the peer. By
+      default, there is no limit. Use {!ping} to keep a connection open
+      through proxies that close idle connections.
 
     When [f] ends, [accept] closes the connection with 1000. If [f] raises
-    {!Closed}, the connection is closed already. If [f] raises a different
-    exception, [accept] closes the connection with 1011 and gives the
-    exception to the server, which reports it. [accept] does not accept
-    extensions. *)
+    {!Closed} for its connection, the connection is closed already. If [f]
+    raises a different exception, [accept] closes the connection with 1011
+    and gives the exception to the server, which reports it. A {!Closed} of
+    a different connection, for example a different client, is such an
+    exception. A [Cancelled] from a call
+    that [f] made goes to the server as a [Failure]. If the server cancels
+    [f], [accept] sends no Close frame. [accept] does not accept
+    extensions.
+
+    @raise Invalid_argument if [max_message] is negative. *)
 
 val protocol : t -> string option
 (** [protocol c] is the subprotocol that {!accept} chose for [c], if one. *)
@@ -85,21 +110,31 @@ exception Closed of { code : int; reason : string }
     - The code that we sent because the peer did not obey the protocol: 1002
       for a protocol error, 1007 for text that is not UTF-8, 1009 for a
       message that is too large. The reason tells the problem.
+    - 1001 with the reason ["read timeout"] or ["idle timeout"] if no byte
+      came in the [read_timeout] or the [idle_timeout] of {!accept}.
     - 1006 if the connection stopped without a Close frame. *)
 
 val recv : t -> message
 (** [recv c] is the next message from the peer. If the peer sends a Ping,
     [recv] sends a Pong with the same data. It ignores a Pong.
 
-    Only one fiber at a time can call [recv] on a connection.
+    Many fibers can call [recv] on a connection at the same time. They get
+    the messages one at a time: each message goes to one fiber.
+
+    If a cancel stops [recv] between two messages, the connection stays
+    open. If the cancel stops it in the middle of a frame or a fragmented
+    message, the connection closes with the code 1006. If the cancel comes
+    after a Ping and before its Pong goes, the peer gets no Pong.
 
     @raise Closed when the peer closes the connection, or when it does not
-    obey the protocol. Then [recv] sends a Close frame, if possible, and
-    closes the connection. *)
+    obey the protocol. In the second case, [recv] sends a Close frame, if
+    possible. Then it discards the input until the peer closes, for at
+    most the close timeout and 1 MiB, and closes the connection. *)
 
 val send : t -> message -> unit
 (** [send c m] sends [m] in one frame. Many fibers can send on a connection
-    at the same time.
+    at the same time. If a cancel stops [send] in the middle of the frame,
+    the connection closes with the code 1006.
 
     @raise Invalid_argument if [m] is a [Text] that is not valid UTF-8.
     @raise Closed if the connection is closed. *)
@@ -123,7 +158,9 @@ val close : ?code:int -> ?reason:string -> t -> unit
     - If a fiber is in {!recv}, that fiber reads the Close frame of the peer
       and raises {!Closed} with its code. [close] waits for this.
     - At the time limit, the reads and writes on [c] stop, and {!recv}
-      raises {!Closed} with the code 1006.
+      raises {!Closed} with the code 1006. A read or a write with an
+      earlier deadline, from [write_timeout], [read_timeout] or
+      [idle_timeout], stops at that deadline.
     - If we sent a Close frame on [c] before, [close] does nothing.
 
     @raise Invalid_argument if [code] is not a code that a Close frame can
@@ -138,8 +175,13 @@ module Private : sig
   module Frame = Frame
 
   val of_flow :
-    ?max_message:int -> ?close_timeout:Affect_unix.Mtime.Span.t -> Caravan.Flow.t -> t
-    (** [of_flow ~max_message ~close_timeout flow] is a server connection on
-        [flow]. The default of [max_message] is 8 MiB, and the default of
-        [close_timeout] is 5 s. *)
+    ?max_message:int ->
+    ?close_timeout:Affect_unix.Mtime.Span.t ->
+    ?write_timeout:Affect_unix.Mtime.Span.t ->
+    ?read_timeout:Affect_unix.Mtime.Span.t ->
+    ?idle_timeout:Affect_unix.Mtime.Span.t ->
+    Caravan.Flow.t ->
+    t
+    (** [of_flow flow] is a server connection on [flow], with the options
+        of {!accept}. *)
 end

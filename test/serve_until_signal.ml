@@ -1,5 +1,5 @@
 (* Server.run for the signal tests: prints its port, then "started" when a
-   request to /slow (300ms), /stuck (10s) or /deaf (10s, deaf to
+   request to /slow (100ms), /stuck (10s) or /deaf (10s, deaf to
    cancellation) starts, in CRLF lines. With the argument "after-run", it
    prints "stopped" once run returned and lives on for 10s. *)
 
@@ -14,7 +14,7 @@ let handler req =
     Response.string "done"
   in
   match Request.path_only req with
-  | "/slow" -> pause Mtime.Span.(300 * ms)
+  | "/slow" -> pause Mtime.Span.(100 * ms)
   | "/stuck" -> pause Mtime.Span.(10 * s)
   | "/deaf" ->
       print_string "started\r\n";

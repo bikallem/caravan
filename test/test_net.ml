@@ -189,6 +189,51 @@ let tcp_tests =
           raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
           Flow.close server;
           raises Flow.Closed (fun () -> Flow.read server (Bytes.create 1) 0 1));
+      (* A different fiber closes the flow. The waits end with Closed, and
+         the fd keeps its number until they end. *)
+      test "a close ends a read that waits with Closed" (fun () ->
+          with_pair @@ fun _client server ->
+          let reader = Fun.Async.call (fun () -> Flow.read server (Bytes.create 1) 0 1) in
+          Mtime.wait_for Mtime.Span.(20 * ms);
+          Flow.close server;
+          raises Flow.Closed (fun () -> Fun.Async.get reader));
+      test "a close ends a write that waits with Closed" (fun () ->
+          with_pair @@ fun client _server ->
+          let chunk = Bytes.make (1024 * 1024) 'x' in
+          let writer =
+            Fun.Async.call (fun () ->
+                for _ = 1 to 256 do Flow.write client chunk 0 (Bytes.length chunk) done)
+          in
+          Mtime.wait_for Mtime.Span.(50 * ms);
+          Flow.close client;
+          raises Flow.Closed (fun () -> Fun.Async.get writer));
+      test "the fd closes when the last read that waits ends" (fun () ->
+          with_pair @@ fun client server ->
+          let reader = Fun.Async.call (fun () -> Flow.read server (Bytes.create 1) 0 1) in
+          Mtime.wait_for Mtime.Span.(20 * ms);
+          Flow.close server;
+          raises Flow.Closed (fun () -> Fun.Async.get reader);
+          Flow.set_read_deadline client (Some (deadline_in 1000));
+          equal int ~msg:"the end of the stream" 0 (Flow.read client (Bytes.create 1) 0 1));
+      test "a read that waits on a closed flow takes no bytes of a new connection" (fun () ->
+          in_main @@ fun () ->
+          let l = Tcp.Listener.listen loopback in
+          Fun.protect ~finally:(fun () -> Tcp.Listener.close l) @@ fun () ->
+          let connect () = Fun.Async.call (fun () -> Tcp.connect (Tcp.Listener.addr l)) in
+          let accept () = Tcp.flow (fst (Tcp.Listener.accept l)) in
+          let first = connect () in
+          let old = accept () in
+          let buf = Bytes.create 64 in
+          let reader = Fun.Async.call (fun () -> Flow.read old buf 0 64) in
+          Mtime.wait_for Mtime.Span.(20 * ms);
+          Flow.close old;
+          let second = connect () in
+          let fresh = accept () in
+          let client = Fun.Async.get second in
+          Flow.write_string client "0123456789";
+          raises Flow.Closed (fun () -> Fun.Async.get reader);
+          equal string "0123456789" (read_exactly fresh 10);
+          List.iter Flow.close [ fresh; client; Fun.Async.get first ]);
       test "connecting to a closed port fails" (fun () ->
           in_main @@ fun () ->
           let l = Tcp.Listener.listen loopback in

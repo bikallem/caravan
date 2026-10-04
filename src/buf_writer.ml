@@ -26,10 +26,25 @@ let write_bytes w buf off len =
   if off < 0 || len < 0 || off > Bytes.length buf - len
   then invalid_arg "Buf_writer.write_bytes: invalid range";
   let size = w.size in
-  if len > size - w.len then flush w;
   if len >= size
-  then w.write buf off len
+  then begin
+    (* The buffered bytes go out with the start of [buf], not in a small
+       write of their own. *)
+    let k = if w.len > 0 then size - w.len else 0 in
+    Bytes.blit buf off w.buf w.len k;
+    w.len <- w.len + k;
+    flush w;
+    let off = off + k and len = len - k in
+    if len >= size
+    then w.write buf off len
+    else begin
+      ensure_buffer w;
+      Bytes.blit buf off w.buf 0 len;
+      w.len <- len
+    end
+  end
   else begin
+    if len > size - w.len then flush w;
     ensure_buffer w;
     Bytes.blit buf off w.buf w.len len;
     w.len <- w.len + len

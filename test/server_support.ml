@@ -92,7 +92,7 @@ let handler req =
           for i = 1 to 3 do
             Body.Writer.write_string w (string_of_int i);
             Body.Writer.flush w;
-            Mtime.wait_for Mtime.Span.(100 * ms)
+            Mtime.wait_for Mtime.Span.(40 * ms)
           done)
   | _ -> read (); Response.string ~status:Status.not_found "not found"
 
