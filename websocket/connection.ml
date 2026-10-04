@@ -86,6 +86,8 @@ let make ?protocol ?(max_message = 8 * 1024 * 1024) ?(close_timeout = Mtime.Span
   (* [read_bytes] is necessary to make [r], and it needs the connection. *)
   let self = ref None in
   let read buf off len = read_bytes (Option.get !self) buf off len in
+  (* The first [recv] allocates the 4 KiB buffer of [r]. Small frames then
+     need one read of the flow, not one for each part of the frame. *)
   let t =
     { flow; r = Buf_reader.make read; w = Buf_writer.make (Flow.write flow);
       writer = Semaphore.make 1; reader = Semaphore.make 1; protocol; max_message; close_timeout;

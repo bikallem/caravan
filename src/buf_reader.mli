@@ -49,7 +49,9 @@ val read_line : t -> max:int -> string
 val read_into : t -> bytes -> int -> int -> int
 (** [read_into r buf off len] reads at most [len] bytes into [buf] from [off]
     and returns how many it read, [0] at the end of the input. Buffered bytes
-    come first; when there are none, it reads directly into [buf].
+    come first. If there are none, a read of fewer bytes than the initial
+    buffer size fills the buffer first, and a larger read goes directly into
+    [buf].
 
     @raise Invalid_argument if [len <= 0] or the range is not valid in [buf]. *)
 

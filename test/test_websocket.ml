@@ -471,6 +471,26 @@ let connection_tests =
               is_true (Ws.recv (Ws.Private.of_flow flow) = Binary "xy"));
           let grew = (!top - start) * (Sys.word_size / 8) in
           is_true ~msg:(Printf.sprintf "the heap grew by %d bytes" grew) (grew < 4_000_000));
+      test "small frames take one read of the input" (fun () ->
+          let input = client Binary "hello" ^ client Text "hi" and pos = ref 0 and reads = ref 0 in
+          let read buf off len =
+            incr reads;
+            let n = Int.min len (String.length input - !pos) in
+            Bytes.blit_string input !pos buf off n;
+            pos := !pos + n;
+            n
+          in
+          let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
+          let flow =
+            Caravan.Flow.make ~read ~read_now:(fun b o l -> Some (read b o l))
+              ~write:(fun _ _ _ -> ()) ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
+              ~close:ignore ~set_read_deadline:ignore_deadline ~set_write_deadline:ignore_deadline ()
+          in
+          Affect_unix.Unix.main ~domain_count:1 (fun () ->
+              let c = Ws.Private.of_flow flow in
+              is_true (Ws.recv c = Binary "hello");
+              is_true (Ws.recv c = Text "hi"));
+          equal int 1 !reads);
       test "the buffer of a fragmented message stays within max_message" (fun () ->
           (* What recv allocates for a message of [m] bytes in fragments of
              [sizes], more than for the same message in one frame. The
@@ -843,6 +863,18 @@ let socket_tests =
           in
           is_true (Ws.recv c = Binary (String.make 2000 'x'));
           Fun.Async.get writer);
+      test "a frame that is in part in the buffer gets the read timeout" (fun () ->
+          with_socket ~read_timeout:(ms 50) ~close_timeout:(ms 50) @@ fun c peer ->
+          (* One read gets the first frame and 1 byte of the next frame.
+             Without an idle timeout, only the read timeout stops the wait. *)
+          Caravan.Flow.write_string peer (client Text "one" ^ String.sub (client Text "two") 0 1);
+          Affect_unix.Mtime.wait_for (ms 20);
+          is_true (Ws.recv c = Text "one");
+          match within_2s (fun () -> Ws.recv c) with
+          | _ -> fail "a message"
+          | exception Ws.Closed { code; reason } ->
+              equal int 1001 code;
+              equal string "read timeout" reason);
       test "the read timeout does not apply between frames" (fun () ->
           with_socket ~read_timeout:(ms 50) @@ fun c peer ->
           (* A read inside the first frame sets the read timeout. *)

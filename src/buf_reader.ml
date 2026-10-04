@@ -103,6 +103,10 @@ let read_line r ~max =
 let read_into r buf off len =
   if off < 0 || len <= 0 || off > Bytes.length buf - len
   then invalid_arg "Buf_reader.read_into: invalid range";
+  (* A small read fills the buffer first: then the next small reads, for
+     example the parts of a frame header, do not read the input again. A
+     large read goes directly into [buf], without a copy. *)
+  if r.len = 0 && len < r.size then ignore (fill r);
   if r.len > 0
   then begin
     let n = Int.min len r.len in
