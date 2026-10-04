@@ -47,12 +47,22 @@ let shut t code reason =
   Cell.Once.try_set t.finished ();
   Option.get (Atomic.get t.closed)
 
+(* An exception in the middle of a frame, for example a cancel, puts the
+   stream out of step. Thus the connection closes with 1006, and the
+   exception goes on. Call it first in the handler, for the backtrace. *)
+let abort t e =
+  let bt = Printexc.get_raw_backtrace () in
+  ignore (shut t 1006 "");
+  Printexc.raise_with_backtrace e bt
+
 let write_frame t frame =
   Semaphore.with_acquired t.writer (fun () ->
       try
         Frame.write t.w frame;
         Buf_writer.flush t.w
-      with Flow.Closed | Flow.Timeout -> raise (shut t 1006 ""))
+      with
+      | Flow.Closed | Flow.Timeout -> raise (shut t 1006 "")
+      | e -> abort t e)
 
 let send t msg =
   check_open t;
@@ -118,17 +128,25 @@ let message t (op : Frame.opcode) payload =
    [Closed]. *)
 let rec next t part =
   let size = match part with None -> 0 | Some (_, b) -> Buffer.length b in
+  let start = Buf_reader.consumed t.r in
   match Frame.read t.r ~masked:true ~max:(Int.max 125 (t.max_message - size)) with
   | exception Frame.Error (Protocol_error reason) -> fail t 1002 reason
   | exception Frame.Error Too_big -> fail t 1009 "message is too large"
   | exception (End_of_file | Flow.Closed | Flow.Timeout) -> raise (shut t 1006 "")
+  (* Between two messages, an exception before the first byte of a frame,
+     for example a cancel, leaves the stream in step. *)
+  | exception e when part = None && Buf_reader.consumed t.r = start -> raise e
+  | exception e -> abort t e
   | { fin; opcode; payload } -> (
       match (opcode, part) with
       | Close, _ -> peer_closed t payload
       | _ when Atomic.get t.closing <> None -> next t part
-      | Ping, _ ->
-          write_frame t { fin = true; opcode = Pong; payload };
-          next t part
+      | Ping, _ -> (
+          (* An exception before the Pong goes, for example a cancel in
+             the wait for the writer, loses the fragments of [part]. *)
+          match write_frame t { fin = true; opcode = Pong; payload } with
+          | () -> next t part
+          | exception e when part <> None -> abort t e)
       | Pong, _ -> next t part
       | _ when (not (Frame.is_control opcode)) && size + String.length payload > t.max_message ->
           fail t 1009 "message is too large"

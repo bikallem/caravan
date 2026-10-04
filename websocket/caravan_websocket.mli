@@ -93,13 +93,19 @@ val recv : t -> message
 
     Only one fiber at a time can call [recv] on a connection.
 
+    If a cancel stops [recv] between two messages, the connection stays
+    open. If the cancel stops it in the middle of a frame or a fragmented
+    message, the connection closes with the code 1006. If the cancel comes
+    after a Ping and before its Pong goes, the peer gets no Pong.
+
     @raise Closed when the peer closes the connection, or when it does not
     obey the protocol. Then [recv] sends a Close frame, if possible, and
     closes the connection. *)
 
 val send : t -> message -> unit
 (** [send c m] sends [m] in one frame. Many fibers can send on a connection
-    at the same time.
+    at the same time. If a cancel stops [send] in the middle of the frame,
+    the connection closes with the code 1006.
 
     @raise Invalid_argument if [m] is a [Text] that is not valid UTF-8.
     @raise Closed if the connection is closed. *)

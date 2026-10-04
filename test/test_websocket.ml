@@ -623,7 +623,71 @@ let socket_tests =
           Ws.close c;
           let took = elapsed_ms t in
           is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 2000.);
-          equal int 1006 (Fun.Async.get sender)) ]
+          equal int 1006 (Fun.Async.get sender));
+      (* A cancel in the middle of a frame closes the connection, because
+         the stream is out of step. A cancel between messages does not. *)
+      test "a cancel in the middle of a send closes with 1006" (fun () ->
+          let open Affect in
+          with_socket @@ fun c peer ->
+          let sender = Fun.Async.call (fun () -> Ws.send c (Binary (String.make 10_000_000 'x'))) in
+          (* When the first bytes come, the send is in its frame. *)
+          let r = Buf_reader.of_flow peer in
+          is_false (Buf_reader.peek_eof r);
+          Fun.Async.cancel sender;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get sender);
+          equal int 1006 (closed_code (fun () -> Ws.send c (Text "hello")));
+          raises End_of_file (fun () -> Frame.read r ~masked:false ~max:max_int));
+      test "a cancel between messages does not close" (fun () ->
+          let open Affect in
+          with_socket @@ fun c peer ->
+          let reader = Fun.Async.call (fun () -> Ws.recv c) in
+          Affect_unix.Mtime.wait_for (ms 20);
+          Fun.Async.cancel reader;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
+          Caravan.Flow.write_string peer (client Text "hello");
+          is_true (Ws.recv c = Text "hello"));
+      test "a cancel in the middle of a received frame closes with 1006" (fun () ->
+          let open Affect in
+          with_socket @@ fun c peer ->
+          let reader = Fun.Async.call (fun () -> Ws.recv c) in
+          let frame = client Text "hello" in
+          Caravan.Flow.write_string peer (String.sub frame 0 3);
+          Affect_unix.Mtime.wait_for (ms 20);
+          Fun.Async.cancel reader;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
+          Caravan.Flow.write_string peer (String.sub frame 3 (String.length frame - 3) ^ client Text "next");
+          equal int 1006 (closed_code (fun () -> Ws.recv c)));
+      test "a cancel in the wait to send a Pong inside a fragmented message closes with 1006"
+        (fun () ->
+           let open Affect in
+           with_socket @@ fun c peer ->
+           (* The peer reads nothing: [big] keeps the writer semaphore. *)
+           let big =
+             Fun.Async.call (fun () ->
+                 try Ws.send c (Binary (String.make 10_000_000 'x')) with Ws.Closed _ -> ())
+           in
+           Affect_unix.Mtime.wait_for (ms 50);
+           let reader = Fun.Async.call (fun () -> Ws.recv c) in
+           Caravan.Flow.write_string peer (client ~fin:false Text "Hel" ^ client Ping "p");
+           Affect_unix.Mtime.wait_for (ms 20);
+           Fun.Async.cancel reader;
+           raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
+           Caravan.Flow.write_string peer (client Continuation "lo");
+           let t = Affect_unix.Mtime.counter () in
+           equal int 1006 (closed_code (fun () -> Ws.recv c));
+           let took = elapsed_ms t in
+           is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 2000.);
+           Fun.Async.get big);
+      test "a cancel inside a fragmented message closes with 1006" (fun () ->
+          let open Affect in
+          with_socket @@ fun c peer ->
+          let reader = Fun.Async.call (fun () -> Ws.recv c) in
+          Caravan.Flow.write_string peer (client ~fin:false Text "Hel");
+          Affect_unix.Mtime.wait_for (ms 20);
+          Fun.Async.cancel reader;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
+          Caravan.Flow.write_string peer (client Continuation "lo");
+          equal int 1006 (closed_code (fun () -> Ws.recv c))) ]
 
 (* The fields of the RFC 6455 §1.3 example, without [Origin]. *)
 let request_fields =
