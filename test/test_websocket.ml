@@ -689,11 +689,15 @@ let socket_tests =
           is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 2000.));
       test "a peer that sends no frame in the idle timeout gets Close 1001" (fun () ->
           with_socket ~idle_timeout:(ms 50) @@ fun c peer ->
+          (* The connection does not wait for the reply of the peer. *)
+          let t = Affect_unix.Mtime.counter () in
           (match Ws.recv c with
           | _ -> fail "a message"
           | exception Ws.Closed { code; reason } ->
               equal int 1001 code;
               equal string "idle timeout" reason);
+          let took = elapsed_ms t in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 1000.);
           equal string "close 1001" (show_frame (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125)));
       test "a frame that stops in the middle gets Close 1001 at the read timeout" (fun () ->
           let open Affect in
@@ -786,6 +790,51 @@ let socket_tests =
           Ws.close c;
           let took = elapsed_ms t in
           is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 2000.));
+      test "after a protocol error, the peer gets the Close frame and the end of the stream"
+        (fun () ->
+           let open Affect in
+           with_socket @@ fun c peer ->
+           let reader = Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c)) in
+           (* A frame of 20 MiB, over the limit of 8 MiB: the server reads
+              only its header, and 1 MiB stays unread. *)
+           let header = of_hex "82ff" ^ "\x00\x00\x00\x00\x01\x40\x00\x00" ^ "\x01\x02\x03\x04" in
+           Caravan.Flow.write_string peer (header ^ String.make 1_000_000 'x');
+           let r = Buf_reader.of_flow peer in
+           equal string "close 1009" (show_frame (Frame.read r ~masked:false ~max:125));
+           raises End_of_file (fun () -> Frame.read r ~masked:false ~max:125);
+           Caravan.Flow.close peer;
+           equal int 1009 (Fun.Async.get reader));
+      test "a cancel in the linger after a protocol error closes the connection" (fun () ->
+          let open Affect in
+          with_socket ~close_timeout:Affect_unix.Mtime.Span.(10 * s) @@ fun c peer ->
+          (* The peer does not close: the linger waits. *)
+          let reader = Fun.Async.call (fun () -> Ws.recv c) in
+          Caravan.Flow.write_string peer (client Continuation "x");
+          Affect_unix.Mtime.wait_for (ms 50);
+          Fun.Async.cancel reader;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
+          let t = Affect_unix.Mtime.counter () in
+          equal int 1002 (closed_code (fun () -> Ws.recv c));
+          let took = elapsed_ms t in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 2000.));
+      test "the linger after a protocol error discards at most 1 MiB" (fun () ->
+          let open Affect in
+          with_socket @@ fun c peer ->
+          let t = Affect_unix.Mtime.counter () in
+          let reader = Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c)) in
+          (* The peer sends 3 MiB after a frame that is too large, and does
+             not close. The server stops before its close timeout of 5 s. *)
+          let header = of_hex "82ff" ^ "\x00\x00\x00\x00\x01\x40\x00\x00" ^ "\x01\x02\x03\x04" in
+          let writer =
+            Fun.Async.call (fun () ->
+                try Caravan.Flow.write_string peer (header ^ String.make (3 * 1024 * 1024) 'x')
+                with Caravan.Flow.Closed -> ())
+          in
+          equal int 1009 (Fun.Async.get reader);
+          let took = elapsed_ms t in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 2000.);
+          Caravan.Flow.close peer;
+          Fun.Async.get writer);
       (* A cancel in the middle of a frame closes the connection, because
          the stream is out of step. A cancel between messages does not. *)
       test "a cancel in the middle of a send closes with 1006" (fun () ->

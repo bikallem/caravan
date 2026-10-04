@@ -159,10 +159,40 @@ let code_payload code =
   Bytes.set_uint16_be b 0 code;
   Bytes.unsafe_to_string b
 
-(* Sends a Close frame with [code] if we did not send one, then closes the
-   connection. *)
-let fail t code reason =
-  if claim_close t (Closed { code; reason }) then write_close t (code_payload code);
+(* A close of a socket with unread input sends a reset, and a reset can
+   delete our Close frame before the peer reads it. Thus we send the end of
+   our stream first. Then we discard the input until the peer closes, for
+   at most the close timeout and 1 MiB (RFC 9112 §9.6 does the same for
+   HTTP). Only the fiber that reads frames can call it. *)
+let linger t =
+  set_read_deadline t (Some t.close_timeout);
+  let buf = Bytes.create 4096 in
+  let rec discard left =
+    if left > 0
+    then match Flow.read t.flow buf 0 (Int.min left (Bytes.length buf)) with
+    | 0 -> ()
+    | n -> discard (left - n)
+  in
+  (* A different fiber can close the flow at any time. *)
+  try
+    Flow.shutdown_send t.flow;
+    discard (1024 * 1024)
+  with Flow.Closed | Flow.Timeout -> ()
+
+(* The peer does not obey the protocol, or it is idle. We send a Close
+   frame with [code] if we did not send one, then close the connection. If
+   [discard], we linger first. An idle peer leaves no unread input, thus an
+   idle timeout does not linger. *)
+let fail ?(discard = true) t code reason =
+  if claim_close t (Closed { code; reason })
+  then
+    (* A cancel in the wait to write or in the linger closes the
+       connection too. *)
+    Fun.protect
+      ~finally:(fun () -> ignore (shut t code reason))
+      (fun () ->
+         write_close t (code_payload code);
+         if discard then linger t);
   raise (shut t code reason)
 
 (* The peer sent a Close frame. If we did not send one, we send a Close
@@ -209,7 +239,7 @@ let rec next t part =
   | exception Frame.Error (Protocol_error reason) -> fail t 1002 reason
   | exception Frame.Error Too_big -> fail t 1009 "message is too large"
   | exception Flow.Timeout when Atomic.get t.closing = None ->
-      if t.in_frame then fail t 1001 "read timeout" else fail t 1001 "idle timeout"
+      if t.in_frame then fail t 1001 "read timeout" else fail ~discard:false t 1001 "idle timeout"
   | exception (End_of_file | Flow.Closed | Flow.Timeout) -> raise (shut t 1006 "")
   (* Between two messages, an exception before the first byte of a frame,
      for example a cancel, leaves the stream in step. *)

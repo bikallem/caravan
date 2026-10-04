@@ -122,8 +122,9 @@ val recv : t -> message
     after a Ping and before its Pong goes, the peer gets no Pong.
 
     @raise Closed when the peer closes the connection, or when it does not
-    obey the protocol. Then [recv] sends a Close frame, if possible, and
-    closes the connection. *)
+    obey the protocol. In the second case, [recv] sends a Close frame, if
+    possible. Then it discards the input until the peer closes, for at
+    most the close timeout and 1 MiB, and closes the connection. *)
 
 val send : t -> message -> unit
 (** [send c m] sends [m] in one frame. Many fibers can send on a connection
