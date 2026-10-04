@@ -2,16 +2,16 @@
 
 An HTTP server for OCaml 5, built on
 [affect](https://erratique.ch/software/affect), a concurrency library
-with structured concurrency and cancellation. The HTTP/1.1 server works
-today; the design leaves room for HTTP/2, HTTP/3, WebSocket, a client
-and a Traefik-like reverse proxy.
+with structured concurrency and cancellation. The HTTP/1.1 server and
+WebSocket work today; the design leaves room for HTTP/2, HTTP/3, a
+client and a Traefik-like reverse proxy.
 
 ```ocaml
 let () = Caravan.Server.run (fun _req -> Caravan.Response.string "Hello!\n")
 ```
 
-> **Status:** the HTTP/1.1 server is complete but young, and its API may
-> still change. There is no client, WebSocket or proxy yet.
+> **Status:** the HTTP/1.1 server and WebSocket are complete but young,
+> and their API can change. There is no client or proxy yet.
 
 ## What the server does
 
@@ -35,6 +35,32 @@ let () = Caravan.Server.run (fun _req -> Caravan.Response.string "Hello!\n")
 
 Handlers are plain functions, `Request.t -> Response.t`, and each
 request runs in its own asynchronous call, in parallel across domains.
+
+## WebSocket
+
+The `caravan.websocket` library adds WebSocket
+([RFC 6455](https://www.rfc-editor.org/rfc/rfc6455)) to the server. A
+handler gives the response of `Caravan_websocket.accept`:
+
+```ocaml
+let handler req =
+  Caravan_websocket.accept req (fun ws ->
+      let rec echo () =
+        Caravan_websocket.(send ws (recv ws));
+        echo ()
+      in
+      echo ())
+```
+
+- `accept` examines the request and sends the `101` response. By
+  default, it permits browser pages only from the origin of the server.
+- `recv` gives full messages. The library joins fragments, sends a Pong
+  for each Ping, and examines the UTF-8 of text.
+- Many fibers can send at the same time, and `close` closes the
+  connection from any fiber, with a time limit.
+- All the cases of the [Autobahn](https://github.com/crossbario/autobahn-testsuite)
+  test suite give OK or NON-STRICT, except the compression cases:
+  caravan does not accept `permessage-deflate`.
 
 ## Requirements
 
@@ -73,6 +99,7 @@ make test       # all test suites
 make fmt        # indent with ocp-indent
 make mutate     # mutation testing across all suites (slow)
 make coverage   # test coverage report
+make autobahn   # the Autobahn WebSocket test suite, with podman or docker
 ```
 
 Try the example server, and stop it with Ctrl-C:
@@ -81,6 +108,9 @@ Try the example server, and stop it with Ctrl-C:
 dune exec examples/hello.exe
 curl -i localhost:8080/hello
 ```
+
+For WebSocket, run `dune exec examples/ws_echo.exe` and open
+<http://localhost:8080/> in a browser.
 
 ## License
 
