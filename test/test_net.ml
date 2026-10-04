@@ -38,6 +38,18 @@ let read_exactly flow n =
 let deadline_in n = Mtime.add_span (Mtime.now ()) Mtime.Span.(n * ms) |> Option.get
 let elapsed_ms c = Mtime.Span.to_float_ns (Mtime.count c) /. 1e6
 
+(* [call] must end with Timeout in less than 2 s. If it does not, the test
+   cancels it, so that a failure does not stop the suite. *)
+let times_out call =
+  let ended = Action.map (fun () -> `Ended) (Fun.Async.get' call) in
+  match Action.invoke (Action.choose [ ended; Mtime.wait_for' Mtime.Span.(2 * s) `Late ]) with
+  | exception Flow.Timeout -> ()
+  | `Ended -> fail "ended without Timeout"
+  | `Late ->
+      Fun.Async.cancel call;
+      (try Fun.Async.get call with _ -> ());
+      fail "no Timeout after 2 s"
+
 let tcp_tests =
   group "Tcp"
     [ test "listening on port 0 gets a port" (fun () ->
@@ -111,6 +123,33 @@ let tcp_tests =
           Flow.set_write_deadline client (Some (deadline_in 200));
           raises Flow.Timeout (fun () ->
               for _ = 1 to 256 do Flow.write client chunk 0 (Bytes.length chunk) done));
+      (* A deadline set from a different fiber reaches a read or a write
+         that waits already. *)
+      test "a new deadline ends a read that waits" (fun () ->
+          with_pair @@ fun _client server ->
+          let reader = Fun.Async.call (fun () -> ignore (Flow.read server (Bytes.create 1) 0 1)) in
+          Mtime.wait_for Mtime.Span.(20 * ms);
+          Flow.set_read_deadline server (Some (deadline_in 20));
+          times_out reader);
+      test "a new deadline ends a write that waits" (fun () ->
+          with_pair @@ fun client _server ->
+          let chunk = Bytes.make (1024 * 1024) 'x' in
+          let writer =
+            Fun.Async.call (fun () ->
+                for _ = 1 to 256 do Flow.write client chunk 0 (Bytes.length chunk) done)
+          in
+          Mtime.wait_for Mtime.Span.(50 * ms);
+          Flow.set_write_deadline client (Some (deadline_in 20));
+          times_out writer);
+      test "a deadline removed from a read that waits stops it no more" (fun () ->
+          with_pair @@ fun client server ->
+          Flow.set_read_deadline server (Some (deadline_in 100));
+          let reader = Fun.Async.call (fun () -> read_exactly server 4) in
+          Mtime.wait_for Mtime.Span.(20 * ms);
+          Flow.set_read_deadline server None;
+          Mtime.wait_for Mtime.Span.(150 * ms);
+          Flow.write_string client "late";
+          equal string "late" (Fun.Async.get reader));
       test "writing to a closed peer raises Closed" (fun () ->
           with_pair @@ fun client server ->
           Flow.close server;
