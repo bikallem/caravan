@@ -46,7 +46,8 @@ val make :
       including at the end of the stream.
     - [shutdown_send ()] signals the end of the stream to the peer.
     - [close ()] releases the flow's resources. The resulting flow calls it at
-      most once.
+      most once. It must make a read or a write that waits at that time,
+      for example in a different fiber, raise {!Closed}.
     - [reset ()] releases them abortively, so that the peer sees the stream
       fail rather than end (default: [close]). The resulting flow calls at
       most one of [close] and [reset], once.
@@ -108,7 +109,8 @@ val set_write_deadline : t -> Affect_unix.Mtime.t option -> unit
 
 val close : t -> unit
 (** [close flow] closes [flow]. Closing is idempotent. Reads and writes on a
-    closed flow raise {!Closed}. *)
+    closed flow raise {!Closed}, also a read or a write that waits at the
+    time of the call, for example in a different fiber. *)
 
 val reset : t -> unit
 (** [reset flow] closes [flow] abortively: a TCP peer gets a reset instead

@@ -12,9 +12,44 @@ let set_deadline d at =
   let old = Atomic.exchange d { at; changed = Cell.Once.make () } in
   Cell.Once.try_set old.changed ()
 
-(* Waits for [ready], or raises Flow.Timeout when the deadline in [d] has
-   passed. A new deadline applies also to a wait that started before it. *)
-let rec wait ready d =
+(* A socket that fibers share. A read or a write, with its waits, uses the
+   socket. [close] wakes the waits at once, but the fd closes only when no
+   fiber uses it. Thus the operating system cannot give the number of the fd
+   to a new socket while a fiber can use the number. *)
+type socket = {
+  fd : Unix.file_descr;
+  users : int Atomic.t;
+  closing : unit Cell.Once.t;
+  reset : bool Atomic.t; (* [close] sends a reset *)
+  freed : bool Atomic.t; (* the fd is closed *)
+}
+
+let free s =
+  if Atomic.compare_and_set s.freed false true
+  then begin
+    (* A zero linger time makes close send a reset. *)
+    if Atomic.get s.reset
+    then (try Unix.setsockopt_optint s.fd Unix.SO_LINGER (Some 0) with Unix.Unix_error _ -> ());
+    Aunix.close_noerr s.fd
+  end
+
+let release s = if Atomic.fetch_and_add s.users (-1) = 1 && Cell.Once.is_set s.closing then free s
+
+(* Runs [f] while it uses [s]. *)
+let use s f =
+  Atomic.incr s.users;
+  if Cell.Once.is_set s.closing then (release s; raise Flow.Closed);
+  Fun.protect ~finally:(fun () -> release s) f
+
+let close ~reset s =
+  if reset then Atomic.set s.reset true;
+  Cell.Once.try_set s.closing ();
+  if Atomic.get s.users = 0 then free s
+
+(* Waits for [ready]. Raises Flow.Timeout when the deadline in [d] passes,
+   and Flow.Closed when [s] closes. A new deadline applies also to a wait
+   that started before it. *)
+let rec wait s ready d =
   let { at; changed } = Atomic.get d in
   let timeout =
     match at with
@@ -24,10 +59,14 @@ let rec wait ready d =
         if not (Mtime.is_earlier now ~than:at) then raise Flow.Timeout;
         Mtime.wait_for' (Mtime.span now at) `Timeout
   in
-  let events = [ Action.map (fun () -> `Ready) ready; Action.map (fun () -> `Changed) (Cell.Once.get' changed); timeout ] in
+  let events =
+    [ Action.map (fun () -> `Ready) ready; Action.map (fun () -> `Changed) (Cell.Once.get' changed);
+      Action.map (fun () -> `Closed) (Cell.Once.get' s.closing); timeout ]
+  in
   match Action.invoke (Action.choose events) with
   | `Ready -> ()
-  | `Changed -> wait ready d
+  | `Changed -> wait s ready d
+  | `Closed -> raise Flow.Closed
   | `Timeout -> raise Flow.Timeout
 
 let is_closed = function
@@ -35,20 +74,24 @@ let is_closed = function
 | _ -> false
 
 let flow fd =
+  let s =
+    { fd; users = Atomic.make 0; closing = Cell.Once.make (); reset = Atomic.make false;
+      freed = Atomic.make false }
+  in
   let read_deadline = no_deadline () and write_deadline = no_deadline () in
-  let rec read_now buf off len =
+  let rec try_read buf off len =
     match Unix.read fd buf off len with
     | n -> Some n
     | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK), _, _) -> None
-    | exception Unix.Unix_error (EINTR, _, _) -> read_now buf off len
+    | exception Unix.Unix_error (EINTR, _, _) -> try_read buf off len
     | exception Unix.Unix_error (e, _, _) when is_closed e -> raise Flow.Closed
   in
   let rec read buf off len =
     Fun.Async.check_cancellation ();
-    match read_now buf off len with
+    match try_read buf off len with
     | Some n -> n
     | None ->
-        wait (Aunix.wait_readable fd ()) read_deadline;
+        wait s (Aunix.wait_readable fd ()) read_deadline;
         read buf off len
   in
   let rec write buf off len =
@@ -58,7 +101,7 @@ let flow fd =
       match Unix.single_write fd buf off len with
       | n -> write buf (off + n) (len - n)
       | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK), _, _) ->
-          wait (Aunix.wait_writable fd ()) write_deadline;
+          wait s (Aunix.wait_writable fd ()) write_deadline;
           write buf off len
       | exception Unix.Unix_error (EINTR, _, _) -> write buf off len
       | exception Unix.Unix_error (e, _, _) when is_closed e -> raise Flow.Closed
@@ -68,12 +111,21 @@ let flow fd =
     try Unix.shutdown fd Unix.SHUTDOWN_SEND
     with Unix.Unix_error (e, _, _) when is_closed e -> ()
   in
-  Flow.make ~read ~read_now ~write ~readable:(Aunix.wait_readable fd ()) ~shutdown_send
-    ~close:(fun () -> Aunix.close_noerr fd)
-    ~reset:(fun () ->
-        (* A zero linger time makes close send a reset. *)
-        (try Unix.setsockopt_optint fd Unix.SO_LINGER (Some 0) with Unix.Unix_error _ -> ());
-        Aunix.close_noerr fd)
+  (* The action is enabled also when the flow closes. Then a read raises
+     Flow.Closed. *)
+  let readable =
+    Action.choose [ Aunix.wait_readable fd (); Cell.Once.get' s.closing ]
+  in
+  Flow.make
+    ~read:(fun buf off len -> use s (fun () -> read buf off len))
+    ~read_now:(fun buf off len -> use s (fun () -> try_read buf off len))
+    ~write:(fun buf off len -> use s (fun () -> write buf off len))
+    ~readable
+    ~shutdown_send:(fun () ->
+        (* A different fiber can close the flow after the check of Flow. *)
+        try use s shutdown_send with Flow.Closed -> ())
+    ~close:(fun () -> close ~reset:false s)
+    ~reset:(fun () -> close ~reset:true s)
     ~set_read_deadline:(set_deadline read_deadline)
     ~set_write_deadline:(set_deadline write_deadline) ()
 
