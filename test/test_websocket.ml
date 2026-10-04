@@ -625,10 +625,226 @@ let socket_tests =
           is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 2000.);
           equal int 1006 (Fun.Async.get sender)) ]
 
+(* The fields of the RFC 6455 §1.3 example, without [Origin]. *)
+let request_fields =
+  [ ("Host", "server.example.com"); ("Upgrade", "websocket"); ("Connection", "Upgrade");
+    ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="); ("Sec-WebSocket-Version", "13") ]
+
+(* A request with [request_fields], where [fields] replace the fields of the
+   same names and add the others. [""] removes a field. *)
+let request ?(meth = Caravan.Method.GET) ?(version = Caravan.Version.Http_1_1)
+    ?(authority = "server.example.com") fields =
+  let set h (name, value) =
+    if value = "" then Caravan.Headers.remove name h else Caravan.Headers.set name value h
+  in
+  let headers = List.fold_left set (Caravan.Headers.of_list request_fields) fields in
+  Caravan.Request.make ~version ~authority ~headers meth "/chat"
+
+(* The status and the fields of the response to [req], and its body. *)
+let answer ?protocols ?origin req =
+  let r = Ws.accept ?protocols ?origin req (fun _ -> ()) in
+  let body =
+    match Caravan.Response.kind r with
+    | Body b -> Caravan.Body.to_string b
+    | Upgrade _ -> ""
+  in
+  String.trim (Format.asprintf "%a@.%s" Caravan.Response.pp r body)
+
 let handshake_tests =
   group "Handshake"
     [ test "accept_key answers the RFC 6455 example" (fun () ->
           equal string "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-            (Caravan_websocket.accept_key "dGhlIHNhbXBsZSBub25jZQ==")) ]
+            (Caravan_websocket.accept_key "dGhlIHNhbXBsZSBub25jZQ=="));
+      test "accept answers a correct request with 101" (fun () ->
+          expect (answer (request [])) @@ __POS_OF__ {|
+            101 Switching Protocols (upgrade)
+            Upgrade: websocket
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+            |};
+          (* Tokens are case-insensitive, and a list can hold them. *)
+          expect
+            (answer
+               (request [ ("Upgrade", "WebSocket"); ("Connection", "keep-alive, upgrade") ]))
+          @@ __POS_OF__ {|
+            101 Switching Protocols (upgrade)
+            Upgrade: websocket
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+            |});
+      test "accept refuses an incorrect request" (fun () ->
+          let first_line s = List.hd (String.split_on_char '\n' s) in
+          let cases =
+            [ ("POST", request ~meth:Caravan.Method.POST []);
+              ("HTTP/1.0", request ~version:Caravan.Version.Http_1_0 []);
+              ("no Upgrade", request [ ("Upgrade", "") ]);
+              ("Upgrade: h2c", request [ ("Upgrade", "h2c") ]);
+              ("no Connection token", request [ ("Connection", "keep-alive") ]);
+              ("no key", request [ ("Sec-WebSocket-Key", "") ]);
+              ("key of 5 bytes", request [ ("Sec-WebSocket-Key", "aGVsbG8=") ]);
+              ("key not base64", request [ ("Sec-WebSocket-Key", "not base64 at all!!!") ]) ]
+          in
+          expect
+            (String.concat "\n"
+               (List.map
+                  (fun (name, req) ->
+                     let a = answer req in
+                     name ^ ": " ^ first_line a ^ " | "
+                     ^ List.nth (String.split_on_char '\n' a) 2)
+                  cases))
+          @@ __POS_OF__ {|
+            POST: 400 Bad Request | WebSocket handshake: the method is not GET
+            HTTP/1.0: 400 Bad Request | WebSocket handshake: the version is not HTTP/1.1
+            no Upgrade: 400 Bad Request | WebSocket handshake: no Upgrade: websocket
+            Upgrade: h2c: 400 Bad Request | WebSocket handshake: no Upgrade: websocket
+            no Connection token: 400 Bad Request | WebSocket handshake: no Connection: upgrade
+            no key: 400 Bad Request | WebSocket handshake: no Sec-WebSocket-Key
+            key of 5 bytes: 400 Bad Request | WebSocket handshake: the key is not 16 bytes in base64
+            key not base64: 400 Bad Request | WebSocket handshake: the key is not 16 bytes in base64
+            |});
+      test "accept asks for version 13" (fun () ->
+          expect (answer (request [ ("Sec-WebSocket-Version", "8") ])) @@ __POS_OF__ {|
+            426 Upgrade Required
+            Sec-WebSocket-Version: 13
+            Content-Type: text/plain; charset=utf-8
+            WebSocket handshake: the version must be 13
+            |};
+          expect (answer (request [ ("Sec-WebSocket-Version", "") ])) @@ __POS_OF__ {|
+            426 Upgrade Required
+            Sec-WebSocket-Version: 13
+            Content-Type: text/plain; charset=utf-8
+            WebSocket handshake: the version must be 13
+            |});
+      test "accept permits only the origin of the request by default" (fun () ->
+          let status ?origin ?authority o =
+            List.hd (String.split_on_char ' ' (answer ?origin (request ?authority [ ("Origin", o) ])))
+          in
+          expect
+            (String.concat " "
+               [ status "http://server.example.com"; status "https://SERVER.example.com";
+                 status "http://server.example.com:8080"; status "http://evil.example.com";
+                 status "null"; status "server.example.com"; status "http:"; status "http:/";
+                 status "http:/xserver.example.com";
+                 status ~authority:"server.example.com:8080" "http://server.example.com:8080";
+                 status ~origin:(fun o -> o = "null") "null";
+                 status ~origin:(fun _ -> false) "http://server.example.com" ])
+          @@ __POS_OF__ {|101 101 403 403 403 403 403 403 403 101 101 403|});
+      test "accept chooses the first subprotocol of the server that the client offers"
+        (fun () ->
+           let chosen ?protocols offered =
+             let a = answer ?protocols (request [ ("Sec-WebSocket-Protocol", offered) ]) in
+             match
+               List.find_opt
+                 (String.starts_with ~prefix:"Sec-WebSocket-Protocol")
+                 (String.split_on_char '\n' a)
+             with
+             | Some line -> line
+             | None -> "none"
+           in
+           expect
+             (String.concat "\n"
+                [ chosen ~protocols:[ "superchat"; "chat" ] "chat, superchat";
+                  chosen ~protocols:[ "chat" ] "Chat, superchat"; chosen ~protocols:[ "mqtt" ] "chat";
+                  chosen ~protocols:[ "chat" ] ""; chosen "chat" ])
+           @@ __POS_OF__ {|
+             Sec-WebSocket-Protocol: superchat
+             none
+             none
+             none
+             none
+             |}) ]
 
-let () = exit (run "websocket" [ sha1_tests; base64_tests; frame_tests; connection_tests; close_tests; socket_tests; handshake_tests ])
+let server_handler req =
+  match Caravan.Request.path_only req with
+  | "/echo" ->
+      Ws.accept req (fun c ->
+          let rec loop () =
+            Ws.send c (Ws.recv c);
+            loop ()
+          in
+          loop ())
+  | "/protocol" ->
+      Ws.accept ~protocols:[ "chat"; "echo" ] req (fun c ->
+          Ws.send c (Text (Option.value ~default:"none" (Ws.protocol c))))
+  | "/boom" -> Ws.accept req (fun _ -> failwith "boom")
+  | _ -> Caravan.Handler.not_found req
+
+(* A WebSocket session with a server: the request for [path], with [first]
+   in the same write; then [after]. The result is the response head, a "--"
+   line, and the frames from the server until it closes the connection. If
+   [reply], we answer a Close frame of the server. *)
+let session ?(first = "") ?(after = "") ?(reply = true) server path =
+  let flow = Caravan.Tcp.connect (Caravan.Server.local_addr server) in
+  Stdlib.Fun.protect ~finally:(fun () -> Caravan.Flow.close flow) @@ fun () ->
+  Caravan.Flow.write_string flow
+    (String.concat "\r\n"
+       [ "GET " ^ path ^ " HTTP/1.1"; "Host: x"; "Upgrade: websocket"; "Connection: Upgrade";
+         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="; "Sec-WebSocket-Version: 13";
+         "Sec-WebSocket-Protocol: echo"; ""; first ]);
+  let r = Buf_reader.of_flow flow in
+  let rec head acc =
+    match Buf_reader.read_line r ~max:1000 with "" -> List.rev acc | l -> head (l :: acc)
+  in
+  let head = head [] in
+  Caravan.Flow.write_string flow after;
+  let rec frames acc =
+    match Frame.read r ~masked:false ~max:max_int with
+    | exception End_of_file -> List.rev acc
+    | f ->
+        if reply && f.opcode = Close then Caravan.Flow.write_string flow (client Close f.payload);
+        frames (show_frame f :: acc)
+  in
+  String.concat "\n" (head @ ("--" :: frames []))
+
+let server_tests =
+  group "Server"
+    [ test "an echo, with a first frame in the write of the request" (fun () ->
+          expect
+            (Server_support.with_server ~handler:server_handler (fun server ->
+                 session server "/echo" ~first:(client Text "early") ~reply:false
+                   ~after:
+                     (client Text "hi" ^ client Binary "\x01"
+                      ^ client Close (code_reason 1000 "bye"))))
+          @@ __POS_OF__ {|
+            HTTP/1.1 101 Switching Protocols
+            Upgrade: websocket
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+            Connection: Upgrade
+            --
+            text "early"
+            text "hi"
+            binary "\001"
+            close 1000
+            |});
+      test "a handler that ends closes with 1000" (fun () ->
+          expect
+            (Server_support.with_server ~handler:server_handler (fun server ->
+                 session server "/protocol"))
+          @@ __POS_OF__ {|
+            HTTP/1.1 101 Switching Protocols
+            Upgrade: websocket
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+            Sec-WebSocket-Protocol: echo
+            Connection: Upgrade
+            --
+            text "echo"
+            close 1000
+            |});
+      test "a handler that raises closes with 1011, and the server reports it" (fun () ->
+          let errors = ref [] in
+          let config =
+            { Server_support.config with
+              on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
+          in
+          expect
+            (Server_support.with_server ~config ~handler:server_handler (fun server ->
+                 session server "/boom"))
+          @@ __POS_OF__ {|
+            HTTP/1.1 101 Switching Protocols
+            Upgrade: websocket
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+            Connection: Upgrade
+            --
+            close 1011
+            |};
+          equal (list string) [ "Failure(\"boom\")" ] !errors) ]
+
+let () = exit (run "websocket" [ sha1_tests; base64_tests; frame_tests; connection_tests; close_tests; socket_tests; handshake_tests; server_tests ])

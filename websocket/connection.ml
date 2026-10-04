@@ -13,6 +13,7 @@ type t = {
   w : Buf_writer.t;
   writer : Semaphore.t; (* one frame at a time on [w] *)
   reader : Semaphore.t; (* one fiber at a time reads frames *)
+  protocol : string option;
   max_message : int;
   close_timeout : Mtime.Span.t;
   closing : exn option Atomic.t; (* we sent a Close frame: what [send] raises *)
@@ -20,9 +21,9 @@ type t = {
   finished : unit Cell.Once.t; (* set with [closed] *)
 }
 
-let make ?(max_message = 8 * 1024 * 1024) ?(close_timeout = Mtime.Span.(5 * s)) flow =
+let make ?protocol ?(max_message = 8 * 1024 * 1024) ?(close_timeout = Mtime.Span.(5 * s)) flow =
   { flow; r = Buf_reader.of_flow flow; w = Buf_writer.make (Flow.write flow);
-    writer = Semaphore.make 1; reader = Semaphore.make 1; max_message; close_timeout;
+    writer = Semaphore.make 1; reader = Semaphore.make 1; protocol; max_message; close_timeout;
     closing = Atomic.make None; closed = Atomic.make None; finished = Cell.Once.make () }
 
 (* RFC 6455 §7.4: the codes that a Close frame can contain. *)
@@ -30,6 +31,7 @@ let is_permitted code =
   (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014)
   || (code >= 3000 && code <= 4999)
 
+let protocol t = t.protocol
 let check_closed t = Option.iter raise (Atomic.get t.closed)
 
 let check_open t =
@@ -150,7 +152,7 @@ let close ?(code = 1000) ?(reason = "") t =
   if not (is_permitted code) then invalid_arg "Caravan_websocket.close: code not permitted";
   if String.length reason > 123 || not (String.is_valid_utf_8 reason)
   then invalid_arg "Caravan_websocket.close: reason is not UTF-8 of at most 123 bytes";
-  if claim_close t (Closed { code; reason })
+  if Atomic.get t.closed = None && claim_close t (Closed { code; reason })
   then begin
     (* The deadlines reach also the fibers that read or write at this
        time. *)

@@ -1,7 +1,65 @@
 (** WebSocket ({{:https://www.rfc-editor.org/rfc/rfc6455}RFC 6455}) for
-    caravan servers. *)
+    caravan servers.
+
+    A handler gives the response of {!accept} to a WebSocket request:
+    {[
+      let handler req =
+        match Caravan.Request.path_only req with
+        | "/echo" ->
+            Caravan_websocket.accept req (fun c ->
+                let rec loop () =
+                  Caravan_websocket.(send c (recv c));
+                  loop ()
+                in
+                loop ())
+        | _ -> Caravan.Handler.not_found req
+    ]} *)
+
+type t
+(** The type for WebSocket connections. *)
 
 (** {1:handshake Opening handshake} *)
+
+val accept :
+  ?protocols:string list ->
+  ?origin:(string -> bool) ->
+  ?max_message:int ->
+  ?close_timeout:Affect_unix.Mtime.Span.t ->
+  Caravan.Request.t ->
+  (t -> unit) ->
+  Caravan.Response.t
+(** [accept req f] is the response to the WebSocket request [req]
+    ({{:https://www.rfc-editor.org/rfc/rfc6455#section-4.2}RFC 6455
+    §4.2}). If [req] is a correct request, the response is a [101] that
+    gives the connection to [f]. If not, the response is an error:
+    - [426] with [Sec-WebSocket-Version: 13] if [req] asks for a different
+      version of the protocol.
+    - [403] if the origin of [req] is not permitted.
+    - [400] for other problems: a method that is not [GET], a version that
+      is not HTTP/1.1, no [Upgrade: websocket] or [Connection: upgrade]
+      token, no [Sec-WebSocket-Key] or a key that is not 16 bytes.
+
+    The options are:
+    - [protocols] are the subprotocols of the server, in order of
+      preference. [accept] chooses the first one that [req] offers in
+      [Sec-WebSocket-Protocol], see {!protocol}. The default is none.
+    - [origin o] is [true] if the [Origin] [o] of a request is permitted.
+      By default, the origin must have the host and the port of [req]: a
+      page from a different site cannot use the cookies of the user on
+      this server. A request without [Origin] does not come from a browser,
+      and [accept] permits it.
+    - [max_message] is the size limit of a received message, 8 MiB by
+      default.
+    - [close_timeout] is the time limit of {!close}, 5 s by default.
+
+    When [f] ends, [accept] closes the connection with 1000. If [f] raises
+    {!Closed}, the connection is closed already. If [f] raises a different
+    exception, [accept] closes the connection with 1011 and gives the
+    exception to the server, which reports it. [accept] does not accept
+    extensions. *)
+
+val protocol : t -> string option
+(** [protocol c] is the subprotocol that {!accept} chose for [c], if one. *)
 
 val accept_key : string -> string
 (** [accept_key key] is the [Sec-WebSocket-Accept] value that answers a
@@ -11,9 +69,6 @@ val accept_key : string -> string
     §4.2.2}). *)
 
 (** {1:connections Connections} *)
-
-type t
-(** The type for WebSocket connections. *)
 
 type message =
 | Text of string  (** A text message. The text is valid UTF-8. *)
