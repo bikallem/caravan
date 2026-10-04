@@ -525,6 +525,31 @@ let close_tests =
             --
             close 1000
             |});
+      test "close stops at the time limit if the peer sends without a stop" (fun () ->
+          (* A flow that always has bytes: a read never waits for its
+             deadline. The peer sends 100 000 000 frames, then ends. A read
+             of all of them takes many seconds. *)
+          let frame = client Binary "" and count = 100_000_000 in
+          let size = String.length frame in
+          let total = count * size and pos = ref 0 in
+          let read buf off len =
+            let n = Int.min len (total - !pos) in
+            for i = 0 to n - 1 do Bytes.set buf (off + i) frame.[(!pos + i) mod size] done;
+            pos := !pos + n;
+            n
+          in
+          let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
+          let flow =
+            Caravan.Flow.make ~read ~read_now:(fun b o l -> Some (read b o l))
+              ~write:(fun _ _ _ -> ()) ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
+              ~close:ignore ~set_read_deadline:ignore_deadline ~set_write_deadline:ignore_deadline ()
+          in
+          let t = Affect_unix.Mtime.counter () in
+          Affect_unix.Unix.main ~domain_count:1 (fun () ->
+              Ws.close (Ws.Private.of_flow ~close_timeout:Affect_unix.Mtime.Span.(50 * ms) flow));
+          let took = Affect_unix.Mtime.Span.to_float_ns (Affect_unix.Mtime.count t) /. 1e6 in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 2000.);
+          is_true ~msg:(Printf.sprintf "read %d of %d bytes" !pos total) (!pos < total));
       test "close examines its code and its reason" (fun () ->
           (* The largest reason: 123 bytes of UTF-8. *)
           let reason = String.make 120 'x' ^ "\xe2\x82\xac" in

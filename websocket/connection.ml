@@ -183,6 +183,11 @@ let peer_closed t payload =
   if claim_close t (Closed { code; reason }) then write_close t echo;
   raise (shut t code reason)
 
+let after_close_deadline t =
+  match Atomic.get t.close_at with
+  | Some c -> not (Mtime.is_earlier (Mtime.now ()) ~than:c)
+  | None -> false
+
 let message t (op : Frame.opcode) payload =
   if op <> Text then Binary payload
   else if String.is_valid_utf_8 payload then Text payload
@@ -213,7 +218,10 @@ let rec next t part =
   | { fin; opcode; payload } -> (
       match (opcode, part) with
       | Close, _ -> peer_closed t payload
-      | _ when Atomic.get t.closing <> None -> next t part
+      | _ when Atomic.get t.closing <> None ->
+          (* A read that finds bytes does not wait, thus its deadline does
+             not stop a peer that sends without a stop. *)
+          if after_close_deadline t then raise (shut t 1006 "") else next t part
       | Ping, _ -> (
           (* An exception before the Pong goes, for example a cancel in
              the wait for the writer, loses the fragments of [part]. *)
