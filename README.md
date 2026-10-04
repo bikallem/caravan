@@ -101,7 +101,8 @@ Then:
 make build      # dune build
 make test       # all test suites
 make fmt        # indent with ocp-indent
-make mutate     # mutation testing across all suites (slow)
+make mutate     # mutation testing across all suites, in parallel
+make mutate MUTATE=websocket/   # only the mutants of the files under a prefix
 make coverage   # test coverage report
 make autobahn   # the Autobahn WebSocket test suite, with podman or docker
 ```
