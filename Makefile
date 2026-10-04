@@ -30,11 +30,18 @@ test:
 # - MUTATE=websocket/ tests only the mutants of the files under this prefix.
 #   A run without it first removes all verdicts.
 # - MUTATE_TIMEOUT is the time limit of a test in seconds. A mutant that
-#   makes a test hang fails at this limit.
+#   makes a test hang fails at this limit. Under many new connections, a
+#   loopback SYN can need a retransmission, and a connect then takes 1 s or
+#   3 s. Thus the limit is more than 3 s.
+# - MUTATE_STATEFUL_COUNT is the number of programs of the stateful test,
+#   300 in a normal run. Each program opens many connections, and the check
+#   runs the test again for each mutant. With less than 200, the test can
+#   fail its own rule that each label must occur.
 MUTATE ?=
 MUTATE_JOBS ?= $(shell nproc)
-MUTATE_SHARDS ?= 4
+MUTATE_SHARDS ?= 8
 MUTATE_TIMEOUT ?= 5
+MUTATE_STATEFUL_COUNT ?= 200
 MUTATE_FILES = $(filter $(MUTATE)%,$(sort $(wildcard src/*.ml websocket/*.ml)))
 MUTATE_LOGS = _build/_mutate_logs
 
@@ -51,7 +58,8 @@ mutate:
 	done | xargs -P $(MUTATE_JOBS) -n 3 sh -c ' \
 	  exe=_build/default/test/$$0.mutate-$$1.exe; \
 	  cp -f _build/default/test/$$0.exe $$exe; \
-	  TEST_DOMAINS=1 ./$$exe --mutate=$$2 --timeout=$(MUTATE_TIMEOUT) \
+	  TEST_DOMAINS=1 CARAVAN_STATEFUL_COUNT=$(MUTATE_STATEFUL_COUNT) \
+	    ./$$exe --mutate=$$2 --timeout=$(MUTATE_TIMEOUT) \
 	    > $(MUTATE_LOGS)/$$0.$$1.log 2>&1 || true'
 	@failed=$$(grep -L -E "^mutants|leaves no mutant|links no instrumented" $(MUTATE_LOGS)/*.log); \
 	if [ -n "$$failed" ]; then \

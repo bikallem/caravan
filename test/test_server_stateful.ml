@@ -130,9 +130,15 @@ let commands =
     command "receive" ~pre:Model.can_receive (conn ^-> returns string) Model.receive System.receive;
     command "close" ~pre:Model.can_close (conn ^-> returns unit) Model.close System.close ]
 
+(* 300 programs by default. The mutation check runs this test again for
+   each mutant, and each program opens many connections: it sets a lower
+   count with CARAVAN_STATEFUL_COUNT. *)
+let count =
+  Option.value ~default:300
+    (Option.bind (Sys.getenv_opt "CARAVAN_STATEFUL_COUNT") int_of_string_opt)
+
 let stateful_tests =
-  group "HTTP/1.1 connections"
-    [ stateful ~count:300 ~steps:25 "behave like the model" commands ]
+  group "HTTP/1.1 connections" [ stateful ~count ~steps:25 "behave like the model" commands ]
 
 let () =
   let code =

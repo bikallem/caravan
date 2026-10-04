@@ -50,7 +50,10 @@ let integration_tests =
              connection in one choice, and under several domains affect
              could miss the call's return: about one round in 30 hung. *)
           let domains = if domain_count = 1 then 1 else 4 in
-          for _ = 1 to 100 do
+          (* The race needs several domains. On one domain, as in the
+             mutation check, 10 rounds are sufficient. *)
+          let rounds = if domains = 1 then 10 else 100 in
+          for _ = 1 to rounds do
             Affect_unix.Unix.main ~domain_count:domains @@ fun () ->
             let server = Server.start ~config handler in
             let client () =
