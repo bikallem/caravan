@@ -72,9 +72,11 @@ val accept :
       through proxies that close idle connections.
 
     When [f] ends, [accept] closes the connection with 1000. If [f] raises
-    {!Closed}, the connection is closed already. If [f] raises a different
-    exception, [accept] closes the connection with 1011 and gives the
-    exception to the server, which reports it. A [Cancelled] from a call
+    {!Closed} for its connection, the connection is closed already. If [f]
+    raises a different exception, [accept] closes the connection with 1011
+    and gives the exception to the server, which reports it. A {!Closed} of
+    a different connection, for example a different client, is such an
+    exception. A [Cancelled] from a call
     that [f] made goes to the server as a [Failure]. If the server cancels
     [f], [accept] sends no Close frame. [accept] does not accept
     extensions. *)

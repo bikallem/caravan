@@ -95,6 +95,8 @@ let make ?protocol ?(max_message = 8 * 1024 * 1024) ?(close_timeout = Mtime.Span
   self := Some t;
   t
 
+let is_closing t = Atomic.get t.closing <> None || Cell.Once.is_set t.closed
+
 let check_closed t = if Cell.Once.is_set t.closed then raise (Cell.Once.get t.closed)
 
 (* If the connection is open, this function keeps [code] and [reason] as its

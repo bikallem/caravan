@@ -19,6 +19,10 @@ val make :
   t
 
 val protocol : t -> string option
+
+(* [is_closing c] is [true] if we sent a Close frame on [c] or [c] is
+   closed. *)
+val is_closing : t -> bool
 val recv : t -> message
 val send : t -> message -> unit
 val ping : t -> string -> unit

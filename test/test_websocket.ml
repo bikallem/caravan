@@ -1150,6 +1150,9 @@ let handshake_tests =
              none
              |}) ]
 
+(* What recv raised in the handler of "/record". *)
+let recorded = Atomic.make None
+
 let server_handler req =
   match Caravan.Request.path_only req with
   | "/echo" ->
@@ -1163,6 +1166,20 @@ let server_handler req =
       Ws.accept ~protocols:[ "chat"; "echo" ] req (fun c ->
           Ws.send c (Text (Option.value ~default:"none" (Ws.protocol c))))
   | "/boom" -> Ws.accept req (fun _ -> failwith "boom")
+  | "/record" ->
+      Ws.accept req (fun c ->
+          match Ws.recv c with
+          | _ -> ()
+          | exception e ->
+              Atomic.set recorded (Some (Printexc.to_string e));
+              raise e)
+  | "/other" ->
+      (* A Closed of a different connection is an exception of the
+         handler. *)
+      Ws.accept req (fun _ ->
+          let input = client Close (code_reason 1000 "") in
+          let other = Ws.Private.of_flow (Caravan.Flow.of_string input (Buffer.create 16)) in
+          ignore (Ws.recv other))
   | "/child" ->
       (* The Cancelled of a child call is not a stop of the server. *)
       Ws.accept req (fun _ ->
@@ -1177,19 +1194,24 @@ let server_handler req =
    response head, a "--" line, and the frames from the server until it
    closes the connection. If [reply], we answer a Close frame of the
    server. *)
-let session ?(first = "") ?(after = "") ?(during = ignore) ?(reply = true) server path =
-  let flow = Caravan.Tcp.connect (Caravan.Server.local_addr server) in
-  Stdlib.Fun.protect ~finally:(fun () -> Caravan.Flow.close flow) @@ fun () ->
-  Caravan.Flow.write_string flow
-    (String.concat "\r\n"
-       [ "GET " ^ path ^ " HTTP/1.1"; "Host: x"; "Upgrade: websocket"; "Connection: Upgrade";
-         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="; "Sec-WebSocket-Version: 13";
-         "Sec-WebSocket-Protocol: echo"; ""; first ]);
-  let r = Buf_reader.of_flow flow in
+let upgrade_request ?(first = "") path =
+  String.concat "\r\n"
+    [ "GET " ^ path ^ " HTTP/1.1"; "Host: x"; "Upgrade: websocket"; "Connection: Upgrade";
+      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="; "Sec-WebSocket-Version: 13";
+      "Sec-WebSocket-Protocol: echo"; ""; first ]
+
+let response_head r =
   let rec head acc =
     match Buf_reader.read_line r ~max:1000 with "" -> List.rev acc | l -> head (l :: acc)
   in
-  let head = head [] in
+  head []
+
+let session ?first ?(after = "") ?(during = ignore) ?(reply = true) server path =
+  let flow = Caravan.Tcp.connect (Caravan.Server.local_addr server) in
+  Stdlib.Fun.protect ~finally:(fun () -> Caravan.Flow.close flow) @@ fun () ->
+  Caravan.Flow.write_string flow (upgrade_request ?first path);
+  let r = Buf_reader.of_flow flow in
+  let head = response_head r in
   Caravan.Flow.write_string flow after;
   during ();
   let rec frames acc =
@@ -1273,6 +1295,49 @@ let server_tests =
           equal (list string)
             [ "Failure(\"Caravan_websocket: a call of the handler was cancelled\")" ]
             !errors);
+      test "a Closed of a different connection closes with 1011, and the server reports it"
+        (fun () ->
+           let errors = ref [] in
+           let config =
+             { Server_support.config with
+               on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
+           in
+           expect
+             (Server_support.with_server ~config ~handler:server_handler (fun server ->
+                  session server "/other"))
+           @@ __POS_OF__ {|
+            HTTP/1.1 101 Switching Protocols
+            Upgrade: websocket
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+            Connection: Upgrade
+            --
+            close 1011
+            |};
+           equal int 1 (List.length !errors));
+      test "a peer that leaves without a Close frame is not an error" (fun () ->
+          let errors = ref [] in
+          let config =
+            { Server_support.config with
+              on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
+          in
+          Atomic.set recorded None;
+          Server_support.with_server ~config ~handler:server_handler (fun server ->
+              let flow = Caravan.Tcp.connect (Caravan.Server.local_addr server) in
+              Caravan.Flow.write_string flow (upgrade_request "/record");
+              equal string "HTTP/1.1 101 Switching Protocols"
+                (List.hd (response_head (Buf_reader.of_flow flow)));
+              Caravan.Flow.close flow;
+              (* Waits at most 2 s for the handler to get Closed 1006. Then
+                 the server stops: it waits for the end of the handler. *)
+              let rec wait n =
+                if Atomic.get recorded = None && n > 0
+                then (Affect_unix.Mtime.wait_for (ms 10); wait (n - 1))
+              in
+              wait 200);
+          equal (option string)
+            (Some "Caravan_websocket__Connection.Closed(1006, \"\")")
+            (Atomic.get recorded);
+          equal (list string) [] !errors);
       test "a server that stops cancels the handler without a Close frame" (fun () ->
           let errors = ref [] in
           let config =
