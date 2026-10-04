@@ -222,13 +222,29 @@ let message t (op : Frame.opcode) payload =
   else if String.is_valid_utf_8 payload then Text payload
   else fail t 1007 "text is not UTF-8"
 
-(* Reads frames until a full message. [part] is the opcode and the data of
-   a fragmented message, if one is open. Control frames between fragments
+(* Adds [s] to the [len] bytes of the message buffer [b]. The capacity
+   doubles, but it never goes over [max_message]: [Frame.read] makes sure
+   that the message fits. *)
+let append t (b, len) s =
+  let n = String.length s in
+  let b =
+    if len + n <= Bytes.length b
+    then b
+    else
+    let cap = Int.min t.max_message (Int.max (len + n) (2 * Bytes.length b)) in
+    Bytes.extend b 0 (cap - Bytes.length b)
+  in
+  Bytes.blit_string s 0 b len n;
+  (b, len + n)
+
+(* Reads frames until a full message. [part] is the opcode, the buffer and
+   the length of a fragmented message, if one is open. The buffer starts as
+   the first payload, without a copy. Control frames between fragments
    do not count in the size of the message. After we sent a Close frame,
    this function discards data frames and sends no Pong: it ends only with
    [Closed]. *)
 let rec next t part =
-  let size = match part with None -> 0 | Some (_, b) -> Buffer.length b in
+  let size = match part with None -> 0 | Some (_, (_, len)) -> len in
   (* The idle timeout applies until the first byte of the frame. The bytes
      of the frame can be in [t.r] at this time. *)
   t.in_frame <- Buf_reader.buffered t.r > 0;
@@ -262,12 +278,15 @@ let rec next t part =
       | Continuation, None -> fail t 1002 "continuation frame without a message"
       | (Text | Binary), None when fin -> message t opcode payload
       | (Text | Binary), None ->
-          let b = Buffer.create (2 * String.length payload) in
-          Buffer.add_string b payload;
-          next t (Some (opcode, b))
-      | Continuation, Some (op, b) ->
-          Buffer.add_string b payload;
-          if fin then message t op (Buffer.contents b) else next t part)
+          (* [Frame.read] gives a new string: nothing else has it. *)
+          next t (Some (opcode, (Bytes.unsafe_of_string payload, String.length payload)))
+      | Continuation, Some (op, data) ->
+          let ((b, len) as data) = append t data payload in
+          if not fin
+          then next t (Some (op, data))
+          else if len = Bytes.length b
+          then message t op (Bytes.unsafe_to_string b)
+          else message t op (Bytes.sub_string b 0 len))
 
 let recv t =
   Semaphore.with_acquired t.reader (fun () ->

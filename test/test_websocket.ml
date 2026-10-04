@@ -471,6 +471,49 @@ let connection_tests =
               is_true (Ws.recv (Ws.Private.of_flow flow) = Binary "xy"));
           let grew = (!top - start) * (Sys.word_size / 8) in
           is_true ~msg:(Printf.sprintf "the heap grew by %d bytes" grew) (grew < 4_000_000));
+      test "the buffer of a fragmented message stays within max_message" (fun () ->
+          (* What recv allocates for a message of [m] bytes in fragments of
+             [sizes], more than for the same message in one frame. The
+             expected message is made before the measure. *)
+          let m = 1024 * 1024 in
+          let expected = String.make m 'x' in
+          let allocated frames =
+            let flow = Caravan.Flow.of_string (String.concat "" frames) (Buffer.create 16) in
+            let used = ref 0. in
+            Affect_unix.Unix.main ~domain_count:1 (fun () ->
+                let c = Ws.Private.of_flow ~max_message:m flow in
+                let before = Gc.allocated_bytes () in
+                let msg = Ws.recv c in
+                used := Gc.allocated_bytes () -. before;
+                is_true (msg = Binary expected));
+            !used
+          in
+          let whole = allocated [ client Binary expected ] in
+          let more sizes =
+            let rec frames first = function
+            | [] -> []
+            | [ n ] -> [ client (if first then Binary else Continuation) (String.make n 'x') ]
+            | n :: rest ->
+                client ~fin:false (if first then Binary else Continuation) (String.make n 'x')
+                :: frames false rest
+            in
+            (allocated (frames true sizes) -. whole) /. Float.of_int m
+          in
+          (* At most one buffer of [m] bytes, and the copy when it grows:
+             1.50 m at this time. A buffer of 2 times the first fragment
+             gave 2.00 m to 4.44 m. A full first fragment and an empty last
+             fragment do not cause a copy. In the last three cases, the
+             double size is more than [m]: without the limit, they give
+             2.44 m to 3.00 m. *)
+          List.iter
+            (fun (sizes, limit) ->
+               let r = more sizes in
+               is_true
+                 ~msg:(Printf.sprintf "%s: %.2f m" (String.concat " + " (List.map string_of_int sizes)) r)
+                 (r < limit))
+            [ ([ m; 0 ], 0.5); ([ (m / 2) - 1; (m / 2) + 1 ], 1.75); ([ 3; m - 3 ], 1.75);
+              ([ m - 1; 1 ], 1.75); ([ (m / 2) + 1; (m / 2) - 1 ], 1.75);
+              ([ 6 * m / 10; m / 10; m - (6 * m / 10) - (m / 10) ], 1.75) ]);
       test "a connection that stops inside a frame" (fun () ->
           expect (converse (String.sub (client Text "Hello") 0 4) echo) @@ __POS_OF__ {|
             closed 1006 ""
