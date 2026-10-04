@@ -25,8 +25,7 @@ type t = {
   mutable read_at : Mtime.t option; (* the read deadline, with [deadlines] *)
   mutable write_at : Mtime.t option; (* the write deadline, with [deadlines] *)
   closing : exn option Atomic.t; (* we sent a Close frame: what [send] raises *)
-  closed : exn option Atomic.t; (* the first [Closed] exception *)
-  finished : unit Cell.Once.t; (* set with [closed] *)
+  closed : exn Cell.Once.t; (* the first [Closed] exception *)
 }
 
 (* RFC 6455 §7.4: the codes that a Close frame can contain. *)
@@ -91,21 +90,20 @@ let make ?protocol ?(max_message = 8 * 1024 * 1024) ?(close_timeout = Mtime.Span
       writer = Semaphore.make 1; reader = Semaphore.make 1; protocol; max_message; close_timeout;
       write_timeout; read_timeout; idle_timeout; in_frame = false; deadlines = Mutex.create ();
       close_at = Atomic.make None; read_at = None; write_at = None; closing = Atomic.make None;
-      closed = Atomic.make None; finished = Cell.Once.make () }
+      closed = Cell.Once.make () }
   in
   self := Some t;
   t
 
-let check_closed t = Option.iter raise (Atomic.get t.closed)
+let check_closed t = if Cell.Once.is_set t.closed then raise (Cell.Once.get t.closed)
 
 (* If the connection is open, this function keeps [code] and [reason] as its
    [Closed] exception. Then it closes the flow and gives the exception that
    the connection keeps. *)
 let shut t code reason =
-  ignore (Atomic.compare_and_set t.closed None (Some (Closed { code; reason })));
+  Cell.Once.try_set t.closed (Closed { code; reason });
   Flow.close t.flow;
-  Cell.Once.try_set t.finished ();
-  Option.get (Atomic.get t.closed)
+  Cell.Once.get t.closed
 
 (* An exception in the middle of a frame, for example a cancel, puts the
    stream out of step. Thus the connection closes with 1006, and the
@@ -279,14 +277,14 @@ let close ?(code = 1000) ?(reason = "") t =
   if not (is_permitted code) then invalid_arg "Caravan_websocket.close: code not permitted";
   if String.length reason > 123 || not (String.is_valid_utf_8 reason)
   then invalid_arg "Caravan_websocket.close: reason is not UTF-8 of at most 123 bytes";
-  if Atomic.get t.closed = None && claim_close t (Closed { code; reason })
+  if (not (Cell.Once.is_set t.closed)) && claim_close t (Closed { code; reason })
   then begin
     set_close_deadline t (Mtime.add_span (Mtime.now ()) t.close_timeout);
     write_close t (code_payload code ^ reason);
     (* A fiber in [recv] reads the peer's Close frame. If no fiber reads,
        we read it. *)
     let read = Semaphore.acquire' t.reader `Read
-    and finished = Action.map (fun () -> `Finished) (Cell.Once.get' t.finished) in
+    and finished = Action.map (fun _ -> `Finished) (Cell.Once.get' t.closed) in
     match Action.invoke (Action.choose [ finished; read ]) with
     | `Finished -> ()
     | `Read ->
