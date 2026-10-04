@@ -919,7 +919,11 @@ let socket_tests =
           (* The peer does not close: the linger waits. *)
           let reader = Fun.Async.call (fun () -> Ws.recv c) in
           Caravan.Flow.write_string peer (client Continuation "x");
-          Affect_unix.Mtime.wait_for (ms 50);
+          (* The end of the stream comes after the Close frame: the server
+             is in the linger. *)
+          let r = Buf_reader.of_flow peer in
+          equal string "close 1002" (show_frame (Frame.read r ~masked:false ~max:125));
+          is_true (Buf_reader.peek_eof r);
           Fun.Async.cancel reader;
           raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
           let t = Affect_unix.Mtime.counter () in
