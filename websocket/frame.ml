@@ -27,10 +27,18 @@ let int_of_opcode = function
 
 let is_control = function Close | Ping | Pong -> true | Continuation | Text | Binary -> false
 
-(* XORs [len] bytes of [buf] from [off] with the 4-byte [key]; masking and
-   unmasking are the same. *)
+(* XORs [len] bytes of [buf] from [off] with the 4-byte [key]. Masking and
+   unmasking are the same operation. The loop does 8 bytes at a time with
+   the key two times in a 64-bit word, then the remaining bytes. *)
 let apply_mask key buf off len =
-  for i = 0 to len - 1 do
+  let k = Int64.logand (Int64.of_int32 (String.get_int32_le key 0)) 0xffff_ffffL in
+  let k = Int64.logor k (Int64.shift_left k 32) in
+  let words = len / 8 in
+  for w = 0 to words - 1 do
+    let i = off + (8 * w) in
+    Bytes.set_int64_le buf i (Int64.logxor (Bytes.get_int64_le buf i) k)
+  done;
+  for i = 8 * words to len - 1 do
     let b = Char.code (Bytes.get buf (off + i)) lxor Char.code key.[i land 3] in
     Bytes.set buf (off + i) (Char.chr b)
   done

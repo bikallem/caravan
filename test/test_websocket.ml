@@ -213,6 +213,15 @@ top bit: protocol error: length with its top bit set
             [ (Some "abc", f Text ""); (Some "abcde", f Text ""); (None, f ~fin:false Ping "");
               (None, f Close (String.make 126 'x')); (None, f Pong (String.make 126 'x')) ];
           is_true (String.length (encode ~mask:key (f Ping (String.make 125 'x'))) = 131));
+      prop "a masked payload is the XOR of each byte with the key"
+        Gen.(pair (string_of ~size:(constant 4) char) (string_of ~size:(int_range 0 300) char))
+        (fun (mask, payload) ->
+           let out = encode ~mask (f Binary payload) in
+           let n = String.length payload in
+           let masked = String.sub out (String.length out - n) n in
+           equal string
+             (String.mapi (fun i c -> Char.chr (Char.code c lxor Char.code mask.[i land 3])) payload)
+             masked);
       prop "read inverts write, however the input is split"
         Gen.(
           quad
