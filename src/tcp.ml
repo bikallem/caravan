@@ -8,9 +8,14 @@ type deadline = { at : Mtime.t option; changed : unit Cell.Once.t }
 
 let no_deadline () = Atomic.make { at = None; changed = Cell.Once.make () }
 
+(* A deadline that does not change keeps its record: the engines set the
+   same read deadline again before many reads. *)
 let set_deadline d at =
-  let old = Atomic.exchange d { at; changed = Cell.Once.make () } in
-  Cell.Once.try_set old.changed ()
+  if not (Option.equal Mtime.equal (Atomic.get d).at at)
+  then begin
+    let old = Atomic.exchange d { at; changed = Cell.Once.make () } in
+    Cell.Once.try_set old.changed ()
+  end
 
 (* A socket that fibers share. A read or a write, with its waits, uses the
    socket. [close] wakes the waits at once, but the fd closes only when no
