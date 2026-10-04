@@ -768,10 +768,11 @@ let server_handler req =
   | _ -> Caravan.Handler.not_found req
 
 (* A WebSocket session with a server: the request for [path], with [first]
-   in the same write; then [after]. The result is the response head, a "--"
-   line, and the frames from the server until it closes the connection. If
-   [reply], we answer a Close frame of the server. *)
-let session ?(first = "") ?(after = "") ?(reply = true) server path =
+   in the same write; then [after], then [during ()]. The result is the
+   response head, a "--" line, and the frames from the server until it
+   closes the connection. If [reply], we answer a Close frame of the
+   server. *)
+let session ?(first = "") ?(after = "") ?(during = ignore) ?(reply = true) server path =
   let flow = Caravan.Tcp.connect (Caravan.Server.local_addr server) in
   Stdlib.Fun.protect ~finally:(fun () -> Caravan.Flow.close flow) @@ fun () ->
   Caravan.Flow.write_string flow
@@ -785,6 +786,7 @@ let session ?(first = "") ?(after = "") ?(reply = true) server path =
   in
   let head = head [] in
   Caravan.Flow.write_string flow after;
+  during ();
   let rec frames acc =
     match Frame.read r ~masked:false ~max:max_int with
     | exception End_of_file -> List.rev acc
@@ -845,6 +847,24 @@ let server_tests =
             --
             close 1011
             |};
-          equal (list string) [ "Failure(\"boom\")" ] !errors) ]
+          equal (list string) [ "Failure(\"boom\")" ] !errors);
+      test "a server that stops cancels the handler without a Close frame" (fun () ->
+          let errors = ref [] in
+          let config =
+            { Server_support.config with
+              shutdown_grace = ms 50;
+              on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
+          in
+          expect
+            (Server_support.with_server ~config ~handler:server_handler (fun server ->
+                 session server "/echo" ~during:(fun () -> Caravan.Server.shutdown server)))
+          @@ __POS_OF__ {|
+            HTTP/1.1 101 Switching Protocols
+            Upgrade: websocket
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+            Connection: Upgrade
+            --
+            |};
+          equal (list string) [] !errors) ]
 
 let () = exit (run "websocket" [ sha1_tests; base64_tests; frame_tests; connection_tests; close_tests; socket_tests; handshake_tests; server_tests ])
