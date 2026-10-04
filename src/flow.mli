@@ -119,6 +119,17 @@ val reset : t -> unit
     of the end of the stream, so it can tell that what it received was cut
     short. It does nothing on a closed flow. *)
 
+val linger : t -> max:int -> unit
+(** [linger flow ~max] prepares [flow] for a {!close} when the peer can
+    still send input. A close of a TCP socket with unread input sends a
+    reset, and a reset can delete our last bytes before the peer reads
+    them. Thus [linger] calls {!shutdown_send} first. Then it reads and
+    discards the input until the end of the stream, for at most [max]
+    bytes. It stops at the read deadline of [flow], and it ignores
+    {!Timeout} and {!Closed}. Set the read deadline before the call, and
+    close [flow] after it. No other fiber can read [flow] during the call.
+    RFC 9112 §9.6 tells this procedure for HTTP. *)
+
 (** {1:derived Derived flows} *)
 
 val prepend : string -> t -> t

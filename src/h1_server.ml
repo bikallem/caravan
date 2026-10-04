@@ -37,24 +37,12 @@ let expectation (h : H1_parse.head) =
 
 let expects_continue h = expectation h = `Continue
 
-(* RFC 9112 §9.6: a connection the server ends is closed in stages. Closing
-   it over unread input makes the kernel reset it, and a reset can destroy the
-   response before the client reads it. So we send our FIN first and read
-   until the client closes too, for at most [linger_timeout] and [max_drain]
-   bytes. *)
+(* RFC 9112 §9.6: a connection that the server ends closes in stages, for
+   at most [linger_timeout] and [max_drain] bytes. *)
 let linger (config : Config.t) flow =
   Flow.set_read_deadline flow
     (Mtime.add_span (Mtime.now ()) config.linger_timeout);
-  Flow.shutdown_send flow;
-  (* Small: the first read usually finds the client's FIN. *)
-  let buf = Bytes.create 512 in
-  let rec discard left =
-    if left > 0
-    then match Flow.read flow buf 0 (Int.min left (Bytes.length buf)) with
-    | 0 -> ()
-    | n -> discard (left - n)
-  in
-  try discard config.max_drain with Flow.Closed | Flow.Timeout -> ()
+  Flow.linger flow ~max:config.max_drain
 
 (* An action enabled with [tag] at [deadline], at once if it has passed;
    never for [None]. *)

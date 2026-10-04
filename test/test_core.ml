@@ -388,6 +388,39 @@ let flow_tests =
           log := [];
           Flow.reset (flow ());
           equal (list string) ~msg:"without reset, close" [ "close" ] !log);
+      test "linger sends the end of the stream, then discards at most max bytes" (fun () ->
+          let log = ref [] and input = ref "abcdef" in
+          let flow ?read_error () =
+            Flow.make
+              ~read:(fun buf off len ->
+                  Option.iter raise read_error;
+                  let n = Int.min (Int.min len 2) (String.length !input) in
+                  Bytes.blit_string !input 0 buf off n;
+                  input := String.sub !input n (String.length !input - n);
+                  log := Printf.sprintf "read %d" n :: !log;
+                  n)
+              ~read_now:(fun _ _ _ -> None) ~write:(fun _ _ _ -> ())
+              ~readable:(Affect.Action.always ())
+              ~shutdown_send:(fun () -> log := "shutdown" :: !log)
+              ~close:ignore ~set_read_deadline:ignore ~set_write_deadline:ignore ()
+          in
+          Flow.linger (flow ()) ~max:3;
+          equal (list string) [ "shutdown"; "read 2"; "read 1" ] (List.rev !log);
+          equal string "def" !input;
+          log := [];
+          Flow.linger (flow ()) ~max:100;
+          equal (list string) ~msg:"until the end of the stream"
+            [ "shutdown"; "read 2"; "read 1"; "read 0" ] (List.rev !log);
+          List.iter
+            (fun e -> Flow.linger (flow ~read_error:e ()) ~max:100)
+            [ Flow.Timeout; Flow.Closed ];
+          raises Affect.Fun.Async.Cancelled (fun () ->
+              Flow.linger (flow ~read_error:Affect.Fun.Async.Cancelled ()) ~max:100);
+          let f = flow () in
+          Flow.close f;
+          log := [];
+          Flow.linger f ~max:100;
+          equal (list string) ~msg:"a closed flow" [] !log);
       test "close is idempotent and later use raises Closed" (fun () ->
           let closes = ref 0 in
           let flow =
