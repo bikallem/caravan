@@ -157,7 +157,10 @@ let frame_tests =
       test "the length limit" (fun () ->
           let input = encode (f Binary "0123456789") in
           expect (outcome ~masked:false ~max:10 input) @@ __POS_OF__ {|binary "0123456789"|};
-          expect (outcome ~masked:false ~max:9 input) @@ __POS_OF__ {|too big|});
+          expect (outcome ~masked:false ~max:9 input) @@ __POS_OF__ {|too big|};
+          (* The limit is only for data frames. *)
+          expect (outcome ~masked:false ~max:0 (encode (f Ping "0123456789")))
+          @@ __POS_OF__ {|ping "0123456789"|});
       (* Inputs end right after their length, so reading further would give
          "end of input". *)
       test "bad frames" (fun () ->

@@ -20,14 +20,16 @@ val is_control : opcode -> bool
 (** [is_control op] is [true] for [Close], [Ping] and [Pong]. *)
 
 val read : Buf_reader.t -> masked:bool -> max:int -> t
-(** [read r ~masked ~max] reads a frame whose payload is at most [max]
-    bytes. A server reads with [~masked:true], a client with
+(** [read r ~masked ~max] reads a frame. The payload of a data frame is at
+    most [max] bytes. The payload of a control frame is at most 125 bytes,
+    whatever [max] is. A server reads with [~masked:true], a client with
     [~masked:false].
 
     @raise Error if the frame has a reserved bit or opcode, is a control frame
     that is fragmented or longer than 125 bytes, is masked otherwise than
     [masked] says, or has a 64-bit length with its top bit set
-    ([Protocol_error]), or if its length is over [max] ([Too_big]). Nothing
+    ([Protocol_error]), or if it is a data frame with a length over [max]
+    ([Too_big]). Nothing
     after the length is read then. The payload buffer grows as the bytes
     arrive: a declared length does not allocate memory before its payload.
     @raise End_of_file if the input ends before the frame does. *)

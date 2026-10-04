@@ -235,7 +235,7 @@ let rec next t part =
   t.in_frame <- Buf_reader.buffered t.r > 0;
   if not t.in_frame then set_read_deadline t t.idle_timeout;
   let start = Buf_reader.consumed t.r in
-  match Frame.read t.r ~masked:true ~max:(Int.max 125 (t.max_message - size)) with
+  match Frame.read t.r ~masked:true ~max:(t.max_message - size) with
   | exception Frame.Error (Protocol_error reason) -> fail t 1002 reason
   | exception Frame.Error Too_big -> fail t 1009 "message is too large"
   | exception Flow.Timeout when Atomic.get t.closing = None ->
@@ -259,8 +259,6 @@ let rec next t part =
           | () -> next t part
           | exception e when part <> None -> abort t e)
       | Pong, _ -> next t part
-      | _ when (not (Frame.is_control opcode)) && size + String.length payload > t.max_message ->
-          fail t 1009 "message is too large"
       | (Text | Binary), Some _ -> fail t 1002 "new message inside a fragmented message"
       | Continuation, None -> fail t 1002 "continuation frame without a message"
       | (Text | Binary), None when fin -> message t opcode payload

@@ -89,7 +89,7 @@ let read r ~masked ~max =
         Int64.to_int n
     | n -> n
   in
-  if len > max then raise (Error Too_big);
+  if len > max && not (is_control opcode) then raise (Error Too_big);
   let key = if masked then (really_read r hdr 0 4; Bytes.sub_string hdr 0 4) else "" in
   let payload = read_payload r len in
   if masked then apply_mask key payload 0 len;
