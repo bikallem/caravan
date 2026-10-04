@@ -64,6 +64,10 @@ let run ?protocol ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle
 
 let accept ?(protocols = []) ?origin ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout req
     f =
+  (* The connection starts after the response: we examine the limit at this
+     time. *)
+  if Option.fold ~none:false ~some:(fun m -> m < 0) max_message
+  then invalid_arg "Caravan_websocket.accept: max_message is negative";
   let h = Request.headers req in
   let refuse ?(status = Status.bad_request) ?headers why =
     Response.string ~status ?headers ("WebSocket handshake: " ^ why ^ "\n")

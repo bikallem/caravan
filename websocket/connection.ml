@@ -82,6 +82,7 @@ let read_bytes t buf off len =
 let make ?protocol ?(max_message = 8 * 1024 * 1024) ?(close_timeout = Mtime.Span.(5 * s))
     ?(write_timeout = Mtime.Span.(30 * s)) ?(read_timeout = Mtime.Span.(30 * s)) ?idle_timeout
     flow =
+  if max_message < 0 then invalid_arg "Caravan_websocket: max_message is negative";
   (* [read_bytes] is necessary to make [r], and it needs the connection. *)
   let self = ref None in
   let read buf off len = read_bytes (Option.get !self) buf off len in

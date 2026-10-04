@@ -1078,6 +1078,12 @@ let handshake_tests =
             key of 5 bytes: 400 Bad Request | WebSocket handshake: the key is not 16 bytes in base64
             key not base64: 400 Bad Request | WebSocket handshake: the key is not 16 bytes in base64
             |});
+      test "a negative max_message is not permitted" (fun () ->
+          raises_match is_invalid_arg (fun () -> Ws.accept ~max_message:(-1) (request []) ignore);
+          raises_match is_invalid_arg (fun () ->
+              Ws.Private.of_flow ~max_message:(-1) (Caravan.Flow.of_string "" (Buffer.create 16)));
+          ignore (Ws.accept ~max_message:0 (request []) ignore);
+          ignore (Ws.Private.of_flow ~max_message:0 (Caravan.Flow.of_string "" (Buffer.create 16))));
       test "accept asks for version 13" (fun () ->
           expect (answer (request [ ("Sec-WebSocket-Version", "8") ])) @@ __POS_OF__ {|
             426 Upgrade Required

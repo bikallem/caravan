@@ -79,7 +79,9 @@ val accept :
     exception. A [Cancelled] from a call
     that [f] made goes to the server as a [Failure]. If the server cancels
     [f], [accept] sends no Close frame. [accept] does not accept
-    extensions. *)
+    extensions.
+
+    @raise Invalid_argument if [max_message] is negative. *)
 
 val protocol : t -> string option
 (** [protocol c] is the subprotocol that {!accept} chose for [c], if one. *)
