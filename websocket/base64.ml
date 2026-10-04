@@ -31,8 +31,8 @@ let decode s =
     if len >= 4 && s.[len - 1] = '=' then if s.[len - 2] = '=' then 2 else 1
     else 0
   in
-  (* [data] characters carry 6 bits each; whole bytes come out and the
-     2 or 4 bits left at the end must be zero. *)
+  (* Each of the [data] characters holds 6 bits. The result is full bytes,
+     and the 2 or 4 bits that remain at the end must be zero. *)
   let data = len - pad in
   let out = Bytes.create (data * 6 / 8) in
   let rec go i acc bits o =

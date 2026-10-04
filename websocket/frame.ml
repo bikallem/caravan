@@ -84,7 +84,8 @@ let read r ~masked ~max =
         really_read r hdr 0 8;
         let n = Bytes.get_int64_be hdr 0 in
         if Int64.compare n 0L < 0 then protocol_error "length with its top bit set";
-        (* Compared before conversion: [n] may not fit an [int]. *)
+        (* We compare before the conversion, because [n] can be too large
+           for an [int]. *)
         if Int64.compare n (Int64.of_int max) > 0 then raise (Error Too_big);
         Int64.to_int n
     | n -> n

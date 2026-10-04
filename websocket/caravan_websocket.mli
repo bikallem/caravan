@@ -114,7 +114,8 @@ val recv : t -> message
 (** [recv c] is the next message from the peer. If the peer sends a Ping,
     [recv] sends a Pong with the same data. It ignores a Pong.
 
-    Only one fiber at a time can call [recv] on a connection.
+    Many fibers can call [recv] on a connection at the same time. They get
+    the messages one at a time: each message goes to one fiber.
 
     If a cancel stops [recv] between two messages, the connection stays
     open. If the cancel stops it in the middle of a frame or a fragmented

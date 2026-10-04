@@ -148,7 +148,8 @@ let ping t data =
    [send] raises [exn]. *)
 let claim_close t exn = Atomic.compare_and_set t.closing None (Some exn)
 
-(* The flow can be closed at this time. Thus, we ignore a write error. *)
+(* A different fiber can close the flow before this write. Thus we ignore
+   a write error. *)
 let write_close t payload =
   try write_frame t { fin = true; opcode = Close; payload } with Closed _ -> ()
 

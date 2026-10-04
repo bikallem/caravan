@@ -1,4 +1,4 @@
-(* Stdlib Unix for system calls; affect's for waiting. *)
+(* Stdlib Unix does the system calls, and affect does the waits. *)
 open Affect
 module Aunix = Affect_unix.Unix
 module Mtime = Affect_unix.Mtime

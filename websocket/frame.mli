@@ -11,8 +11,8 @@ type t = { fin : bool; opcode : opcode; payload : string }
 
 type error =
 | Protocol_error of string
-(** A frame that breaks the protocol; the connection closes with 1002. *)
-| Too_big  (** A payload over the limit; the connection closes with 1009. *)
+(** A frame that breaks the protocol. The connection closes with 1002. *)
+| Too_big  (** A payload over the limit. The connection closes with 1009. *)
 
 exception Error of error
 
@@ -29,9 +29,9 @@ val read : Buf_reader.t -> masked:bool -> max:int -> t
     that is fragmented or longer than 125 bytes, is masked otherwise than
     [masked] says, or has a 64-bit length with its top bit set
     ([Protocol_error]), or if it is a data frame with a length over [max]
-    ([Too_big]). Nothing
-    after the length is read then. The payload buffer grows as the bytes
-    arrive: a declared length does not allocate memory before its payload.
+    ([Too_big]). [read] reads nothing after the length then. The payload
+    buffer grows as the bytes arrive: before its payload, a declared length
+    allocates at most 64 KiB.
     @raise End_of_file if the input ends before the frame does. *)
 
 val write : ?mask:string -> Buf_writer.t -> t -> unit

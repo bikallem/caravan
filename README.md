@@ -3,8 +3,8 @@
 An HTTP server for OCaml 5, built on
 [affect](https://erratique.ch/software/affect), a concurrency library
 with structured concurrency and cancellation. The HTTP/1.1 server and
-WebSocket work today; the design leaves room for HTTP/2, HTTP/3, a
-client and a Traefik-like reverse proxy.
+WebSocket are available at this time. The design leaves room for HTTP/2,
+HTTP/3, a client and a Traefik-like reverse proxy.
 
 ```ocaml
 let () = Caravan.Server.run (fun _req -> Caravan.Response.string "Hello!\n")
