@@ -624,6 +624,24 @@ let socket_tests =
           let took = elapsed_ms t in
           is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 2000.);
           equal int 1006 (Fun.Async.get sender));
+      test "a send that waits for a different send raises Closed after close" (fun () ->
+          let open Affect in
+          with_socket ~close_timeout:(ms 2000) @@ fun c peer ->
+          (* The peer reads nothing: [big] fills the socket buffers. *)
+          let big = Fun.Async.call (fun () -> Ws.send c (Binary (String.make 4_000_000 'x'))) in
+          Affect_unix.Mtime.wait_for (ms 50);
+          let late = Fun.Async.call (fun () -> closed_code (fun () -> Ws.send c (Text "late"))) in
+          Affect_unix.Mtime.wait_for (ms 20);
+          let closer = Fun.Async.call (fun () -> Ws.close c) in
+          Affect_unix.Mtime.wait_for (ms 20);
+          let r = Buf_reader.of_flow peer in
+          let next () = Frame.read r ~masked:false ~max:max_int in
+          equal int 4_000_000 (String.length (next ()).payload);
+          equal string "close 1000" (show_frame (next ()));
+          Caravan.Flow.write_string peer (client Close (code_reason 1000 ""));
+          Fun.Async.get big;
+          equal int 1000 (Fun.Async.get late);
+          Fun.Async.get closer);
       (* A cancel in the middle of a frame closes the connection, because
          the stream is out of step. A cancel between messages does not. *)
       test "a cancel in the middle of a send closes with 1006" (fun () ->

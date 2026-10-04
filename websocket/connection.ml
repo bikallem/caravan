@@ -34,10 +34,6 @@ let is_permitted code =
 let protocol t = t.protocol
 let check_closed t = Option.iter raise (Atomic.get t.closed)
 
-let check_open t =
-  check_closed t;
-  Option.iter raise (Atomic.get t.closing)
-
 (* If the connection is open, this function keeps [code] and [reason] as its
    [Closed] exception. Then it closes the flow and gives the exception that
    the connection keeps. *)
@@ -55,17 +51,24 @@ let abort t e =
   ignore (shut t 1006 "");
   Printexc.raise_with_backtrace e bt
 
-let write_frame t frame =
+(* After our Close frame, no data frame and no Pong can go (RFC 6455
+   §5.5.1). The check is in the semaphore, thus a frame cannot go after a
+   Close frame that a different fiber wrote first. *)
+let write_frame t (frame : Frame.t) =
   Semaphore.with_acquired t.writer (fun () ->
-      try
-        Frame.write t.w frame;
-        Buf_writer.flush t.w
-      with
-      | Flow.Closed | Flow.Timeout -> raise (shut t 1006 "")
-      | e -> abort t e)
+      check_closed t;
+      match (frame.opcode, Atomic.get t.closing) with
+      | Pong, Some _ -> ()
+      | (Text | Binary | Continuation | Ping), Some e -> raise e
+      | _ -> (
+          try
+            Frame.write t.w frame;
+            Buf_writer.flush t.w
+          with
+          | Flow.Closed | Flow.Timeout -> raise (shut t 1006 "")
+          | e -> abort t e))
 
 let send t msg =
-  check_open t;
   let frame opcode payload = { Frame.fin = true; opcode; payload } in
   match msg with
   | Text s ->
@@ -76,7 +79,6 @@ let send t msg =
 
 let ping t data =
   if String.length data > 125 then invalid_arg "Caravan_websocket.ping: more than 125 bytes";
-  check_open t;
   write_frame t { fin = true; opcode = Ping; payload = data }
 
 (* [true] if we did not send a Close frame: then the caller sends it, and
