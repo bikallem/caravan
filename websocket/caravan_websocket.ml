@@ -28,16 +28,24 @@ let is_key key = match Base64.decode key with Some k -> String.length k = 16 | N
 
 (* Runs [f] on the connection. If [f] ends, we close the connection. If [f]
    raises, we close with 1011 and give the exception to the server. If the
-   server cancels us, we do not close. *)
+   server cancels us, we do not close. A [Cancelled] from a different call,
+   for example a child of [f], is an exception of [f]. *)
 let run ?protocol ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout f flow =
   let c = Connection.make ?protocol ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout flow in
   match f c with
   | () -> Connection.close c
   | exception Closed _ -> ()
-  | exception (Affect.Fun.Async.Cancelled as e) -> raise e
+  | exception (Affect.Fun.Async.Cancelled as e) when Affect.Fun.Async.is_current_cancelled () ->
+      Printexc.raise_with_backtrace e (Printexc.get_raw_backtrace ())
   | exception e ->
       let bt = Printexc.get_raw_backtrace () in
       Connection.close ~code:1011 c;
+      (* The server does not report a Cancelled, thus we give a Failure. *)
+      let e =
+        match e with
+        | Affect.Fun.Async.Cancelled -> Failure "Caravan_websocket: a call of the handler was cancelled"
+        | e -> e
+      in
       Printexc.raise_with_backtrace e bt
 
 let accept ?(protocols = []) ?origin ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout req

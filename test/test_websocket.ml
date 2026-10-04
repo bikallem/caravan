@@ -993,6 +993,13 @@ let server_handler req =
       Ws.accept ~protocols:[ "chat"; "echo" ] req (fun c ->
           Ws.send c (Text (Option.value ~default:"none" (Ws.protocol c))))
   | "/boom" -> Ws.accept req (fun _ -> failwith "boom")
+  | "/child" ->
+      (* The Cancelled of a child call is not a stop of the server. *)
+      Ws.accept req (fun _ ->
+          let open Affect in
+          let child = Fun.Async.call (fun () -> Affect_unix.Mtime.wait_for (ms 10_000)) in
+          Fun.Async.cancel child;
+          Fun.Async.get child)
   | _ -> Caravan.Handler.not_found req
 
 (* A WebSocket session with a server: the request for [path], with [first]
@@ -1076,6 +1083,26 @@ let server_tests =
             close 1011
             |};
           equal (list string) [ "Failure(\"boom\")" ] !errors);
+      test "a Cancelled from a child call closes with 1011, and the server reports it" (fun () ->
+          let errors = ref [] in
+          let config =
+            { Server_support.config with
+              on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
+          in
+          expect
+            (Server_support.with_server ~config ~handler:server_handler (fun server ->
+                 session server "/child"))
+          @@ __POS_OF__ {|
+            HTTP/1.1 101 Switching Protocols
+            Upgrade: websocket
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+            Connection: Upgrade
+            --
+            close 1011
+            |};
+          equal (list string)
+            [ "Failure(\"Caravan_websocket: a call of the handler was cancelled\")" ]
+            !errors);
       test "a server that stops cancels the handler without a Close frame" (fun () ->
           let errors = ref [] in
           let config =
