@@ -660,7 +660,15 @@ let conn_info_tests =
           in
           is_true (Conn_info.scheme c6 = `Https);
           equal (option string) (Some "h2") (Conn_info.alpn c6);
-          expect (Format.asprintf "%a" Conn_info.pp c6) @@ __POS_OF__ {|#1 [::1]:1 -> /run/s.sock|}) ]
+          expect (Format.asprintf "%a" Conn_info.pp c6) @@ __POS_OF__ {|#1 [::1]:1 -> /run/s.sock|});
+      test "the stopping action of a connection is never enabled by default" (fun () ->
+          let c = Conn_info.make ~id:1 ~peer:(loopback 1) ~local:(loopback 2) () in
+          let enabled =
+            Affect_unix.Unix.main ~domain_count:1 (fun () ->
+                Affect.Action.(
+                  invoke (choose [ map (fun () -> true) (Conn_info.stopping c); always false ])))
+          in
+          is_false enabled) ]
 
 let request_tests =
   group "Request"

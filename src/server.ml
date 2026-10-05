@@ -29,7 +29,7 @@ let accept config listener =
 
 let serve_connection (config : Config.t) engine handler ~stopping ~id flow (fd, peer) =
   let local = try Unix.getsockname fd with Unix.Unix_error _ -> peer in
-  let conn = Conn_info.make ~id ~peer ~local () in
+  let conn = Conn_info.make ~id ~peer ~local ~stopping:(Cell.Once.get' stopping) () in
   let ctx =
     { Engine.config; conn; stopping = Cell.Once.get' stopping;
       is_stopping = (fun () -> Cell.Once.is_set stopping) }

@@ -30,8 +30,8 @@ val shutdown : t -> unit
 (** [shutdown s] stops [s]. It closes the listening socket, so that new
     clients are refused, and idle connections close. Requests in progress
     get [config.shutdown_grace] to finish, their responses ending their
-    connections; then they are cancelled. [shutdown] returns at once; see
-    {!wait}. *)
+    connections; then they are cancelled. A handler can see the stop with
+    {!Conn_info.stopping}. [shutdown] returns at once; see {!wait}. *)
 
 val abort : t -> unit
 (** [abort s] is like {!shutdown} but cancels the connections in progress at
