@@ -219,6 +219,13 @@ let message t (op : Frame.opcode) payload =
   else if String.is_valid_utf_8 payload then Text payload
   else fail t 1007 "text is not UTF-8"
 
+(* The UTF-8 of a fragment of a message with the opcode [op], after the
+   [pending] bytes of an incomplete sequence (RFC 6455 §8.1: we fail at
+   once). A binary message has no check. *)
+let continue t (op : Frame.opcode) pending s =
+  if op <> Text then ""
+  else try Utf8.continue pending s with Utf8.Invalid -> fail t 1007 "text is not UTF-8"
+
 (* Adds [s] to the [len] bytes of the message buffer [b]. The capacity
    doubles, but it never goes over [max_message]: [Frame.read] makes sure
    that the message fits. *)
@@ -235,13 +242,14 @@ let append t (b, len) s =
   (b, len + n)
 
 (* Reads frames until a full message. [part] is the opcode, the buffer and
-   the length of a fragmented message, if one is open. The buffer starts as
-   the first payload, without a copy. Control frames between fragments
+   the length of a fragmented message, if one is open, and the bytes of an
+   incomplete UTF-8 sequence at its end. The buffer starts as the first
+   payload, without a copy. Control frames between fragments
    do not count in the size of the message. After we sent a Close frame,
    this function discards data frames and sends no Pong: it ends only with
    [Closed]. *)
 let rec next t part =
-  let size = match part with None -> 0 | Some (_, (_, len)) -> len in
+  let size = match part with None -> 0 | Some (_, (_, len), _) -> len in
   (* The idle timeout applies until the first byte of the frame. The bytes
      of the frame can be in [t.r] at this time. *)
   t.in_frame <- Buf_reader.buffered t.r > 0;
@@ -275,15 +283,20 @@ let rec next t part =
       | Continuation, None -> fail t 1002 "continuation frame without a message"
       | (Text | Binary), None when fin -> message t opcode payload
       | (Text | Binary), None ->
+          let pending = continue t opcode "" payload in
           (* [Frame.read] gives a new string: nothing else has it. *)
-          next t (Some (opcode, (Bytes.unsafe_of_string payload, String.length payload)))
-      | Continuation, Some (op, data) ->
+          next t (Some (opcode, (Bytes.unsafe_of_string payload, String.length payload), pending))
+      | Continuation, Some (op, data, pending) ->
+          let pending = continue t op pending payload in
+          if fin && pending <> "" then fail t 1007 "text is not UTF-8";
           let ((b, len) as data) = append t data payload in
           if not fin
-          then next t (Some (op, data))
-          else if len = Bytes.length b
-          then message t op (Bytes.unsafe_to_string b)
-          else message t op (Bytes.sub_string b 0 len))
+          then next t (Some (op, data, pending))
+          else begin
+            (* The fragments are correct UTF-8: no check again. *)
+            let s = if len = Bytes.length b then Bytes.unsafe_to_string b else Bytes.sub_string b 0 len in
+            if op = Text then Text s else Binary s
+          end)
 
 let recv t =
   Semaphore.with_acquired t.reader (fun () ->

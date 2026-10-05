@@ -125,6 +125,7 @@ module Private = struct
   module Sha1 = Sha1
   module Base64 = Base64
   module Frame = Frame
+  module Utf8 = Utf8
 
   let of_flow ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout flow =
     Connection.make ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout flow

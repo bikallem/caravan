@@ -296,6 +296,135 @@ let echo note c =
   in
   loop ()
 
+(* The result of [Utf8.continue], or "invalid". *)
+let continue_result pending s =
+  match Utf8.continue pending s with r -> Printf.sprintf "%S" r | exception Utf8.Invalid -> "invalid"
+
+(* Parts of UTF-8 text: correct characters of 1 to 4 bytes, and bytes or
+   sequences that are not correct, then cut at random points. *)
+let utf8_parts =
+  Gen.(
+    pair
+      (list ~size:(int_range 0 8)
+         (of_list ~pp:(fun ppf s -> Format.fprintf ppf "%S" s)
+            [ "a"; "\xc2\xa9"; "\xc3\xa9"; "\xe2\x82\xac"; "\xf0\x9d\x84\x9e"; "\xed\x9f\xbf";
+              "\xf4\x8f\xbf\xbf"; "\x80"; "\xc0"; "\xff"; "\xed\xa0"; "\xe0"; "\xf4"; "\x90" ]))
+      (list ~size:(int_range 0 5) (int_range 0 6)))
+
+let cut_parts (pieces, sizes) =
+  let rec cut s = function
+  | [] -> [ s ]
+  | n :: ns ->
+      let n = Int.min n (String.length s) in
+      String.sub s 0 n :: cut (String.sub s n (String.length s - n)) ns
+  in
+  cut (String.concat "" pieces) sizes
+
+(* The index of the part where [Utf8.continue] raises, if one, and the
+   last result. *)
+let fold_continue parts =
+  let rec loop i pending = function
+  | [] -> (None, pending)
+  | p :: ps -> (
+      match Utf8.continue pending p with
+      | pending -> loop (i + 1) pending ps
+      | exception Utf8.Invalid -> (Some i, pending))
+  in
+  loop 0 "" parts
+
+(* A model: [x] can start correct UTF-8 if 0 to 3 more bytes make it
+   correct. The bytes 0x80, 0x90 and 0xA0 are in each range of a second
+   byte (Unicode table 3-7), and 0x80 is correct after it. *)
+let can_start x =
+  let bytes = [ "\x80"; "\x90"; "\xa0" ] in
+  let rec ends n = if n = 0 then [ "" ] else List.concat_map (fun e -> List.map (( ^ ) e) bytes) (ends (n - 1)) in
+  List.exists (fun n -> List.exists (fun e -> String.is_valid_utf_8 (x ^ e)) (ends n)) [ 0; 1; 2; 3 ]
+
+let utf8_tests =
+  group "UTF-8 in parts"
+    [ test "boundary cases" (fun () ->
+          equal (list (pair (pair string string) string))
+            [ (("", "\xce\xba"), {|""|}); (("", "\xf4"), {|"\244"|}); (("\xf4", "\x90"), "invalid");
+              (("", "\xf4\x90\x80\x80"), "invalid"); (("\xf0\x9f", "\x98"), {|"\240\159\152"|});
+              (("\xf0\x9f\x98", "\x80ab"), {|""|}); (("\xe2", ""), {|"\226"|}); (("", ""), {|""|});
+              (("", "\xed"), {|"\237"|}); (("\xe0", "\xa0"), {|"\224\160"|}); (("", "\x80"), "invalid");
+              (("", "a\x80"), "invalid"); (("", "\xc0"), "invalid"); (("", "\xc1"), "invalid");
+              (("", "\xf5"), "invalid"); (("", "\xff"), "invalid"); (("\xed", "\xa0"), "invalid");
+              (("\xe0", "\x80"), "invalid"); (("\xc3", "\xa9\xe2\x82"), {|"\226\130"|});
+              (("", "a\xc2"), {|"\194"|}); (("\xc2", "\xa9b"), {|""|}) ]
+            (List.map
+               (fun (pending, s) -> ((pending, s), continue_result pending s))
+               [ ("", "\xce\xba"); ("", "\xf4"); ("\xf4", "\x90"); ("", "\xf4\x90\x80\x80");
+                 ("\xf0\x9f", "\x98"); ("\xf0\x9f\x98", "\x80ab"); ("\xe2", ""); ("", "");
+                 ("", "\xed"); ("\xe0", "\xa0"); ("", "\x80"); ("", "a\x80"); ("", "\xc0");
+                 ("", "\xc1"); ("", "\xf5"); ("", "\xff"); ("\xed", "\xa0"); ("\xe0", "\x80");
+                 ("\xc3", "\xa9\xe2\x82"); ("", "a\xc2"); ("\xc2", "\xa9b") ]));
+      prop ~count:2000 "the parts are correct exactly when the text is" utf8_parts (fun g ->
+          let parts = cut_parts g in
+          let correct = match fold_continue parts with None, "" -> true | _ -> false in
+          equal bool (String.is_valid_utf_8 (String.concat "" parts)) correct);
+      prop ~count:2000 "continue fails at the first part that cannot start correct UTF-8" utf8_parts
+        (fun g ->
+           let parts = cut_parts g in
+           let rec first i prefix = function
+           | [] -> None
+           | p :: ps ->
+               let prefix = prefix ^ p in
+               if can_start prefix then first (i + 1) prefix ps else Some i
+           in
+           equal (option int) (first 0 "" parts) (fst (fold_continue parts)));
+      test "an incorrect fragment gives 1007 before the end of the message" (fun () ->
+          (* Autobahn 6.4.1: the last fragment does not come. *)
+          expect
+            (converse
+               (client ~fin:false Text (of_hex "cebae1bdb9cf83cebcceb5")
+                ^ client ~fin:false Continuation (of_hex "f4908080"))
+               echo)
+          @@ __POS_OF__ {|
+            closed 1007 "text is not UTF-8"
+            --
+            close 1007
+            |});
+      test "a byte that ends a sequence too early gives 1007 at once" (fun () ->
+          (* Autobahn 6.4.2. *)
+          expect
+            (converse
+               (client ~fin:false Text (of_hex "cebae1bdb9cf83cebcceb5f4")
+                ^ client ~fin:false Continuation (of_hex "90"))
+               echo)
+          @@ __POS_OF__ {|
+            closed 1007 "text is not UTF-8"
+            --
+            close 1007
+            |});
+      test "a character in three fragments is correct" (fun () ->
+          expect
+            (converse
+               (client ~fin:false Text "\xf0" ^ client ~fin:false Continuation "\x9d\x84"
+                ^ client Continuation "\x9e")
+               echo)
+          @@ __POS_OF__ {|
+            text "\240\157\132\158"
+            closed 1006 ""
+            --
+            text "\240\157\132\158"
+            |});
+      test "an incomplete character at the end of a message gives 1007" (fun () ->
+          expect (converse (client ~fin:false Text "a\xe2" ^ client Continuation "\x82") echo)
+          @@ __POS_OF__ {|
+            closed 1007 "text is not UTF-8"
+            --
+            close 1007
+            |});
+      test "a binary message is not examined" (fun () ->
+          expect (converse (client ~fin:false Binary "\xff" ^ client Continuation "\x80") echo)
+          @@ __POS_OF__ {|
+            binary "\255\128"
+            closed 1006 ""
+            --
+            binary "\255\128"
+            |}) ]
+
 let connection_tests =
   group "Connection"
     [ test "messages, then a Close from the peer" (fun () ->
@@ -1683,4 +1812,4 @@ let server_tests =
                   run_handler (fun _ -> ()) (Caravan.Flow.of_string input out)));
           equal (list string) [ "close 1000" ] (frames (Buffer.contents out))) ]
 
-let () = exit (run "websocket" [ sha1_tests; base64_tests; frame_tests; connection_tests; close_tests; socket_tests; handshake_tests; server_tests ])
+let () = exit (run "websocket" [ sha1_tests; base64_tests; frame_tests; utf8_tests; connection_tests; close_tests; socket_tests; handshake_tests; server_tests ])

@@ -55,7 +55,9 @@ let handler req =
 - `accept` examines the request and sends the `101` response. By
   default, it permits browser pages only from the origin of the server.
 - `recv` gives full messages. The library joins fragments, sends a Pong
-  for each Ping, and examines the UTF-8 of text.
+  for each Ping, and examines the UTF-8 of text. It examines each
+  fragment when it comes, thus incorrect text closes the connection
+  before the end of the message.
 - Many fibers can send at the same time, and `close` closes the
   connection from any fiber, with a time limit.
 - When the server stops, each connection sends a Close frame with the

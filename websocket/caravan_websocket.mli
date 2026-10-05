@@ -117,7 +117,9 @@ exception Closed of { code : int; reason : string }
       if the frame has no code.
     - The code that we sent because the peer did not obey the protocol: 1002
       for a protocol error, 1007 for text that is not UTF-8, 1009 for a
-      message that is too large. The reason tells the problem.
+      message that is too large. The reason tells the problem. The
+      connection examines each fragment of a text message when it comes,
+      thus 1007 can come before the end of the message.
     - 1001 with the reason ["read timeout"] or ["idle timeout"] if no byte
       came in the [read_timeout] or the [idle_timeout] of {!accept}.
     - The code and the reason of our Close frame, until the reply of the
@@ -185,6 +187,7 @@ module Private : sig
   module Sha1 = Sha1
   module Base64 = Base64
   module Frame = Frame
+  module Utf8 = Utf8
 
   val of_flow :
     ?max_message:int ->
