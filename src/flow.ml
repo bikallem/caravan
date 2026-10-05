@@ -54,6 +54,20 @@ let set_write_deadline flow d = flow.set_write_deadline d
 let close flow = if not (Atomic.exchange flow.closed true) then flow.close ()
 let reset flow = if not (Atomic.exchange flow.closed true) then flow.reset ()
 
+let linger flow ~max =
+  let buf = Bytes.create 4096 in
+  let rec discard left =
+    if left > 0
+    then match read flow buf 0 (Int.min left (Bytes.length buf)) with
+    | 0 -> ()
+    | n -> discard (left - n)
+  in
+  (* A different fiber can close [flow] at any time. *)
+  try
+    shutdown_send flow;
+    discard max
+  with Closed | Timeout -> ()
+
 let prepend s flow =
   if s = ""
   then flow

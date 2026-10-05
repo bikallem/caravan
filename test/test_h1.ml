@@ -33,11 +33,10 @@ let buf_reader_tests =
     [ test "the buffer is allocated by the first read that needs it" (fun () ->
           let r = Buf_reader.of_string ~size:8 "0123456789abcdefghij\r\nrest" in
           equal int 0 (Buf_reader.capacity r);
-          let buf = Bytes.create 4 in
-          ignore (Buf_reader.read_into r buf 0 4);
-          equal int ~msg:"read_into reads past an empty buffer" 0 (Buf_reader.capacity r);
-          equal string "456789abcdefghij" (Buf_reader.read_line r ~max:100);
-          equal int ~msg:"grown for a long line" 32 (Buf_reader.capacity r));
+          ignore (Buf_reader.read_into r (Bytes.create 8) 0 8);
+          equal int ~msg:"a large read_into reads past an empty buffer" 0 (Buf_reader.capacity r);
+          equal string "89abcdefghij" (Buf_reader.read_line r ~max:100);
+          equal int ~msg:"grown for a long line" 16 (Buf_reader.capacity r));
       test "lines without their CRLF" (fun () ->
           equal (list string) [ "GET / HTTP/1.1"; "Host: x"; "" ]
             (lines ~max:100 "GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
@@ -92,6 +91,29 @@ let buf_reader_tests =
             (fun (off, len) ->
                raises_match is_invalid_arg (fun () -> Buf_reader.read_into r buf off len))
             [ (0, 0); (-1, 1); (2, 3); (5, 1) ]);
+      test "small reads of read_into read the input once" (fun () ->
+          (* Each read of the input records if it went into [buf]. *)
+          let input = "abcdefghijklmnopqrst" and pos = ref 0 and reads = ref [] in
+          let buf = Bytes.create 8 in
+          let r =
+            Buf_reader.make ~size:8 (fun b off len ->
+                let n = Int.min len (String.length input - !pos) in
+                Bytes.blit_string input !pos b off n;
+                pos := !pos + n;
+                reads := (b == buf) :: !reads;
+                n)
+          in
+          equal int 2 (Buf_reader.read_into r buf 0 2);
+          equal int 4 (Buf_reader.read_into r buf 2 4);
+          equal string "abcdef" (Bytes.sub_string buf 0 6);
+          equal (list bool) ~msg:"one read into the buffer of the reader" [ false ] !reads;
+          equal int 2 (Buf_reader.buffered r);
+          equal int 2 (Buf_reader.read_into r buf 0 7);
+          equal string "gh" (Bytes.sub_string buf 0 2);
+          equal int 8 (Buf_reader.read_into r buf 0 8);
+          equal string "ijklmnop" (Bytes.to_string buf);
+          equal (list bool) ~msg:"the large read went directly" [ true; false ] !reads;
+          equal int 0 (Buf_reader.buffered r));
       test "take_buffered, peek_eof and consumed" (fun () ->
           let r = Buf_reader.of_string "GET / HTTP/1.1\r\n\x16\x03\x01" in
           is_true (not (Buf_reader.peek_eof r));

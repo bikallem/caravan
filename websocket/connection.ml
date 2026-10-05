@@ -86,6 +86,8 @@ let make ?protocol ?(max_message = 8 * 1024 * 1024) ?(close_timeout = Mtime.Span
   (* [read_bytes] is necessary to make [r], and it needs the connection. *)
   let self = ref None in
   let read buf off len = read_bytes (Option.get !self) buf off len in
+  (* The first [recv] allocates the 4 KiB buffer of [r]. Small frames then
+     need one read of the flow, not one for each part of the frame. *)
   let t =
     { flow; r = Buf_reader.make read; w = Buf_writer.make (Flow.write flow);
       writer = Semaphore.make 1; reader = Semaphore.make 1; protocol; max_message; close_timeout;
@@ -161,25 +163,12 @@ let code_payload code =
   Bytes.set_uint16_be b 0 code;
   Bytes.unsafe_to_string b
 
-(* A close of a socket with unread input sends a reset, and a reset can
-   delete our Close frame before the peer reads it. Thus we send the end of
-   our stream first. Then we discard the input until the peer closes, for
-   at most the close timeout and 1 MiB (RFC 9112 §9.6 does the same for
-   HTTP). Only the fiber that reads frames can call it. *)
+(* A reset can delete our Close frame before the peer reads it. Thus we
+   linger, for at most the close timeout and 1 MiB. Only the fiber that
+   reads frames can call it. *)
 let linger t =
   set_read_deadline t (Some t.close_timeout);
-  let buf = Bytes.create 4096 in
-  let rec discard left =
-    if left > 0
-    then match Flow.read t.flow buf 0 (Int.min left (Bytes.length buf)) with
-    | 0 -> ()
-    | n -> discard (left - n)
-  in
-  (* A different fiber can close the flow at any time. *)
-  try
-    Flow.shutdown_send t.flow;
-    discard (1024 * 1024)
-  with Flow.Closed | Flow.Timeout -> ()
+  Flow.linger t.flow ~max:(1024 * 1024)
 
 (* The peer does not obey the protocol, or it is idle. We send a Close
    frame with [code] if we did not send one, then close the connection. If
