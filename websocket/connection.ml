@@ -59,9 +59,11 @@ let set_write_deadline t span =
       Flow.set_write_deadline t.flow t.write_at)
 
 (* The deadline of [close] stops also the reads and writes that wait at
-   this time, but it does not make their deadlines later. *)
+   this time, but it does not make their deadlines later. A second [close]
+   keeps the earlier deadline. *)
 let set_close_deadline t d =
   Mutex.protect t.deadlines (fun () ->
+      let d = earlier (Atomic.get t.close_at) d in
       Atomic.set t.close_at d;
       t.read_at <- earlier t.read_at d;
       t.write_at <- earlier t.write_at d;
@@ -201,7 +203,10 @@ let peer_closed t payload =
         (code, reason)
   in
   let echo = String.sub payload 0 (Int.min 2 (String.length payload)) in
-  if claim_close t (Closed { code; reason }) then write_close t echo;
+  if claim_close t (Closed { code; reason })
+  then
+    (* A cancel in the wait to write closes the connection too. *)
+    Fun.protect ~finally:(fun () -> ignore (shut t code reason)) (fun () -> write_close t echo);
   raise (shut t code reason)
 
 let after_close_deadline t =
@@ -285,16 +290,14 @@ let recv t =
       check_closed t;
       next t None)
 
-let close ?(code = 1000) ?(reason = "") t =
-  if not (is_permitted code) then invalid_arg "Caravan_websocket.close: code not permitted";
-  if String.length reason > 123 || not (String.is_valid_utf_8 reason)
-  then invalid_arg "Caravan_websocket.close: reason is not UTF-8 of at most 123 bytes";
-  if (not (Cell.Once.is_set t.closed)) && claim_close t (Closed { code; reason })
+(* If a close started (a Close frame went or waits to go), waits until the
+   connection closes. A fiber in [recv] reads the peer's Close frame. If no
+   fiber reads, we read it. [close] sets the close deadline, and [fail] and
+   [peer_closed] end with [shut], thus the wait has a limit. If the
+   connection is closed, [finished] is enabled at once. *)
+let wait_closed t =
+  if Atomic.get t.closing <> None
   then begin
-    set_close_deadline t (Mtime.add_span (Mtime.now ()) t.close_timeout);
-    write_close t (code_payload code ^ reason);
-    (* A fiber in [recv] reads the peer's Close frame. If no fiber reads,
-       we read it. *)
     let read = Semaphore.acquire' t.reader `Read
     and finished = Action.map (fun _ -> `Finished) (Cell.Once.get' t.closed) in
     match Action.invoke (Action.choose [ finished; read ]) with
@@ -303,3 +306,16 @@ let close ?(code = 1000) ?(reason = "") t =
         Fun.protect ~finally:(fun () -> Semaphore.release t.reader) (fun () ->
             try check_closed t; ignore (next t None) with Closed _ -> ())
   end
+
+let close ?(code = 1000) ?(reason = "") t =
+  if not (is_permitted code) then invalid_arg "Caravan_websocket.close: code not permitted";
+  if String.length reason > 123 || not (String.is_valid_utf_8 reason)
+  then invalid_arg "Caravan_websocket.close: reason is not UTF-8 of at most 123 bytes";
+  if not (Cell.Once.is_set t.closed)
+  then begin
+    (* Also if a different fiber started the close, for example to reply
+       to the peer: we wait at most the close timeout. *)
+    set_close_deadline t (Mtime.add_span (Mtime.now ()) t.close_timeout);
+    if claim_close t (Closed { code; reason }) then write_close t (code_payload code ^ reason)
+  end;
+  wait_closed t

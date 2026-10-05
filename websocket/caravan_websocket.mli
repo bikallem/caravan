@@ -77,9 +77,17 @@ val accept :
     and gives the exception to the server, which reports it. A {!Closed} of
     a different connection, for example a different client, is such an
     exception. A [Cancelled] from a call
-    that [f] made goes to the server as a [Failure]. If the server cancels
-    [f], [accept] sends no Close frame. [accept] does not accept
-    extensions.
+    that [f] made goes to the server as a [Failure]. [accept] does not
+    accept extensions.
+
+    When the server starts to stop ({!Caravan.Conn_info.stopping}),
+    [accept] does as {!close} with the code 1001 and the reason
+    ["server shutdown"]. Thus {!recv} raises {!Closed} with the reply of
+    the peer, or with 1006 at the close timeout. {!send} and {!ping} raise
+    {!Closed} at once, thus [f] cannot send a last message. When [f] ends,
+    [accept] waits for the end of this closing handshake. If [f] does not
+    end, the server cancels it at the end of its [shutdown_grace]. A
+    cancel of [f] does not send a Close frame.
 
     @raise Invalid_argument if [max_message] is negative. *)
 
@@ -112,6 +120,9 @@ exception Closed of { code : int; reason : string }
       message that is too large. The reason tells the problem.
     - 1001 with the reason ["read timeout"] or ["idle timeout"] if no byte
       came in the [read_timeout] or the [idle_timeout] of {!accept}.
+    - The code and the reason of our Close frame, until the reply of the
+      peer comes. {!send} and {!ping} raise it after {!close}, and after a
+      stop of the server (1001 with the reason ["server shutdown"]).
     - 1006 if the connection stopped without a Close frame. *)
 
 val recv : t -> message
@@ -161,7 +172,8 @@ val close : ?code:int -> ?reason:string -> t -> unit
       raises {!Closed} with the code 1006. A read or a write with an
       earlier deadline, from [write_timeout], [read_timeout] or
       [idle_timeout], stops at that deadline.
-    - If we sent a Close frame on [c] before, [close] does nothing.
+    - If we sent a Close frame on [c] before, [close] does not send a
+      second one. It waits for the end of the first closing handshake.
 
     @raise Invalid_argument if [code] is not a code that a Close frame can
     contain, or if [reason] is not valid UTF-8 or has more than 123 bytes. *)
@@ -184,4 +196,18 @@ module Private : sig
     t
     (** [of_flow flow] is a server connection on [flow], with the options
         of {!accept}. *)
+
+  val is_closing : t -> bool
+  (** [is_closing c] is [true] if a close started on [c] (a Close frame
+      went or waits to go), or [c] is closed. *)
+
+  val run_handler :
+    ?stopping:unit Affect.Action.t ->
+    ?close_timeout:Affect_unix.Mtime.Span.t ->
+    (t -> unit) ->
+    Caravan.Flow.t ->
+    unit
+  (** [run_handler ~stopping f flow] runs [f] on a server connection on [flow], as
+      {!accept} does after its response. [stopping] is the stop of the
+      server, {!Affect.Action.never} by default. *)
 end

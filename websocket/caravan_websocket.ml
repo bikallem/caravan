@@ -43,21 +43,37 @@ let is_key key = match Base64.decode key with Some k -> String.length k = 16 | N
    server cancels us, we do not close. A [Cancelled] from a different call,
    for example a child of [f], is an exception of [f]. A [Closed] is not an
    exception of [f] only if our connection closes: else it comes from a
-   different connection. *)
-let run ?protocol ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout f flow =
+   different connection. When [stopping] is enabled, we close with 1001
+   (RFC 6455 §7.4.1: an endpoint that goes away). *)
+let run ?(stopping = Affect.Action.never) ?protocol ?max_message ?close_timeout ?write_timeout
+    ?read_timeout ?idle_timeout f flow =
+  let open Affect in
   let c = Connection.make ?protocol ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout flow in
+  let watch =
+    Fun.Async.call (fun () ->
+        Action.invoke stopping;
+        Connection.close ~code:1001 ~reason:"server shutdown" c)
+  in
+  (* If the stop started a closing handshake, [close] waits for its end
+     and sends no second Close frame. Thus the end of [f] does not stop
+     the handshake. The connection call waits for the end of [watch]. *)
+  let finish ?code () =
+    Connection.close ?code c;
+    Fun.Async.cancel watch
+  in
   match f c with
-  | () -> Connection.close c
-  | exception Closed _ when Connection.is_closing c -> ()
-  | exception (Affect.Fun.Async.Cancelled as e) when Affect.Fun.Async.is_current_cancelled () ->
+  | () -> finish ()
+  | exception Closed _ when Connection.is_closing c -> finish ()
+  | exception (Fun.Async.Cancelled as e) when Fun.Async.is_current_cancelled () ->
+      (* The cancel goes to [watch] too. *)
       Printexc.raise_with_backtrace e (Printexc.get_raw_backtrace ())
   | exception e ->
       let bt = Printexc.get_raw_backtrace () in
-      Connection.close ~code:1011 c;
+      finish ~code:1011 ();
       (* The server does not report a Cancelled, thus we give a Failure. *)
       let e =
         match e with
-        | Affect.Fun.Async.Cancelled -> Failure "Caravan_websocket: a call of the handler was cancelled"
+        | Fun.Async.Cancelled -> Failure "Caravan_websocket: a call of the handler was cancelled"
         | e -> e
       in
       Printexc.raise_with_backtrace e bt
@@ -100,8 +116,10 @@ let accept ?(protocols = []) ?origin ?max_message ?close_timeout ?write_timeout 
           ([ ("Upgrade", "websocket"); ("Sec-WebSocket-Accept", accept_key key) ]
            @ Option.fold ~none:[] ~some:(fun p -> [ ("Sec-WebSocket-Protocol", p) ]) protocol)
       in
+      let stopping = Option.map Conn_info.stopping (Request.conn req) in
       Response.upgrade ~headers
-        (run ?protocol ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout f)
+        (run ?stopping ?protocol ?max_message ?close_timeout ?write_timeout ?read_timeout
+           ?idle_timeout f)
 
 module Private = struct
   module Sha1 = Sha1
@@ -110,4 +128,7 @@ module Private = struct
 
   let of_flow ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout flow =
     Connection.make ?max_message ?close_timeout ?write_timeout ?read_timeout ?idle_timeout flow
+
+  let is_closing = Connection.is_closing
+  let run_handler ?stopping ?close_timeout f flow = run ?stopping ?close_timeout f flow
 end

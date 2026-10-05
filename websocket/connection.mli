@@ -20,8 +20,8 @@ val make :
 
 val protocol : t -> string option
 
-(* [is_closing c] is [true] if we sent a Close frame on [c] or [c] is
-   closed. *)
+(* [is_closing c] is [true] if a close started on [c] (a Close frame went
+   or waits to go), or [c] is closed. *)
 val is_closing : t -> bool
 val recv : t -> message
 val send : t -> message -> unit

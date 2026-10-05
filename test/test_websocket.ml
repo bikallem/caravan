@@ -684,9 +684,9 @@ let close_tests =
                      (5000, ""); (1000, reason ^ "x"); (1000, "\xff") ];
                  Ws.close ~code:4999 ~reason c))) ]
 
-(* Runs [f] with a server connection and the flow of its peer, on a TCP
+(* Runs [f] with the flows of the server and of the peer of a TCP
    connection. *)
-let with_socket ?close_timeout ?write_timeout ?read_timeout ?idle_timeout f =
+let with_flows f =
   let open Affect in
   Affect_unix.Unix.main ~domain_count:Server_support.domain_count @@ fun () ->
   let l = Caravan.Tcp.Listener.listen Server_support.loopback in
@@ -695,8 +695,13 @@ let with_socket ?close_timeout ?write_timeout ?read_timeout ?idle_timeout f =
   let fd, _ = Caravan.Tcp.Listener.accept l in
   let server = Caravan.Tcp.flow fd and peer = Fun.Async.get peer in
   Stdlib.Fun.protect ~finally:(fun () -> Caravan.Flow.close peer; Caravan.Flow.close server)
-  @@ fun () ->
-  f (Ws.Private.of_flow ?close_timeout ?write_timeout ?read_timeout ?idle_timeout server) peer
+  @@ fun () -> f server peer
+
+(* Runs [f] with a server connection and the flow of its peer, on a TCP
+   connection. *)
+let with_socket ?close_timeout ?write_timeout ?read_timeout ?idle_timeout f =
+  with_flows (fun server peer ->
+      f (Ws.Private.of_flow ?close_timeout ?write_timeout ?read_timeout ?idle_timeout server) peer)
 
 let ms n = Affect_unix.Mtime.Span.(n * ms)
 let elapsed_ms c = Affect_unix.Mtime.Span.to_float_ns (Affect_unix.Mtime.count c) /. 1e6
@@ -716,6 +721,14 @@ let closed_code f =
   match f () with
   | _ -> fail "no Closed exception"
   | exception Ws.Closed { code; _ } -> code
+
+(* Waits at most 2 s until a close starts on [c]. *)
+let wait_closing c =
+  let rec wait n =
+    if (not (is_closing c)) && n > 0 then (Affect_unix.Mtime.wait_for (ms 5); wait (n - 1))
+  in
+  wait 400;
+  is_true ~msg:"a close started" (is_closing c)
 
 let socket_tests =
   group "Connection on a socket"
@@ -748,7 +761,7 @@ let socket_tests =
       test "close stops at the time limit if the peer does not reply" (fun () ->
           with_socket ~close_timeout:(ms 50) @@ fun c peer ->
           let t = Affect_unix.Mtime.counter () in
-          Ws.close c;
+          within_2s (fun () -> Ws.close c);
           let took = elapsed_ms t in
           is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 2000.);
           equal string "close 1000" (show_frame (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125));
@@ -769,7 +782,7 @@ let socket_tests =
           let reader = Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c)) in
           Affect_unix.Mtime.wait_for (ms 20);
           let t = Affect_unix.Mtime.counter () in
-          Ws.close c;
+          within_2s (fun () -> Ws.close c);
           let took = elapsed_ms t in
           is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 2000.);
           equal int 1006 (Fun.Async.get reader));
@@ -784,7 +797,7 @@ let socket_tests =
           in
           Affect_unix.Mtime.wait_for (ms 50);
           let t = Affect_unix.Mtime.counter () in
-          Ws.close c;
+          within_2s (fun () -> Ws.close c);
           let took = elapsed_ms t in
           is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 2000.);
           equal int 1006 (Fun.Async.get sender));
@@ -905,7 +918,7 @@ let socket_tests =
       test "close stops at a shorter idle timeout" (fun () ->
           with_socket ~close_timeout:(ms 1000) ~idle_timeout:(ms 50) @@ fun c _peer ->
           let t = Affect_unix.Mtime.counter () in
-          Ws.close c;
+          within_2s (fun () -> Ws.close c);
           let took = elapsed_ms t in
           is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 500.));
       test "close keeps the shorter write timeout of a send that waits" (fun () ->
@@ -928,7 +941,7 @@ let socket_tests =
       test "close keeps its time limit with a long idle timeout" (fun () ->
           with_socket ~close_timeout:(ms 50) ~idle_timeout:(ms 1000) @@ fun c _peer ->
           let t = Affect_unix.Mtime.counter () in
-          Ws.close c;
+          within_2s (fun () -> Ws.close c);
           let took = elapsed_ms t in
           is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 500.));
       test "after a protocol error, the peer gets the Close frame and the end of the stream"
@@ -945,6 +958,124 @@ let socket_tests =
            raises End_of_file (fun () -> Frame.read r ~masked:false ~max:125);
            Caravan.Flow.close peer;
            equal int 1009 (Fun.Async.get reader));
+      test "a second close waits for the end of the first closing handshake" (fun () ->
+          let open Affect in
+          with_socket ~close_timeout:(ms 2000) @@ fun c peer ->
+          let first = Fun.Async.call (fun () -> Ws.close ~code:1001 c) in
+          let r = Buf_reader.of_flow peer in
+          equal string "close 1001" (show_frame (Frame.read r ~masked:false ~max:125));
+          let second =
+            Fun.Async.call (fun () ->
+                let t = Affect_unix.Mtime.counter () in
+                Ws.close c;
+                elapsed_ms t)
+          in
+          (* The peer replies after 100 ms. *)
+          Affect_unix.Mtime.wait_for (ms 100);
+          Caravan.Flow.write_string peer (client Close (code_reason 1001 ""));
+          within_2s (fun () -> Fun.Async.get first);
+          let took = within_2s (fun () -> Fun.Async.get second) in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 50.);
+          raises End_of_file (fun () -> Frame.read r ~masked:false ~max:125));
+      test "a cancel in the reply to a Close frame closes the connection" (fun () ->
+          let open Affect in
+          with_socket @@ fun c peer ->
+          (* The peer reads only the first bytes: the send holds the writer
+             until the connection closes. *)
+          let sender =
+            Fun.Async.call (fun () -> closed_code (fun () -> Ws.send c (Binary (String.make 10_000_000 'x'))))
+          in
+          is_false (Buf_reader.peek_eof (Buf_reader.of_flow peer));
+          let reader = Fun.Async.call (fun () -> Ws.recv c) in
+          Caravan.Flow.write_string peer (client Close (code_reason 1000 ""));
+          (* The reply to the Close frame waits for the writer. *)
+          wait_closing c;
+          Fun.Async.cancel reader;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
+          within_2s (fun () -> Ws.close c);
+          equal int 1000 (closed_code (fun () -> Ws.recv c));
+          ignore (Fun.Async.get sender));
+      test "close keeps its time limit when the reply to the peer waits for a send" (fun () ->
+          let open Affect in
+          with_socket ~close_timeout:(ms 100) ~write_timeout:(ms 1500) @@ fun c peer ->
+          (* The peer reads only the first bytes: the send holds the writer
+             until its write timeout. *)
+          let sender =
+            Fun.Async.call (fun () -> closed_code (fun () -> Ws.send c (Binary (String.make 10_000_000 'x'))))
+          in
+          is_false (Buf_reader.peek_eof (Buf_reader.of_flow peer));
+          let reader = Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c)) in
+          Caravan.Flow.write_string peer (client Close (code_reason 1000 ""));
+          wait_closing c;
+          let t = Affect_unix.Mtime.counter () in
+          within_2s (fun () -> Ws.close c);
+          let took = elapsed_ms t in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 500.);
+          ignore (Fun.Async.get reader);
+          ignore (Fun.Async.get sender));
+      test "a second close does not make the close deadline later" (fun () ->
+          let open Affect in
+          with_socket ~close_timeout:(ms 300) @@ fun c peer ->
+          (* The peer sends a message each 10 ms and does not reply: each
+             read gets the deadline again. The second close starts 200 ms
+             after the first: with a new deadline, the first close takes
+             500 ms. *)
+          let stop = Atomic.make false in
+          let sender =
+            Fun.Async.call (fun () ->
+                try
+                  while not (Atomic.get stop) do
+                    Caravan.Flow.write_string peer (client Text "x");
+                    Affect_unix.Mtime.wait_for (ms 10)
+                  done
+                with Caravan.Flow.Closed -> ())
+          in
+          let t = Affect_unix.Mtime.counter () in
+          let first = Fun.Async.call (fun () -> Ws.close c; elapsed_ms t) in
+          Affect_unix.Mtime.wait_for (ms 200);
+          within_2s (fun () -> Ws.close c);
+          let took = within_2s (fun () -> Fun.Async.get first) in
+          Atomic.set stop true;
+          Fun.Async.get sender;
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 290. && took < 450.));
+      test "the end of the handler does not stop the closing handshake of a stop" (fun () ->
+          let open Affect in
+          with_flows @@ fun server peer ->
+          let stop = Cell.Once.make () and raised = Cell.Once.make () in
+          let handler =
+            Fun.Async.call (fun () ->
+                run_handler ~stopping:(Cell.Once.get' stop) ~close_timeout:(ms 1000)
+                  (fun c ->
+                     (* The peer does not read yet: the send holds the writer,
+                        and the Close frame of the stop waits for it. *)
+                     ignore
+                       (Fun.Async.call (fun () ->
+                            try Ws.send c (Binary (String.make 4_000_000 'x')) with Ws.Closed _ -> ()));
+                     Cell.Once.get stop;
+                     wait_closing c;
+                     Cell.Once.try_set raised ();
+                     raise (Ws.Closed { code = 1001; reason = "server shutdown" }))
+                  server)
+          in
+          let r = Buf_reader.of_flow peer in
+          is_false (Buf_reader.peek_eof r);
+          Cell.Once.try_set stop ();
+          (* The peer reads after the end of the handler. The wait of 50 ms
+             only gives the end of the handler time to act: the result of
+             correct code does not depend on it. *)
+          within_2s (fun () -> Cell.Once.get raised);
+          Affect_unix.Mtime.wait_for (ms 50);
+          let first = Frame.read r ~masked:false ~max:max_int in
+          let second =
+            match Frame.read r ~masked:false ~max:125 with
+            | f ->
+                Caravan.Flow.write_string peer (client Close f.payload);
+                show_frame f
+            | exception End_of_file -> "end of the stream"
+          in
+          within_2s (fun () -> Fun.Async.get handler);
+          equal (list string) [ "binary"; "close 1001 \"server shutdown\"" ]
+            [ opcode_name first.opcode; second ]);
       test "a cancel in the linger after a protocol error closes the connection" (fun () ->
           let open Affect in
           with_socket ~close_timeout:(ms 1000) @@ fun c peer ->
@@ -1203,15 +1334,36 @@ let handshake_tests =
 (* What recv raised in the handler of "/record". *)
 let recorded = Atomic.make None
 
+(* "/ticker" sets it after its first message, and "/late" when it starts. *)
+let started = ref (Affect.Cell.Once.make ())
+
+let echo c =
+  let rec loop () =
+    Ws.send c (Ws.recv c);
+    loop ()
+  in
+  loop ()
+
 let server_handler req =
   match Caravan.Request.path_only req with
-  | "/echo" ->
-      Ws.accept req (fun c ->
+  | "/echo" -> Ws.accept req echo
+  | "/echo-fast" -> Ws.accept ~close_timeout:(ms 100) req echo
+  | "/wait" -> Ws.accept req (fun _ -> Affect_unix.Mtime.wait_for (ms 10_000))
+  | "/wait-slow-close" ->
+      Ws.accept ~close_timeout:(ms 2000) req (fun _ -> Affect_unix.Mtime.wait_for (ms 10_000))
+  | "/ticker" ->
+      Ws.accept ~close_timeout:(ms 300) req (fun c ->
           let rec loop () =
-            Ws.send c (Ws.recv c);
+            Ws.send c (Text "tick");
+            Affect.Cell.Once.try_set !started ();
+            Affect_unix.Mtime.wait_for (ms 10);
             loop ()
           in
           loop ())
+  | "/late" ->
+      Affect.Cell.Once.try_set !started ();
+      Affect.Action.invoke (Caravan.Conn_info.stopping (Option.get (Caravan.Request.conn req)));
+      Ws.accept req echo
   | "/protocol" ->
       Ws.accept ~protocols:[ "chat"; "echo" ] req (fun c ->
           Ws.send c (Text (Option.value ~default:"none" (Ws.protocol c))))
@@ -1388,23 +1540,147 @@ let server_tests =
             (Some "Caravan_websocket__Connection.Closed(1006, \"\")")
             (Atomic.get recorded);
           equal (list string) [] !errors);
-      test "a server that stops cancels the handler without a Close frame" (fun () ->
+      test "a server that stops sends Close 1001, and the handler ends" (fun () ->
           let errors = ref [] in
           let config =
             { Server_support.config with
-              shutdown_grace = ms 50;
+              shutdown_grace = ms 30_000;
               on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
           in
           expect
             (Server_support.with_server ~config ~handler:server_handler (fun server ->
-                 session server "/echo" ~during:(fun () -> Caravan.Server.shutdown server)))
+                 let s =
+                   within_2s (fun () ->
+                       session server "/echo" ~during:(fun () -> Caravan.Server.shutdown server))
+                 in
+                 (* The handler does not wait for the grace of 30 s. *)
+                 within_2s (fun () -> Caravan.Server.wait server);
+                 s))
           @@ __POS_OF__ {|
             HTTP/1.1 101 Switching Protocols
             Upgrade: websocket
             Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
             Connection: Upgrade
             --
+            close 1001 "server shutdown"
             |};
-          equal (list string) [] !errors) ]
+          equal (list string) [] !errors);
+      test "a handler that is in recv when the server stops gets Closed 1001" (fun () ->
+          let config = { Server_support.config with shutdown_grace = ms 30_000 } in
+          Atomic.set recorded None;
+          Server_support.with_server ~config ~handler:server_handler (fun server ->
+              ignore
+                (within_2s (fun () ->
+                     session server "/record" ~during:(fun () -> Caravan.Server.shutdown server))));
+          (* The server waits for the handler. *)
+          equal (option string)
+            (Some "Caravan_websocket__Connection.Closed(1001, \"server shutdown\")")
+            (Atomic.get recorded));
+      test "a handler that does not use the connection gets Close 1001, then the cancel" (fun () ->
+          let errors = ref [] in
+          let config =
+            { Server_support.config with
+              shutdown_grace = ms 300;
+              on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
+          in
+          let t = ref (Affect_unix.Mtime.counter ()) in
+          let s =
+            Server_support.with_server ~config ~handler:server_handler (fun server ->
+                within_2s (fun () ->
+                    session server "/wait" ~during:(fun () ->
+                        t := Affect_unix.Mtime.counter ();
+                        Caravan.Server.shutdown server)))
+          in
+          let took = elapsed_ms !t in
+          equal string "close 1001 \"server shutdown\"" (List.nth (String.split_on_char '\n' s) 5);
+          is_true ~msg:(Printf.sprintf "stopped after %.0fms" took) (took >= 290.);
+          equal (list string) [] !errors);
+      test "a cancel at the grace while the stop waits for the reply is not an error" (fun () ->
+          let errors = ref [] in
+          let config =
+            { Server_support.config with
+              shutdown_grace = ms 300;
+              on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
+          in
+          let s =
+            Server_support.with_server ~config ~handler:server_handler (fun server ->
+                within_2s (fun () ->
+                    session server "/wait-slow-close" ~reply:false ~during:(fun () ->
+                        Caravan.Server.shutdown server)))
+          in
+          equal string "close 1001 \"server shutdown\"" (List.nth (String.split_on_char '\n' s) 5);
+          equal (list string) [] !errors);
+      test "a peer that does not reply to Close 1001 gets the end of the stream at the close timeout"
+        (fun () ->
+           let t = ref (Affect_unix.Mtime.counter ()) and took = ref 0. in
+           let s =
+             Server_support.with_server ~handler:server_handler (fun server ->
+                 let s =
+                   within_2s (fun () ->
+                       session server "/echo-fast" ~reply:false ~during:(fun () ->
+                           t := Affect_unix.Mtime.counter ();
+                           Caravan.Server.shutdown server))
+                 in
+                 took := elapsed_ms !t;
+                 s)
+           in
+           equal string "close 1001 \"server shutdown\"" (List.nth (String.split_on_char '\n' s) 5);
+           is_true ~msg:(Printf.sprintf "ended after %.0fms" !took) (!took >= 90.));
+      test "a handler that only sends gets the full closing handshake" (fun () ->
+          let errors = ref [] in
+          let config =
+            { Server_support.config with
+              shutdown_grace = ms 30_000;
+              on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
+          in
+          started := Affect.Cell.Once.make ();
+          let t = ref (Affect_unix.Mtime.counter ()) and took = ref 0. in
+          let s =
+            Server_support.with_server ~config ~handler:server_handler (fun server ->
+                let s =
+                  within_2s (fun () ->
+                      session server "/ticker" ~reply:false ~during:(fun () ->
+                          within_2s (fun () -> Affect.Cell.Once.get !started);
+                          t := Affect_unix.Mtime.counter ();
+                          Caravan.Server.shutdown server))
+                in
+                took := elapsed_ms !t;
+                s)
+          in
+          let frames =
+            List.filteri (fun i _ -> i > 4) (String.split_on_char '\n' s)
+          in
+          is_true ~msg:"one or more ticks" (List.hd frames = "text \"tick\"");
+          equal (list string) [ "close 1001 \"server shutdown\"" ]
+            (List.filter (fun f -> f <> "text \"tick\"") frames);
+          equal string "close 1001 \"server shutdown\"" (List.nth frames (List.length frames - 1));
+          is_true ~msg:(Printf.sprintf "ended after %.0fms" !took) (!took >= 290.);
+          equal (list string) [] !errors);
+      test "a stop before the handler starts sends the 101, then Close 1001" (fun () ->
+          let open Affect in
+          started := Cell.Once.make ();
+          let config = { Server_support.config with shutdown_grace = ms 30_000 } in
+          expect
+            (Server_support.with_server ~config ~handler:server_handler (fun server ->
+                 (* The response comes only after the stop. *)
+                 let s = Fun.Async.call (fun () -> session server "/late") in
+                 within_2s (fun () -> Cell.Once.get !started);
+                 Caravan.Server.shutdown server;
+                 within_2s (fun () -> Fun.Async.get s)))
+          @@ __POS_OF__ {|
+            HTTP/1.1 101 Switching Protocols
+            Upgrade: websocket
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+            Connection: Upgrade
+            --
+            close 1001 "server shutdown"
+            |});
+      test "the end of the handler stops the wait for the stop" (fun () ->
+          let input = client Close (code_reason 1000 "") in
+          let out = Buffer.create 16 in
+          Affect_unix.Unix.main ~domain_count:1 (fun () ->
+              within_2s (fun () ->
+                  run_handler (fun _ -> ()) (Caravan.Flow.of_string input out)));
+          equal (list string) [ "close 1000" ] (frames (Buffer.contents out))) ]
 
 let () = exit (run "websocket" [ sha1_tests; base64_tests; frame_tests; connection_tests; close_tests; socket_tests; handshake_tests; server_tests ])

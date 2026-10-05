@@ -26,7 +26,7 @@ let () = Caravan.Server.run (fun _req -> Caravan.Response.string "Hello!\n")
   responses are not lost to connection resets; a cap on connections.
 - Graceful shutdown on SIGINT or SIGTERM: stop accepting, let requests
   in progress finish within a grace period, then cancel them. A second
-  signal aborts.
+  signal aborts. A handler can see the stop with `Conn_info.stopping`.
 - `Response.upgrade` hands the connection over after a `101 Switching
   Protocols` or a `2xx` to `CONNECT`, the basis for WebSocket and
   tunnels.
@@ -58,6 +58,9 @@ let handler req =
   for each Ping, and examines the UTF-8 of text.
 - Many fibers can send at the same time, and `close` closes the
   connection from any fiber, with a time limit.
+- When the server stops, each connection sends a Close frame with the
+  code 1001 and waits for the reply of the peer, with the same time
+  limit.
 - A write timeout (30 s by default) stops a send to a peer that reads
   nothing. A read timeout (30 s by default) closes a connection when a
   frame stops in the middle. An optional idle timeout closes a connection
