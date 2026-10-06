@@ -82,11 +82,16 @@ let request_target req authority =
   | _, p when p.[0] = '/' && not (String.contains p '#') -> p
   | _, p -> invalid "invalid path %S" p
 
-let request_head w framing req =
+let authority_and_target req =
   let authority =
     match Request.authority req with Some a -> a | None -> invalid "no authority"
   in
-  let target = request_target req authority and headers = Request.headers req in
+  (authority, request_target req authority)
+
+let check_request req = ignore (authority_and_target req)
+
+let request_head w framing req =
+  let authority, target = authority_and_target req and headers = Request.headers req in
   (* The fields that Connection names are for this connection only. *)
   let named = List.map String.lowercase_ascii (Headers.tokens "connection" headers) in
   let owned name =

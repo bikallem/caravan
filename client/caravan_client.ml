@@ -15,23 +15,49 @@ type error = Error.t =
 
 exception Error = Error.Error
 
-type t = { config : Config.t; writers : Writers.t; pool : Pool.t }
+type t = { config : Config.t; writers : Writers.t; pool : Pool.t; reaper : unit Affect.Fun.Async.t }
+
+(* Half of [idle_timeout], and 10 ms or more: a short [idle_timeout] does
+   not make a busy loop. *)
+let reap_interval (config : Config.t) =
+  let open Affect_unix.Mtime.Span in
+  let h = config.idle_timeout / 2 in
+  if is_shorter h ~than:(10 * ms) then 10 * ms else h
+
+(* The reaper closes the idle connections that are too old. *)
+let reaper (config : Config.t) pool =
+  let half = reap_interval config in
+  Affect.Fun.Async.call (fun () ->
+      try
+        while true do
+          Affect_unix.Mtime.wait_for half;
+          Pool.reap pool
+        done
+      with Affect.Fun.Async.Cancelled -> ())
 
 let make ?(config = Config.default) () =
   let pool = Pool.make config in
   (* A cancel of the fiber that made the client is a close too. *)
   let writers = Writers.make ~on_stop:(fun () -> Pool.close pool) () in
-  { config; writers; pool }
+  { config; writers; pool; reaper = reaper config pool }
 
 let close t =
   Writers.stop t.writers;
+  Affect.Fun.Async.cancel t.reaper;
   Pool.close t.pool
 
 let run ?config f =
   let t = make ?config () in
-  let finish () = close t; Writers.wait t.writers in
+  (* The request bodies that still go get [close_grace]. A cancel of the
+     caller ends the grace at once. *)
+  let finish () =
+    Writers.finish t.writers ~grace:t.config.close_grace;
+    close t;
+    Writers.wait t.writers;
+    Affect.Fun.Async.mask_cancellation (fun () -> Affect.Fun.Async.get t.reaper)
+  in
   match f t with
-  | v -> finish (); v
+  | v -> finish (); Affect.Fun.Async.check_cancellation (); v
   | exception e ->
       let bt = Printexc.get_raw_backtrace () in
       finish ();
@@ -65,26 +91,44 @@ let host_port authority =
 let idempotent m = List.exists (Method.equal m) Method.[ GET; HEAD; PUT; DELETE; OPTIONS; TRACE ]
 
 let request t req =
-  if Request.scheme req <> "http" then Error.fail (Unsupported ("the scheme " ^ Request.scheme req));
-  let authority =
-    match Request.authority req with
-    | Some a -> a
-    | None -> invalid_arg "Caravan_client.request: the request has no authority"
+  (* If [request] raises before the exchange, the body of the request
+     closes here. A second close does nothing. *)
+  let host, port, c, kind =
+    try
+      if Request.scheme req <> "http" then Error.fail (Unsupported ("the scheme " ^ Request.scheme req));
+      let authority =
+        match Request.authority req with
+        | Some a -> a
+        | None -> invalid_arg "Caravan_client.request: the request has no authority"
+      in
+      let host, port = host_port authority in
+      (* A bad request, and a request during the grace of [run], raise
+         before a connect. *)
+      Caravan.Private.H1_write.check_request req;
+      if Writers.is_stopping t.writers then invalid_arg "Caravan_client: the client is closed";
+      let c, kind = Pool.checkout t.pool ~host ~port in
+      (host, port, c, kind)
+    with e ->
+      let bt = Printexc.get_raw_backtrace () in
+      (try Body.close (Request.body req) with _ -> ());
+      Printexc.raise_with_backtrace e bt
   in
-  let host, port = host_port authority in
-  let attempt ~reuse =
-    let c, kind = Pool.checkout ~reuse t.pool ~host ~port in
-    (Exchange.run t.config t.writers c ~on_release:(fun c ~reusable -> Pool.release t.pool c ~reusable) req, kind)
-  in
+  let release c ~reusable = Pool.release t.pool c ~reusable in
   (* A server can close an idle connection while the request goes. One
      retry on a new connection is safe for an idempotent request without
-     a body, when no byte of a response came (RFC 9112 §9.3.1). *)
-  match attempt ~reuse:true with
-  | resp, _ -> resp
+     a body, when no byte of a response came on a reused connection
+     (RFC 9112 §9.3.1). The retry gets a new empty body, because the first
+     attempt closed the body of the request. *)
+  match Exchange.run t.config t.writers c ~on_release:release req with
+  | resp -> resp
   | exception (Error.Error Closed as e) ->
       let bt = Printexc.get_raw_backtrace () in
-      if idempotent (Request.meth req) && Body.length (Request.body req) = Some 0
-      then fst (attempt ~reuse:false)
+      if kind = `Reused && idempotent (Request.meth req) && Body.length (Request.body req) = Some 0
+         && not (Writers.is_stopping t.writers)
+      then begin
+        let c, _ = Pool.checkout ~reuse:false t.pool ~host ~port in
+        Exchange.run t.config t.writers c ~on_release:release (Request.with_body Body.empty req)
+      end
       else Printexc.raise_with_backtrace e bt
 
 let body resp =
@@ -132,4 +176,5 @@ module Private = struct
   module Pool = Pool
 
   let parse_url = parse_url
+  let reap_interval = reap_interval
 end

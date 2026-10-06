@@ -23,5 +23,11 @@ val release : t -> Conn.t -> reusable:bool -> unit
    not closed, and its host has less than [max_idle_per_host] idle
    connections. Else it closes [c]. *)
 
+val reap : t -> unit
+(* [reap t] closes the idle connections that are older than [idle_timeout]. *)
+
+val idle_hosts : t -> int
+(* The number of hosts with idle connections, for tests. *)
+
 val close : t -> unit
 (* [close t] closes the idle connections and the connections in use. *)

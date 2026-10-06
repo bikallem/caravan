@@ -9,6 +9,12 @@ module Client_config = Caravan_client.Config
 let ms n = Mtime.Span.(n * ms)
 let elapsed_ms c = Mtime.Span.to_float_ns (Mtime.count c) /. 1e6
 let within_2s = Server_support.within_2s
+
+(* Polls [p] each 10 ms, for at most 2 s. *)
+let eventually p =
+  let rec loop n = if p () then true else if n = 0 then false else (Mtime.wait_for (ms 10); loop (n - 1)) in
+  loop 200
+
 let server_limits = H1_server.limits Config.default
 
 let req ?(meth = Method.GET) ?(headers = []) ?body path =
@@ -75,6 +81,31 @@ let endless raised =
           Body.Writer.flush w
         done
       with e -> Cell.Once.try_set raised (); raise e)
+
+(* [f] with a client flow, over a socket pair, whose writes raise [error]
+   after [break ()]. [failed] is set at the first such write. *)
+let with_breakable error f =
+  Affect_unix.Unix.main ~domain_count:Server_support.domain_count @@ fun () ->
+  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  Unix.set_nonblock a;
+  Unix.set_nonblock b;
+  let real = Tcp.flow a and server = Tcp.flow b in
+  let broken = Atomic.make false and failed = Cell.Once.make () in
+  let client =
+    Flow.make ~read:(Flow.read real) ~read_now:(Flow.read_now real)
+      ~write:(fun buf off len ->
+          if Atomic.get broken then (Cell.Once.try_set failed (); raise error) else Flow.write real buf off len)
+      ~readable:(Flow.readable' real ()) ~shutdown_send:(fun () -> Flow.shutdown_send real)
+      ~close:(fun () -> Flow.close real) ~set_read_deadline:(Flow.set_read_deadline real)
+      ~set_write_deadline:(Flow.set_write_deadline real) ()
+  in
+  let writers = Writers.make () in
+  Stdlib.Fun.protect
+    ~finally:(fun () -> Writers.stop writers; Writers.wait writers; Flow.close server; Flow.close client)
+  @@ fun () ->
+  let conn = Conn.make ~host:"a" ~port:80 client in
+  let run config r = Exchange.run config writers conn ~on_release:(fun _ ~reusable:_ -> ()) r in
+  f ~server ~run ~break:(fun () -> Atomic.set broken true) ~failed
 
 let exchange_tests =
   group "Exchange"
@@ -398,7 +429,7 @@ let exchange_tests =
               [ (HEAD, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"); (GET, "HTTP/1.1 204 No Content\r\n\r\n");
                 (GET, "HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n");
                 (GET, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n") ]);
-      test "a response that ends before the upload waits for the upload" (fun () ->
+      test "a response that ends before the upload releases at the end of the upload" (fun () ->
           with_conn @@ fun t ->
           let s =
             serve t (fun r ->
@@ -418,7 +449,500 @@ let exchange_tests =
           in
           let resp = t.run (req ~meth:Method.POST ~body:slow "/") in
           equal string "ok" (within_2s (fun () -> Body.to_string (body resp)));
-          equal (list bool) [ true ] (t.releases ());
+          is_true ~msg:"released at the end of the upload" (eventually (fun () -> t.releases () = [ true ]));
+          await s);
+      test "the end of the response does not wait for the producer" (fun () ->
+          let check ~response =
+            with_conn @@ fun t ->
+            let s =
+              serve t (fun r ->
+                  let h = read_head r in
+                  respond t response;
+                  ignore
+                    (Body.to_string
+                       (H1_body.body (H1_body.make ~limits:server_limits r (H1_parse.request_framing h)))))
+            in
+            let go = Cell.Once.make () in
+            (* The producer waits for the caller. *)
+            let waiting =
+              Body.of_writer (fun w ->
+                  Body.Writer.write_string w "abc";
+                  Body.Writer.flush w;
+                  Cell.Once.get go;
+                  Body.Writer.write_string w "def")
+            in
+            let got = within_2s (fun () -> Body.to_string (body (t.run (req ~meth:Method.POST ~body:waiting "/")))) in
+            (* The connection goes back only after the producer. *)
+            equal (list bool) [] (t.releases ());
+            Cell.Once.try_set go ();
+            is_true ~msg:"released after the producer" (eventually (fun () -> t.releases () = [ true ]));
+            await s;
+            got
+          in
+          equal string "ok" (check ~response:"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+          equal string "" (check ~response:"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+      test "a producer that fails after a deferred release closes the connection" (fun () ->
+          with_conn @@ fun t ->
+          let s =
+            serve t (fun r ->
+                ignore (read_head r);
+                respond t "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                ignore (Buf_reader.peek_eof r))
+          in
+          let go = Cell.Once.make () in
+          let failing =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "abc";
+                Body.Writer.flush w;
+                Cell.Once.get go;
+                failwith "late")
+          in
+          equal string "ok" (within_2s (fun () -> Body.to_string (body (t.run (req ~meth:Method.POST ~body:failing "/")))));
+          Cell.Once.try_set go ();
+          is_true ~msg:"released, not reusable" (eventually (fun () -> t.releases () = [ false ]));
+          await s);
+      test "a body of length 0 with a producer does not make the response wait" (fun () ->
+          with_conn @@ fun t ->
+          let s =
+            serve t (fun r ->
+                let h = read_head r in
+                respond t "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                ignore
+                  (Body.to_string
+                     (H1_body.body (H1_body.make ~limits:server_limits r (H1_parse.request_framing h)))))
+          in
+          let go = Cell.Once.make () in
+          (* Content-Length: 0, but the producer runs and waits for the
+             caller. *)
+          let waiting = Body.of_writer ~length:0 (fun w -> Body.Writer.flush w; Cell.Once.get go) in
+          let st =
+            Stdlib.Fun.protect ~finally:(fun () -> Cell.Once.try_set go ()) (fun () ->
+                within_2s (fun () -> status (t.run (req ~meth:Method.POST ~body:waiting "/"))))
+          in
+          equal int 200 st;
+          is_true ~msg:"released after the producer" (eventually (fun () -> t.releases () = [ true ]));
+          await s);
+      test "a cancel during the last writes of the request closes the connection" (fun () ->
+          (* Each write returns 1 s after it sends its bytes: the read that
+             ends the response body waits for the last write. *)
+          Affect_unix.Unix.main ~domain_count:Server_support.domain_count @@ fun () ->
+          let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+          Unix.set_nonblock a;
+          Unix.set_nonblock b;
+          let real = Tcp.flow a and server = Tcp.flow b in
+          let client =
+            Flow.make ~read:(Flow.read real) ~read_now:(Flow.read_now real)
+              ~write:(fun buf off len -> Flow.write real buf off len; Mtime.wait_for (ms 1000))
+              ~readable:(Flow.readable' real ()) ~shutdown_send:(fun () -> Flow.shutdown_send real)
+              ~close:(fun () -> Flow.close real) ~set_read_deadline:(Flow.set_read_deadline real)
+              ~set_write_deadline:(Flow.set_write_deadline real) ()
+          in
+          let writers = Writers.make () in
+          Stdlib.Fun.protect
+            ~finally:(fun () -> Writers.stop writers; Writers.wait writers; Flow.close server; Flow.close client)
+          @@ fun () ->
+          let conn = Conn.make ~host:"a" ~port:80 client and releases = ref [] in
+          let r = Buf_reader.of_flow server in
+          let s =
+            Fun.Async.call (fun () ->
+                ignore (read_request r);
+                Flow.write_string server "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+          in
+          let reading = Cell.Once.make () in
+          let caller =
+            Fun.Async.call (fun () ->
+                let resp =
+                  Exchange.run Client_config.default writers conn
+                    ~on_release:(fun _ ~reusable -> releases := reusable :: !releases)
+                    (req "/")
+                in
+                Cell.Once.try_set reading ();
+                Body.to_string (body resp))
+          in
+          within_2s (fun () -> Cell.Once.get reading);
+          Mtime.wait_for (ms 50);
+          Fun.Async.cancel caller;
+          within_2s (fun () -> raises Fun.Async.Cancelled (fun () -> Fun.Async.get caller));
+          equal (list bool) [ false ] !releases;
+          within_2s (fun () -> Fun.Async.get s));
+      test "the head goes before the producer runs" (fun () ->
+          (* A chunked body, and a body of known length. *)
+          let case length =
+            with_conn @@ fun t ->
+            let s =
+              serve t (fun r ->
+                  let h = read_head r in
+                  respond t "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                  ignore
+                    (Body.to_string
+                       (H1_body.body (H1_body.make ~limits:server_limits r (H1_parse.request_framing h)))))
+            in
+            let go = Cell.Once.make () in
+            (* The producer waits for the response before its first write. *)
+            let waiting = Body.of_writer ?length (fun w -> Cell.Once.get go; Body.Writer.write_string w "abc") in
+            let got =
+              Stdlib.Fun.protect ~finally:(fun () -> Cell.Once.try_set go ()) (fun () ->
+                  within_2s (fun () -> Body.to_string (body (t.run (req ~meth:Method.POST ~body:waiting "/")))))
+            in
+            equal string "ok" got;
+            is_true ~msg:"released after the producer" (eventually (fun () -> t.releases () = [ true ]));
+            await s
+          in
+          case None;
+          case (Some 3));
+      test "the body closes when the write of the head fails" (fun () ->
+          with_breakable Flow.Closed @@ fun ~server:_ ~run ~break ~failed ->
+          let closes = Atomic.make 0 in
+          let source = Body.of_source ~length:3 ~close:(fun () -> Atomic.incr closes) (fun _ _ _ -> 0) in
+          break ();
+          let config = { Client_config.default with response_timeout = ms 100 } in
+          (match within_2s (fun () -> run config (req ~meth:Method.POST ~body:source "/")) with
+           | _ -> fail "a response"
+           | exception Caravan_client.Error _ -> ());
+          is_true ~msg:"the write failed" (Cell.Once.is_set failed);
+          is_true ~msg:"closed one time" (eventually (fun () -> Atomic.get closes = 1));
+          equal int 1 (Atomic.get closes));
+      test "a cancel during the close of a source is a cancel of the client" (fun () ->
+          with_conn @@ fun t ->
+          let s =
+            serve t (fun r ->
+                ignore (read_head r);
+                respond t "HTTP/1.1 413 Too Large\r\nConnection: close\r\nContent-Length: 4\r\n\r\n";
+                Mtime.wait_for (ms 100);
+                respond t "nope")
+          in
+          (* The read is slow. The close waits, thus it gets the cancel of
+             the job. *)
+          let closes = Atomic.make 0 in
+          let source =
+            Body.of_source ~length:3
+              ~close:(fun () -> Atomic.incr closes; Mtime.wait_for (ms 1))
+              (fun _ _ _ -> Mtime.wait_for (ms 500); 0)
+          in
+          let resp = within_2s (fun () -> t.run (req ~meth:Method.POST ~body:source "/")) in
+          equal int 413 (status resp);
+          equal string "nope" (within_2s (fun () -> Body.to_string (body resp)));
+          equal (list bool) [ false ] (t.releases ());
+          equal int 1 (Atomic.get closes);
+          await s);
+      test "the body closes when the writers stopped before the job" (fun () ->
+          Affect_unix.Unix.main ~domain_count:Server_support.domain_count @@ fun () ->
+          let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+          Unix.set_nonblock a;
+          Unix.set_nonblock b;
+          let client = Tcp.flow a and server = Tcp.flow b in
+          Stdlib.Fun.protect ~finally:(fun () -> Flow.close server; Flow.close client) @@ fun () ->
+          let writers = Writers.make () in
+          Writers.stop writers;
+          Writers.wait writers;
+          let conn = Conn.make ~host:"a" ~port:80 client and releases = ref [] in
+          let closes = Atomic.make 0 in
+          let source = Body.of_source ~length:3 ~close:(fun () -> Atomic.incr closes) (fun _ _ _ -> 0) in
+          raises_match is_invalid_arg (fun () ->
+              Exchange.run Client_config.default writers conn
+                ~on_release:(fun _ ~reusable -> releases := reusable :: !releases)
+                (req ~meth:Method.POST ~body:source "/"));
+          equal (list bool) [ false ] !releases;
+          equal int 1 (Atomic.get closes));
+      test "an exception of the close of a source goes to the caller" (fun () ->
+          (* A chunked body: the server waits for its end, which does not
+             go, thus the error of the writer comes before a response. *)
+          let case ~read ~close expected =
+            with_conn @@ fun t ->
+            let s = serve t (fun r -> try ignore (read_request r) with _ -> ()) in
+            let sent = ref false in
+            let source =
+              Body.of_source ~close (fun buf off _ ->
+                  read ();
+                  if !sent then 0 else (Bytes.blit_string "abc" 0 buf off 3; sent := true; 3))
+            in
+            raises expected (fun () -> within_2s (fun () -> ignore (t.run (req ~meth:Method.POST ~body:source "/"))));
+            equal (list bool) [ false ] (t.releases ());
+            Flow.close t.server;
+            await s
+          in
+          case ~read:ignore ~close:(fun () -> failwith "close") (Failure "close");
+          (* The exception of the read has priority. *)
+          case ~read:(fun () -> failwith "read") ~close:(fun () -> failwith "close") (Failure "read"));
+      test "a cancel during the close of a source after its reads is a cancel of the client" (fun () ->
+          with_conn @@ fun t ->
+          let in_close = Cell.Once.make () in
+          (* The server answers while the close waits. *)
+          let s =
+            serve t (fun r ->
+                ignore (read_head r);
+                Cell.Once.get in_close;
+                respond t "HTTP/1.1 413 Too Large\r\nConnection: close\r\nContent-Length: 4\r\n\r\nnope")
+          in
+          let closes = Atomic.make 0 and sent = ref false in
+          let source =
+            Body.of_source ~length:3
+              ~close:(fun () ->
+                Atomic.incr closes;
+                Cell.Once.try_set in_close ();
+                Mtime.wait_for (ms 1000))
+              (fun buf off _ -> if !sent then 0 else (Bytes.blit_string "abc" 0 buf off 3; sent := true; 3))
+          in
+          let resp = within_2s (fun () -> t.run (req ~meth:Method.POST ~body:source "/")) in
+          equal int 413 (status resp);
+          equal string "nope" (within_2s (fun () -> Body.to_string (body resp)));
+          equal (list bool) [ false ] (t.releases ());
+          equal int 1 (Atomic.get closes);
+          await s);
+      test "a close of a request with no body that raises keeps the connection" (fun () ->
+          let case close check =
+            with_conn @@ fun t ->
+            let source = Body.of_source ~length:0 ~close (fun _ _ _ -> 0) in
+            raises_match check (fun () -> t.run (req ~body:source "/"));
+            equal (list bool) [ true ] (t.releases ())
+          in
+          case (fun () -> failwith "close") (function Failure s -> s = "close" | _ -> false);
+          (* A Cancelled of a different call: the caller is not cancelled. *)
+          case (fun () -> raise Fun.Async.Cancelled) (function Failure _ -> true | _ -> false));
+      test "a cancel during the close of a request with no body keeps the connection" (fun () ->
+          with_conn @@ fun t ->
+          let in_close = Cell.Once.make () in
+          let source =
+            Body.of_source ~length:0
+              ~close:(fun () -> Cell.Once.try_set in_close (); Cell.Once.get (Cell.Once.make ()))
+              (fun _ _ _ -> 0)
+          in
+          let caller = Fun.Async.call (fun () -> ignore (t.run (req ~body:source "/"))) in
+          within_2s (fun () -> Cell.Once.get in_close);
+          Fun.Async.cancel caller;
+          within_2s (fun () -> raises Fun.Async.Cancelled (fun () -> Fun.Async.get caller));
+          equal (list bool) [ true ] (t.releases ()));
+      test "the close of a request with no body runs in the caller" (fun () ->
+          with_conn @@ fun t ->
+          let s =
+            serve t (fun r ->
+                ignore (read_request r);
+                respond t "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+          in
+          let closer = ref [] in
+          let source =
+            Body.of_source ~length:0 ~close:(fun () -> closer := Fun.Async.Call.current () :: !closer) (fun _ _ _ -> 0)
+          in
+          let caller =
+            Fun.Async.call (fun () ->
+                let st = status (t.run (req ~body:source "/")) in
+                (st, Fun.Async.Call.current ()))
+          in
+          let st, me = within_2s (fun () -> Fun.Async.get caller) in
+          equal int 200 st;
+          (match !closer with
+           | [ c ] -> is_true ~msg:"the caller closed" (Fun.Async.Call.equal c me)
+           | l -> fail (Printf.sprintf "%d closes" (List.length l)));
+          await s);
+      test "the close of a user source does not make the response wait" (fun () ->
+          with_conn @@ fun t ->
+          let s =
+            serve t (fun r ->
+                ignore (read_request r);
+                respond t "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+          in
+          let go = Cell.Once.make () and sent = ref false in
+          (* The close of the source waits for the caller. *)
+          let source =
+            Body.of_source ~length:3 ~close:(fun () -> Cell.Once.get go) (fun buf off _ ->
+                if !sent then 0 else (Bytes.blit_string "abc" 0 buf off 3; sent := true; 3))
+          in
+          let got =
+            Stdlib.Fun.protect ~finally:(fun () -> Cell.Once.try_set go ()) (fun () ->
+                within_2s (fun () -> Body.to_string (body (t.run (req ~meth:Method.POST ~body:source "/")))))
+          in
+          equal string "ok" got;
+          is_true ~msg:"released after the close" (eventually (fun () -> t.releases () = [ true ]));
+          await s);
+      test "a cancel during the release inside run closes the connection" (fun () ->
+          (* Each write returns 1 s after it sends its bytes. The response
+             has no body, thus run itself waits for the last write. *)
+          Affect_unix.Unix.main ~domain_count:Server_support.domain_count @@ fun () ->
+          let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+          Unix.set_nonblock a;
+          Unix.set_nonblock b;
+          let real = Tcp.flow a and server = Tcp.flow b in
+          let client =
+            Flow.make ~read:(Flow.read real) ~read_now:(Flow.read_now real)
+              ~write:(fun buf off len -> Flow.write real buf off len; Mtime.wait_for (ms 1000))
+              ~readable:(Flow.readable' real ()) ~shutdown_send:(fun () -> Flow.shutdown_send real)
+              ~close:(fun () -> Flow.close real) ~set_read_deadline:(Flow.set_read_deadline real)
+              ~set_write_deadline:(Flow.set_write_deadline real) ()
+          in
+          let writers = Writers.make () in
+          Stdlib.Fun.protect
+            ~finally:(fun () -> Writers.stop writers; Writers.wait writers; Flow.close server; Flow.close client)
+          @@ fun () ->
+          let conn = Conn.make ~host:"a" ~port:80 client and releases = ref [] in
+          let r = Buf_reader.of_flow server in
+          let responded = Cell.Once.make () in
+          let s =
+            Fun.Async.call (fun () ->
+                ignore (read_request r);
+                Flow.write_string server "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                Cell.Once.try_set responded ())
+          in
+          let caller =
+            Fun.Async.call (fun () ->
+                Exchange.run Client_config.default writers conn
+                  ~on_release:(fun _ ~reusable -> releases := reusable :: !releases)
+                  (req "/"))
+          in
+          (* The write of the head returns 1 s after the response came. *)
+          within_2s (fun () -> Cell.Once.get responded);
+          Mtime.wait_for (ms 100);
+          Fun.Async.cancel caller;
+          within_2s (fun () -> raises Fun.Async.Cancelled (fun () -> ignore (Fun.Async.get caller)));
+          equal (list bool) [ false ] !releases;
+          within_2s (fun () -> Fun.Async.get s));
+      test "a user source of the request body gets its close" (fun () ->
+          with_conn @@ fun t ->
+          let s =
+            serve t (fun r ->
+                ignore (read_request r);
+                respond t "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+          in
+          let closes = Atomic.make 0 and sent = ref false in
+          let source =
+            Body.of_source ~length:3 ~close:(fun () -> Atomic.incr closes) (fun buf off _ ->
+                if !sent then 0 else (Bytes.blit_string "abc" 0 buf off 3; sent := true; 3))
+          in
+          equal int 200 (status (t.run (req ~meth:Method.POST ~body:source "/")));
+          await s;
+          is_true ~msg:"closed one time" (eventually (fun () -> Atomic.get closes = 1));
+          equal int 1 (Atomic.get closes));
+      test "a producer that closes its own response releases the connection" (fun () ->
+          with_conn @@ fun t ->
+          let s = serve t (fun r -> ignore (read_head r); respond t "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n") in
+          let resp = ref None and ready = Cell.Once.make () and seen = Cell.Once.make () in
+          let producer =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "abc";
+                Body.Writer.flush w;
+                Cell.Once.get ready;
+                match Body.close (body (Option.get !resp)) with
+                | () -> Cell.Once.try_set seen "no error"
+                | exception Invalid_argument _ -> Cell.Once.try_set seen "Invalid_argument")
+          in
+          resp := Some (t.run (req ~meth:Method.POST ~body:producer "/"));
+          Cell.Once.try_set ready ();
+          equal string "Invalid_argument" (within_2s (fun () -> Cell.Once.get seen));
+          equal (list bool) [ false ] (t.releases ());
+          await s);
+      test "which ends of the writer stop a read" (fun () ->
+          let show phase e = string_of_bool (Exchange.stops phase e) in
+          equal (list string)
+            [ "false"; "true"; "true"; "false"; "false"; "true"; "true"; "true"; "true"; "false" ]
+            [ show `Head (Exchange.Net Flow.Closed); show `Head (Exchange.Net Flow.Timeout);
+              show `Head Flow.Closed; show `Body (Exchange.Net Flow.Timeout); show `Body Writers.Job_cancelled;
+              show `Body (Failure "x"); show `Body H1_write.Length_mismatch; show `Head Flow.Timeout;
+              show `Head Fun.Async.Cancelled;
+              show `Head (Exchange.Net (Unix.Unix_error (Unix.ETIMEDOUT, "write", ""))) ]);
+      test "a producer that raises Cancelled of a different call gives Failure" (fun () ->
+          with_conn @@ fun t ->
+          let s = serve t (fun r -> ignore (error_text (fun () -> read_request r))) in
+          let failing =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "abc";
+                Body.Writer.flush w;
+                let other = Fun.Async.call (fun () -> Mtime.wait_for (ms 10_000)) in
+                Fun.Async.cancel other;
+                Fun.Async.get other)
+          in
+          equal string "Failure(\"Caravan_client: the request body producer raised Cancelled\")"
+            (within_2s (fun () -> error_text (fun () -> t.run (req ~meth:Method.POST ~body:failing "/"))));
+          await s);
+      test "a write error of the network lets the response body arrive" (fun () ->
+          List.iter
+            (fun error ->
+               with_breakable error @@ fun ~server ~run ~break ~failed ->
+               let go = Cell.Once.make () in
+               let producer =
+                 Body.of_writer (fun w ->
+                     Body.Writer.write_string w "abc";
+                     Body.Writer.flush w;
+                     Cell.Once.get go;
+                     Body.Writer.write_string w "def";
+                     Body.Writer.flush w)
+               in
+               let r = Buf_reader.of_flow server in
+               let s =
+                 Fun.Async.call (fun () ->
+                     ignore (read_head r);
+                     Flow.write_string server "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab")
+               in
+               let resp = run Client_config.default (Request.make ~authority:"a" ~body:producer Method.POST "/") in
+               within_2s (fun () -> Fun.Async.get s);
+               let b = body resp in
+               let buf = Bytes.create 2 in
+               equal string "ab" (Bytes.sub_string buf 0 (Body.read b buf 0 2));
+               (* The write error comes first, then the rest of the body. *)
+               break ();
+               Cell.Once.try_set go ();
+               within_2s (fun () -> Cell.Once.get failed);
+               Flow.write_string server "cd";
+               equal string "cd" (within_2s (fun () -> Body.to_string b)))
+            [ Flow.Closed; Unix.Unix_error (Unix.EIO, "write", "") ]);
+      test "a full response before the end of the last write releases at once" (fun () ->
+          (* A write that sends its bytes, then waits 100 ms before it
+             returns: the response comes while the writer is in its last
+             write. A request without a body runs no user code, and the
+             producer of a chunked body returned before the last chunk.
+             Thus the release waits for the writer, and the connection is
+             reusable when the read ends. *)
+          List.iter (fun (meth, request_body) ->
+          Affect_unix.Unix.main ~domain_count:Server_support.domain_count @@ fun () ->
+          let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+          Unix.set_nonblock a;
+          Unix.set_nonblock b;
+          let real = Tcp.flow a and server = Tcp.flow b in
+          let client =
+            Flow.make ~read:(Flow.read real) ~read_now:(Flow.read_now real)
+              ~write:(fun buf off len -> Flow.write real buf off len; Mtime.wait_for (ms 100))
+              ~readable:(Flow.readable' real ()) ~shutdown_send:(fun () -> Flow.shutdown_send real)
+              ~close:(fun () -> Flow.close real) ~set_read_deadline:(Flow.set_read_deadline real)
+              ~set_write_deadline:(Flow.set_write_deadline real) ()
+          in
+          let writers = Writers.make () in
+          Stdlib.Fun.protect
+            ~finally:(fun () -> Writers.stop writers; Writers.wait writers; Flow.close server; Flow.close client)
+          @@ fun () ->
+          let conn = Conn.make ~host:"a" ~port:80 client and releases = ref [] in
+          let r = Buf_reader.of_flow server in
+          let s =
+            Fun.Async.call (fun () ->
+                (* The whole request, then the response. *)
+                ignore (read_request r);
+                Flow.write_string server "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+          in
+          let resp =
+            Exchange.run Client_config.default writers conn
+              ~on_release:(fun _ ~reusable -> releases := reusable :: !releases)
+              (req ~meth ~body:(request_body ()) "/")
+          in
+          equal string "ok" (within_2s (fun () -> Body.to_string (body resp)));
+          equal (list bool) [ true ] !releases;
+          within_2s (fun () -> Fun.Async.get s))
+          [ (Method.GET, fun () -> Body.empty);
+            (Method.POST, fun () -> Body.of_writer (fun w -> Body.Writer.write_string w "abc")) ]);
+      test "a write error of the network before the head starts the response deadline" (fun () ->
+          with_breakable (Unix.Unix_error (Unix.EIO, "write", "")) @@ fun ~server:_ ~run ~break ~failed:_ ->
+          break ();
+          let config = { Client_config.default with response_timeout = ms 300 } in
+          equal string "Caravan_client.Error: response timeout"
+            (within_2s (fun () -> error_text (fun () -> run config (req "/")))));
+      test "a producer that raises Flow.Closed of a different flow is a user error" (fun () ->
+          with_conn @@ fun t ->
+          let s = serve t (fun r -> ignore (error_text (fun () -> read_request r))) in
+          let failing =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "abc";
+                Body.Writer.flush w;
+                raise Flow.Closed)
+          in
+          let config = { Client_config.default with response_timeout = ms 200 } in
+          equal string "Caravan__Flow.Closed"
+            (within_2s (fun () -> error_text (fun () -> t.run ~config (req ~meth:Method.POST ~body:failing "/"))));
           await s);
       test "Body.close before the end stops the upload" (fun () ->
           with_conn @@ fun t ->
@@ -584,11 +1108,6 @@ let stub ?(delay = 0.) ?(ended = Atomic.make false) addrs _ _ _ =
 
 let open_fds () = Array.length (Sys.readdir "/proc/self/fd")
 
-(* Polls [p] each 10 ms, for at most 2 s. *)
-let eventually p =
-  let rec loop n = if p () then true else if n = 0 then false else (Mtime.wait_for (ms 10); loop (n - 1)) in
-  loop 200
-
 (* [f port] with a port that refuses connections: a socket that is bound
    but does not listen. The socket keeps the port, thus a different
    process cannot take it during [f]. *)
@@ -715,6 +1234,13 @@ let resolver_tests =
           let took = elapsed_ms c in
           is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 400.);
           is_true ~msg:"the thread ended" (eventually (fun () -> Atomic.get ended)));
+      test "lookups leak no file descriptor" (fun () ->
+          main @@ fun () ->
+          let before = open_fds () in
+          for _ = 1 to 20 do
+            ignore (Resolver.resolve ~getaddrinfo:(stub [ inet "127.0.0.1" 80 ]) ~host:"a.example" ~port:80 ())
+          done;
+          is_true ~msg:"no fd leaked" (eventually (fun () -> open_fds () = before)));
       test "a cancel during the connect stops it" (fun () ->
           main @@ fun () ->
           let before = open_fds () and ended = Atomic.make false in
@@ -786,6 +1312,13 @@ let pool_tests =
           let a = get_id pool writers ~port () in
           let b = get_id pool writers ~port () in
           equal string a b);
+      test "requests in sequence always use one connection" (fun () ->
+          (* The release of a request without a body never waits for the
+             writer at a different time: each next request finds the
+             connection. *)
+          with_pool @@ fun pool writers port ->
+          let ids = List.init 1000 (fun _ -> get_id pool writers ~port ()) in
+          equal int 1 (List.length (List.sort_uniq compare ids)));
       test "two requests at the same time use two connections" (fun () ->
           (* The handler waits until [gate] opens: the second request of a
              round opens it. Thus the two requests are in the server at
@@ -852,6 +1385,35 @@ let pool_tests =
           Pool.close pool;
           equal (list bool) [ true; true ] (List.map (fun f -> !(f.closed)) (made ()));
           raises_match is_invalid_arg (fun () -> Pool.checkout pool ~host:"a" ~port:80));
+      test "reap closes the idle connections that are too old" (fun () ->
+          let pool, advance, made = fake_pool () in
+          let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          let b, _ = Pool.checkout pool ~host:"b" ~port:80 in
+          Pool.release pool a ~reusable:true;
+          advance Mtime.Span.(3 * s);
+          Pool.release pool b ~reusable:true;
+          advance Mtime.Span.(3 * s);
+          Pool.reap pool;
+          equal (list bool) [ true; false ] (List.map (fun f -> !(f.closed)) (made ())));
+      test "the timer runs each half of idle_timeout, and each 10 ms or more" (fun () ->
+          let interval t = Mtime.Span.to_float_ns (Caravan_client.Private.reap_interval { Client_config.default with idle_timeout = t }) /. 1e6 in
+          equal (list (float 0.001)) [ 50.; 10.; 10.; 2500. ] [ interval (ms 100); interval (ms 0); interval (ms 20); interval (ms 5000) ]);
+      test "the pool keeps no empty list of a host" (fun () ->
+          let pool, advance, _ = fake_pool () in
+          let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          Pool.release pool a ~reusable:true;
+          equal int 1 (Pool.idle_hosts pool);
+          let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          equal int 0 (Pool.idle_hosts pool);
+          Pool.release pool a ~reusable:true;
+          advance Mtime.Span.(6 * s);
+          Pool.reap pool;
+          equal int 0 (Pool.idle_hosts pool));
+      test "a new connection after close is refused without a connect" (fun () ->
+          let pool, _, made = fake_pool () in
+          Pool.close pool;
+          raises_match is_invalid_arg (fun () -> Pool.checkout ~reuse:false pool ~host:"a" ~port:80);
+          equal int 0 (List.length (made ())));
       test "a connect during close is closed" (fun () ->
           let pool = ref None and flows = ref [] in
           let connect ~host:_ ~port:_ =
@@ -1016,7 +1578,24 @@ let with_scripts scripts f =
 
 let api_tests =
   group "Caravan_client"
-    [ test "GET, HEAD, 204 and a stream, with reuse" (fun () ->
+    [ test "the body closes when request raises before the exchange" (fun () ->
+          main @@ fun () ->
+          with_refused_port @@ fun port ->
+          C.run @@ fun client ->
+          let case name r =
+            let closes = Atomic.make 0 in
+            let body = Body.of_source ~length:3 ~close:(fun () -> Atomic.incr closes) (fun _ _ _ -> 0) in
+            (match C.request client (r body) with
+             | _ -> fail (name ^ ": a response")
+             | exception (C.Error _ | Invalid_argument _) -> ());
+            equal ~msg:name int 1 (Atomic.get closes)
+          in
+          let authority = Printf.sprintf "127.0.0.1:%d" port in
+          case "refused" (fun body -> Request.make ~authority ~body Method.POST "/");
+          case "https" (fun body -> Request.make ~scheme:"https" ~authority ~body Method.POST "/");
+          case "no authority" (fun body -> Request.make ~body Method.POST "/");
+          case "bad path" (fun body -> Request.make ~authority ~body Method.POST "/a#b"));
+ test "GET, HEAD, 204 and a stream, with reuse" (fun () ->
           with_client @@ fun client url ->
           let id0 = get_text client (url ^ "/id") in
           equal string "hello" (get_text client (url ^ "/hello"));
@@ -1065,6 +1644,51 @@ let api_tests =
           equal string "a" (text (C.request client (at_port port "/")));
           equal string "b" (within_2s (fun () -> text (C.request client (at_port port "/"))));
           equal int 2 (Atomic.get accepted));
+      test "a stale connection is retried for a PUT with an empty body" (fun () ->
+          let first flow r =
+            ignore (read_request r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na";
+            ignore (read_request r)
+          and second flow r =
+            ignore (read_request r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb"
+          in
+          with_scripts [ first; second ] @@ fun client port accepted ->
+          equal string "a" (text (C.request client (at_port port "/")));
+          equal string "b"
+            (within_2s (fun () -> text (C.request client (at_port port ~meth:Method.PUT ~body:(Body.of_string "") "/"))));
+          equal int 2 (Atomic.get accepted));
+      test "a new connection that closes is not retried" (fun () ->
+          let closes _ r = ignore (read_head r) in
+          with_scripts [ closes; closes ] @@ fun client port accepted ->
+          equal string "Caravan_client.Error: the connection closed before the response"
+            (within_2s (fun () -> error_text (fun () -> C.request client (at_port port "/"))));
+          equal int 1 (Atomic.get accepted));
+      test "the timer closes an idle connection" (fun () ->
+          let eof = Cell.Once.make () in
+          let script flow r =
+            ignore (read_request r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na";
+            ignore (Buf_reader.peek_eof r);
+            Cell.Once.try_set eof ()
+          in
+          main @@ fun () ->
+          let l = Tcp.Listener.listen Server_support.loopback in
+          let port = match Tcp.Listener.addr l with Unix.ADDR_INET (_, p) -> p | _ -> 0 in
+          let server =
+            Fun.Async.call (fun () ->
+                let fd, _ = Tcp.Listener.accept l in
+                let flow = Tcp.flow fd in
+                Stdlib.Fun.protect ~finally:(fun () -> Flow.close flow) (fun () ->
+                    try script flow (Buf_reader.of_flow flow) with _ -> ()))
+          in
+          Stdlib.Fun.protect ~finally:(fun () -> Fun.Async.cancel server; Tcp.Listener.close l) @@ fun () ->
+          let config = { Client_config.default with idle_timeout = ms 100 } in
+          within_5s @@ fun () ->
+          C.run ~config @@ fun client ->
+          equal string "a" (text (C.request client (at_port port "/")));
+          (* No request uses the host again: only the timer closes it. *)
+          within_2s (fun () -> Cell.Once.get eof));
       test "a stale connection is not retried for a POST" (fun () ->
           let first flow r =
             ignore (read_request r);
@@ -1125,6 +1749,141 @@ let api_tests =
                          Cell.Once.try_set go ();
                          Cell.Once.get raised;
                          failwith "f")))));
+      test "run waits for a request body that goes after its response" (fun () ->
+          main @@ fun () ->
+          let l = Tcp.Listener.listen Server_support.loopback in
+          let port = match Tcp.Listener.addr l with Unix.ADDR_INET (_, p) -> p | _ -> 0 in
+          let received = Cell.Once.make () in
+          let server =
+            Fun.Async.call (fun () ->
+                let fd, _ = Tcp.Listener.accept l in
+                let flow = Tcp.flow fd in
+                Stdlib.Fun.protect ~finally:(fun () -> Flow.close flow) (fun () ->
+                    let r = Buf_reader.of_flow flow in
+                    let h = read_head r in
+                    Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                    Cell.Once.try_set received
+                      (error_text (fun () ->
+                           Body.to_string (H1_body.body (H1_body.make ~limits:server_limits r (H1_parse.request_framing h))))
+                       |> fun e -> e)))
+          in
+          Stdlib.Fun.protect ~finally:(fun () -> Fun.Async.cancel server; Tcp.Listener.close l) @@ fun () ->
+          let got = ref "" in
+          let slow =
+            Body.of_writer (fun w ->
+                List.iter
+                  (fun part ->
+                     Body.Writer.write_string w part;
+                     Body.Writer.flush w;
+                     Mtime.wait_for (ms 50))
+                  [ "part1;"; "part2;"; "part3" ];
+                got := "part1;part2;part3")
+          in
+          within_5s (fun () ->
+              C.run (fun client ->
+                  equal int 200 (status (C.request client (at_port port ~meth:Method.POST ~body:slow "/")))));
+          (* [run] returned after the producer ended, not after a cancel. *)
+          equal string "part1;part2;part3" !got;
+          equal string "no error" (within_2s (fun () -> Cell.Once.get received)));
+      test "a request during the grace of run raises before a connect" (fun () ->
+          let script flow r =
+            ignore (read_head r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            ignore (Buf_reader.peek_eof r)
+          in
+          let late = Cell.Once.make () in
+          with_scripts [ script; script ] (fun client port accepted ->
+              let go = Cell.Once.make () in
+              let waiting =
+                Body.of_writer (fun w ->
+                    Body.Writer.write_string w "abc";
+                    Body.Writer.flush w;
+                    Cell.Once.get go)
+              in
+              equal int 200 (status (C.request client (at_port port ~meth:Method.POST ~body:waiting "/")));
+              (* A child fiber makes a request after f returns, during the
+                 grace, then lets the first body end. *)
+              ignore
+                (Fun.Async.call (fun () ->
+                     Mtime.wait_for (ms 100);
+                     Cell.Once.try_set late
+                       (match C.request client (at_port port "/") with
+                        | _ -> "no error"
+                        | exception Invalid_argument _ ->
+                            (* A connect, if any, has time to arrive. *)
+                            Mtime.wait_for (ms 100);
+                            Printf.sprintf "Invalid_argument, %d accepted" (Atomic.get accepted)
+                        | exception e -> Printexc.to_string e);
+                     Cell.Once.try_set go ())));
+          equal string "Invalid_argument, 1 accepted" (Cell.Once.get late));
+      test "a cancel during the grace of run raises Cancelled" (fun () ->
+          let script flow r =
+            ignore (read_head r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            ignore (Buf_reader.peek_eof r)
+          in
+          main @@ fun () ->
+          let l = Tcp.Listener.listen Server_support.loopback in
+          let port = match Tcp.Listener.addr l with Unix.ADDR_INET (_, p) -> p | _ -> 0 in
+          let server =
+            Fun.Async.call (fun () ->
+                let fd, _ = Tcp.Listener.accept l in
+                let flow = Tcp.flow fd in
+                Stdlib.Fun.protect ~finally:(fun () -> Flow.close flow) (fun () ->
+                    try script flow (Buf_reader.of_flow flow) with _ -> ()))
+          in
+          (* The producer ends at the end of the test in all cases: a bug
+             that waits for it gives a failure, not a hang. *)
+          let stop = Cell.Once.make () in
+          Stdlib.Fun.protect
+            ~finally:(fun () -> Cell.Once.try_set stop (); Fun.Async.cancel server; Tcp.Listener.close l)
+          @@ fun () ->
+          let returned = Cell.Once.make () in
+          let waiting =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "abc";
+                Body.Writer.flush w;
+                Cell.Once.get stop)
+          in
+          let caller =
+            Fun.Async.call (fun () ->
+                C.run (fun client ->
+                    ignore (C.request client (at_port port ~meth:Method.POST ~body:waiting "/"));
+                    Cell.Once.try_set returned ()))
+          in
+          (* f returned: the grace of 5 s runs. *)
+          within_2s (fun () -> Cell.Once.get returned);
+          Mtime.wait_for (ms 50);
+          Fun.Async.cancel caller;
+          within_2s (fun () -> raises Fun.Async.Cancelled (fun () -> Fun.Async.get caller)));
+      test "close stops a request body at once" (fun () ->
+          let script flow r =
+            ignore (read_head r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            ignore (Buf_reader.peek_eof r)
+          in
+          with_scripts [ script ] @@ fun client port _ ->
+          let seen = Cell.Once.make () in
+          let waiting =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "abc";
+                Body.Writer.flush w;
+                try Cell.Once.get (Cell.Once.make ()) with e -> Cell.Once.try_set seen (name e); raise e)
+          in
+          equal int 200 (status (C.request client (at_port port ~meth:Method.POST ~body:waiting "/")));
+          C.close client;
+          equal string "Cancelled" (within_2s (fun () -> Cell.Once.get seen)));
+      test "a bad path raises before a connect" (fun () ->
+          main @@ fun () ->
+          with_refused_port @@ fun port ->
+          within_5s @@ fun () ->
+          C.run @@ fun client ->
+          (* A connect to this port gives Error (Connect _). *)
+          equal string "Invalid_argument"
+            (match C.request client (at_port port "/a#b") with
+             | _ -> "no error"
+             | exception Invalid_argument _ -> "Invalid_argument"
+             | exception e -> Printexc.to_string e));
       test "request after close raises Invalid_argument" (fun () ->
           main @@ fun () ->
           within_2s @@ fun () ->
@@ -1174,7 +1933,7 @@ let api_tests =
           Flow.write_string flow "0\r\n\r\n";
           equal string "" (within_2s (fun () -> Body.to_string b));
           ok := true);
-      test "close cancels the writers, and run returns after them" (fun () ->
+      test "run cancels the writers after the grace, and returns after them" (fun () ->
           let script flow r =
             ignore (read_head r);
             Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n";
@@ -1203,7 +1962,7 @@ let api_tests =
                   seen := name e;
                   raise e)
           in
-          let config = { Client_config.default with write_timeout = ms 5000 } in
+          let config = { Client_config.default with write_timeout = ms 5000; close_grace = ms 100 } in
           let at_return =
             within_2s (fun () ->
                 C.run ~config (fun client -> ignore (C.request client (at_port port ~meth:Method.POST ~body:waiting "/")));

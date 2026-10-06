@@ -57,6 +57,10 @@ val request_closes : Request.t -> bool
 (** [request_closes req] is [true] iff [req] has a [Connection] field with
     the token [close]. *)
 
+val check_request : Request.t -> unit
+(** [check_request req] raises the [Invalid_argument] of {!request_head}
+    for [req], if any, and writes nothing. *)
+
 val request_head : Buf_writer.t -> framing -> Request.t -> unit
 (** [request_head w framing req] writes the head of [req] to [w]:
     - The request line [METHOD SP target SP HTTP/1.1]. The target is the
