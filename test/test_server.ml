@@ -472,4 +472,29 @@ let signal_tests =
           equal bool ~msg:"killed by SIGTERM" true (status = Unix.WSIGNALED Sys.sigterm);
           is_true ~msg:(Printf.sprintf "after %.0fms" ms) (ms < 2000.)) ]
 
-let () = exit (run "server" [ integration_tests; timeout_tests; upgrade_tests; disconnect_tests; signal_tests ])
+(* The stop of the server, as a handler sees it *)
+
+let stop_tests =
+  let config = { config with shutdown_grace = Mtime.Span.(30 * s) } in
+  group "Server stop"
+    [ test "before the stop, the stopping action is not enabled" (fun () ->
+          with_server ~config @@ fun server ->
+          let flow, r = connect server in
+          Flow.write_string flow (get "/is-stopping");
+          equal string {|200 "no"|} (read_response ~head:false r);
+          Flow.close flow);
+      test "a handler sees that the server stops" (fun () ->
+          waiting := Cell.Once.make ();
+          with_server ~config @@ fun server ->
+          let flow, r = connect server in
+          Flow.write_string flow (get "/stopping");
+          Cell.Once.get !waiting;
+          Server.shutdown server;
+          (* The handler gives "timeout" after 2 s without the stop. *)
+          equal string {|200 "stopping" close|} (read_response ~head:false r);
+          Flow.close flow) ]
+
+let () =
+  exit
+    (run "server"
+       [ integration_tests; timeout_tests; upgrade_tests; disconnect_tests; signal_tests; stop_tests ])

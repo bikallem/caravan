@@ -4,16 +4,18 @@ type t = {
   local : Unix.sockaddr;
   scheme : [ `Http | `Https ];
   alpn : string option;
+  stopping : unit Affect.Action.t;
 }
 
-let make ~id ~peer ~local ?(scheme = `Http) ?alpn () =
-  { id; peer; local; scheme; alpn }
+let make ~id ~peer ~local ?(scheme = `Http) ?alpn ?(stopping = Affect.Action.never) () =
+  { id; peer; local; scheme; alpn; stopping }
 
 let id c = c.id
 let peer c = c.peer
 let local c = c.local
 let scheme c = c.scheme
 let alpn c = c.alpn
+let stopping c = c.stopping
 
 let pp_addr ppf = function
 | Unix.ADDR_UNIX path -> Format.pp_print_string ppf path

@@ -59,9 +59,11 @@ let set_write_deadline t span =
       Flow.set_write_deadline t.flow t.write_at)
 
 (* The deadline of [close] stops also the reads and writes that wait at
-   this time, but it does not make their deadlines later. *)
+   this time, but it does not make their deadlines later. A second [close]
+   keeps the earlier deadline. *)
 let set_close_deadline t d =
   Mutex.protect t.deadlines (fun () ->
+      let d = earlier (Atomic.get t.close_at) d in
       Atomic.set t.close_at d;
       t.read_at <- earlier t.read_at d;
       t.write_at <- earlier t.write_at d;
@@ -201,7 +203,10 @@ let peer_closed t payload =
         (code, reason)
   in
   let echo = String.sub payload 0 (Int.min 2 (String.length payload)) in
-  if claim_close t (Closed { code; reason }) then write_close t echo;
+  if claim_close t (Closed { code; reason })
+  then
+    (* A cancel in the wait to write closes the connection too. *)
+    Fun.protect ~finally:(fun () -> ignore (shut t code reason)) (fun () -> write_close t echo);
   raise (shut t code reason)
 
 let after_close_deadline t =
@@ -213,6 +218,13 @@ let message t (op : Frame.opcode) payload =
   if op <> Text then Binary payload
   else if String.is_valid_utf_8 payload then Text payload
   else fail t 1007 "text is not UTF-8"
+
+(* The UTF-8 of a fragment of a message with the opcode [op], after the
+   [pending] bytes of an incomplete sequence (RFC 6455 §8.1: we fail at
+   once). A binary message has no check. *)
+let continue t (op : Frame.opcode) pending s =
+  if op <> Text then ""
+  else try Utf8.continue pending s with Utf8.Invalid -> fail t 1007 "text is not UTF-8"
 
 (* Adds [s] to the [len] bytes of the message buffer [b]. The capacity
    doubles, but it never goes over [max_message]: [Frame.read] makes sure
@@ -230,13 +242,14 @@ let append t (b, len) s =
   (b, len + n)
 
 (* Reads frames until a full message. [part] is the opcode, the buffer and
-   the length of a fragmented message, if one is open. The buffer starts as
-   the first payload, without a copy. Control frames between fragments
+   the length of a fragmented message, if one is open, and the bytes of an
+   incomplete UTF-8 sequence at its end. The buffer starts as the first
+   payload, without a copy. Control frames between fragments
    do not count in the size of the message. After we sent a Close frame,
    this function discards data frames and sends no Pong: it ends only with
    [Closed]. *)
 let rec next t part =
-  let size = match part with None -> 0 | Some (_, (_, len)) -> len in
+  let size = match part with None -> 0 | Some (_, (_, len), _) -> len in
   (* The idle timeout applies until the first byte of the frame. The bytes
      of the frame can be in [t.r] at this time. *)
   t.in_frame <- Buf_reader.buffered t.r > 0;
@@ -270,31 +283,34 @@ let rec next t part =
       | Continuation, None -> fail t 1002 "continuation frame without a message"
       | (Text | Binary), None when fin -> message t opcode payload
       | (Text | Binary), None ->
+          let pending = continue t opcode "" payload in
           (* [Frame.read] gives a new string: nothing else has it. *)
-          next t (Some (opcode, (Bytes.unsafe_of_string payload, String.length payload)))
-      | Continuation, Some (op, data) ->
+          next t (Some (opcode, (Bytes.unsafe_of_string payload, String.length payload), pending))
+      | Continuation, Some (op, data, pending) ->
+          let pending = continue t op pending payload in
+          if fin && pending <> "" then fail t 1007 "text is not UTF-8";
           let ((b, len) as data) = append t data payload in
           if not fin
-          then next t (Some (op, data))
-          else if len = Bytes.length b
-          then message t op (Bytes.unsafe_to_string b)
-          else message t op (Bytes.sub_string b 0 len))
+          then next t (Some (op, data, pending))
+          else begin
+            (* The fragments are correct UTF-8: no check again. *)
+            let s = if len = Bytes.length b then Bytes.unsafe_to_string b else Bytes.sub_string b 0 len in
+            if op = Text then Text s else Binary s
+          end)
 
 let recv t =
   Semaphore.with_acquired t.reader (fun () ->
       check_closed t;
       next t None)
 
-let close ?(code = 1000) ?(reason = "") t =
-  if not (is_permitted code) then invalid_arg "Caravan_websocket.close: code not permitted";
-  if String.length reason > 123 || not (String.is_valid_utf_8 reason)
-  then invalid_arg "Caravan_websocket.close: reason is not UTF-8 of at most 123 bytes";
-  if (not (Cell.Once.is_set t.closed)) && claim_close t (Closed { code; reason })
+(* If a close started (a Close frame went or waits to go), waits until the
+   connection closes. A fiber in [recv] reads the peer's Close frame. If no
+   fiber reads, we read it. [close] sets the close deadline, and [fail] and
+   [peer_closed] end with [shut], thus the wait has a limit. If the
+   connection is closed, [finished] is enabled at once. *)
+let wait_closed t =
+  if Atomic.get t.closing <> None
   then begin
-    set_close_deadline t (Mtime.add_span (Mtime.now ()) t.close_timeout);
-    write_close t (code_payload code ^ reason);
-    (* A fiber in [recv] reads the peer's Close frame. If no fiber reads,
-       we read it. *)
     let read = Semaphore.acquire' t.reader `Read
     and finished = Action.map (fun _ -> `Finished) (Cell.Once.get' t.closed) in
     match Action.invoke (Action.choose [ finished; read ]) with
@@ -303,3 +319,16 @@ let close ?(code = 1000) ?(reason = "") t =
         Fun.protect ~finally:(fun () -> Semaphore.release t.reader) (fun () ->
             try check_closed t; ignore (next t None) with Closed _ -> ())
   end
+
+let close ?(code = 1000) ?(reason = "") t =
+  if not (is_permitted code) then invalid_arg "Caravan_websocket.close: code not permitted";
+  if String.length reason > 123 || not (String.is_valid_utf_8 reason)
+  then invalid_arg "Caravan_websocket.close: reason is not UTF-8 of at most 123 bytes";
+  if not (Cell.Once.is_set t.closed)
+  then begin
+    (* Also if a different fiber started the close, for example to reply
+       to the peer: we wait at most the close timeout. *)
+    set_close_deadline t (Mtime.add_span (Mtime.now ()) t.close_timeout);
+    if claim_close t (Closed { code; reason }) then write_close t (code_payload code ^ reason)
+  end;
+  wait_closed t

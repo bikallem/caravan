@@ -9,7 +9,8 @@ type ctx = {
   conn : Conn_info.t; (** The connection being served. *)
   stopping : unit Affect.Action.t;
   (** Enabled once the server is stopping: an engine finishes the request in
-      progress and stops taking new ones. *)
+      progress and stops taking new ones. The server makes it from the same
+      cell as {!Conn_info.stopping} of [conn]. *)
   is_stopping : unit -> bool; (** Whether {!stopping} is enabled. *)
 }
 (** The type for what a server gives an engine for a connection. *)

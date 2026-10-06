@@ -63,6 +63,20 @@ let handler req =
       until_cancelled (fun () -> Mtime.wait_for Mtime.Span.(10 * s));
       Response.string "late"
   | "/fetch" -> fetch ()
+  | "/stopping" ->
+      (* Sets [waiting], then gives "stopping" when the server starts to
+         stop, or "timeout" after 2 s. *)
+      Cell.Once.try_set !waiting ();
+      let stopping = Conn_info.stopping (Option.get (Request.conn req)) in
+      Response.string
+        (Action.invoke
+           (Action.choose
+              [ Action.map (fun () -> "stopping") stopping;
+                Mtime.wait_for' Mtime.Span.(2 * s) "timeout" ]))
+  | "/is-stopping" ->
+      let stopping = Conn_info.stopping (Option.get (Request.conn req)) in
+      Response.string
+        (Action.invoke (Action.choose [ Action.map (fun () -> "yes") stopping; Action.always "no" ]))
   | "/partial" ->
       Response.stream (fun w ->
           Body.Writer.write_string w "partial";
