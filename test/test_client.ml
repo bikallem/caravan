@@ -948,4 +948,363 @@ let pool_stateful =
   in
   group "Pool model" [ stateful ~count:300 ~steps:30 "the pool behaves like a model" commands ]
 
-let () = exit (run "client" [ exchange_tests; resolver_tests; pool_tests; pool_stateful ])
+(* The public API *)
+
+module C = Caravan_client
+
+let name = function Fun.Async.Cancelled -> "Cancelled" | e -> Printexc.to_string e
+
+(* The handler of the tests: "/id" gives the id of the connection, "/conn"
+   the Connection field and the id, and the others go to the handler of
+   Server_support. *)
+let api_handler req =
+  match Request.path_only req with
+  | "/id" -> id_handler req
+  | "/conn" ->
+      Response.string
+        (Option.value ~default:"-" (Headers.find "connection" (Request.headers req))
+        ^ " " ^ Body.to_string (match Response.kind (id_handler req) with Body b -> b | _ -> Body.empty))
+  | _ -> Server_support.handler req
+
+let big_config = { Server_support.config with max_body = None }
+
+(* The result of [f], or a failure after 5 s. A whole client run gets this
+   guard: a bug in its close gives a failure, not a hang. *)
+let within_5s f =
+  let call = Fun.Async.call f in
+  let ended = Action.map (fun v -> `Ended v) (Fun.Async.get' call) in
+  match Action.invoke (Action.choose [ ended; Mtime.wait_for' Mtime.Span.(5 * s) `Late ]) with
+  | `Ended v -> v
+  | `Late -> Fun.Async.cancel call; fail "no end after 5 s"
+
+(* [f client url] against a caravan server. *)
+let with_client ?(config = big_config) ?client_config f =
+  Server_support.with_server ~config ~handler:api_handler @@ fun server ->
+  within_5s @@ fun () ->
+  C.run ?config:client_config @@ fun client ->
+  f client (Printf.sprintf "http://127.0.0.1:%d" (server_port server))
+
+let text resp = Body.to_string (C.body resp)
+let get_text client url = text (C.get client url)
+
+let at_port port ?(meth = Method.GET) ?(headers = []) ?body path =
+  Request.make ~authority:(Printf.sprintf "127.0.0.1:%d" port) ~headers:(Headers.of_list headers) ?body meth path
+
+(* A listener whose connections follow [scripts], one script for each
+   connection, in order. [f client port accepted] runs with a client. *)
+let with_scripts scripts f =
+  main @@ fun () ->
+  let l = Tcp.Listener.listen Server_support.loopback in
+  let port = match Tcp.Listener.addr l with Unix.ADDR_INET (_, p) -> p | _ -> 0 in
+  let accepted = Atomic.make 0 in
+  let acceptor =
+    Fun.Async.call (fun () ->
+        List.iter
+          (fun script ->
+             let fd, _ = Tcp.Listener.accept l in
+             Atomic.incr accepted;
+             let flow = Tcp.flow fd in
+             ignore
+               (Fun.Async.call (fun () ->
+                    Stdlib.Fun.protect ~finally:(fun () -> Flow.close flow) (fun () ->
+                        try script flow (Buf_reader.of_flow flow) with _ -> ()))))
+          scripts)
+  in
+  Stdlib.Fun.protect
+    ~finally:(fun () -> Fun.Async.cancel acceptor; Tcp.Listener.close l)
+    (fun () -> within_5s (fun () -> C.run (fun client -> f client port accepted)))
+
+let api_tests =
+  group "Caravan_client"
+    [ test "GET, HEAD, 204 and a stream, with reuse" (fun () ->
+          with_client @@ fun client url ->
+          let id0 = get_text client (url ^ "/id") in
+          equal string "hello" (get_text client (url ^ "/hello"));
+          let head = C.request client (at_port (int_of_string (List.nth (String.split_on_char ':' url) 2)) ~meth:Method.HEAD "/hello") in
+          equal int 200 (status head);
+          equal string "" (text head);
+          equal string id0 (get_text client (url ^ "/id"));
+          equal int 204 (status (C.get client (url ^ "/empty")));
+          equal string id0 (get_text client (url ^ "/id"));
+          equal string "abcd" (get_text client (url ^ "/stream")));
+      test "an upload of unknown length goes chunked, and comes back" (fun () ->
+          with_client @@ fun client url ->
+          let port = int_of_string (List.nth (String.split_on_char ':' url) 2) in
+          let b = Body.of_writer (fun w -> List.iter (Body.Writer.write_string w) [ "one;"; "two;"; "three" ]) in
+          equal string "one;two;three" (text (C.request client (at_port port ~meth:Method.POST ~body:b "/echo"))));
+      test "8 MiB echoed while it uploads" (fun () ->
+          with_client @@ fun client url ->
+          let port = int_of_string (List.nth (String.split_on_char ':' url) 2) in
+          let data = String.init (8 * 1024 * 1024) (fun i -> Char.chr (i land 0xff)) in
+          let b =
+            Body.of_writer (fun w ->
+                let rec go i =
+                  if i < String.length data
+                  then begin
+                    let n = Int.min 65536 (String.length data - i) in
+                    Body.Writer.write_string w (String.sub data i n);
+                    Body.Writer.flush w;
+                    go (i + n)
+                  end
+                in
+                go 0)
+          in
+          let got = within_2s (fun () -> text (C.request client (at_port port ~meth:Method.POST ~body:b "/echo"))) in
+          is_true ~msg:"the echo is equal" (got = data));
+      test "a stale connection is retried for a GET" (fun () ->
+          let first flow r =
+            ignore (read_request r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na";
+            (* The next request comes, and the server closes. *)
+            ignore (read_head r)
+          and second flow r =
+            ignore (read_request r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb"
+          in
+          with_scripts [ first; second ] @@ fun client port accepted ->
+          equal string "a" (text (C.request client (at_port port "/")));
+          equal string "b" (within_2s (fun () -> text (C.request client (at_port port "/"))));
+          equal int 2 (Atomic.get accepted));
+      test "a stale connection is not retried for a POST" (fun () ->
+          let first flow r =
+            ignore (read_request r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na";
+            ignore (read_request r)
+          in
+          with_scripts [ first; first ] @@ fun client port accepted ->
+          equal string "a" (text (C.request client (at_port port "/")));
+          equal string "Caravan_client.Error: the connection closed before the response"
+            (within_2s (fun () ->
+                 error_text (fun () -> C.request client (at_port port ~meth:Method.POST ~body:Body.empty "/"))));
+          equal int 1 (Atomic.get accepted));
+      test "a stale connection is not retried for a PUT with a body" (fun () ->
+          let first flow r =
+            ignore (read_request r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na";
+            ignore (read_request r)
+          in
+          with_scripts [ first; first ] @@ fun client port accepted ->
+          equal string "a" (text (C.request client (at_port port "/")));
+          equal string "Caravan_client.Error: the connection closed before the response"
+            (within_2s (fun () ->
+                 error_text (fun () ->
+                     C.request client (at_port port ~meth:Method.PUT ~body:(Body.of_string "abc") "/"))));
+          equal int 1 (Atomic.get accepted));
+      test "with_response closes an unread body" (fun () ->
+          let eof = Cell.Once.make () in
+          let script flow r =
+            ignore (read_request r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nabc";
+            ignore (Buf_reader.peek_eof r);
+            Cell.Once.try_set eof ()
+          in
+          with_scripts [ script ] @@ fun client port _ ->
+          within_2s (fun () -> C.with_response client (at_port port "/") ignore);
+          (* The client closes the connection of the unread body. *)
+          within_2s (fun () -> Cell.Once.get eof));
+      test "with_response gives the exception of f" (fun () ->
+          let go = Cell.Once.make () and raised = Cell.Once.make () in
+          let script flow r =
+            ignore (read_head r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";
+            ignore (Buf_reader.peek_eof r)
+          in
+          with_scripts [ script ] @@ fun client port _ ->
+          let failing =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "abc";
+                Body.Writer.flush w;
+                Cell.Once.get go;
+                Cell.Once.try_set raised ();
+                failwith "p")
+          in
+          equal string "Failure(\"f\")"
+            (within_2s (fun () ->
+                 error_text (fun () ->
+                     C.with_response client (at_port port ~meth:Method.POST ~body:failing "/") (fun _ ->
+                         Cell.Once.try_set go ();
+                         Cell.Once.get raised;
+                         failwith "f")))));
+      test "request after close raises Invalid_argument" (fun () ->
+          main @@ fun () ->
+          within_2s @@ fun () ->
+          C.run @@ fun client ->
+          C.close client;
+          raises_match is_invalid_arg (fun () -> C.request client (at_port 9 "/")));
+      test "a proxy handler streams an upload to an upstream echo" (fun () ->
+          main @@ fun () ->
+          let upstream = Server.start ~config:big_config Server_support.handler in
+          Stdlib.Fun.protect ~finally:(fun () -> Server.shutdown upstream; Server.wait upstream) @@ fun () ->
+          let up = Printf.sprintf "127.0.0.1:%d" (server_port upstream) in
+          within_5s @@ fun () ->
+          C.run @@ fun client ->
+          let forward req =
+            let r =
+              Request.make ~authority:up ~headers:(Request.headers req) ~body:(Request.body req)
+                (Request.meth req) (Request.path req)
+            in
+            let resp = C.request client r in
+            Response.make ~status:(Response.status resp) ~headers:(Response.headers resp) (C.body resp)
+          in
+          let proxy = Server.start ~config:big_config forward in
+          let ok = ref false in
+          Stdlib.Fun.protect
+            ~finally:(fun () -> if !ok then (Server.shutdown proxy; Server.wait proxy) else Server.abort proxy)
+          @@ fun () ->
+          let flow = Tcp.connect (Server.local_addr proxy) in
+          Stdlib.Fun.protect ~finally:(fun () -> Flow.close flow) @@ fun () ->
+          Flow.write_string flow "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+          let r = Buf_reader.of_flow flow and n = 65536 in
+          let send k = Flow.write_string flow (Printf.sprintf "%x\r\n%s\r\n" n (String.make n (Char.chr (65 + k)))) in
+          send 0;
+          let h = within_2s (fun () -> H1_parse.response_head server_limits r) in
+          equal int 200 (Status.code h.status);
+          let b = H1_body.chunked ~limits:server_limits r in
+          let read_n () =
+            let buf = Bytes.create n in
+            let rec go got = if got < n then go (got + Body.read b buf got (n - got)) in
+            go 0;
+            Bytes.to_string buf
+          in
+          (* Chunk k goes only after the echo of chunk k - 1 came. *)
+          for k = 0 to 15 do
+            if k > 0 then send k;
+            equal string (String.make n (Char.chr (65 + k))) (within_2s read_n)
+          done;
+          Flow.write_string flow "0\r\n\r\n";
+          equal string "" (within_2s (fun () -> Body.to_string b));
+          ok := true);
+      test "close cancels the writers, and run returns after them" (fun () ->
+          let script flow r =
+            ignore (read_head r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n";
+            ignore (Buf_reader.peek_eof r)
+          in
+          main @@ fun () ->
+          let l = Tcp.Listener.listen Server_support.loopback in
+          let port = match Tcp.Listener.addr l with Unix.ADDR_INET (_, p) -> p | _ -> 0 in
+          let server =
+            Fun.Async.call (fun () ->
+                let fd, _ = Tcp.Listener.accept l in
+                let flow = Tcp.flow fd in
+                Stdlib.Fun.protect ~finally:(fun () -> Flow.close flow) (fun () ->
+                    try script flow (Buf_reader.of_flow flow) with _ -> ()))
+          in
+          Stdlib.Fun.protect ~finally:(fun () -> Fun.Async.cancel server; Tcp.Listener.close l) @@ fun () ->
+          let seen = ref "none" in
+          let waiting =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "abc";
+                Body.Writer.flush w;
+                try Cell.Once.get (Cell.Once.make ())
+                with e ->
+                  (* Late: only a run that waits for the writers sees it. *)
+                  Fun.Async.mask_cancellation (fun () -> Mtime.wait_for (ms 50));
+                  seen := name e;
+                  raise e)
+          in
+          let config = { Client_config.default with write_timeout = ms 5000 } in
+          let at_return =
+            within_2s (fun () ->
+                C.run ~config (fun client -> ignore (C.request client (at_port port ~meth:Method.POST ~body:waiting "/")));
+                !seen)
+          in
+          equal string "Cancelled" at_return);
+      test "a cancel of the caller during the head wait stops the writer" (fun () ->
+          let eof = Cell.Once.make () in
+          let script _ r =
+            ignore (read_head r);
+            ignore (Buf_reader.peek_eof r);
+            Cell.Once.try_set eof ()
+          in
+          with_scripts [ script ] @@ fun client port _ ->
+          let wrote = Cell.Once.make () and seen = Cell.Once.make () in
+          let waiting =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "abc";
+                Body.Writer.flush w;
+                Cell.Once.try_set wrote ();
+                try Cell.Once.get (Cell.Once.make ()) with e -> Cell.Once.try_set seen (name e); raise e)
+          in
+          let caller = Fun.Async.call (fun () -> C.request client (at_port port ~meth:Method.POST ~body:waiting "/")) in
+          within_2s (fun () -> Cell.Once.get wrote);
+          Fun.Async.cancel caller;
+          equal string "Cancelled" (within_2s (fun () -> Cell.Once.get seen));
+          within_2s (fun () -> Cell.Once.get eof);
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get caller));
+      test "a cancel of the caller during the body closes the connection" (fun () ->
+          let eof = Cell.Once.make () in
+          let script flow r =
+            ignore (read_request r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nab";
+            ignore (Buf_reader.peek_eof r);
+            Cell.Once.try_set eof ()
+          in
+          with_scripts [ script ] @@ fun client port _ ->
+          let reading = Cell.Once.make () in
+          let caller =
+            Fun.Async.call (fun () ->
+                let b = C.body (C.request client (at_port port "/")) in
+                ignore (Body.read b (Bytes.create 8) 0 8);
+                Cell.Once.try_set reading ();
+                Body.to_string b)
+          in
+          within_2s (fun () -> Cell.Once.get reading);
+          Fun.Async.cancel caller;
+          within_2s (fun () -> Cell.Once.get eof);
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get caller));
+      test "get parses URLs" (fun () ->
+          let show url =
+            match C.Private.parse_url url with
+            | a, p -> Printf.sprintf "%s => %s %s" url a p
+            | exception C.Error e -> Printf.sprintf "%s => %s" url (Printexc.to_string (C.Error e))
+            | exception Invalid_argument _ -> url ^ " => Invalid_argument"
+          in
+          expect
+            (String.concat "\n"
+               (List.map show
+                  [ "http://a.example"; "HTTP://a.example:8080/p?q#f"; "http://a.example?x=1"; "http://[::1]:80/";
+                    "http://[::1]:8080/x"; "http://a:/"; "https://a"; "ftp://x"; "http://"; "http://u@a/";
+                    "http://a:70000/"; "http://a:0/"; "http://a:8x/"; "a.example/p"; "http://a:1/";
+                    "http://a:65535/"; "http://a:65536/"; "http://a:+80/" ]))
+          @@ __POS_OF__ {|
+            http://a.example => a.example /
+            HTTP://a.example:8080/p?q#f => a.example:8080 /p?q
+            http://a.example?x=1 => a.example /?x=1
+            http://[::1]:80/ => [::1] /
+            http://[::1]:8080/x => [::1]:8080 /x
+            http://a:/ => a /
+            https://a => Caravan_client.Error: unsupported: the scheme https
+            ftp://x => Caravan_client.Error: unsupported: the scheme ftp
+            http:// => Invalid_argument
+            http://u@a/ => Invalid_argument
+            http://a:70000/ => Invalid_argument
+            http://a:0/ => Invalid_argument
+            http://a:8x/ => Invalid_argument
+            a.example/p => Invalid_argument
+            http://a:1/ => a:1 /
+            http://a:65535/ => a:65535 /
+            http://a:65536/ => Invalid_argument
+            http://a:+80/ => Invalid_argument
+            |});
+      test "the client and the server under load" (fun () ->
+          let client_config = { Client_config.default with max_idle_per_host = 20 } in
+          with_client ~client_config @@ fun client url ->
+          let ids =
+            List.concat
+              (Fun.Async.get_all
+                 (List.init 20 (fun _ -> Fun.Async.call (fun () -> List.init 25 (fun _ -> get_text client (url ^ "/id"))))))
+          in
+          equal int 500 (List.length ids);
+          let distinct = List.sort_uniq compare ids in
+          is_true ~msg:(Printf.sprintf "%d connections" (List.length distinct)) (List.length distinct <= 20));
+      test "a user Connection: close is sent, and the next request uses a new connection" (fun () ->
+          with_client @@ fun client url ->
+          let port = int_of_string (List.nth (String.split_on_char ':' url) 2) in
+          let first = text (C.request client (at_port port ~headers:[ ("Connection", "close") ] "/conn")) in
+          let id1 = List.nth (String.split_on_char ' ' first) 1 in
+          equal string "close" (List.hd (String.split_on_char ' ' first));
+          let id2 = get_text client (url ^ "/id") in
+          is_true ~msg:(id1 ^ " then " ^ id2) (id1 <> id2)) ]
+
+let () = exit (run "client" [ exchange_tests; resolver_tests; pool_tests; pool_stateful; api_tests ])

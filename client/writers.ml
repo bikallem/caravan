@@ -26,7 +26,7 @@ let run_job j =
   let r = match j.body () with () -> Ok () | exception e -> Error (e, Printexc.get_raw_backtrace ()) in
   Cell.Once.try_set j.result r
 
-let make () =
+let make ?(on_stop = ignore) () =
   let jobs = Port.make () and stopping = Cell.Once.make () in
   let stop = Action.map (fun () -> `Stop) (Cell.Once.get' stopping) in
   let take = Action.map (fun j -> `Job j) (Port.take' jobs) in
@@ -41,7 +41,7 @@ let make () =
   let supervisor =
     Fun.Async.call (fun () ->
         Fun.Async.protect
-          ~finally:(fun () -> Cell.Once.try_set stopping ())
+          ~finally:(fun () -> Cell.Once.try_set stopping (); on_stop ())
           (fun () -> try loop () with Fun.Async.Cancelled -> ()))
   in
   { jobs; stopping; supervisor }

@@ -1,4 +1,21 @@
-(** An HTTP/1.1 client for caravan (work in progress). *)
+(** An HTTP/1.1 client for caravan servers and programs.
+
+    {[
+      Affect_unix.Unix.main @@ fun () ->
+      Caravan_client.run @@ fun client ->
+      Caravan_client.with_response client
+        (Caravan.Request.make ~authority:"example.com" Caravan.Method.GET "/")
+        (fun resp -> print_string (Caravan.Body.to_string (Caravan_client.body resp)))
+    ]}
+
+    The client keeps idle connections for each host and port. The writer
+    of a request body belongs to the client, not to the fiber that makes
+    the request: a request returns its response when the response head
+    comes, while the request body continues. Thus a server handler can
+    forward a request and stream the two bodies at the same time.
+
+    Version 1 sends HTTP/1.1 over TCP to [http] URLs only. It has no TLS,
+    no proxy support, no redirects, no cookies and no content codings. *)
 
 module Config : sig
   type t = Config.t = {
@@ -37,6 +54,75 @@ type error = Error.t =
 exception Error of error
 (** The exception for errors. *)
 
+type t
+(** The type for clients. *)
+
+val make : ?config:Config.t -> unit -> t
+(** [make ~config ()] is a client. It must run inside the affect runtime.
+    It starts a fiber, a child of the fiber that calls [make], that writes
+    the request bodies. Thus the fiber that calls [make] returns only
+    after {!close}. Use {!run} if possible.
+
+    Make one client for a program, outside the handlers of a server, for
+    example with {!run} around [Server.start]. Do not make it in [on_start]
+    of [Server.run]: nothing then closes it, and [Server.run] does not
+    return. A client is for one [Affect_unix.Unix.main] only. *)
+
+val run : ?config:Config.t -> (t -> 'a) -> 'a
+(** [run ~config f] makes a client, calls [f] with it, and closes it, also
+    when [f] raises. It returns after all the writers of request bodies
+    end. *)
+
+val close : t -> unit
+(** [close t] closes [t]: its connections close, and the writers of
+    request bodies stop. A request in progress gets [Error Closed],
+    [Error Truncated] or [Invalid_argument]. A later {!request} raises
+    [Invalid_argument]. *)
+
+val request : t -> Caravan.Request.t -> Caravan.Response.t
+(** [request t req] sends [req] and gives the response when its head
+    comes:
+    - The scheme of [req] must be [http], and [req] must have an
+      authority: [host], [host:port] or [[ipv6]:port]. The port is 80 by
+      default.
+    - The body of [req] goes while the caller reads the response. If the
+      response tells that the connection closes, the rest of the body
+      does not go.
+    - The caller must read the response body to its end, or call
+      {!Caravan.Body.close}, or the connection stays in use. Use
+      {!with_response} if possible.
+    - The producer of the request body must not read or close the
+      response body of the same request.
+    - If the server closed an idle connection, an idempotent request
+      without a body goes again one time on a new connection.
+    - If the caller is cancelled during [request] or a read of the body,
+      the connection closes and the request body stops. If the caller is
+      cancelled at a different time, the request body continues until the
+      response body closes or the client closes.
+
+    @raise Error for the errors of the network and of the server.
+    @raise Invalid_argument if [req] has no authority or an invalid path,
+    or if [t] is closed. An exception of the request body producer goes
+    to the caller: from [request], or after the response head, from the
+    read that ends the response body or from {!Caravan.Body.close}. *)
+
+val with_response : t -> Caravan.Request.t -> (Caravan.Response.t -> 'a) -> 'a
+(** [with_response t req f] calls [f] with the response to [req], then
+    closes its body, also when [f] raises. An exception of [f] wins over
+    an exception of the close. *)
+
+val get : ?headers:Caravan.Headers.t -> t -> string -> Caravan.Response.t
+(** [get t url] is the response to a [GET] of [url]:
+    [http://host[:port][/path][?query][#fragment]]. The scheme can be in
+    any case, and the fragment does not go.
+
+    @raise Error with [Unsupported] for a different scheme.
+    @raise Invalid_argument for a URL with user information, an empty
+    host or a port out of the range 1 to 65535. *)
+
+val body : Caravan.Response.t -> Caravan.Body.t
+(** [body resp] is the body of [resp]. *)
+
 (**/**)
 
 module Private : sig
@@ -46,4 +132,6 @@ module Private : sig
   module Resolver = Resolver
   module Connect = Connect
   module Pool = Pool
+
+  val parse_url : string -> string * string
 end

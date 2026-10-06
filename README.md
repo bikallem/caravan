@@ -71,6 +71,32 @@ let handler req =
   test suite give OK or NON-STRICT, except the compression cases:
   caravan does not accept `permessage-deflate`.
 
+## Client
+
+The `caravan.client` library is an HTTP/1.1 client. It uses the parser
+and the writer of the server:
+
+```ocaml
+Caravan_client.run @@ fun client ->
+Caravan_client.with_response client
+  (Caravan.Request.make ~authority:"example.com" Caravan.Method.GET "/")
+  (fun resp -> Caravan.Body.to_string (Caravan_client.body resp))
+```
+
+- The client keeps idle connections for each host and port, and gives a
+  connection back when the response body ends.
+- The request body goes while the caller reads the response. The writer
+  of the body belongs to the client, not to the caller. Thus a server
+  handler can forward a request and stream the two bodies at the same
+  time.
+- A system thread does the DNS lookup, thus a lookup does not stop the
+  fibers of its domain.
+- Time limits for the connect, the response head, each read and each
+  write. One retry of an idempotent request without a body when the
+  server closed an idle connection.
+- Version 1 has no TLS, no proxy support, no redirects, no cookies and
+  no content codings.
+
 ## Requirements
 
 - OCaml >= 5.5.0
@@ -120,7 +146,9 @@ curl -i localhost:8080/hello
 ```
 
 For WebSocket, run `dune exec examples/ws_echo.exe` and open
-<http://localhost:8080/> in a browser.
+<http://localhost:8080/> in a browser. While the example server runs,
+`dune exec examples/fetch.exe -- http://localhost:8080/hello` fetches a
+page with the client.
 
 ## License
 
