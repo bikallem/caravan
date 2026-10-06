@@ -3,7 +3,7 @@ ML_FILES = $(shell find . \( -path ./_build -o -path ./.direnv -o -path ./.git \
 
 # Test suites with mutation results to merge.
 SUITES = test_core test_h1 test_h1_server test_net test_server test_server_stateful \
-  test_websocket
+  test_websocket test_client
 
 .PHONY: build fmt test mutate coverage autobahn
 
@@ -42,7 +42,7 @@ MUTATE_JOBS ?= $(shell nproc)
 MUTATE_SHARDS ?= 8
 MUTATE_TIMEOUT ?= 5
 MUTATE_STATEFUL_COUNT ?= 200
-MUTATE_FILES = $(filter $(MUTATE)%,$(sort $(wildcard src/*.ml websocket/*.ml)))
+MUTATE_FILES = $(filter $(MUTATE)%,$(sort $(wildcard src/*.ml websocket/*.ml client/*.ml)))
 MUTATE_LOGS = _build/_mutate_logs
 
 mutate:

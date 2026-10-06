@@ -201,3 +201,24 @@ let with_server ?(config = config) ?engine ?(handler = handler) f =
   let server = Server.start ~config ?engine handler in
   Fun.protect ~finally:(fun () -> Server.shutdown server; Server.wait server) (fun () -> f server)
 
+(* Runs [f] with the flows of the server and of the peer of a TCP
+   connection. *)
+let with_flows f =
+  Affect_unix.Unix.main ~domain_count @@ fun () ->
+  let l = Tcp.Listener.listen loopback in
+  Stdlib.Fun.protect ~finally:(fun () -> Tcp.Listener.close l) @@ fun () ->
+  let peer = Fun.Async.call (fun () -> Tcp.connect (Tcp.Listener.addr l)) in
+  let fd, _ = Tcp.Listener.accept l in
+  let server = Tcp.flow fd and peer = Fun.Async.get peer in
+  Stdlib.Fun.protect ~finally:(fun () -> Flow.close peer; Flow.close server)
+  @@ fun () -> f server peer
+
+(* The result of [f], or a failure of the test if [f] takes more than
+   2 s: a bug gives a failure, not a hang. *)
+let within_2s f =
+  let call = Fun.Async.call f in
+  let ended = Action.map (fun v -> `Ended v) (Fun.Async.get' call) in
+  match Action.invoke (Action.choose [ ended; Mtime.wait_for' Mtime.Span.(2 * s) `Late ]) with
+  | `Ended v -> v
+  | `Late -> Fun.Async.cancel call; Windtrap.fail "no end after 2 s"
+
