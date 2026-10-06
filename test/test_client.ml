@@ -14,6 +14,7 @@ let server_limits = H1_server.limits Config.default
 let req ?(meth = Method.GET) ?(headers = []) ?body path =
   Request.make ~authority:"a.example" ~headers:(Headers.of_list headers) ?body meth path
 
+let is_invalid_arg = function Invalid_argument _ -> true | _ -> false
 let body r = match Response.kind r with Response.Body b -> b | Upgrade _ -> fail "an upgrade"
 let status r = Status.code (Response.status r)
 
@@ -732,4 +733,219 @@ let resolver_tests =
           main @@ fun () ->
           with_listener @@ fun port -> Flow.close (Connect.connect Client_config.default ~host:"localhost" ~port)) ]
 
-let () = exit (run "client" [ exchange_tests; resolver_tests ])
+(* Pool *)
+
+(* A request through a pool, as the client will make it. *)
+let pooled pool writers ?(config = Client_config.default) ~port r =
+  let c, _ = Pool.checkout pool ~host:"127.0.0.1" ~port in
+  Exchange.run config writers c ~on_release:(fun c ~reusable -> Pool.release pool c ~reusable) r
+
+let server_port server = match Server.local_addr server with Unix.ADDR_INET (_, p) -> p | _ -> 0
+
+(* A server whose handler gives the id of the connection. *)
+let id_handler req = Response.string (string_of_int (Conn_info.id (Option.get (Request.conn req))))
+
+(* [f pool writers port] against a caravan server. *)
+let with_pool ?config ?engine ?(handler = id_handler) f =
+  Server_support.with_server ?config ?engine ~handler @@ fun server ->
+  let writers = Writers.make () in
+  let pool = Pool.make Client_config.default in
+  Stdlib.Fun.protect ~finally:(fun () -> Pool.close pool; Writers.stop writers; Writers.wait writers)
+  @@ fun () -> f pool writers (server_port server)
+
+let get_id pool writers ~port ?(meth = Method.GET) () =
+  Body.to_string (body (pooled pool writers ~port (req ~meth ~body:Body.empty "/id")))
+
+(* A flow for the fake connects: it records its close, and its server can
+   close it. *)
+type fake = { closed : bool ref; server_closed : bool ref; flow : Flow.t }
+
+let fake () =
+  let closed = ref false and server_closed = ref false in
+  let flow =
+    Flow.make ~read:(fun _ _ _ -> 0)
+      ~read_now:(fun _ _ _ -> if !server_closed then Some 0 else None)
+      ~write:(fun _ _ _ -> ()) ~readable:Action.never ~shutdown_send:ignore
+      ~close:(fun () -> closed := true) ~set_read_deadline:ignore ~set_write_deadline:ignore ()
+  in
+  { closed; server_closed; flow }
+
+(* A pool with a fake clock and fake connects. *)
+let fake_pool ?(config = Client_config.default) () =
+  let clock = ref Mtime.(now ()) and made = ref [] in
+  let now () = !clock in
+  let connect ~host:_ ~port:_ = let f = fake () in made := f :: !made; f.flow in
+  let pool = Pool.make ~now ~connect config in
+  let advance span = clock := Option.get (Mtime.add_span !clock span) in
+  (pool, advance, fun () -> List.rev !made)
+
+let pool_tests =
+  group "Pool"
+    [ test "two requests in sequence use one connection" (fun () ->
+          with_pool @@ fun pool writers port ->
+          let a = get_id pool writers ~port () in
+          let b = get_id pool writers ~port () in
+          equal string a b);
+      test "two requests at the same time use two connections" (fun () ->
+          (* The handler waits until [gate] opens: the second request of a
+             round opens it. Thus the two requests are in the server at
+             the same time. *)
+          let arrived = Atomic.make 0 and gate = Atomic.make (Cell.Once.make ()) in
+          let handler req =
+            let g = Atomic.get gate in
+            if Atomic.fetch_and_add arrived 1 = 1 then Cell.Once.try_set g ();
+            ignore
+              (Action.invoke (Action.choose [ Action.map ignore (Cell.Once.get' g); Mtime.wait_for' (ms 2000) () ]));
+            id_handler req
+          in
+          with_pool ~handler @@ fun pool writers port ->
+          (* One idle connection first, with an open gate. *)
+          let opened = Cell.Once.make () in
+          Cell.Once.try_set opened ();
+          Atomic.set gate opened;
+          ignore (get_id pool writers ~port ());
+          Atomic.set arrived 0;
+          Atomic.set gate (Cell.Once.make ());
+          let a = Fun.Async.call (fun () -> get_id pool writers ~port ()) in
+          let b = Fun.Async.call (fun () -> get_id pool writers ~port ()) in
+          let a = within_2s (fun () -> Fun.Async.get a) and b = within_2s (fun () -> Fun.Async.get b) in
+          is_true ~msg:(a ^ " and " ^ b) (a <> b));
+      test "an idle connection that the server closed is not used" (fun () ->
+          let closed = Cell.Once.make () in
+          let engine ctx flow handler =
+            H1_server.serve ctx flow handler;
+            Flow.close flow;
+            Cell.Once.try_set closed ()
+          in
+          let config = { Server_support.config with idle_timeout = ms 50 } in
+          with_pool ~config ~engine @@ fun pool writers port ->
+          let a = get_id pool writers ~port () in
+          within_2s (fun () -> Cell.Once.get closed);
+          (* A POST, which the client never retries. *)
+          let b = get_id pool writers ~port ~meth:Method.POST () in
+          is_true ~msg:(a ^ " then " ^ b) (a <> b));
+      test "an idle connection older than idle_timeout is closed" (fun () ->
+          let pool, advance, made = fake_pool () in
+          let c, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          Pool.release pool c ~reusable:true;
+          advance (Mtime.Span.(4 * s));
+          let c', kind = Pool.checkout pool ~host:"A" ~port:80 in
+          is_true ~msg:"reused at 4 s" (kind = `Reused && c'.Conn.id = c.Conn.id);
+          Pool.release pool c' ~reusable:true;
+          advance (Mtime.Span.(6 * s));
+          let _, kind = Pool.checkout pool ~host:"a" ~port:80 in
+          is_true ~msg:"new at 6 s" (kind = `New);
+          equal (list bool) [ true; false ] (List.map (fun f -> !(f.closed)) (made ())));
+      test "max_idle_per_host keeps at most that number" (fun () ->
+          let pool, _, made = fake_pool ~config:{ Client_config.default with max_idle_per_host = 2 } () in
+          let cs = List.init 3 (fun _ -> fst (Pool.checkout pool ~host:"a" ~port:80)) in
+          List.iter (fun c -> Pool.release pool c ~reusable:true) cs;
+          equal (list bool) [ false; false; true ] (List.map (fun f -> !(f.closed)) (made ()));
+          let kinds = List.init 3 (fun _ -> snd (Pool.checkout pool ~host:"a" ~port:80)) in
+          equal (list bool) [ true; true; false ] (List.map (fun k -> k = `Reused) kinds);
+          equal int 4 (List.length (made ())));
+      test "close closes idle and used connections" (fun () ->
+          let pool, _, made = fake_pool () in
+          let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          let _b, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          Pool.release pool a ~reusable:true;
+          Pool.close pool;
+          equal (list bool) [ true; true ] (List.map (fun f -> !(f.closed)) (made ()));
+          raises_match is_invalid_arg (fun () -> Pool.checkout pool ~host:"a" ~port:80));
+      test "a connect during close is closed" (fun () ->
+          let pool = ref None and flows = ref [] in
+          let connect ~host:_ ~port:_ =
+            let f = fake () in
+            flows := f :: !flows;
+            Pool.close (Option.get !pool);
+            f.flow
+          in
+          pool := Some (Pool.make ~connect Client_config.default);
+          raises_match is_invalid_arg (fun () -> Pool.checkout (Option.get !pool) ~host:"a" ~port:80);
+          equal (list bool) [ true ] (List.map (fun f -> !(f.closed)) !flows)) ]
+
+(* The pool against a model: one host, a fake clock and fake flows. Each
+   program makes its pool first. *)
+module Pool_model = struct
+  type pool = { mutable clock : int; mutable connects : int; mutable idle : conn list }
+  and conn = { pool : pool; mutable state : [ `Used | `Idle of int | `Closed ]; mutable server_closed : bool }
+
+  let make () = { clock = 0; connects = 0; idle = [] }
+
+  (* Idle for less than 5 s, and not closed by its server. *)
+  let rec checkout p =
+    match p.idle with
+    | c :: rest -> (
+        p.idle <- rest;
+        match c.state with
+        | `Idle t when p.clock - t < 5000 && not c.server_closed -> c.state <- `Used; c
+        | _ -> c.state <- `Closed; checkout p)
+    | [] -> p.connects <- p.connects + 1; { pool = p; state = `Used; server_closed = false }
+
+  let release c reusable =
+    let p = c.pool in
+    if reusable && List.length p.idle < 2 then (c.state <- `Idle p.clock; p.idle <- c :: p.idle)
+    else c.state <- `Closed
+
+  let advance p ms = p.clock <- p.clock + ms
+  let server_close c = c.server_closed <- true
+  let is_closed c = c.state = `Closed
+  let connects p = p.connects
+  let used c = c.state = `Used
+  let is_idle c = match c.state with `Idle _ -> true | _ -> false
+end
+
+module Pool_system = struct
+  type pool = { pool : Pool.t; clock : Mtime.t ref; fakes : (int, fake) Hashtbl.t; connects : int ref }
+
+  let owners : (int, pool) Hashtbl.t = Hashtbl.create 64
+
+  let make () =
+    let clock = ref Mtime.(now ()) and fakes = Hashtbl.create 8 and connects = ref 0 in
+    let connect ~host:_ ~port:_ =
+      incr connects;
+      let f = fake () in
+      (* [Conn.make] takes the next id after the connect. *)
+      Hashtbl.replace fakes (Atomic.get Conn.next_id) f;
+      f.flow
+    in
+    let config = { Client_config.default with max_idle_per_host = 2; idle_timeout = Mtime.Span.(5 * s) } in
+    { pool = Pool.make ~now:(fun () -> !clock) ~connect config; clock; fakes; connects }
+
+  let checkout p =
+    let c, _ = Pool.checkout p.pool ~host:"a" ~port:80 in
+    Hashtbl.replace owners c.Conn.id p;
+    c
+
+  let release (c : Conn.t) reusable = Pool.release (Hashtbl.find owners c.id).pool c ~reusable
+  let advance p n = p.clock := Option.get (Mtime.add_span !(p.clock) Mtime.Span.(n * ms))
+  let fake_of (c : Conn.t) = Hashtbl.find (Hashtbl.find owners c.id).fakes c.id
+  let server_close c = (fake_of c).server_closed := true
+  let is_closed c = !((fake_of c).closed)
+  let connects p = !(p.connects)
+end
+
+let pool_stateful =
+  let pool = abstract "p" ~pp:(fun ppf _ -> Format.pp_print_string ppf "pool") ~release:ignore in
+  let conn =
+    abstract "c"
+      ~pp:(fun ppf (c : Pool_model.conn) ->
+          Format.pp_print_string ppf
+            (match c.state with `Used -> "used" | `Idle _ -> "idle" | `Closed -> "closed"))
+      ~release:ignore
+  in
+  let commands =
+    [ command "pool" (Gen.unit @-> makes pool) Pool_model.make Pool_system.make;
+      command "checkout" (pool ^-> makes conn) Pool_model.checkout Pool_system.checkout;
+      command "release" ~pre:(fun c _ -> Pool_model.used c) (conn ^-> Gen.bool @-> returns unit)
+        Pool_model.release Pool_system.release;
+      command "advance" (pool ^-> Gen.int_range 0 3000 @-> returns unit) Pool_model.advance
+        Pool_system.advance;
+      command "server closes" ~pre:Pool_model.is_idle (conn ^-> returns unit) Pool_model.server_close
+        Pool_system.server_close;
+      command "is closed" (conn ^-> returns bool) Pool_model.is_closed Pool_system.is_closed;
+      command "connects" (pool ^-> returns int) Pool_model.connects Pool_system.connects ]
+  in
+  group "Pool model" [ stateful ~count:300 ~steps:30 "the pool behaves like a model" commands ]
+
+let () = exit (run "client" [ exchange_tests; resolver_tests; pool_tests; pool_stateful ])

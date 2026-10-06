@@ -45,4 +45,5 @@ module Private : sig
   module Exchange = Exchange
   module Resolver = Resolver
   module Connect = Connect
+  module Pool = Pool
 end

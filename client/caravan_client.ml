@@ -16,4 +16,5 @@ module Private = struct
   module Exchange = Exchange
   module Resolver = Resolver
   module Connect = Connect
+  module Pool = Pool
 end
