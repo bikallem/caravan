@@ -85,6 +85,31 @@ val request_framing : head -> framing
     @raise H1_error.E with {!H1_error.Bad_request}, or
     {!H1_error.Not_implemented} for a transfer coding other than [chunked]. *)
 
+type response_framing =
+| No_body (** No body: a response to [HEAD], 1xx, 204 or 304. *)
+| Fixed of int (** A body of exactly this many bytes. *)
+| Chunked (** A chunked body. *)
+| Until_close (** A body that ends when the connection closes. *)
+| Tunnel (** A 101, or a 2xx to [CONNECT]: the connection is no longer HTTP. *)
+(** The type for how a response body is delimited. *)
+
+val response_framing : meth:Method.t -> response_head -> response_framing
+(** [response_framing ~meth h] is how the body of the response [h] to a
+    request with method [meth] is delimited (RFC 9112 §6.3). The rules, in
+    order:
+    + A 101, or a 2xx to [CONNECT]: {!Tunnel}.
+    + A response to [HEAD], other 1xx, 204 and 304: {!No_body}, whatever
+      their fields.
+    + [Transfer-Encoding] and [Content-Length] together, or
+      [Transfer-Encoding] in HTTP/1.0: an error.
+    + [Transfer-Encoding: chunked]: {!Chunked}. A different coding:
+      {!H1_error.Not_implemented}.
+    + [Content-Length]: {!Fixed}, if all its values are the same number.
+    + No framing field: {!Until_close}.
+
+    @raise H1_error.E with {!H1_error.Bad_request} or
+    {!H1_error.Not_implemented}. *)
+
 (** {1:target Request target} *)
 
 type target = {

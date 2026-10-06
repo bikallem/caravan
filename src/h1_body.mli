@@ -21,6 +21,12 @@ val chunked : ?max_body:int -> limits:H1_parse.limits -> Buf_reader.t -> Body.t
     body past [max_body] bytes as sent, chunk framing included (default: no
     limit), and {!Body.Truncated} if [r] ends first. *)
 
+val until_close : Buf_reader.t -> Body.t
+(** [until_close r] is the body of a response without a length: all the
+    bytes of [r] until the end of its input. Its {!Body.length} is [None].
+    Reads raise {!Body.Truncated} if the input ends with a reset
+    ({!Flow.Closed}), because a reset is not a correct end. *)
+
 (** {1:handle Request body handles} *)
 
 type t

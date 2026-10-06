@@ -149,18 +149,18 @@ let length_value s =
   then bad "invalid Content-Length %S" s;
   int_of_string s
 
-let content_length (h : head) =
-  if not (Headers.mem "content-length" h.headers)
+let content_length headers =
+  if not (Headers.mem "content-length" headers)
   then None
   else
-  match List.map length_value (Headers.tokens "content-length" h.headers) with
+  match List.map length_value (Headers.tokens "content-length" headers) with
   | [] -> bad "empty Content-Length"
   | n :: rest ->
       if List.exists (fun m -> m <> n) rest then bad "conflicting Content-Length";
       Some n
 
 let request_framing (h : head) =
-  let length = content_length h in
+  let length = content_length h.headers in
   if not (Headers.mem "transfer-encoding" h.headers)
   then match length with None -> No_body | Some n -> Fixed n
   else begin
@@ -172,6 +172,30 @@ let request_framing (h : head) =
     | "chunked" :: _ ->
         fail (H1_error.Not_implemented "transfer codings other than chunked")
     | _ -> bad "chunked is not the final transfer coding"
+  end
+
+type response_framing = No_body | Fixed of int | Chunked | Until_close | Tunnel
+
+(* RFC 9112 §6.3, in its order. A response with the two framing fields is
+   an error, as for requests: a proxy that guesses can be the victim of
+   response smuggling. *)
+let response_framing ~meth h =
+  let code = Status.code h.status in
+  if code = 101 || (meth = Method.CONNECT && code >= 200 && code < 300)
+  then Tunnel
+  else if meth = Method.HEAD || code < 200 || code = 204 || code = 304
+  then No_body
+  else begin
+    let length = content_length h.headers in
+    if not (Headers.mem "transfer-encoding" h.headers)
+    then match length with None -> Until_close | Some n -> Fixed n
+    else begin
+      if length <> None then bad "both Transfer-Encoding and Content-Length";
+      if h.version = Version.Http_1_0 then bad "Transfer-Encoding in HTTP/1.0";
+      match List.map String.lowercase_ascii (Headers.tokens "transfer-encoding" h.headers) with
+      | [ "chunked" ] -> Chunked
+      | _ -> fail (H1_error.Not_implemented "transfer codings other than chunked")
+    end
   end
 
 (* Request target, RFC 9112 §3.2 *)

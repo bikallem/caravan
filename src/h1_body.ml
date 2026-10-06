@@ -145,9 +145,20 @@ let chunked_source ?(max_body = max_int) ~(limits : H1_parse.limits) r =
   { read; finished; unread = (fun () -> if finished () then Some 0 else None);
     failed = (fun () -> false); trailers = (fun () -> !trailers); length = None }
 
+(* A reset is not a correct end of a body that ends at the close. Only
+   [to_body] uses this source, and it reads only [read], [length] and
+   [trailers]. *)
+let until_close_source r =
+  let read buf off len =
+    try Buf_reader.read_into r buf off len with Flow.Closed -> raise Body.Truncated
+  in
+  { read; finished = (fun () -> false); unread = (fun () -> None); failed = (fun () -> false);
+    trailers = (fun () -> Headers.empty); length = None }
+
 let to_body src = Body.of_source ?length:src.length ~trailers:src.trailers src.read
 let fixed r n = to_body (fail_for_good (fixed_source r n))
 let chunked ?max_body ~limits r = to_body (fail_for_good (chunked_source ?max_body ~limits r))
+let until_close r = to_body (fail_for_good (until_close_source r))
 
 (* The request body handle *)
 

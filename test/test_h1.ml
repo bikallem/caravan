@@ -529,6 +529,92 @@ let parse_response_props =
            equal string reason h.reason;
            equal (list (pair string string)) fields (Headers.to_list h.headers)) ]
 
+(* H1_parse.response_framing and H1_body.until_close, for a client *)
+
+let show_response_framing (label, meth, s) =
+  Printf.sprintf "%s => %s" label
+    (match H1_parse.response_framing ~meth (parse_response s) with
+     | H1_parse.No_body -> "no body"
+     | Fixed n -> Printf.sprintf "fixed %d" n
+     | Chunked -> "chunked"
+     | Until_close -> "until close"
+     | Tunnel -> "tunnel"
+     | exception H1_error.E e -> Format.asprintf "%a" H1_error.pp e)
+
+let resp ?(v = "HTTP/1.1") code fields =
+  Printf.sprintf "%s %d X\r\n%s\r\n" v code
+    (String.concat "" (List.map (fun (n, v) -> n ^ ": " ^ v ^ "\r\n") fields))
+
+let response_framing_parse_tests =
+  let te v = ("Transfer-Encoding", v) and cl v = ("Content-Length", v) in
+  group "H1_parse.response_framing"
+    [ test "framing table" (fun () ->
+          expect
+            (String.concat "\n"
+               (List.map show_response_framing
+                  Method.
+                    [ ("HEAD, Content-Length: 5", HEAD, resp 200 [ cl "5" ]);
+                      ("HEAD, TE and CL", HEAD, resp 200 [ te "chunked"; cl "5" ]);
+                      ("100", GET, resp 100 []); ("204 with CL", GET, resp 204 [ cl "5" ]);
+                      ("304 with TE", GET, resp 304 [ te "chunked" ]); ("101", GET, resp 101 [ cl "5" ]);
+                      ("200 to CONNECT", CONNECT, resp 200 [ cl "5" ]);
+                      ("300 to CONNECT", CONNECT, resp 300 [ cl "0" ]);
+                      ("404 to CONNECT", CONNECT, resp 404 [ cl "3" ]);
+                      ("TE and CL", GET, resp 200 [ te "chunked"; cl "5" ]);
+                      ("TE in 1.0", GET, resp ~v:"HTTP/1.0" 200 [ te "chunked" ]);
+                      ("chunked", GET, resp 200 [ te "chunked" ]); ("Chunked", GET, resp 200 [ te "Chunked" ]);
+                      ("gzip, chunked", GET, resp 200 [ te "gzip, chunked" ]); ("gzip", GET, resp 200 [ te "gzip" ]);
+                      ("CL 5, 5", GET, resp 200 [ cl "5, 5" ]); ("CL 5 and 6", GET, resp 200 [ cl "5"; cl "6" ]);
+                      ("CL -1", GET, resp 200 [ cl "-1" ]); ("no field", GET, resp 200 []);
+                      ("205 with CL 0", GET, resp 205 [ cl "0" ]) ]))
+          @@ __POS_OF__ {|
+            HEAD, Content-Length: 5 => no body
+            HEAD, TE and CL => no body
+            100 => no body
+            204 with CL => no body
+            304 with TE => no body
+            101 => tunnel
+            200 to CONNECT => tunnel
+            300 to CONNECT => fixed 0
+            404 to CONNECT => fixed 3
+            TE and CL => 400 Bad Request (both Transfer-Encoding and Content-Length)
+            TE in 1.0 => 400 Bad Request (Transfer-Encoding in HTTP/1.0)
+            chunked => chunked
+            Chunked => chunked
+            gzip, chunked => 501 Not Implemented (transfer codings other than chunked)
+            gzip => 501 Not Implemented (transfer codings other than chunked)
+            CL 5, 5 => fixed 5
+            CL 5 and 6 => 400 Bad Request (conflicting Content-Length)
+            CL -1 => 400 Bad Request (invalid Content-Length "-1")
+            no field => until close
+            205 with CL 0 => fixed 0
+            |}) ]
+
+(* A reader whose input gives [s], then raises [Flow.Closed]. *)
+let reset_after s =
+  let pos = ref 0 in
+  Buf_reader.make (fun buf off len ->
+      if !pos = String.length s then raise Flow.Closed
+      else begin
+        let n = Int.min len (String.length s - !pos) in
+        Bytes.blit_string s !pos buf off n;
+        pos := !pos + n;
+        n
+      end)
+
+let until_close_tests =
+  group "H1_body.until_close"
+    [ test "until_close reads to the end of the input" (fun () ->
+          let b = Private.H1_body.until_close (Buf_reader.of_string ~chunk:3 "abcdefg") in
+          equal (option int) None (Body.length b);
+          equal string "abcdefg" (Body.to_string b);
+          equal int 0 (Body.read b (Bytes.create 4) 0 4));
+      test "a reset is not a correct end" (fun () ->
+          let b = Private.H1_body.until_close (reset_after "abc") in
+          let buf = Bytes.create 8 in
+          equal int 3 (Body.read b buf 0 8);
+          raises Body.Truncated (fun () -> Body.read b buf 0 8)) ]
+
 (* H1_parse.request_framing and request_target *)
 
 (* [req ~v fields target] is a head with method [meth]. *)
@@ -1105,7 +1191,7 @@ let handle_tests =
         (fun ((body, chunked), read, (chunk, pieces)) ->
            let input, framing =
              if chunked
-             then (encode_chunked (body :: pieces) "" [], H1_parse.Chunked)
+             then (encode_chunked (body :: pieces) "" [], (H1_parse.Chunked : H1_parse.framing))
              else (body, H1_parse.Fixed (String.length body))
            in
            let r, t = handle ~chunk (input ^ next) framing in
@@ -1622,7 +1708,7 @@ let () =
   exit
     (run "h1"
        [ buf_reader_tests; buf_reader_model; request_head_tests; head_props; parse_response_tests;
-         parse_response_props; framing_tests;
+         parse_response_props; response_framing_parse_tests; until_close_tests; framing_tests;
          target_tests; framing_props; h1_body_tests; chunked_tests;
          chunked_props; handle_tests; buf_writer_tests;
          response_framing_tests; response_head_tests;
