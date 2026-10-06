@@ -562,4 +562,174 @@ let exchange_tests =
           within_2s (fun () -> raises Fun.Async.Cancelled (fun () -> Fun.Async.get f));
           equal (list bool) [ false ] !releases) ]
 
-let () = exit (run "client" [ exchange_tests ])
+(* Resolver and connect *)
+
+let inet a port = Unix.ADDR_INET (Unix.inet_addr_of_string a, port)
+
+let show_addr = function
+| Unix.ADDR_INET (a, p) -> Printf.sprintf "%s:%d" (Unix.string_of_inet_addr a) p
+| Unix.ADDR_UNIX s -> s
+
+(* A getaddrinfo stub that gives [addrs], after [delay] seconds in its
+   thread, and sets [ended] at its end. *)
+let stub ?(delay = 0.) ?(ended = Atomic.make false) addrs _ _ _ =
+  Unix.sleepf delay;
+  Atomic.set ended true;
+  List.map
+    (fun a ->
+       { Unix.ai_family = Unix.PF_INET; ai_socktype = Unix.SOCK_STREAM; ai_protocol = 0; ai_addr = a;
+         ai_canonname = "" })
+    addrs
+
+let open_fds () = Array.length (Sys.readdir "/proc/self/fd")
+
+(* Polls [p] each 10 ms, for at most 2 s. *)
+let eventually p =
+  let rec loop n = if p () then true else if n = 0 then false else (Mtime.wait_for (ms 10); loop (n - 1)) in
+  loop 200
+
+(* [f port] with a port that refuses connections: a socket that is bound
+   but does not listen. The socket keeps the port, thus a different
+   process cannot take it during [f]. *)
+let with_refused_port f =
+  let s = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Stdlib.Fun.protect ~finally:(fun () -> Unix.close s) @@ fun () ->
+  Unix.bind s Server_support.loopback;
+  match Unix.getsockname s with Unix.ADDR_INET (_, p) -> f p | _ -> fail "no port"
+
+let main f = Affect_unix.Unix.main ~domain_count:Server_support.domain_count f
+
+(* [f port] with a listener on [port] that accepts one connection. The
+   accept stops at the end, also when [f] raises. *)
+let with_listener f =
+  let l = Tcp.Listener.listen Server_support.loopback in
+  let port = match Tcp.Listener.addr l with Unix.ADDR_INET (_, p) -> p | _ -> 0 in
+  let accepted = Fun.Async.call (fun () -> let fd, _ = Tcp.Listener.accept l in Unix.close fd) in
+  Stdlib.Fun.protect
+    ~finally:(fun () -> Fun.Async.cancel accepted; Tcp.Listener.close l)
+    (fun () -> f port)
+
+let resolver_tests =
+  group "Resolver and connect"
+    [ test "a numeric host does not start a thread" (fun () ->
+          main @@ fun () ->
+          let before = Atomic.get Resolver.threads_started in
+          equal (list string) [ "127.0.0.1:80" ]
+            (List.map show_addr (Resolver.resolve ~host:"127.0.0.1" ~port:80 ()));
+          equal (list string) [ "::1:443" ] (List.map show_addr (Resolver.resolve ~host:"[::1]" ~port:443 ()));
+          equal int before (Atomic.get Resolver.threads_started));
+      test "a host name uses a thread" (fun () ->
+          main @@ fun () ->
+          let before = Atomic.get Resolver.threads_started in
+          equal (list string) [ "127.0.0.1:8080" ]
+            (List.map show_addr
+               (Resolver.resolve ~getaddrinfo:(stub [ inet "127.0.0.1" 8080 ]) ~host:"a.example" ~port:8080 ()));
+          equal int (before + 1) (Atomic.get Resolver.threads_started));
+      test "a broken IPv6 host is not numeric" (fun () ->
+          main @@ fun () ->
+          let before = Atomic.get Resolver.threads_started in
+          equal (list string) [ "127.0.0.1:80" ]
+            (List.map show_addr
+               (Resolver.resolve ~getaddrinfo:(stub [ inet "127.0.0.1" 80 ]) ~host:"[::1" ~port:80 ()));
+          equal int (before + 1) (Atomic.get Resolver.threads_started));
+      test "the read end of the pipe stays open until the thread ends" (fun () ->
+          main @@ fun () ->
+          let before = open_fds () and go = Atomic.make false and ended = Atomic.make false in
+          let held _ _ _ =
+            while not (Atomic.get go) do Unix.sleepf 0.005 done;
+            Atomic.set ended true;
+            []
+          in
+          let c = Fun.Async.call (fun () -> Resolver.resolve ~getaddrinfo:held ~host:"a.example" ~port:80 ()) in
+          is_true ~msg:"the pipe is open" (eventually (fun () -> open_fds () = before + 2));
+          Fun.Async.cancel c;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get c);
+          (* The thread still owns the read end: it writes to it later. *)
+          equal int (before + 2) (open_fds ());
+          Atomic.set go true;
+          is_true ~msg:"the thread ended" (eventually (fun () -> Atomic.get ended));
+          is_true ~msg:"no fd leaked" (eventually (fun () -> open_fds () = before)));
+      test "no address gives Error (Connect _)" (fun () ->
+          main @@ fun () ->
+          equal string "Caravan_client.Error: cannot connect: no address for a.example"
+            (error_text (fun () -> Resolver.resolve ~getaddrinfo:(stub []) ~host:"a.example" ~port:80 ())));
+      test "a cancel during the lookup leaks no file descriptor" (fun () ->
+          main @@ fun () ->
+          let before = open_fds () and ended = Atomic.make false in
+          let c =
+            Fun.Async.call (fun () ->
+                Resolver.resolve ~getaddrinfo:(stub ~delay:0.3 ~ended [ inet "127.0.0.1" 80 ]) ~host:"a.example"
+                  ~port:80 ())
+          in
+          Mtime.wait_for (ms 50);
+          Fun.Async.cancel c;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get c);
+          is_true ~msg:"the thread ended" (eventually (fun () -> Atomic.get ended));
+          is_true ~msg:"no fd leaked" (eventually (fun () -> open_fds () = before)));
+      test "other fibers run during a lookup" (fun () ->
+          (* One domain: a lookup in the fiber stops the ticker. *)
+          Affect_unix.Unix.main ~domain_count:1 @@ fun () ->
+          let ticks = Atomic.make 0 and stop = Atomic.make false in
+          let ticker =
+            Fun.Async.call (fun () ->
+                while not (Atomic.get stop) do
+                  Mtime.wait_for (ms 10);
+                  Atomic.incr ticks
+                done)
+          in
+          ignore (Resolver.resolve ~getaddrinfo:(stub ~delay:0.3 [ inet "127.0.0.1" 80 ]) ~host:"a.example" ~port:80 ());
+          let n = Atomic.get ticks in
+          Atomic.set stop true;
+          Fun.Async.get ticker;
+          is_true ~msg:(Printf.sprintf "%d ticks" n) (n >= 10));
+      test "connect tries the next address" (fun () ->
+          main @@ fun () ->
+          with_listener @@ fun port ->
+          with_refused_port @@ fun closed ->
+          Flow.close
+            (Connect.connect
+               ~getaddrinfo:(stub [ inet "127.0.0.1" closed; inet "127.0.0.1" port ])
+               Client_config.default ~host:"a.example" ~port));
+      test "all addresses refused gives Error (Connect _)" (fun () ->
+          main @@ fun () ->
+          with_refused_port @@ fun p1 ->
+          with_refused_port @@ fun p2 ->
+          equal string "Caravan_client.Error: cannot connect: Connection refused"
+            (error_text (fun () ->
+                 Connect.connect
+                   ~getaddrinfo:(stub [ inet "127.0.0.1" p1; inet "127.0.0.1" p2 ])
+                   Client_config.default ~host:"a.example" ~port:80)));
+      test "the connect deadline covers the lookup" (fun () ->
+          main @@ fun () ->
+          let ended = Atomic.make false in
+          let config = { Client_config.default with connect_timeout = ms 100 } in
+          let c = Mtime.counter () in
+          equal string "Caravan_client.Error: connect timeout"
+            (within_2s (fun () ->
+                 error_text (fun () ->
+                     Connect.connect
+                       ~getaddrinfo:(stub ~delay:0.5 ~ended [ inet "127.0.0.1" 80 ])
+                       config ~host:"a.example" ~port:80)));
+          (* The stub takes 500 ms: the lookup stops at the deadline. *)
+          let took = elapsed_ms c in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 400.);
+          is_true ~msg:"the thread ended" (eventually (fun () -> Atomic.get ended)));
+      test "a cancel during the connect stops it" (fun () ->
+          main @@ fun () ->
+          let before = open_fds () and ended = Atomic.make false in
+          let c =
+            Fun.Async.call (fun () ->
+                Connect.connect
+                  ~getaddrinfo:(stub ~delay:0.3 ~ended [ inet "127.0.0.1" 80 ])
+                  Client_config.default ~host:"a.example" ~port:80)
+          in
+          Mtime.wait_for (ms 50);
+          Fun.Async.cancel c;
+          within_2s (fun () -> raises Fun.Async.Cancelled (fun () -> Fun.Async.get c));
+          is_true ~msg:"the thread ended" (eventually (fun () -> Atomic.get ended));
+          is_true ~msg:"no fd leaked" (eventually (fun () -> open_fds () = before)));
+      test "localhost reaches a server on 127.0.0.1" (fun () ->
+          main @@ fun () ->
+          with_listener @@ fun port -> Flow.close (Connect.connect Client_config.default ~host:"localhost" ~port)) ]
+
+let () = exit (run "client" [ exchange_tests; resolver_tests ])

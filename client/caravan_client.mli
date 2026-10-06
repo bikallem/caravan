@@ -43,4 +43,6 @@ module Private : sig
   module Conn = Conn
   module Writers = Writers
   module Exchange = Exchange
+  module Resolver = Resolver
+  module Connect = Connect
 end
