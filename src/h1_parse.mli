@@ -37,6 +37,34 @@ val field_lines : max_bytes:int -> max_count:int -> Buf_reader.t -> Headers.t
     past the limits.
     @raise Buf_reader.Eof if the input ends first. *)
 
+(** {1:response Response heads} *)
+
+type response_head = {
+  version : Version.t;
+  status : Status.t;
+  reason : string;
+  headers : Headers.t;
+}
+(** The type for response heads: the status line and the header fields. *)
+
+val response_head : limits -> Buf_reader.t -> response_head
+(** [response_head limits r] parses a status line and a header section from
+    [r] (RFC 9112 §4), for a client:
+    - The version is [HTTP/1.0] or [HTTP/1.1]. A later [HTTP/1.x] is
+      HTTP/1.1.
+    - The status code has 3 digits, from 100 to 599.
+    - The reason phrase can be empty. A line that ends after the code is
+      also correct.
+    - The status line counts against [limits.max_request_line], and the
+      fields against the header limits.
+    - An empty line before the status line, and obs-fold in a field, are
+      errors. RFC 9112 §5.2 tells a user agent to replace obs-fold, but
+      this parser is strict.
+
+    @raise H1_error.E with {!H1_error.Bad_request} if the head is not
+    correct, or {!H1_error.Header_fields_too_large} past the limits.
+    @raise Buf_reader.Eof if the input ends first. *)
+
 (** {1:framing Message framing} *)
 
 type framing =

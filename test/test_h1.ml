@@ -417,6 +417,118 @@ let head_props =
             (List.map (fun (n, (v, _)) -> (n, v)) fields)
             (Headers.to_list h.headers)) ]
 
+(* H1_parse.response_head, for a client *)
+
+let parse_response ?(limits = default_limits) ?size ?chunk s =
+  H1_parse.response_head limits (Buf_reader.of_string ?size ?chunk s)
+
+let show_response ?limits s =
+  match parse_response ?limits s with
+  | h ->
+      Format.asprintf "%a %d %S%t" Version.pp h.version (Status.code h.status) h.reason (fun ppf ->
+          Headers.iter (fun n v -> Format.fprintf ppf "@\n  %s: %S" n v) h.headers)
+  | exception H1_error.E e -> Format.asprintf "%a" H1_error.pp e
+  | exception Buf_reader.Eof -> "end of input"
+
+let parse_response_tests =
+  group "H1_parse.response_head"
+    [ test "status lines" (fun () ->
+          expect
+            (String.concat "\n"
+               (List.map
+                  (fun s -> Printf.sprintf "%S\n=> %s" s (show_response s))
+                  [ "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"; "HTTP/1.0 404 Not Found\r\n\r\n";
+                    "HTTP/1.1 204\r\n\r\n"; "HTTP/1.1 204 \r\n\r\n"; "HTTP/1.2 200 OK\r\n\r\n";
+                    "HTTP/1.1 599 \tx\x80\r\n\r\n"; "HTTP/1.1 100 Continue\r\n\r\n";
+                    "HTTP/2 200 OK\r\n\r\n"; "HTTP/2.0 200 OK\r\n\r\n"; "HTTP/1.1 99 X\r\n\r\n";
+                    "HTTP/1.1 600 X\r\n\r\n"; "HTTP/1.1 2000 X\r\n\r\n"; "HTTP/1.1 20a X\r\n\r\n";
+                    "HTTP/1.1  200 X\r\n\r\n"; "http/1.1 200 X\r\n\r\n"; "HTTP/1.1 200 a\x01b\r\n\r\n";
+                    "HTTP/1.1 200 OK\n\n"; "\r\nHTTP/1.1 200 OK\r\n\r\n"; "HTTP/1.1 200 OK\r\n folded\r\n\r\n";
+                    "HTTP/1.1 200 OK\r\n" ]))
+          @@ __POS_OF__ {|
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"
+            => HTTP/1.1 200 "OK"
+              Content-Length: "5"
+            "HTTP/1.0 404 Not Found\r\n\r\n"
+            => HTTP/1.0 404 "Not Found"
+            "HTTP/1.1 204\r\n\r\n"
+            => HTTP/1.1 204 ""
+            "HTTP/1.1 204 \r\n\r\n"
+            => HTTP/1.1 204 ""
+            "HTTP/1.2 200 OK\r\n\r\n"
+            => HTTP/1.1 200 "OK"
+            "HTTP/1.1 599 \tx\128\r\n\r\n"
+            => HTTP/1.1 599 "\tx\128"
+            "HTTP/1.1 100 Continue\r\n\r\n"
+            => HTTP/1.1 100 "Continue"
+            "HTTP/2 200 OK\r\n\r\n"
+            => 400 Bad Request (malformed status line)
+            "HTTP/2.0 200 OK\r\n\r\n"
+            => 400 Bad Request (unsupported HTTP version "HTTP/2.0")
+            "HTTP/1.1 99 X\r\n\r\n"
+            => 400 Bad Request (invalid status code "99 ")
+            "HTTP/1.1 600 X\r\n\r\n"
+            => 400 Bad Request (status code 600 out of range)
+            "HTTP/1.1 2000 X\r\n\r\n"
+            => 400 Bad Request (malformed status line)
+            "HTTP/1.1 20a X\r\n\r\n"
+            => 400 Bad Request (invalid status code "20a")
+            "HTTP/1.1  200 X\r\n\r\n"
+            => 400 Bad Request (invalid status code " 20")
+            "http/1.1 200 X\r\n\r\n"
+            => 400 Bad Request (invalid HTTP version "http/1.1")
+            "HTTP/1.1 200 a\001b\r\n\r\n"
+            => 400 Bad Request (invalid reason phrase)
+            "HTTP/1.1 200 OK\n\n"
+            => 400 Bad Request (bare CR or LF)
+            "\r\nHTTP/1.1 200 OK\r\n\r\n"
+            => 400 Bad Request (malformed status line)
+            "HTTP/1.1 200 OK\r\n folded\r\n\r\n"
+            => 400 Bad Request (obsolete line folding)
+            "HTTP/1.1 200 OK\r\n"
+            => end of input
+            |});
+      test "the limits apply to response heads" (fun () ->
+          let line = "HTTP/1.1 200 " ^ String.make (default_limits.max_request_line - 12) 'x' in
+          is_true (String.length line = default_limits.max_request_line + 1);
+          equal string "400 Bad Request (status line too long)" (show_response (line ^ "\r\n\r\n"));
+          let ok = "HTTP/1.1 200 " ^ String.make (default_limits.max_request_line - 13) 'x' in
+          is_true (parse_response (ok ^ "\r\n\r\n") |> fun h -> Status.code h.status = 200);
+          let fields n = String.concat "" (List.init n (fun i -> Printf.sprintf "X-%d: v\r\n" i)) in
+          let limits = { default_limits with max_header_count = 100 } in
+          equal string "431 Request Header Fields Too Large"
+            (show_response ~limits ("HTTP/1.1 200 OK\r\n" ^ fields 101 ^ "\r\n"));
+          is_true (parse_response ~limits ("HTTP/1.1 200 OK\r\n" ^ fields 100 ^ "\r\n") |> fun h ->
+                   Headers.length h.headers = 100));
+      test "the bytes after the head stay in the reader" (fun () ->
+          let r = Buf_reader.of_string "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody" in
+          ignore (H1_parse.response_head default_limits r);
+          equal string "body" (Buf_reader.take_buffered r)) ]
+
+let response_gen =
+  let open Gen in
+  let reason = string_of ~size:(int_range 0 10) (of_list (List.of_seq (String.to_seq "Ok z9\t-"))) in
+  let value =
+    map (fun s -> String.trim s) (string_of ~size:(int_range 0 10) (of_list (List.of_seq (String.to_seq "ab z9,;=\t\""))))
+  in
+  triple (triple (int_range 100 599) reason (of_list Version.[ Http_1_0; Http_1_1 ]))
+    (list ~size:(int_range 0 5) (pair token_gen value))
+    (pair (int_range 1 9) (int_range 1 32))
+
+let parse_response_props =
+  group "H1_parse.response_head properties"
+    [ prop "a response head parses the same however the input is split" response_gen
+        (fun ((code, reason, v), fields, (chunk, size)) ->
+           let s =
+             Printf.sprintf "%s %d %s\r\n%s\r\n" (Version.to_string v) code reason
+               (String.concat "" (List.map (fun (n, v) -> n ^ ": " ^ v ^ "\r\n") fields))
+           in
+           let h = parse_response ~chunk ~size s in
+           is_true (h.version = v);
+           equal int code (Status.code h.status);
+           equal string reason h.reason;
+           equal (list (pair string string)) fields (Headers.to_list h.headers)) ]
+
 (* H1_parse.request_framing and request_target *)
 
 (* [req ~v fields target] is a head with method [meth]. *)
@@ -1509,7 +1621,8 @@ let response_body_tests =
 let () =
   exit
     (run "h1"
-       [ buf_reader_tests; buf_reader_model; request_head_tests; head_props; framing_tests;
+       [ buf_reader_tests; buf_reader_model; request_head_tests; head_props; parse_response_tests;
+         parse_response_props; framing_tests;
          target_tests; framing_props; h1_body_tests; chunked_tests;
          chunked_props; handle_tests; buf_writer_tests;
          response_framing_tests; response_head_tests;
