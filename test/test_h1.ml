@@ -1704,6 +1704,138 @@ let response_body_tests =
            let wire, _ = write_body ~size (Length (String.length all)) (Body.of_writer produce) in
            equal string all wire) ]
 
+(* H1_write.request_head, for a client *)
+
+(* The bytes of [req] on the wire: its head, then its body. *)
+let request_bytes req =
+  let w, calls = recorded () in
+  let framing = H1_write.request_framing req in
+  H1_write.request_head w framing req;
+  H1_write.body w framing (Request.body req);
+  String.concat "" (calls ())
+
+let show_wire s =
+  String.concat "\n" (List.map String.escaped (String.split_on_char '\n' s))
+
+let request_write_tests =
+  let req ?(authority = "a.example") ?(headers = []) ?body meth path =
+    Request.make ~authority ~headers:(Headers.of_list headers) ?body meth path
+  in
+  group "H1_write.request_head"
+    [ test "request heads" (fun () ->
+          expect
+            (String.concat "\n--\n"
+               (List.map
+                  (fun r -> show_wire (request_bytes r))
+                  Method.
+                    [ req GET ""; req GET "/search?q=ocaml"; req ~body:(Body.of_string "abc") POST "/p";
+                      req POST "/empty";
+                      req
+                        ~body:(Body.of_writer (fun w -> Body.Writer.write_string w "ab"; Body.Writer.write_string w "cd"))
+                        PUT "/w";
+                      req OPTIONS "*"; req ~authority:"a.example:443" CONNECT "";
+                      req
+                        ~headers:
+                          [ ("Host", "evil.example"); ("Connection", "close, X-Hop"); ("X-Hop", "1");
+                            ("Transfer-Encoding", "chunked"); ("X-Keep", "1"); ("Content-Length", "9");
+                            ("TE", "trailers"); ("Upgrade", "h2c"); ("Keep-Alive", "5") ]
+                        GET "/h" ]))
+          @@ __POS_OF__ {|
+            GET / HTTP/1.1\r
+            Host: a.example\r
+            \r
+
+            --
+            GET /search?q=ocaml HTTP/1.1\r
+            Host: a.example\r
+            \r
+
+            --
+            POST /p HTTP/1.1\r
+            Host: a.example\r
+            Content-Length: 3\r
+            \r
+            abc
+            --
+            POST /empty HTTP/1.1\r
+            Host: a.example\r
+            Content-Length: 0\r
+            \r
+
+            --
+            PUT /w HTTP/1.1\r
+            Host: a.example\r
+            Transfer-Encoding: chunked\r
+            \r
+            2\r
+            ab\r
+            2\r
+            cd\r
+            0\r
+            \r
+
+            --
+            OPTIONS * HTTP/1.1\r
+            Host: a.example\r
+            \r
+
+            --
+            CONNECT a.example:443 HTTP/1.1\r
+            Host: a.example:443\r
+            \r
+
+            --
+            GET /h HTTP/1.1\r
+            Host: a.example\r
+            X-Keep: 1\r
+            Connection: close\r
+            \r
+            |});
+      test "bad requests raise Invalid_argument" (fun () ->
+          List.iter
+            (fun r -> raises_match is_invalid_arg (fun () -> request_bytes r))
+            [ Request.make Method.GET "/"; req Method.GET "foo"; req Method.GET "/a#b";
+              req Method.OPTIONS "foo" ]) ]
+
+let request_round_trip =
+  let open Gen in
+  let meth = of_list Method.[ GET; POST; PUT; DELETE; PATCH ] in
+  let path =
+    map (fun s -> "/" ^ s) (string_of ~size:(int_range 0 12) (of_list (List.of_seq (String.to_seq "abz09/?=&%-._~"))))
+  in
+  let value =
+    map (fun s -> String.trim s) (string_of ~size:(int_range 0 10) (of_list (List.of_seq (String.to_seq "ab z9,;=\t\""))))
+  in
+  let body = pair bool (list ~size:(int_range 0 4) (string_of ~size:(int_range 0 20) char)) in
+  triple (pair meth path) (list ~size:(int_range 0 5) (pair token_gen value)) body
+
+let request_write_props =
+  group "H1_write.request_head properties"
+    [ prop "the server parser reads what the client writes" request_round_trip
+        (fun ((meth, path), fields, (known, pieces)) ->
+           let all = String.concat "" pieces in
+           let body =
+             if known then Body.of_string all
+             else Body.of_writer (fun w -> List.iter (Body.Writer.write_string w) pieces)
+           in
+           let req =
+             Request.make ~authority:"a.example:8080" ~headers:(Headers.of_list fields) ~body meth path
+           in
+           let r = Buf_reader.of_string (request_bytes req) in
+           let h = H1_parse.request_head limits r in
+           let t = H1_parse.request_target ~scheme:"http" h in
+           let b = H1_body.body (H1_body.make ~limits r (H1_parse.request_framing h)) in
+           equal string (Method.to_string meth) (Method.to_string h.meth);
+           equal string path t.path;
+           equal (option string) (Some "a.example:8080") t.authority;
+           let framing_field (n, _) =
+             List.mem (String.lowercase_ascii n) [ "host"; "content-length"; "transfer-encoding" ]
+           in
+           equal (list (pair string string)) fields
+             (List.filter (fun f -> not (framing_field f)) (Headers.to_list h.headers));
+           equal string all (Body.to_string b);
+           is_true (Buf_reader.peek_eof r)) ]
+
 let () =
   exit
     (run "h1"
@@ -1712,4 +1844,4 @@ let () =
          target_tests; framing_props; h1_body_tests; chunked_tests;
          chunked_props; handle_tests; buf_writer_tests;
          response_framing_tests; response_head_tests;
-         response_body_tests ])
+         response_body_tests; request_write_tests; request_write_props ])
