@@ -1816,6 +1816,53 @@ let api_tests =
                         | exception e -> Printexc.to_string e);
                      Cell.Once.try_set go ())));
           equal string "Invalid_argument, 1 accepted" (Cell.Once.get late));
+      test "a stale connection is not retried during the grace of run" (fun () ->
+          let returned = Cell.Once.make () and second_head = Cell.Once.make () in
+          (* Connection 1 keeps the grace open: its request body goes
+             after the response. *)
+          let first flow r =
+            ignore (read_head r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            ignore (Buf_reader.peek_eof r)
+          (* Connection 2 answers one GET, then closes during the grace
+             without a response to the second GET. *)
+          and second flow r =
+            ignore (read_request r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb";
+            ignore (read_head r);
+            Cell.Once.try_set second_head ();
+            Cell.Once.get returned;
+            (* [run] sets the stop after f returns, without a wait. *)
+            Mtime.wait_for (ms 50)
+          (* Only a retry connects a third time. *)
+          and third flow r =
+            ignore (read_request r);
+            Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nc"
+          in
+          let late = Cell.Once.make () in
+          with_scripts [ first; second; third ] (fun client port accepted ->
+              let go = Cell.Once.make () in
+              let waiting =
+                Body.of_writer (fun w ->
+                    Body.Writer.write_string w "abc";
+                    Body.Writer.flush w;
+                    Cell.Once.get go)
+              in
+              equal int 200 (status (C.request client (at_port port ~meth:Method.POST ~body:waiting "/")));
+              (* Connection 1 is in use: this GET makes connection 2. *)
+              equal string "b" (text (C.request client (at_port port "/")));
+              ignore
+                (Fun.Async.call (fun () ->
+                     let result = error_text (fun () -> text (C.request client (at_port port "/"))) in
+                     (* A connect, if any, has time to arrive. *)
+                     Mtime.wait_for (ms 100);
+                     Cell.Once.try_set late (Printf.sprintf "%s, %d accepted" result (Atomic.get accepted));
+                     Cell.Once.try_set go ()));
+              (* The GET goes on connection 2 before f returns. *)
+              within_2s (fun () -> Cell.Once.get second_head);
+              Cell.Once.try_set returned ());
+          equal string "Caravan_client.Error: the connection closed before the response, 2 accepted"
+            (Cell.Once.get late));
       test "a cancel during the grace of run raises Cancelled" (fun () ->
           let script flow r =
             ignore (read_head r);
