@@ -1,8 +1,20 @@
 open Affect
 module Mtime = Affect_unix.Mtime
 
+module type LISTENER = sig
+  type t
+
+  val addr : t -> Unix.sockaddr
+
+  val wait_acceptable : t -> 'tag -> 'tag Action.t
+
+  val try_accept : t -> (Unix.file_descr * Unix.sockaddr) option
+
+  val close : t -> unit
+end
+
 type t =
-  { listener: Tcp.Listener.t
+  { addr: Unix.sockaddr
   ; acceptor: unit Fun.Async.t
   ; supervisor: unit Fun.Async.t
   ; grace: unit Fun.Async.t
@@ -15,8 +27,8 @@ let report (config : Config.t) e =
    Errors that do not concern the listener are ridden out: a connection that
    failed while queued, or running out of file descriptors, which is reported
    and waited out. *)
-let accept config listener =
-  match Tcp.Listener.try_accept listener with
+let accept config (module L : LISTENER) listener =
+  match L.try_accept listener with
   | conn ->
       conn
   | exception (Unix.Unix_error (err, _, _) as e) -> (
@@ -53,7 +65,7 @@ let serve_connection (config : Config.t) engine handler ~stopping ~id flow
 (* Takes a free connection slot, accepts a connection and hands it to the
    supervisor, until [stopping] is set. Then closes the listener, so that new
    clients are refused. *)
-let acceptor config listener ~stopping ~slots handoff =
+let acceptor config (module L : LISTENER) listener ~stopping ~slots handoff =
   let wait action =
     Action.invoke
       (Action.choose
@@ -66,11 +78,11 @@ let acceptor config listener ~stopping ~slots handoff =
     | `Slot ->
         with_slot ()
   and with_slot () =
-    match wait (Tcp.Listener.wait_acceptable listener `Ready) with
+    match wait (L.wait_acceptable listener `Ready) with
     | `Stop ->
         Semaphore.release slots
     | `Ready -> (
-      match accept config listener with
+      match accept config (module L) listener with
       | exception e ->
           Semaphore.release slots ; raise e
       | None ->
@@ -84,7 +96,7 @@ let acceptor config listener ~stopping ~slots handoff =
             Affect_unix.Unix.close_noerr (fst conn) ;
             Semaphore.release slots ) )
   in
-  Fun.Async.protect ~finally:(fun () -> Tcp.Listener.close listener) loop
+  Fun.Async.protect ~finally:(fun () -> L.close listener) loop
 
 (* Owns the connections: each one is an asynchronous call of the supervisor,
    which therefore returns only once they have all finished. *)
@@ -106,10 +118,18 @@ let supervisor config engine handler ~stopping ~slots handoff =
   in
   loop 0
 
-let start ?(config = Config.default) ?(engine = H1_server.serve) handler =
-  let listener = Tcp.Listener.listen ~backlog:config.backlog config.addr in
-  let stopping = Cell.Once.make ()
-  and slots = Semaphore.make config.max_connections in
+let start_with ?(config = Config.default) ?(engine = H1_server.serve)
+    (module L : LISTENER) listener handler =
+  let addr, slots =
+    match (L.addr listener, Semaphore.make config.max_connections) with
+    | setup ->
+        setup
+    | exception e ->
+        let bt = Printexc.get_raw_backtrace () in
+        L.close listener ;
+        Printexc.raise_with_backtrace e bt
+  in
+  let stopping = Cell.Once.make () in
   let handoff = Port.make () in
   let supervisor =
     Fun.Async.call (fun () ->
@@ -120,7 +140,8 @@ let start ?(config = Config.default) ?(engine = H1_server.serve) handler =
         (* If accepting fails, the connections still finish. *)
         Fun.Async.protect
           ~finally:(fun () -> Cell.Once.try_set stopping ())
-          (fun () -> acceptor config listener ~stopping ~slots handoff) )
+          (fun () ->
+            acceptor config (module L) listener ~stopping ~slots handoff ) )
   in
   (* Once stopping, the connections get [shutdown_grace] to finish. *)
   let grace =
@@ -140,9 +161,13 @@ let start ?(config = Config.default) ?(engine = H1_server.serve) handler =
           when not (Fun.Async.is_current_cancelled ()) ->
             () )
   in
-  {listener; acceptor; supervisor; grace; stopping}
+  {addr; acceptor; supervisor; grace; stopping}
 
-let local_addr s = Tcp.Listener.addr s.listener
+let start ?(config = Config.default) ?engine handler =
+  let listener = Tcp.Listener.listen ~backlog:config.backlog config.addr in
+  start_with ~config ?engine (module Tcp.Listener) listener handler
+
+let local_addr s = s.addr
 
 let shutdown s = Cell.Once.try_set s.stopping ()
 
