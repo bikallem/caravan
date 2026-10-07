@@ -37,6 +37,34 @@ val field_lines : max_bytes:int -> max_count:int -> Buf_reader.t -> Headers.t
     past the limits.
     @raise Buf_reader.Eof if the input ends first. *)
 
+(** {1:response Response heads} *)
+
+type response_head = {
+  version : Version.t;
+  status : Status.t;
+  reason : string;
+  headers : Headers.t;
+}
+(** The type for response heads: the status line and the header fields. *)
+
+val response_head : limits -> Buf_reader.t -> response_head
+(** [response_head limits r] parses a status line and a header section from
+    [r] (RFC 9112 §4), for a client:
+    - The version is [HTTP/1.0] or [HTTP/1.1]. A later [HTTP/1.x] is
+      HTTP/1.1.
+    - The status code has 3 digits, from 100 to 599.
+    - The reason phrase can be empty. A line that ends after the code is
+      also correct.
+    - The status line counts against [limits.max_request_line], and the
+      fields against the header limits.
+    - An empty line before the status line, and obs-fold in a field, are
+      errors. RFC 9112 §5.2 tells a user agent to replace obs-fold, but
+      this parser is strict.
+
+    @raise H1_error.E with {!H1_error.Bad_request} if the head is not
+    correct, or {!H1_error.Header_fields_too_large} past the limits.
+    @raise Buf_reader.Eof if the input ends first. *)
+
 (** {1:framing Message framing} *)
 
 type framing =
@@ -56,6 +84,31 @@ val request_framing : head -> framing
 
     @raise H1_error.E with {!H1_error.Bad_request}, or
     {!H1_error.Not_implemented} for a transfer coding other than [chunked]. *)
+
+type response_framing =
+| No_body (** No body: a response to [HEAD], 1xx, 204 or 304. *)
+| Fixed of int (** A body of exactly this many bytes. *)
+| Chunked (** A chunked body. *)
+| Until_close (** A body that ends when the connection closes. *)
+| Tunnel (** A 101, or a 2xx to [CONNECT]: the connection is no longer HTTP. *)
+(** The type for how a response body is delimited. *)
+
+val response_framing : meth:Method.t -> response_head -> response_framing
+(** [response_framing ~meth h] is how the body of the response [h] to a
+    request with method [meth] is delimited (RFC 9112 §6.3). The rules, in
+    order:
+    + A 101, or a 2xx to [CONNECT]: {!Tunnel}.
+    + A response to [HEAD], other 1xx, 204 and 304: {!No_body}, whatever
+      their fields.
+    + [Transfer-Encoding] and [Content-Length] together, or
+      [Transfer-Encoding] in HTTP/1.0: an error.
+    + [Transfer-Encoding: chunked]: {!Chunked}. A different coding:
+      {!H1_error.Not_implemented}.
+    + [Content-Length]: {!Fixed}, if all its values are the same number.
+    + No framing field: {!Until_close}.
+
+    @raise H1_error.E with {!H1_error.Bad_request} or
+    {!H1_error.Not_implemented}. *)
 
 (** {1:target Request target} *)
 

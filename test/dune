@@ -6,7 +6,8 @@
   test_net
   test_server
   test_server_stateful
-  test_websocket)
+  test_websocket
+  test_client)
  (modules
   test_core
   test_h1
@@ -15,8 +16,9 @@
   test_server
   test_server_stateful
   test_websocket
+  test_client
   server_support)
- (libraries caravan caravan.websocket affect affect.unix windtrap http-date unix)
+ (libraries caravan caravan.websocket caravan.client affect affect.unix windtrap http-date unix)
  (deps serve_until_signal.exe))
 
 (executable

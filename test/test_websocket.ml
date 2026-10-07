@@ -815,16 +815,7 @@ let close_tests =
 
 (* Runs [f] with the flows of the server and of the peer of a TCP
    connection. *)
-let with_flows f =
-  let open Affect in
-  Affect_unix.Unix.main ~domain_count:Server_support.domain_count @@ fun () ->
-  let l = Caravan.Tcp.Listener.listen Server_support.loopback in
-  Stdlib.Fun.protect ~finally:(fun () -> Caravan.Tcp.Listener.close l) @@ fun () ->
-  let peer = Fun.Async.call (fun () -> Caravan.Tcp.connect (Caravan.Tcp.Listener.addr l)) in
-  let fd, _ = Caravan.Tcp.Listener.accept l in
-  let server = Caravan.Tcp.flow fd and peer = Fun.Async.get peer in
-  Stdlib.Fun.protect ~finally:(fun () -> Caravan.Flow.close peer; Caravan.Flow.close server)
-  @@ fun () -> f server peer
+let with_flows = Server_support.with_flows
 
 (* Runs [f] with a server connection and the flow of its peer, on a TCP
    connection. *)
@@ -837,13 +828,7 @@ let elapsed_ms c = Affect_unix.Mtime.Span.to_float_ns (Affect_unix.Mtime.count c
 
 (* [f ()], in a call that must end in 2 s. If not, the test cancels the
    call and fails, so that a regression does not stop the suite. *)
-let within_2s f =
-  let open Affect in
-  let call = Fun.Async.call f in
-  let ended = Action.map (fun v -> `Ended v) (Fun.Async.get' call) in
-  match Action.invoke (Action.choose [ ended; Affect_unix.Mtime.wait_for' (ms 2000) `Late ]) with
-  | `Ended v -> v
-  | `Late -> Fun.Async.cancel call; fail "no end after 2 s"
+let within_2s f = Server_support.within_2s f
 
 (* The code of the [Closed] exception that [f] raises. *)
 let closed_code f =

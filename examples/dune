@@ -1,3 +1,3 @@
 (executables
- (names hello ws_echo)
- (libraries caravan caravan.websocket affect affect.unix))
+ (names hello ws_echo fetch)
+ (libraries caravan caravan.websocket caravan.client affect affect.unix))

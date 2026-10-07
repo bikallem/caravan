@@ -417,6 +417,204 @@ let head_props =
             (List.map (fun (n, (v, _)) -> (n, v)) fields)
             (Headers.to_list h.headers)) ]
 
+(* H1_parse.response_head, for a client *)
+
+let parse_response ?(limits = default_limits) ?size ?chunk s =
+  H1_parse.response_head limits (Buf_reader.of_string ?size ?chunk s)
+
+let show_response ?limits s =
+  match parse_response ?limits s with
+  | h ->
+      Format.asprintf "%a %d %S%t" Version.pp h.version (Status.code h.status) h.reason (fun ppf ->
+          Headers.iter (fun n v -> Format.fprintf ppf "@\n  %s: %S" n v) h.headers)
+  | exception H1_error.E e -> Format.asprintf "%a" H1_error.pp e
+  | exception Buf_reader.Eof -> "end of input"
+
+let parse_response_tests =
+  group "H1_parse.response_head"
+    [ test "status lines" (fun () ->
+          expect
+            (String.concat "\n"
+               (List.map
+                  (fun s -> Printf.sprintf "%S\n=> %s" s (show_response s))
+                  [ "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"; "HTTP/1.0 404 Not Found\r\n\r\n";
+                    "HTTP/1.1 204\r\n\r\n"; "HTTP/1.1 204 \r\n\r\n"; "HTTP/1.2 200 OK\r\n\r\n";
+                    "HTTP/1.1 599 \tx\x80\r\n\r\n"; "HTTP/1.1 100 Continue\r\n\r\n";
+                    "HTTP/2 200 OK\r\n\r\n"; "HTTP/2.0 200 OK\r\n\r\n"; "HTTP/1.1 99 X\r\n\r\n";
+                    "HTTP/1.1 600 X\r\n\r\n"; "HTTP/1.1 2000 X\r\n\r\n"; "HTTP/1.1 20a X\r\n\r\n";
+                    "HTTP/1.1  200 X\r\n\r\n"; "http/1.1 200 X\r\n\r\n"; "HTTP/1.1 200 a\x01b\r\n\r\n";
+                    "HTTP/1.1 200 OK\n\n"; "\r\nHTTP/1.1 200 OK\r\n\r\n"; "HTTP/1.1 200 OK\r\n folded\r\n\r\n";
+                    "HTTP/1.1 200 OK\r\n" ]))
+          @@ __POS_OF__ {|
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"
+            => HTTP/1.1 200 "OK"
+              Content-Length: "5"
+            "HTTP/1.0 404 Not Found\r\n\r\n"
+            => HTTP/1.0 404 "Not Found"
+            "HTTP/1.1 204\r\n\r\n"
+            => HTTP/1.1 204 ""
+            "HTTP/1.1 204 \r\n\r\n"
+            => HTTP/1.1 204 ""
+            "HTTP/1.2 200 OK\r\n\r\n"
+            => HTTP/1.1 200 "OK"
+            "HTTP/1.1 599 \tx\128\r\n\r\n"
+            => HTTP/1.1 599 "\tx\128"
+            "HTTP/1.1 100 Continue\r\n\r\n"
+            => HTTP/1.1 100 "Continue"
+            "HTTP/2 200 OK\r\n\r\n"
+            => 400 Bad Request (malformed status line)
+            "HTTP/2.0 200 OK\r\n\r\n"
+            => 400 Bad Request (unsupported HTTP version "HTTP/2.0")
+            "HTTP/1.1 99 X\r\n\r\n"
+            => 400 Bad Request (invalid status code "99 ")
+            "HTTP/1.1 600 X\r\n\r\n"
+            => 400 Bad Request (status code 600 out of range)
+            "HTTP/1.1 2000 X\r\n\r\n"
+            => 400 Bad Request (malformed status line)
+            "HTTP/1.1 20a X\r\n\r\n"
+            => 400 Bad Request (invalid status code "20a")
+            "HTTP/1.1  200 X\r\n\r\n"
+            => 400 Bad Request (invalid status code " 20")
+            "http/1.1 200 X\r\n\r\n"
+            => 400 Bad Request (invalid HTTP version "http/1.1")
+            "HTTP/1.1 200 a\001b\r\n\r\n"
+            => 400 Bad Request (invalid reason phrase)
+            "HTTP/1.1 200 OK\n\n"
+            => 400 Bad Request (bare CR or LF)
+            "\r\nHTTP/1.1 200 OK\r\n\r\n"
+            => 400 Bad Request (malformed status line)
+            "HTTP/1.1 200 OK\r\n folded\r\n\r\n"
+            => 400 Bad Request (obsolete line folding)
+            "HTTP/1.1 200 OK\r\n"
+            => end of input
+            |});
+      test "the limits apply to response heads" (fun () ->
+          let line = "HTTP/1.1 200 " ^ String.make (default_limits.max_request_line - 12) 'x' in
+          is_true (String.length line = default_limits.max_request_line + 1);
+          equal string "400 Bad Request (status line too long)" (show_response (line ^ "\r\n\r\n"));
+          let ok = "HTTP/1.1 200 " ^ String.make (default_limits.max_request_line - 13) 'x' in
+          is_true (parse_response (ok ^ "\r\n\r\n") |> fun h -> Status.code h.status = 200);
+          let fields n = String.concat "" (List.init n (fun i -> Printf.sprintf "X-%d: v\r\n" i)) in
+          let limits = { default_limits with max_header_count = 100 } in
+          equal string "431 Request Header Fields Too Large"
+            (show_response ~limits ("HTTP/1.1 200 OK\r\n" ^ fields 101 ^ "\r\n"));
+          is_true (parse_response ~limits ("HTTP/1.1 200 OK\r\n" ^ fields 100 ^ "\r\n") |> fun h ->
+                   Headers.length h.headers = 100));
+      test "the bytes after the head stay in the reader" (fun () ->
+          let r = Buf_reader.of_string "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody" in
+          ignore (H1_parse.response_head default_limits r);
+          equal string "body" (Buf_reader.take_buffered r)) ]
+
+let response_gen =
+  let open Gen in
+  let reason = string_of ~size:(int_range 0 10) (of_list (List.of_seq (String.to_seq "Ok z9\t-"))) in
+  let value =
+    map (fun s -> String.trim s) (string_of ~size:(int_range 0 10) (of_list (List.of_seq (String.to_seq "ab z9,;=\t\""))))
+  in
+  triple (triple (int_range 100 599) reason (of_list Version.[ Http_1_0; Http_1_1 ]))
+    (list ~size:(int_range 0 5) (pair token_gen value))
+    (pair (int_range 1 9) (int_range 1 32))
+
+let parse_response_props =
+  group "H1_parse.response_head properties"
+    [ prop "a response head parses the same however the input is split" response_gen
+        (fun ((code, reason, v), fields, (chunk, size)) ->
+           let s =
+             Printf.sprintf "%s %d %s\r\n%s\r\n" (Version.to_string v) code reason
+               (String.concat "" (List.map (fun (n, v) -> n ^ ": " ^ v ^ "\r\n") fields))
+           in
+           let h = parse_response ~chunk ~size s in
+           is_true (h.version = v);
+           equal int code (Status.code h.status);
+           equal string reason h.reason;
+           equal (list (pair string string)) fields (Headers.to_list h.headers)) ]
+
+(* H1_parse.response_framing and H1_body.until_close, for a client *)
+
+let show_response_framing (label, meth, s) =
+  Printf.sprintf "%s => %s" label
+    (match H1_parse.response_framing ~meth (parse_response s) with
+     | H1_parse.No_body -> "no body"
+     | Fixed n -> Printf.sprintf "fixed %d" n
+     | Chunked -> "chunked"
+     | Until_close -> "until close"
+     | Tunnel -> "tunnel"
+     | exception H1_error.E e -> Format.asprintf "%a" H1_error.pp e)
+
+let resp ?(v = "HTTP/1.1") code fields =
+  Printf.sprintf "%s %d X\r\n%s\r\n" v code
+    (String.concat "" (List.map (fun (n, v) -> n ^ ": " ^ v ^ "\r\n") fields))
+
+let response_framing_parse_tests =
+  let te v = ("Transfer-Encoding", v) and cl v = ("Content-Length", v) in
+  group "H1_parse.response_framing"
+    [ test "framing table" (fun () ->
+          expect
+            (String.concat "\n"
+               (List.map show_response_framing
+                  Method.
+                    [ ("HEAD, Content-Length: 5", HEAD, resp 200 [ cl "5" ]);
+                      ("HEAD, TE and CL", HEAD, resp 200 [ te "chunked"; cl "5" ]);
+                      ("100", GET, resp 100 []); ("204 with CL", GET, resp 204 [ cl "5" ]);
+                      ("304 with TE", GET, resp 304 [ te "chunked" ]); ("101", GET, resp 101 [ cl "5" ]);
+                      ("200 to CONNECT", CONNECT, resp 200 [ cl "5" ]);
+                      ("300 to CONNECT", CONNECT, resp 300 [ cl "0" ]);
+                      ("404 to CONNECT", CONNECT, resp 404 [ cl "3" ]);
+                      ("TE and CL", GET, resp 200 [ te "chunked"; cl "5" ]);
+                      ("TE in 1.0", GET, resp ~v:"HTTP/1.0" 200 [ te "chunked" ]);
+                      ("chunked", GET, resp 200 [ te "chunked" ]); ("Chunked", GET, resp 200 [ te "Chunked" ]);
+                      ("gzip, chunked", GET, resp 200 [ te "gzip, chunked" ]); ("gzip", GET, resp 200 [ te "gzip" ]);
+                      ("CL 5, 5", GET, resp 200 [ cl "5, 5" ]); ("CL 5 and 6", GET, resp 200 [ cl "5"; cl "6" ]);
+                      ("CL -1", GET, resp 200 [ cl "-1" ]); ("no field", GET, resp 200 []);
+                      ("205 with CL 0", GET, resp 205 [ cl "0" ]) ]))
+          @@ __POS_OF__ {|
+            HEAD, Content-Length: 5 => no body
+            HEAD, TE and CL => no body
+            100 => no body
+            204 with CL => no body
+            304 with TE => no body
+            101 => tunnel
+            200 to CONNECT => tunnel
+            300 to CONNECT => fixed 0
+            404 to CONNECT => fixed 3
+            TE and CL => 400 Bad Request (both Transfer-Encoding and Content-Length)
+            TE in 1.0 => 400 Bad Request (Transfer-Encoding in HTTP/1.0)
+            chunked => chunked
+            Chunked => chunked
+            gzip, chunked => 501 Not Implemented (transfer codings other than chunked)
+            gzip => 501 Not Implemented (transfer codings other than chunked)
+            CL 5, 5 => fixed 5
+            CL 5 and 6 => 400 Bad Request (conflicting Content-Length)
+            CL -1 => 400 Bad Request (invalid Content-Length "-1")
+            no field => until close
+            205 with CL 0 => fixed 0
+            |}) ]
+
+(* A reader whose input gives [s], then raises [Flow.Closed]. *)
+let reset_after s =
+  let pos = ref 0 in
+  Buf_reader.make (fun buf off len ->
+      if !pos = String.length s then raise Flow.Closed
+      else begin
+        let n = Int.min len (String.length s - !pos) in
+        Bytes.blit_string s !pos buf off n;
+        pos := !pos + n;
+        n
+      end)
+
+let until_close_tests =
+  group "H1_body.until_close"
+    [ test "until_close reads to the end of the input" (fun () ->
+          let b = Private.H1_body.until_close (Buf_reader.of_string ~chunk:3 "abcdefg") in
+          equal (option int) None (Body.length b);
+          equal string "abcdefg" (Body.to_string b);
+          equal int 0 (Body.read b (Bytes.create 4) 0 4));
+      test "a reset is not a correct end" (fun () ->
+          let b = Private.H1_body.until_close (reset_after "abc") in
+          let buf = Bytes.create 8 in
+          equal int 3 (Body.read b buf 0 8);
+          raises Body.Truncated (fun () -> Body.read b buf 0 8)) ]
+
 (* H1_parse.request_framing and request_target *)
 
 (* [req ~v fields target] is a head with method [meth]. *)
@@ -993,7 +1191,7 @@ let handle_tests =
         (fun ((body, chunked), read, (chunk, pieces)) ->
            let input, framing =
              if chunked
-             then (encode_chunked (body :: pieces) "" [], H1_parse.Chunked)
+             then (encode_chunked (body :: pieces) "" [], (H1_parse.Chunked : H1_parse.framing))
              else (body, H1_parse.Fixed (String.length body))
            in
            let r, t = handle ~chunk (input ^ next) framing in
@@ -1506,11 +1704,144 @@ let response_body_tests =
            let wire, _ = write_body ~size (Length (String.length all)) (Body.of_writer produce) in
            equal string all wire) ]
 
+(* H1_write.request_head, for a client *)
+
+(* The bytes of [req] on the wire: its head, then its body. *)
+let request_bytes req =
+  let w, calls = recorded () in
+  let framing = H1_write.request_framing req in
+  H1_write.request_head w framing req;
+  H1_write.body w framing (Request.body req);
+  String.concat "" (calls ())
+
+let show_wire s =
+  String.concat "\n" (List.map String.escaped (String.split_on_char '\n' s))
+
+let request_write_tests =
+  let req ?(authority = "a.example") ?(headers = []) ?body meth path =
+    Request.make ~authority ~headers:(Headers.of_list headers) ?body meth path
+  in
+  group "H1_write.request_head"
+    [ test "request heads" (fun () ->
+          expect
+            (String.concat "\n--\n"
+               (List.map
+                  (fun r -> show_wire (request_bytes r))
+                  Method.
+                    [ req GET ""; req GET "/search?q=ocaml"; req ~body:(Body.of_string "abc") POST "/p";
+                      req POST "/empty";
+                      req
+                        ~body:(Body.of_writer (fun w -> Body.Writer.write_string w "ab"; Body.Writer.write_string w "cd"))
+                        PUT "/w";
+                      req OPTIONS "*"; req ~authority:"a.example:443" CONNECT "";
+                      req
+                        ~headers:
+                          [ ("Host", "evil.example"); ("Connection", "close, X-Hop"); ("X-Hop", "1");
+                            ("Transfer-Encoding", "chunked"); ("X-Keep", "1"); ("Content-Length", "9");
+                            ("TE", "trailers"); ("Upgrade", "h2c"); ("Keep-Alive", "5") ]
+                        GET "/h" ]))
+          @@ __POS_OF__ {|
+            GET / HTTP/1.1\r
+            Host: a.example\r
+            \r
+
+            --
+            GET /search?q=ocaml HTTP/1.1\r
+            Host: a.example\r
+            \r
+
+            --
+            POST /p HTTP/1.1\r
+            Host: a.example\r
+            Content-Length: 3\r
+            \r
+            abc
+            --
+            POST /empty HTTP/1.1\r
+            Host: a.example\r
+            Content-Length: 0\r
+            \r
+
+            --
+            PUT /w HTTP/1.1\r
+            Host: a.example\r
+            Transfer-Encoding: chunked\r
+            \r
+            2\r
+            ab\r
+            2\r
+            cd\r
+            0\r
+            \r
+
+            --
+            OPTIONS * HTTP/1.1\r
+            Host: a.example\r
+            \r
+
+            --
+            CONNECT a.example:443 HTTP/1.1\r
+            Host: a.example:443\r
+            \r
+
+            --
+            GET /h HTTP/1.1\r
+            Host: a.example\r
+            X-Keep: 1\r
+            Connection: close\r
+            \r
+            |});
+      test "bad requests raise Invalid_argument" (fun () ->
+          List.iter
+            (fun r -> raises_match is_invalid_arg (fun () -> request_bytes r))
+            [ Request.make Method.GET "/"; req Method.GET "foo"; req Method.GET "/a#b";
+              req Method.OPTIONS "foo" ]) ]
+
+let request_round_trip =
+  let open Gen in
+  let meth = of_list Method.[ GET; POST; PUT; DELETE; PATCH ] in
+  let path =
+    map (fun s -> "/" ^ s) (string_of ~size:(int_range 0 12) (of_list (List.of_seq (String.to_seq "abz09/?=&%-._~"))))
+  in
+  let value =
+    map (fun s -> String.trim s) (string_of ~size:(int_range 0 10) (of_list (List.of_seq (String.to_seq "ab z9,;=\t\""))))
+  in
+  let body = pair bool (list ~size:(int_range 0 4) (string_of ~size:(int_range 0 20) char)) in
+  triple (pair meth path) (list ~size:(int_range 0 5) (pair token_gen value)) body
+
+let request_write_props =
+  group "H1_write.request_head properties"
+    [ prop "the server parser reads what the client writes" request_round_trip
+        (fun ((meth, path), fields, (known, pieces)) ->
+           let all = String.concat "" pieces in
+           let body =
+             if known then Body.of_string all
+             else Body.of_writer (fun w -> List.iter (Body.Writer.write_string w) pieces)
+           in
+           let req =
+             Request.make ~authority:"a.example:8080" ~headers:(Headers.of_list fields) ~body meth path
+           in
+           let r = Buf_reader.of_string (request_bytes req) in
+           let h = H1_parse.request_head limits r in
+           let t = H1_parse.request_target ~scheme:"http" h in
+           let b = H1_body.body (H1_body.make ~limits r (H1_parse.request_framing h)) in
+           equal string (Method.to_string meth) (Method.to_string h.meth);
+           equal string path t.path;
+           equal (option string) (Some "a.example:8080") t.authority;
+           let framing_field (n, _) =
+             List.mem (String.lowercase_ascii n) [ "host"; "content-length"; "transfer-encoding" ]
+           in
+           equal (list (pair string string)) fields
+             (List.filter (fun f -> not (framing_field f)) (Headers.to_list h.headers));
+           equal string all (Body.to_string b);
+           is_true (Buf_reader.peek_eof r)) ]
+
 let () =
   exit
     (run "h1"
-       [ buf_reader_tests; buf_reader_model; request_head_tests; head_props; framing_tests;
+       [ buf_reader_tests; buf_reader_model; request_head_tests; head_props; parse_response_tests;
+         parse_response_props; response_framing_parse_tests; until_close_tests; framing_tests;
          target_tests; framing_props; h1_body_tests; chunked_tests;
          chunked_props; handle_tests; buf_writer_tests;
          response_framing_tests; response_head_tests;
-         response_body_tests ])
+         response_body_tests; request_write_tests; request_write_props ])

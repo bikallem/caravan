@@ -56,6 +56,61 @@ let head w ?date ~version ~keep_alive framing r =
   then field w "Connection" "keep-alive";
   Buf_writer.write_string w "\r\n"
 
+(* Requests, for a client *)
+
+(* RFC 9110 §8.6: a request of these methods without content has no
+   framing field. Other methods send Content-Length: 0. *)
+let no_content_methods = Method.[ GET; HEAD; DELETE; OPTIONS; TRACE; CONNECT ]
+
+let request_framing req =
+  match Body.length (Request.body req) with
+  | Some 0 when List.exists (Method.equal (Request.meth req)) no_content_methods -> No_body
+  | Some n -> Length n
+  | None -> Chunked
+
+let request_closes req = Headers.has_token "connection" "close" (Request.headers req)
+
+let invalid fmt = Printf.ksprintf (fun s -> invalid_arg ("H1_write.request_head: " ^ s)) fmt
+
+(* RFC 9112 §3.2: origin-form, authority-form for CONNECT, asterisk-form
+   for a server-wide OPTIONS. *)
+let request_target req authority =
+  match (Request.meth req, Request.path req) with
+  | Method.CONNECT, _ -> authority
+  | Method.OPTIONS, "*" -> "*"
+  | _, "" -> "/"
+  | _, p when p.[0] = '/' && not (String.contains p '#') -> p
+  | _, p -> invalid "invalid path %S" p
+
+let authority_and_target req =
+  let authority =
+    match Request.authority req with Some a -> a | None -> invalid "no authority"
+  in
+  (authority, request_target req authority)
+
+let check_request req = ignore (authority_and_target req)
+
+let request_head w framing req =
+  let authority, target = authority_and_target req and headers = Request.headers req in
+  (* The fields that Connection names are for this connection only. *)
+  let named = List.map String.lowercase_ascii (Headers.tokens "connection" headers) in
+  let owned name =
+    let name = String.lowercase_ascii name in
+    name = "host" || List.mem name connection_fields || List.mem name named
+  in
+  Buf_writer.write_string w (Method.to_string (Request.meth req));
+  Buf_writer.write_char w ' ';
+  Buf_writer.write_string w target;
+  Buf_writer.write_string w " HTTP/1.1\r\n";
+  field w "Host" authority;
+  Headers.iter (fun n v -> if not (owned n) then field w n v) headers;
+  (match framing with
+  | Length n -> field w "Content-Length" (string_of_int n)
+  | Chunked -> field w "Transfer-Encoding" "chunked"
+  | No_body | Head_length _ | Close_delimited -> ());
+  if request_closes req then field w "Connection" "close";
+  Buf_writer.write_string w "\r\n"
+
 (* RFC 9110 §6.5.1: fields that framing, routing, request modifiers,
    authentication, response control or content processing depend on cannot
    come after the content. A proxied body may carry them as trailers. *)

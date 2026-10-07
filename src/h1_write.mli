@@ -42,6 +42,43 @@ val head :
       [Connection: keep-alive] for an HTTP/1.0 request that is kept alive.
     - The empty line that ends the head. *)
 
+(** {1:request Requests, for a client} *)
+
+val request_framing : Request.t -> framing
+(** [request_framing req] is how the body of [req] is sent (RFC 9110
+    §8.6, RFC 9112 §6.2):
+    - A body of length 0: no framing field ({!No_body}) for [GET], [HEAD],
+      [DELETE], [OPTIONS], [TRACE] and [CONNECT], and [Content-Length: 0]
+      ([Length 0]) for the other methods.
+    - A body of known length [n]: [Length n].
+    - A body of unknown length: {!Chunked}. *)
+
+val request_closes : Request.t -> bool
+(** [request_closes req] is [true] iff [req] has a [Connection] field with
+    the token [close]. *)
+
+val check_request : Request.t -> unit
+(** [check_request req] raises the [Invalid_argument] of {!request_head}
+    for [req], if any, and writes nothing. *)
+
+val request_head : Buf_writer.t -> framing -> Request.t -> unit
+(** [request_head w framing req] writes the head of [req] to [w]:
+    - The request line [METHOD SP target SP HTTP/1.1]. The target is the
+      path of [req], ["/"] for an empty path, the authority for [CONNECT],
+      and ["*"] for a server-wide [OPTIONS].
+    - [Host], the authority of [req], as the first field.
+    - The fields of [req], in order, except [Host], the fields that the
+      connection owns ([Content-Length], [Transfer-Encoding], [Connection],
+      [Keep-Alive], [Proxy-Connection], [TE], [Upgrade]), and the fields that
+      [Connection] names.
+    - The framing field of [framing], if any.
+    - [Connection: close] if {!request_closes} [req].
+    - The empty line that ends the head.
+
+    @raise Invalid_argument if [req] has no authority, or a path that is
+    not empty and does not start with ["/"] (except ["*"] for [OPTIONS]
+    and any path for [CONNECT]), or a path with ["#"]. *)
+
 (** {1:body Bodies} *)
 
 exception Length_mismatch

@@ -95,6 +95,49 @@ let request_head limits r =
   in
   { meth; target; version; headers }
 
+(* Response heads, RFC 9112 §4 *)
+
+type response_head = {
+  version : Version.t;
+  status : Status.t;
+  reason : string;
+  headers : Headers.t;
+}
+
+(* reason-phrase = 1*( HTAB / SP / VCHAR / obs-text ) *)
+let is_reason_char c = c = '\t' || (c >= ' ' && c <> '\x7f')
+
+(* status-line = HTTP-version SP status-code SP [ reason-phrase ]. Many
+   servers end the line after the code, thus we also accept that. *)
+let status_line limits r =
+  let line =
+    read_line r ~max:limits.max_request_line ~too_long:(Bad_request "status line too long")
+  in
+  let n = String.length line in
+  if n < 12 || line.[8] <> ' ' then bad "malformed status line";
+  let v = String.sub line 0 8 in
+  let version =
+    try version v with H1_error.E Version_not_supported -> bad "unsupported HTTP version %S" v
+  in
+  let code = String.sub line 9 3 in
+  if not (String.for_all is_digit code) then bad "invalid status code %S" code;
+  let code = int_of_string code in
+  if code < 100 || code > 599 then bad "status code %d out of range" code;
+  let reason =
+    if n = 12 then ""
+    else if line.[12] <> ' ' then bad "malformed status line"
+    else String.sub line 13 (n - 13)
+  in
+  if not (String.for_all is_reason_char reason) then bad "invalid reason phrase";
+  (version, Status.v code, reason)
+
+let response_head limits r =
+  let version, status, reason = status_line limits r in
+  let headers =
+    field_lines ~max_bytes:limits.max_header_bytes ~max_count:limits.max_header_count r
+  in
+  { version; status; reason; headers }
+
 (* Framing, RFC 9112 §6 *)
 
 type framing = No_body | Fixed of int | Chunked
@@ -106,18 +149,18 @@ let length_value s =
   then bad "invalid Content-Length %S" s;
   int_of_string s
 
-let content_length h =
-  if not (Headers.mem "content-length" h.headers)
+let content_length headers =
+  if not (Headers.mem "content-length" headers)
   then None
   else
-  match List.map length_value (Headers.tokens "content-length" h.headers) with
+  match List.map length_value (Headers.tokens "content-length" headers) with
   | [] -> bad "empty Content-Length"
   | n :: rest ->
       if List.exists (fun m -> m <> n) rest then bad "conflicting Content-Length";
       Some n
 
-let request_framing h =
-  let length = content_length h in
+let request_framing (h : head) =
+  let length = content_length h.headers in
   if not (Headers.mem "transfer-encoding" h.headers)
   then match length with None -> No_body | Some n -> Fixed n
   else begin
@@ -129,6 +172,30 @@ let request_framing h =
     | "chunked" :: _ ->
         fail (H1_error.Not_implemented "transfer codings other than chunked")
     | _ -> bad "chunked is not the final transfer coding"
+  end
+
+type response_framing = No_body | Fixed of int | Chunked | Until_close | Tunnel
+
+(* RFC 9112 §6.3, in its order. A response with the two framing fields is
+   an error, as for requests: a proxy that guesses can be the victim of
+   response smuggling. *)
+let response_framing ~meth h =
+  let code = Status.code h.status in
+  if code = 101 || (meth = Method.CONNECT && code >= 200 && code < 300)
+  then Tunnel
+  else if meth = Method.HEAD || code < 200 || code = 204 || code = 304
+  then No_body
+  else begin
+    let length = content_length h.headers in
+    if not (Headers.mem "transfer-encoding" h.headers)
+    then match length with None -> Until_close | Some n -> Fixed n
+    else begin
+      if length <> None then bad "both Transfer-Encoding and Content-Length";
+      if h.version = Version.Http_1_0 then bad "Transfer-Encoding in HTTP/1.0";
+      match List.map String.lowercase_ascii (Headers.tokens "transfer-encoding" h.headers) with
+      | [ "chunked" ] -> Chunked
+      | _ -> fail (H1_error.Not_implemented "transfer codings other than chunked")
+    end
   end
 
 (* Request target, RFC 9112 §3.2 *)
@@ -166,7 +233,7 @@ let is_authority ?(port = false) s =
       let digits = String.sub s (i + 1) (n - i - 1) in
       s.[i] = ':' && String.for_all is_digit digits && not (port && digits = "")
 
-let host h =
+let host (h : head) =
   match Headers.find_all "host" h.headers with
   | [] -> if h.version = Version.Http_1_1 then bad "missing Host" else None
   | [ "" ] -> None
@@ -198,7 +265,7 @@ let absolute_form t =
       in
       { scheme; authority = Some authority; path }
 
-let request_target ~scheme h =
+let request_target ~scheme (h : head) =
   let authority = host h in
   let t = h.target in
   match h.meth with
