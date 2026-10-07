@@ -2,11 +2,11 @@
 
 type t =
   [ `Connection
-  (** The connection being accepted failed, or a signal interrupted the
-      call: try again. Linux reports the pending network errors of the new
-      socket this way, and [EPERM] for firewall rules (man 2 accept). *)
+    (** The connection being accepted failed, or a signal interrupted the call:
+        try again. Linux reports the pending network errors of the new socket
+        this way, and [EPERM] for firewall rules (man 2 accept). *)
   | `Resources
-  (** The process or system is out of descriptors or memory: wait. *)
+    (** The process or system is out of descriptors or memory: wait. *)
   | `Listener  (** The listening socket itself is unusable. *) ]
 
 val classify : Unix.error -> t

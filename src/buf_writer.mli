@@ -1,12 +1,12 @@
 (* Internal. Buffered writing, for HTTP/1.1 serialization. *)
 
-type t
 (** The type for buffered writers. A writer has a single producer. *)
+type t
 
 val make : ?size:int -> (bytes -> int -> int -> unit) -> t
-(** [make ~size write] writes its output with [write buf off len], which
-    writes all [len] bytes or raises. [size] is the buffer size, 4 KiB by
-    default. The buffer is allocated by the first write that needs it.
+(** [make ~size write] writes its output with [write buf off len], which writes
+    all [len] bytes or raises. [size] is the buffer size, 4 KiB by default. The
+    buffer is allocated by the first write that needs it.
 
     @raise Invalid_argument if [size <= 0]. *)
 
@@ -18,11 +18,11 @@ val write_bytes : t -> bytes -> int -> int -> unit
     - A write that fits goes into the buffer.
     - A write that is smaller than the buffer but does not fit flushes the
       buffer first. Then it goes into the buffer.
-    - A write of at least the buffer size first fills the buffer and
-      flushes it, if the buffer holds bytes. Then the rest goes directly
-      to the output, without a copy, if it is at least the buffer size. If
-      not, the rest stays in the buffer. Thus a small head does not go out
-      alone before a large body.
+    - A write of at least the buffer size first fills the buffer and flushes it,
+      if the buffer holds bytes. Then the rest goes directly to the output,
+      without a copy, if it is at least the buffer size. If not, the rest stays
+      in the buffer. Thus a small head does not go out alone before a large
+      body.
 
     Bytes that stay in the buffer go out at the next {!flush}.
 
@@ -39,4 +39,3 @@ val buffered : t -> int
 
 val capacity : t -> int
 (** [capacity w] is the size of [w]'s buffer, [0] until it is allocated. *)
-

@@ -1,9 +1,9 @@
-(** HTTP status codes ({{:https://www.rfc-editor.org/rfc/rfc9110#section-15}
-    RFC 9110 §15}). *)
+(** HTTP status codes
+    ({{:https://www.rfc-editor.org/rfc/rfc9110#section-15} RFC 9110 §15}). *)
 
+(** The type for status codes. A value is always in the range \[[100];[599]\].
+*)
 type t = private int
-(** The type for status codes. A value is always in the range
-    \[[100];[599]\]. *)
 
 val v : int -> t
 (** [v n] is the status code [n].
@@ -18,8 +18,7 @@ val reason : t -> string
     for [404]. It is [""] for codes that are not registered. *)
 
 val kind :
-  t ->
-  [ `Informational | `Success | `Redirection | `Client_error | `Server_error ]
+  t -> [`Informational | `Success | `Redirection | `Client_error | `Server_error]
 (** [kind s] is the class of [s], given by its first digit
     ({{:https://www.rfc-editor.org/rfc/rfc9110#section-15}RFC 9110 §15}). *)
 

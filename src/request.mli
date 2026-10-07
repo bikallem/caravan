@@ -1,22 +1,22 @@
 (** HTTP requests.
 
-    A request carries the same parts in every HTTP version: those of an
-    HTTP/2 request's pseudo-header fields ([:method], [:scheme],
-    [:authority], [:path]), then the header fields and the body. *)
+    A request carries the same parts in every HTTP version: those of an HTTP/2
+    request's pseudo-header fields ([:method], [:scheme], [:authority],
+    [:path]), then the header fields and the body. *)
 
-type t
 (** The type for requests. *)
+type t
 
 val make :
-  ?version:Version.t ->
-  ?scheme:string ->
-  ?authority:string ->
-  ?headers:Headers.t ->
-  ?body:Body.t ->
-  ?conn:Conn_info.t ->
-  Method.t ->
-  string ->
-  t
+     ?version:Version.t
+  -> ?scheme:string
+  -> ?authority:string
+  -> ?headers:Headers.t
+  -> ?body:Body.t
+  -> ?conn:Conn_info.t
+  -> Method.t
+  -> string
+  -> t
 (** [make meth path] is a request for [path] with method [meth], where:
     - [path] is the path and query, as in ["/search?q=ocaml"], or ["*"] for a
       server-wide [OPTIONS], or [""] for [CONNECT], whose target is the
@@ -28,8 +28,8 @@ val make :
     - [headers] defaults to {!Headers.empty}, [body] to {!Body.empty}.
     - [conn] is the connection the request arrived on, if any.
 
-    @raise Invalid_argument if [path] or [authority] contains a space, a control
-    character or DEL. *)
+    @raise Invalid_argument
+      if [path] or [authority] contains a space, a control character or DEL. *)
 
 val meth : t -> Method.t
 (** [meth r] is the method of [r]. *)
@@ -39,8 +39,8 @@ val version : t -> Version.t
 
 val scheme : t -> string
 (** [scheme r] is the scheme of [r], ["http"] or ["https"]. For a request
-    received by a server it is the connection's scheme: a request whose
-    target names another one is refused with [421]. *)
+    received by a server it is the connection's scheme: a request whose target
+    names another one is refused with [421]. *)
 
 val authority : t -> string option
 (** [authority r] is the [host[:port]] that [r] targets, if known. *)
@@ -52,8 +52,8 @@ val path_only : t -> string
 (** [path_only r] is the path of [r] without its query. *)
 
 val query : t -> string option
-(** [query r] is the query of [r], the part after the first ['?'], if any. It
-    is [Some ""] for ["/a?"]. *)
+(** [query r] is the query of [r], the part after the first ['?'], if any. It is
+    [Some ""] for ["/a?"]. *)
 
 val headers : t -> Headers.t
 (** [headers r] are the header fields of [r], as received. *)

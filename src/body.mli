@@ -15,20 +15,20 @@
 
 (** Sinks that bodies are written into. *)
 module Writer : sig
-  type t
   (** The type for body sinks. *)
+  type t
 
   val make : write:(bytes -> int -> int -> unit) -> flush:(unit -> unit) -> t
   (** [make ~write ~flush] is a sink that writes bytes with [write buf off len]
-      and pushes them to the peer with [flush ()]. Protocol engines make
-      these. *)
+      and pushes them to the peer with [flush ()]. Protocol engines make these.
+  *)
 
   val write : t -> bytes -> int -> int -> unit
   (** [write w buf off len] writes the [len] bytes of [buf] starting at [off].
       Writing zero bytes does nothing.
 
-      @raise Invalid_argument if [off] and [len] do not designate a valid range
-      of [buf]. *)
+      @raise Invalid_argument
+        if [off] and [len] do not designate a valid range of [buf]. *)
 
   val write_string : t -> string -> unit
   (** [write_string w s] writes all of [s]. *)
@@ -45,15 +45,15 @@ module Writer : sig
       none. *)
 end
 
-type t
 (** The type for bodies. *)
+type t
 
-exception Too_large
 (** Raised by {!to_string} when a body exceeds its [max]. *)
+exception Too_large
 
-exception Truncated
 (** Raised by reads when the peer ends a body before its declared end, for
     example when a connection closes in the middle of a request body. *)
+exception Truncated
 
 (** {1:make Making bodies} *)
 
@@ -65,20 +65,20 @@ val of_string : string -> t
     [String.length s]. *)
 
 val of_source :
-  ?length:int ->
-  ?trailers:(unit -> Headers.t) ->
-  ?close:(unit -> unit) ->
-  (bytes -> int -> int -> int) ->
-  t
-(** [of_source ~length ~trailers ~close read] is the body whose bytes are
-    pulled with [read buf off len], which returns the number of bytes it read,
-    at most [len > 0], and [0] at the end of the body.
+     ?length:int
+  -> ?trailers:(unit -> Headers.t)
+  -> ?close:(unit -> unit)
+  -> (bytes -> int -> int -> int)
+  -> t
+(** [of_source ~length ~trailers ~close read] is the body whose bytes are pulled
+    with [read buf off len], which returns the number of bytes it read, at most
+    [len > 0], and [0] at the end of the body.
     - [length] is the number of bytes [read] produces in total, if known.
       Engines check it when they write the body out.
-    - [trailers ()] are the trailer fields, called once when [read] returns
-      [0]. Defaults to no trailers.
-    - [close ()] is called at most once, by {!close}, to release the source
-      when it is abandoned. Defaults to doing nothing.
+    - [trailers ()] are the trailer fields, called once when [read] returns [0].
+      Defaults to no trailers.
+    - [close ()] is called at most once, by {!close}, to release the source when
+      it is abandoned. Defaults to doing nothing.
 
     @raise Invalid_argument if [length] is negative. *)
 
@@ -96,12 +96,13 @@ val length : t -> int option
 (** [length b] is the declared number of bytes of [b], if known. *)
 
 val read : t -> bytes -> int -> int -> int
-(** [read b buf off len] reads at most [len] bytes of [b] into [buf] starting
-    at [off] and returns the number of bytes read, [0] at the end of the body.
+(** [read b buf off len] reads at most [len] bytes of [b] into [buf] starting at
+    [off] and returns the number of bytes read, [0] at the end of the body.
 
-    @raise Invalid_argument if [len <= 0], if [off] and [len] do not designate a
-    valid range of [buf], if [b] is a writer body, which can only be written
-    out with {!write_to}, or if [b] was closed. *)
+    @raise Invalid_argument
+      if [len <= 0], if [off] and [len] do not designate a valid range of [buf],
+      if [b] is a writer body, which can only be written out with {!write_to},
+      or if [b] was closed. *)
 
 val write_to : t -> Writer.t -> unit
 (** [write_to b w] writes the rest of [b] into [w]. A source is copied with a
@@ -109,18 +110,19 @@ val write_to : t -> Writer.t -> unit
     proxied responses reach the peer without delay. A writer body runs its
     producer on [w]. The body's trailers, if any, are set on [w].
 
-    @raise Invalid_argument if [b] is a writer body that was already written
-    out, or if [b] was closed. *)
+    @raise Invalid_argument
+      if [b] is a writer body that was already written out, or if [b] was
+      closed. *)
 
 val to_string : ?max:int -> t -> string
 (** [to_string ~max b] is the rest of [b] as a string.
 
-    @raise Too_large if [b] has more than [max] bytes left (default: no
-    limit). *)
+    @raise Too_large if [b] has more than [max] bytes left (default: no limit).
+*)
 
 val trailers : t -> Headers.t
-(** [trailers b] are the trailer fields of [b] once it has been consumed to
-    its end, empty before that or if it has none. *)
+(** [trailers b] are the trailer fields of [b] once it has been consumed to its
+    end, empty before that or if it has none. *)
 
 val close : t -> unit
 (** [close b] abandons [b]: the [close] function of a source is called, and a

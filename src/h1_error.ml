@@ -1,34 +1,46 @@
 type t =
-| Bad_request of string
-| Uri_too_long
-| Header_fields_too_large
-| Content_too_large
-| Request_timeout
-| Expectation_failed
-| Misdirected_request
-| Not_implemented of string
-| Version_not_supported
+  | Bad_request of string
+  | Uri_too_long
+  | Header_fields_too_large
+  | Content_too_large
+  | Request_timeout
+  | Expectation_failed
+  | Misdirected_request
+  | Not_implemented of string
+  | Version_not_supported
 
 exception E of t
 
 let status = function
-| Bad_request _ -> Status.bad_request
-| Uri_too_long -> Status.uri_too_long
-| Header_fields_too_large -> Status.request_header_fields_too_large
-| Content_too_large -> Status.content_too_large
-| Request_timeout -> Status.request_timeout
-| Expectation_failed -> Status.expectation_failed
-| Misdirected_request -> Status.misdirected_request
-| Not_implemented _ -> Status.not_implemented
-| Version_not_supported -> Status.http_version_not_supported
+  | Bad_request _ ->
+      Status.bad_request
+  | Uri_too_long ->
+      Status.uri_too_long
+  | Header_fields_too_large ->
+      Status.request_header_fields_too_large
+  | Content_too_large ->
+      Status.content_too_large
+  | Request_timeout ->
+      Status.request_timeout
+  | Expectation_failed ->
+      Status.expectation_failed
+  | Misdirected_request ->
+      Status.misdirected_request
+  | Not_implemented _ ->
+      Status.not_implemented
+  | Version_not_supported ->
+      Status.http_version_not_supported
 
 let pp ppf e =
   match e with
   | Bad_request detail | Not_implemented detail ->
       Format.fprintf ppf "%a (%s)" Status.pp (status e) detail
-  | _ -> Status.pp ppf (status e)
+  | _ ->
+      Status.pp ppf (status e)
 
 let () =
   Printexc.register_printer (function
-    | E e -> Some (Format.asprintf "H1_error.E (%a)" pp e)
-    | _ -> None)
+    | E e ->
+        Some (Format.asprintf "H1_error.E (%a)" pp e)
+    | _ ->
+        None )

@@ -1,9 +1,9 @@
-(** Base64 ({{:https://www.rfc-editor.org/rfc/rfc4648#section-4}RFC 4648
-    §4}), with padding. *)
+(** Base64 ({{:https://www.rfc-editor.org/rfc/rfc4648#section-4}RFC 4648 §4}),
+    with padding. *)
 
 val encode : string -> string
-(** [encode s] is [s] in base64, padded with [=] to a multiple of 4
-    characters. *)
+(** [encode s] is [s] in base64, padded with [=] to a multiple of 4 characters.
+*)
 
 val decode : string -> string option
 (** [decode s] is the bytes that [s] encodes, or [None] if [s] is not the

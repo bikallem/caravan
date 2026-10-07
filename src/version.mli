@@ -1,7 +1,10 @@
 (** HTTP protocol versions. *)
 
-type t = Http_1_0 | Http_1_1 | Http_2 | Http_3
-(** The type for HTTP versions. *)
+type t =
+  | Http_1_0
+  | Http_1_1
+  | Http_2
+  | Http_3  (** The type for HTTP versions. *)
 
 val to_string : t -> string
 (** [to_string v] is ["HTTP/1.0"], ["HTTP/1.1"], ["HTTP/2"] or ["HTTP/3"]. *)

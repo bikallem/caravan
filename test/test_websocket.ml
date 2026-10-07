@@ -6,176 +6,241 @@ let is_invalid_arg = function Invalid_argument _ -> true | _ -> false
 
 let hex s =
   String.concat ""
-    (List.map (fun c -> Printf.sprintf "%02x" (Char.code c)) (List.of_seq (String.to_seq s)))
+    (List.map
+       (fun c -> Printf.sprintf "%02x" (Char.code c))
+       (List.of_seq (String.to_seq s)) )
 
 let sha1_tests =
   (* Cases are [(name, input, hex digest)]; a failure lists every name. *)
   let digests cases =
-    equal (list (pair string string))
+    equal
+      (list (pair string string))
       (List.map (fun (name, _, digest) -> (name, digest)) cases)
       (List.map (fun (name, input, _) -> (name, hex (Sha1.digest input))) cases)
   in
   group "Sha1"
     [ test "FIPS 180 examples" (fun () ->
           digests
-            [ ("empty", "", "da39a3ee5e6b4b0d3255bfef95601890afd80709");
-              ("abc", "abc", "a9993e364706816aba3e25717850c26c9cd0d89d");
-              ( "448 bits",
-                "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
-                "84983e441c3bd26ebaae4aa1f95129e5e54670f1" );
-              ( "a million a",
-                String.make 1_000_000 'a',
-                "34aa973cd4c4daa4f61eeb2bdbad27316534016f" ) ]);
-      (* Digests from sha1sum, of the bytes 0, 1, 2, ... *)
+            [ ("empty", "", "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+            ; ("abc", "abc", "a9993e364706816aba3e25717850c26c9cd0d89d")
+            ; ( "448 bits"
+              , "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+              , "84983e441c3bd26ebaae4aa1f95129e5e54670f1" )
+            ; ( "a million a"
+              , String.make 1_000_000 'a'
+              , "34aa973cd4c4daa4f61eeb2bdbad27316534016f" ) ] )
+    ; (* Digests from sha1sum, of the bytes 0, 1, 2, ... *)
       test "lengths around a block boundary" (fun () ->
           let bytes n = String.init n (fun i -> Char.chr (i land 255)) in
           digests
             (List.map
                (fun (n, d) -> (string_of_int n, bytes n, d))
-               [ (55, "8ae2d46729cfe68ff927af5eec9c7d1b66d65ac2");
-                 (56, "636e2ec698dac903498e648bd2f3af641d3c88cb");
-                 (63, "6d942da0c4392b123528f2905c713a3ce28364bd");
-                 (64, "c6138d514ffa2135bfce0ed0b8fac65669917ec7");
-                 (65, "69bd728ad6e13cd76ff19751fde427b00e395746");
-                 (119, "41c89d06001bab4ab78736b44efe7ce18ce6ae08") ])) ]
+               [ (55, "8ae2d46729cfe68ff927af5eec9c7d1b66d65ac2")
+               ; (56, "636e2ec698dac903498e648bd2f3af641d3c88cb")
+               ; (63, "6d942da0c4392b123528f2905c713a3ce28364bd")
+               ; (64, "c6138d514ffa2135bfce0ed0b8fac65669917ec7")
+               ; (65, "69bd728ad6e13cd76ff19751fde427b00e395746")
+               ; (119, "41c89d06001bab4ab78736b44efe7ce18ce6ae08") ] ) ) ]
 
-(* Short strings over the alphabet, padding and a few strangers, so that
-   some are valid encodings and most are not. *)
+(* Short strings over the alphabet, padding and a few strangers, so that some
+   are valid encodings and most are not. *)
 let base64ish =
   Gen.string_of ~size:(Gen.int_range 0 12)
     (Gen.of_list (List.of_seq (String.to_seq "AQgw+/Zz09==-_ \n")))
 
 let base64_tests =
   let vectors =
-    [ ("", ""); ("f", "Zg=="); ("fo", "Zm8="); ("foo", "Zm9v"); ("foob", "Zm9vYg==");
-      ("fooba", "Zm9vYmE="); ("foobar", "Zm9vYmFy") ]
+    [ ("", "")
+    ; ("f", "Zg==")
+    ; ("fo", "Zm8=")
+    ; ("foo", "Zm9v")
+    ; ("foob", "Zm9vYg==")
+    ; ("fooba", "Zm9vYmE=")
+    ; ("foobar", "Zm9vYmFy") ]
   in
   group "Base64"
     [ test "RFC 4648 examples encode" (fun () ->
-          equal (list string) (List.map snd vectors) (List.map (fun (s, _) -> Base64.encode s) vectors));
-      test "RFC 4648 examples decode" (fun () ->
-          equal (list (option string))
+          equal (list string) (List.map snd vectors)
+            (List.map (fun (s, _) -> Base64.encode s) vectors) )
+    ; test "RFC 4648 examples decode" (fun () ->
+          equal
+            (list (option string))
             (List.map (fun (s, _) -> Some s) vectors)
-            (List.map (fun (_, e) -> Base64.decode e) vectors));
-      (* Expected from base64(1); it uses all 64 characters. *)
+            (List.map (fun (_, e) -> Base64.decode e) vectors) )
+    ; (* Expected from base64(1); it uses all 64 characters. *)
       test "the bytes 0 to 191" (fun () ->
           let s = String.init 192 (fun i -> Char.chr (i land 255)) in
           equal string
             "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/"
-            (Base64.encode s);
-          equal (option string) (Some s) (Base64.decode (Base64.encode s)));
-      test "rejects what is not a canonical encoding" (fun () ->
+            (Base64.encode s) ;
+          equal (option string) (Some s) (Base64.decode (Base64.encode s)) )
+    ; test "rejects what is not a canonical encoding" (fun () ->
           List.iter
             (fun e -> is_none ~pp:Format.pp_print_string (Base64.decode e))
-            [ "Zg"; "Zg="; "Zm9vY"; "Zm9v!A=="; "Zm-_"; "Zm 9"; "Z==="; "===="; "Zg==Zg==";
-              "Zm=v"; "Zh=="; "Zm9="; "Zm8=\n" ]);
-      prop "decode inverts encode" Gen.string (fun s ->
-          equal (option string) (Some s) (Base64.decode (Base64.encode s)));
-      prop "encodings take 4 characters per 3 bytes, rounded up" Gen.string (fun s ->
-          equal int (4 * ((String.length s + 2) / 3)) (String.length (Base64.encode s)));
-      prop ~count:1000 "only canonical encodings decode" base64ish (fun e ->
+            [ "Zg"
+            ; "Zg="
+            ; "Zm9vY"
+            ; "Zm9v!A=="
+            ; "Zm-_"
+            ; "Zm 9"
+            ; "Z==="
+            ; "===="
+            ; "Zg==Zg=="
+            ; "Zm=v"
+            ; "Zh=="
+            ; "Zm9="
+            ; "Zm8=\n" ] )
+    ; prop "decode inverts encode" Gen.string (fun s ->
+          equal (option string) (Some s) (Base64.decode (Base64.encode s)) )
+    ; prop "encodings take 4 characters per 3 bytes, rounded up" Gen.string
+        (fun s ->
+          equal int
+            (4 * ((String.length s + 2) / 3))
+            (String.length (Base64.encode s)) )
+    ; prop ~count:1000 "only canonical encodings decode" base64ish (fun e ->
           match Base64.decode e with
-          | None -> ()
-          | Some d -> equal string e (Base64.encode d)) ]
+          | None ->
+              ()
+          | Some d ->
+              equal string e (Base64.encode d) ) ]
 
 let of_hex h =
   let h = String.concat "" (String.split_on_char ' ' h) in
-  String.init (String.length h / 2) (fun i -> Char.chr (int_of_string ("0x" ^ String.sub h (2 * i) 2)))
+  String.init
+    (String.length h / 2)
+    (fun i -> Char.chr (int_of_string ("0x" ^ String.sub h (2 * i) 2)))
 
 let opcode_name : Frame.opcode -> string = function
-| Continuation -> "continuation"
-| Text -> "text"
-| Binary -> "binary"
-| Close -> "close"
-| Ping -> "ping"
-| Pong -> "pong"
+  | Continuation ->
+      "continuation"
+  | Text ->
+      "text"
+  | Binary ->
+      "binary"
+  | Close ->
+      "close"
+  | Ping ->
+      "ping"
+  | Pong ->
+      "pong"
 
 let pp_frame ppf (f : Frame.t) =
-  Format.fprintf ppf "%s%s %S" (opcode_name f.opcode) (if f.fin then "" else " (more)") f.payload
+  Format.fprintf ppf "%s%s %S" (opcode_name f.opcode)
+    (if f.fin then "" else " (more)")
+    f.payload
 
 let frame = Testable.structural ~pp:pp_frame
 
 let encode ?mask f =
   let out = Buffer.create 64 in
-  let w = Buf_writer.make (fun b off len -> Buffer.add_subbytes out b off len) in
-  Frame.write ?mask w f;
-  Buf_writer.flush w;
-  Buffer.contents out
+  let w =
+    Buf_writer.make (fun b off len -> Buffer.add_subbytes out b off len)
+  in
+  Frame.write ?mask w f ; Buf_writer.flush w ; Buffer.contents out
 
 (* What [Frame.read] makes of [input]: a frame, or the error. *)
 let outcome ?(masked = true) ?(max = 1000) input =
   match Frame.read (Buf_reader.of_string input) ~masked ~max with
-  | f -> Format.asprintf "%a" pp_frame f
-  | exception Frame.Error (Protocol_error m) -> "protocol error: " ^ m
-  | exception Frame.Error Too_big -> "too big"
-  | exception End_of_file -> "end of input"
+  | f ->
+      Format.asprintf "%a" pp_frame f
+  | exception Frame.Error (Protocol_error m) ->
+      "protocol error: " ^ m
+  | exception Frame.Error Too_big ->
+      "too big"
+  | exception End_of_file ->
+      "end of input"
 
 let frame_tests =
-  let f ?(fin = true) opcode payload = { Frame.fin; opcode; payload } in
+  let f ?(fin = true) opcode payload = {Frame.fin; opcode; payload} in
   let key = of_hex "37 fa 21 3d" in
   let b256 = String.init 256 (fun i -> Char.chr (i land 255)) in
   let b64k = String.init 65536 (fun i -> Char.chr (i land 255)) in
   (* RFC 6455 §5.7: [(frame, mask, bytes)]. *)
   let examples =
-    [ (f Text "Hello", None, of_hex "81 05 48 65 6c 6c 6f");
-      (f Text "Hello", Some key, of_hex "81 85 37 fa 21 3d 7f 9f 4d 51 58");
-      (f ~fin:false Text "Hel", None, of_hex "01 03 48 65 6c");
-      (f Continuation "lo", None, of_hex "80 02 6c 6f");
-      (f Ping "Hello", None, of_hex "89 05 48 65 6c 6c 6f");
-      (f Pong "Hello", Some key, of_hex "8a 85 37 fa 21 3d 7f 9f 4d 51 58");
-      (f Binary b256, None, of_hex "82 7e 01 00" ^ b256);
-      (f Binary b64k, None, of_hex "82 7f 00 00 00 00 00 01 00 00" ^ b64k) ]
+    [ (f Text "Hello", None, of_hex "81 05 48 65 6c 6c 6f")
+    ; (f Text "Hello", Some key, of_hex "81 85 37 fa 21 3d 7f 9f 4d 51 58")
+    ; (f ~fin:false Text "Hel", None, of_hex "01 03 48 65 6c")
+    ; (f Continuation "lo", None, of_hex "80 02 6c 6f")
+    ; (f Ping "Hello", None, of_hex "89 05 48 65 6c 6c 6f")
+    ; (f Pong "Hello", Some key, of_hex "8a 85 37 fa 21 3d 7f 9f 4d 51 58")
+    ; (f Binary b256, None, of_hex "82 7e 01 00" ^ b256)
+    ; (f Binary b64k, None, of_hex "82 7f 00 00 00 00 00 01 00 00" ^ b64k) ]
   in
   group "Frame"
     [ test "RFC 6455 examples encode" (fun () ->
           equal (list string)
             (List.map (fun (_, _, e) -> hex e) examples)
-            (List.map (fun (fr, mask, _) -> hex (encode ?mask fr)) examples));
-      test "RFC 6455 examples decode, one after another" (fun () ->
+            (List.map (fun (fr, mask, _) -> hex (encode ?mask fr)) examples) )
+    ; test "RFC 6455 examples decode, one after another" (fun () ->
           let unmasked = List.filter (fun (_, m, _) -> m = None) examples in
-          let r = Buf_reader.of_string ~size:16 ~chunk:5 (String.concat "" (List.map (fun (_, _, e) -> e) unmasked)) in
+          let r =
+            Buf_reader.of_string ~size:16 ~chunk:5
+              (String.concat "" (List.map (fun (_, _, e) -> e) unmasked))
+          in
           equal (list frame)
             (List.map (fun (fr, _, _) -> fr) unmasked)
-            (List.map (fun _ -> Frame.read r ~masked:false ~max:65536) unmasked);
-          is_true (Buf_reader.peek_eof r);
+            (List.map (fun _ -> Frame.read r ~masked:false ~max:65536) unmasked) ;
+          is_true (Buf_reader.peek_eof r) ;
           List.iter
             (fun (fr, m, e) ->
-               if m <> None
-               then equal frame fr (Frame.read (Buf_reader.of_string e) ~masked:true ~max:5))
-            examples);
-      test "lengths take the shortest encoding" (fun () ->
-          equal (list (pair int int))
-            [ (125, 2); (126, 4); (65535, 4); (65536, 10) ]
+              if m <> None then
+                equal frame fr
+                  (Frame.read (Buf_reader.of_string e) ~masked:true ~max:5) )
+            examples )
+    ; test "lengths take the shortest encoding" (fun () ->
+          equal
+            (list (pair int int))
+            [(125, 2); (126, 4); (65535, 4); (65536, 10)]
             (List.map
-               (fun n -> (n, String.length (encode (f Binary (String.make n 'x'))) - n))
-               [ 125; 126; 65535; 65536 ]);
-          equal (list (pair int int))
-            [ (125, 6); (126, 8); (65536, 14) ]
+               (fun n ->
+                 (n, String.length (encode (f Binary (String.make n 'x'))) - n) )
+               [125; 126; 65535; 65536] ) ;
+          equal
+            (list (pair int int))
+            [(125, 6); (126, 8); (65536, 14)]
             (List.map
-               (fun n -> (n, String.length (encode ~mask:key (f Binary (String.make n 'x'))) - n))
-               [ 125; 126; 65536 ]));
-      test "the length limit" (fun () ->
+               (fun n ->
+                 ( n
+                 , String.length
+                     (encode ~mask:key (f Binary (String.make n 'x')))
+                   - n ) )
+               [125; 126; 65536] ) )
+    ; test "the length limit" (fun () ->
           let input = encode (f Binary "0123456789") in
-          expect (outcome ~masked:false ~max:10 input) @@ __POS_OF__ {|binary "0123456789"|};
-          expect (outcome ~masked:false ~max:9 input) @@ __POS_OF__ {|too big|};
+          expect (outcome ~masked:false ~max:10 input)
+          @@ __POS_OF__ {|binary "0123456789"|} ;
+          expect (outcome ~masked:false ~max:9 input) @@ __POS_OF__ {|too big|} ;
           (* The limit is only for data frames. *)
           expect (outcome ~masked:false ~max:0 (encode (f Ping "0123456789")))
-          @@ __POS_OF__ {|ping "0123456789"|});
-      (* Inputs end right after their length, so reading further would give
-         "end of input". *)
+          @@ __POS_OF__ {|ping "0123456789"|} )
+    ; (* Inputs end right after their length, so reading further would give "end
+         of input". *)
       test "bad frames" (fun () ->
           let cases =
-            [ ("rsv1", "c1 80"); ("rsv2", "a1 80"); ("rsv3", "91 80"); ("opcode 3", "83 80");
-              ("opcode 7", "87 80"); ("opcode b", "8b 80"); ("opcode f", "8f 80");
-              ("fragmented ping", "09 80"); ("fragmented close", "08 80");
-              ("ping of 126", "89 fe 00 7e"); ("pong of 127", "8a ff 00 00 00 00 00 00 00 7f");
-              ("unmasked", "81 00"); ("top bit", "82 ff 80 00 00 00 00 00 00 00");
-              ("2^62 - 1", "82 ff 3f ff ff ff ff ff ff ff"); ("1001", "82 fe 03 e9");
-              ("1000", "82 fe 03 e8") ]
+            [ ("rsv1", "c1 80")
+            ; ("rsv2", "a1 80")
+            ; ("rsv3", "91 80")
+            ; ("opcode 3", "83 80")
+            ; ("opcode 7", "87 80")
+            ; ("opcode b", "8b 80")
+            ; ("opcode f", "8f 80")
+            ; ("fragmented ping", "09 80")
+            ; ("fragmented close", "08 80")
+            ; ("ping of 126", "89 fe 00 7e")
+            ; ("pong of 127", "8a ff 00 00 00 00 00 00 00 7f")
+            ; ("unmasked", "81 00")
+            ; ("top bit", "82 ff 80 00 00 00 00 00 00 00")
+            ; ("2^62 - 1", "82 ff 3f ff ff ff ff ff ff ff")
+            ; ("1001", "82 fe 03 e9")
+            ; ("1000", "82 fe 03 e8") ]
           in
           expect
-            (String.concat "\n" (List.map (fun (name, h) -> name ^ ": " ^ outcome (of_hex h)) cases))
-          @@ __POS_OF__ {|rsv1: protocol error: reserved bits set
+            (String.concat "\n"
+               (List.map
+                  (fun (name, h) -> name ^ ": " ^ outcome (of_hex h))
+                  cases ) )
+          @@ __POS_OF__
+               {|rsv1: protocol error: reserved bits set
 rsv2: protocol error: reserved bits set
 rsv3: protocol error: reserved bits set
 opcode 3: protocol error: reserved opcode 3
@@ -190,115 +255,156 @@ unmasked: protocol error: unmasked frame
 top bit: protocol error: length with its top bit set
 2^62 - 1: too big
 1001: too big
-1000: end of input|};
-          expect (outcome ~masked:false (of_hex "81 85 37 fa 21 3d 7f 9f 4d 51 58"))
-          @@ __POS_OF__ {|protocol error: masked frame|};
+1000: end of input|} ;
+          expect
+            (outcome ~masked:false (of_hex "81 85 37 fa 21 3d 7f 9f 4d 51 58"))
+          @@ __POS_OF__ {|protocol error: masked frame|} ;
           (* Long encodings of short lengths are accepted. *)
-          expect (outcome ~masked:false (of_hex "81 7e 00 02 68 69")) @@ __POS_OF__ {|text "hi"|};
-          expect (outcome ~masked:false (of_hex "81 7f 00 00 00 00 00 00 00 00"))
-          @@ __POS_OF__ {|text ""|});
-      test "a declared length does not allocate before the payload arrives" (fun () ->
+          expect (outcome ~masked:false (of_hex "81 7e 00 02 68 69"))
+          @@ __POS_OF__ {|text "hi"|} ;
+          expect
+            (outcome ~masked:false (of_hex "81 7f 00 00 00 00 00 00 00 00"))
+          @@ __POS_OF__ {|text ""|} )
+    ; test "a declared length does not allocate before the payload arrives"
+        (fun () ->
           let header = of_hex "827f" ^ "\x00\x00\x00\x00\x00\x80\x00\x00" in
           let r = Buf_reader.of_string (header ^ "short") in
           let before = Gc.allocated_bytes () in
-          raises End_of_file (fun () -> Frame.read r ~masked:false ~max:max_int);
+          raises End_of_file (fun () -> Frame.read r ~masked:false ~max:max_int) ;
           let used = Gc.allocated_bytes () -. before in
-          is_true ~msg:(Printf.sprintf "%.0f bytes" used) (used < 1_000_000.));
-      test "truncated input" (fun () ->
+          is_true ~msg:(Printf.sprintf "%.0f bytes" used) (used < 1_000_000.) )
+    ; test "truncated input" (fun () ->
           let input = of_hex "81 fe 00 02 37 fa 21 3d 7f 9f" in
           equal (list string)
             (List.init (String.length input) (fun _ -> "end of input"))
-            (List.init (String.length input) (fun n -> outcome (String.sub input 0 n)));
-          expect (outcome input) @@ __POS_OF__ {|text "He"|});
-      test "write rejects what it cannot send" (fun () ->
+            (List.init (String.length input) (fun n ->
+                 outcome (String.sub input 0 n) ) ) ;
+          expect (outcome input) @@ __POS_OF__ {|text "He"|} )
+    ; test "write rejects what it cannot send" (fun () ->
           List.iter
-            (fun (mask, fr) -> raises_match is_invalid_arg (fun () -> encode ?mask fr))
-            [ (Some "abc", f Text ""); (Some "abcde", f Text ""); (None, f ~fin:false Ping "");
-              (None, f Close (String.make 126 'x')); (None, f Pong (String.make 126 'x')) ];
-          is_true (String.length (encode ~mask:key (f Ping (String.make 125 'x'))) = 131));
-      prop "a masked payload is the XOR of each byte with the key"
-        Gen.(pair (string_of ~size:(constant 4) char) (string_of ~size:(int_range 0 300) char))
+            (fun (mask, fr) ->
+              raises_match is_invalid_arg (fun () -> encode ?mask fr) )
+            [ (Some "abc", f Text "")
+            ; (Some "abcde", f Text "")
+            ; (None, f ~fin:false Ping "")
+            ; (None, f Close (String.make 126 'x'))
+            ; (None, f Pong (String.make 126 'x')) ] ;
+          is_true
+            ( String.length (encode ~mask:key (f Ping (String.make 125 'x')))
+            = 131 ) )
+    ; prop "a masked payload is the XOR of each byte with the key"
+        Gen.(
+          pair
+            (string_of ~size:(constant 4) char)
+            (string_of ~size:(int_range 0 300) char) )
         (fun (mask, payload) ->
-           let out = encode ~mask (f Binary payload) in
-           let n = String.length payload in
-           let masked = String.sub out (String.length out - n) n in
-           equal string
-             (String.mapi (fun i c -> Char.chr (Char.code c lxor Char.code mask.[i land 3])) payload)
-             masked);
-      prop "read inverts write, however the input is split"
+          let out = encode ~mask (f Binary payload) in
+          let n = String.length payload in
+          let masked = String.sub out (String.length out - n) n in
+          equal string
+            (String.mapi
+               (fun i c -> Char.chr (Char.code c lxor Char.code mask.[i land 3]))
+               payload )
+            masked )
+    ; prop "read inverts write, however the input is split"
         Gen.(
           quad
-            (triple (of_list ~pp:(fun ppf o -> Format.pp_print_string ppf (opcode_name o))
-                       Frame.[ Continuation; Text; Binary; Close; Ping; Pong ])
-               bool (string_of ~size:(int_range 0 300) char))
+            (triple
+               (of_list
+                  ~pp:(fun ppf o -> Format.pp_print_string ppf (opcode_name o))
+                  Frame.[Continuation; Text; Binary; Close; Ping; Pong] )
+               bool
+               (string_of ~size:(int_range 0 300) char) )
             (option (string_of ~size:(constant 4) char))
-            (int_range 1 9) (int_range 1 9))
+            (int_range 1 9) (int_range 1 9) )
         (fun ((opcode, fin, payload), mask, (chunk : int), size) ->
-           let fr =
-             if Frame.is_control opcode
-             then f opcode (String.sub payload 0 (Int.min 125 (String.length payload)))
-             else f ~fin opcode payload
-           in
-           let r = Buf_reader.of_string ~size ~chunk (encode ?mask fr) in
-           equal frame fr (Frame.read r ~masked:(mask <> None) ~max:300);
-           is_true (Buf_reader.peek_eof r)) ]
+          let fr =
+            if Frame.is_control opcode then
+              f opcode
+                (String.sub payload 0 (Int.min 125 (String.length payload)))
+            else f ~fin opcode payload
+          in
+          let r = Buf_reader.of_string ~size ~chunk (encode ?mask fr) in
+          equal frame fr (Frame.read r ~masked:(mask <> None) ~max:300) ;
+          is_true (Buf_reader.peek_eof r) ) ]
 
 module Ws = Caravan_websocket
 
 (* A frame from a client: clients mask their frames. *)
-let client ?(fin = true) opcode payload = encode ~mask:"\x01\x02\x03\x04" { Frame.fin; opcode; payload }
+let client ?(fin = true) opcode payload =
+  encode ~mask:"\x01\x02\x03\x04" {Frame.fin; opcode; payload}
 
 let code_reason code reason =
   let b = Bytes.create 2 in
-  Bytes.set_uint16_be b 0 code;
+  Bytes.set_uint16_be b 0 code ;
   Bytes.to_string b ^ reason
 
 (* A Close frame shows its code and its reason. *)
 let show_frame (f : Frame.t) =
   match f.opcode with
-  | Close when f.payload = "" -> "close"
-  | Close when String.length f.payload = 2 -> Printf.sprintf "close %d" (String.get_uint16_be f.payload 0)
+  | Close when f.payload = "" ->
+      "close"
+  | Close when String.length f.payload = 2 ->
+      Printf.sprintf "close %d" (String.get_uint16_be f.payload 0)
   | Close ->
-      Printf.sprintf "close %d %S" (String.get_uint16_be f.payload 0)
+      Printf.sprintf "close %d %S"
+        (String.get_uint16_be f.payload 0)
         (String.sub f.payload 2 (String.length f.payload - 2))
-  | _ -> Format.asprintf "%a" pp_frame f
+  | _ ->
+      Format.asprintf "%a" pp_frame f
 
 (* The frames in [out], one for each line. *)
 let frames out =
   let r = Buf_reader.of_string out in
   let rec loop acc =
     match Frame.read r ~masked:false ~max:max_int with
-    | f -> loop (show_frame f :: acc)
-    | exception End_of_file -> List.rev acc
+    | f ->
+        loop (show_frame f :: acc)
+    | exception End_of_file ->
+        List.rev acc
   in
   loop []
 
-(* Runs [app] on a server connection that reads [input]. The result is the
-   lines that [app] logs, a "--" line, then the frames that the server sent. *)
+(* Runs [app] on a server connection that reads [input]. The result is the lines
+   that [app] logs, a "--" line, then the frames that the server sent. *)
 let converse ?max_message input app =
   let out = Buffer.create 64 and log = ref [] in
   let note s = log := s :: !log in
   Affect_unix.Unix.main ~domain_count:1 (fun () ->
-      app note (Ws.Private.of_flow ?max_message (Caravan.Flow.of_string input out)));
+      app note
+        (Ws.Private.of_flow ?max_message (Caravan.Flow.of_string input out)) ) ;
   String.concat "\n" (List.rev !log @ ("--" :: frames (Buffer.contents out)))
 
 let note_closed note = function
-| Ws.Closed { code; reason } -> note (Printf.sprintf "closed %d %S" code reason)
-| e -> raise e
+  | Ws.Closed {code; reason} ->
+      note (Printf.sprintf "closed %d %S" code reason)
+  | e ->
+      raise e
 
 (* Sends back each message until the connection closes. *)
 let echo note c =
   let rec loop () =
     match Ws.recv c with
-    | Text s -> note (Printf.sprintf "text %S" s); Ws.send c (Text s); loop ()
-    | Binary s -> note (Printf.sprintf "binary %S" s); Ws.send c (Binary s); loop ()
-    | exception e -> note_closed note e
+    | Text s ->
+        note (Printf.sprintf "text %S" s) ;
+        Ws.send c (Text s) ;
+        loop ()
+    | Binary s ->
+        note (Printf.sprintf "binary %S" s) ;
+        Ws.send c (Binary s) ;
+        loop ()
+    | exception e ->
+        note_closed note e
   in
   loop ()
 
 (* The result of [Utf8.continue], or "invalid". *)
 let continue_result pending s =
-  match Utf8.continue pending s with r -> Printf.sprintf "%S" r | exception Utf8.Invalid -> "invalid"
+  match Utf8.continue pending s with
+  | r ->
+      Printf.sprintf "%S" r
+  | exception Utf8.Invalid ->
+      "invalid"
 
 (* Parts of UTF-8 text: correct characters of 1 to 4 bytes, and bytes or
    sequences that are not correct, then cut at random points. *)
@@ -306,134 +412,207 @@ let utf8_parts =
   Gen.(
     pair
       (list ~size:(int_range 0 8)
-         (of_list ~pp:(fun ppf s -> Format.fprintf ppf "%S" s)
-            [ "a"; "\xc2\xa9"; "\xc3\xa9"; "\xe2\x82\xac"; "\xf0\x9d\x84\x9e"; "\xed\x9f\xbf";
-              "\xf4\x8f\xbf\xbf"; "\x80"; "\xc0"; "\xff"; "\xed\xa0"; "\xe0"; "\xf4"; "\x90" ]))
-      (list ~size:(int_range 0 5) (int_range 0 6)))
+         (of_list
+            ~pp:(fun ppf s -> Format.fprintf ppf "%S" s)
+            [ "a"
+            ; "\xc2\xa9"
+            ; "\xc3\xa9"
+            ; "\xe2\x82\xac"
+            ; "\xf0\x9d\x84\x9e"
+            ; "\xed\x9f\xbf"
+            ; "\xf4\x8f\xbf\xbf"
+            ; "\x80"
+            ; "\xc0"
+            ; "\xff"
+            ; "\xed\xa0"
+            ; "\xe0"
+            ; "\xf4"
+            ; "\x90" ] ) )
+      (list ~size:(int_range 0 5) (int_range 0 6)) )
 
 let cut_parts (pieces, sizes) =
   let rec cut s = function
-  | [] -> [ s ]
-  | n :: ns ->
-      let n = Int.min n (String.length s) in
-      String.sub s 0 n :: cut (String.sub s n (String.length s - n)) ns
+    | [] ->
+        [s]
+    | n :: ns ->
+        let n = Int.min n (String.length s) in
+        String.sub s 0 n :: cut (String.sub s n (String.length s - n)) ns
   in
   cut (String.concat "" pieces) sizes
 
-(* The index of the part where [Utf8.continue] raises, if one, and the
-   last result. *)
+(* The index of the part where [Utf8.continue] raises, if one, and the last
+   result. *)
 let fold_continue parts =
   let rec loop i pending = function
-  | [] -> (None, pending)
-  | p :: ps -> (
+    | [] ->
+        (None, pending)
+    | p :: ps -> (
       match Utf8.continue pending p with
-      | pending -> loop (i + 1) pending ps
-      | exception Utf8.Invalid -> (Some i, pending))
+      | pending ->
+          loop (i + 1) pending ps
+      | exception Utf8.Invalid ->
+          (Some i, pending) )
   in
   loop 0 "" parts
 
-(* A model: [x] can start correct UTF-8 if 0 to 3 more bytes make it
-   correct. The bytes 0x80, 0x90 and 0xA0 are in each range of a second
-   byte (Unicode table 3-7), and 0x80 is correct after it. *)
+(* A model: [x] can start correct UTF-8 if 0 to 3 more bytes make it correct.
+   The bytes 0x80, 0x90 and 0xA0 are in each range of a second byte (Unicode
+   table 3-7), and 0x80 is correct after it. *)
 let can_start x =
-  let bytes = [ "\x80"; "\x90"; "\xa0" ] in
-  let rec ends n = if n = 0 then [ "" ] else List.concat_map (fun e -> List.map (( ^ ) e) bytes) (ends (n - 1)) in
-  List.exists (fun n -> List.exists (fun e -> String.is_valid_utf_8 (x ^ e)) (ends n)) [ 0; 1; 2; 3 ]
+  let bytes = ["\x80"; "\x90"; "\xa0"] in
+  let rec ends n =
+    if n = 0 then [""]
+    else List.concat_map (fun e -> List.map (( ^ ) e) bytes) (ends (n - 1))
+  in
+  List.exists
+    (fun n -> List.exists (fun e -> String.is_valid_utf_8 (x ^ e)) (ends n))
+    [0; 1; 2; 3]
 
 let utf8_tests =
   group "UTF-8 in parts"
     [ test "boundary cases" (fun () ->
-          equal (list (pair (pair string string) string))
-            [ (("", "\xce\xba"), {|""|}); (("", "\xf4"), {|"\244"|}); (("\xf4", "\x90"), "invalid");
-              (("", "\xf4\x90\x80\x80"), "invalid"); (("\xf0\x9f", "\x98"), {|"\240\159\152"|});
-              (("\xf0\x9f\x98", "\x80ab"), {|""|}); (("\xe2", ""), {|"\226"|}); (("", ""), {|""|});
-              (("", "\xed"), {|"\237"|}); (("\xe0", "\xa0"), {|"\224\160"|}); (("", "\x80"), "invalid");
-              (("", "a\x80"), "invalid"); (("", "\xc0"), "invalid"); (("", "\xc1"), "invalid");
-              (("", "\xf5"), "invalid"); (("", "\xff"), "invalid"); (("\xed", "\xa0"), "invalid");
-              (("\xe0", "\x80"), "invalid"); (("\xc3", "\xa9\xe2\x82"), {|"\226\130"|});
-              (("", "a\xc2"), {|"\194"|}); (("\xc2", "\xa9b"), {|""|}) ]
+          equal
+            (list (pair (pair string string) string))
+            [ (("", "\xce\xba"), {|""|})
+            ; (("", "\xf4"), {|"\244"|})
+            ; (("\xf4", "\x90"), "invalid")
+            ; (("", "\xf4\x90\x80\x80"), "invalid")
+            ; (("\xf0\x9f", "\x98"), {|"\240\159\152"|})
+            ; (("\xf0\x9f\x98", "\x80ab"), {|""|})
+            ; (("\xe2", ""), {|"\226"|})
+            ; (("", ""), {|""|})
+            ; (("", "\xed"), {|"\237"|})
+            ; (("\xe0", "\xa0"), {|"\224\160"|})
+            ; (("", "\x80"), "invalid")
+            ; (("", "a\x80"), "invalid")
+            ; (("", "\xc0"), "invalid")
+            ; (("", "\xc1"), "invalid")
+            ; (("", "\xf5"), "invalid")
+            ; (("", "\xff"), "invalid")
+            ; (("\xed", "\xa0"), "invalid")
+            ; (("\xe0", "\x80"), "invalid")
+            ; (("\xc3", "\xa9\xe2\x82"), {|"\226\130"|})
+            ; (("", "a\xc2"), {|"\194"|})
+            ; (("\xc2", "\xa9b"), {|""|}) ]
             (List.map
                (fun (pending, s) -> ((pending, s), continue_result pending s))
-               [ ("", "\xce\xba"); ("", "\xf4"); ("\xf4", "\x90"); ("", "\xf4\x90\x80\x80");
-                 ("\xf0\x9f", "\x98"); ("\xf0\x9f\x98", "\x80ab"); ("\xe2", ""); ("", "");
-                 ("", "\xed"); ("\xe0", "\xa0"); ("", "\x80"); ("", "a\x80"); ("", "\xc0");
-                 ("", "\xc1"); ("", "\xf5"); ("", "\xff"); ("\xed", "\xa0"); ("\xe0", "\x80");
-                 ("\xc3", "\xa9\xe2\x82"); ("", "a\xc2"); ("\xc2", "\xa9b") ]));
-      prop ~count:2000 "the parts are correct exactly when the text is" utf8_parts (fun g ->
+               [ ("", "\xce\xba")
+               ; ("", "\xf4")
+               ; ("\xf4", "\x90")
+               ; ("", "\xf4\x90\x80\x80")
+               ; ("\xf0\x9f", "\x98")
+               ; ("\xf0\x9f\x98", "\x80ab")
+               ; ("\xe2", "")
+               ; ("", "")
+               ; ("", "\xed")
+               ; ("\xe0", "\xa0")
+               ; ("", "\x80")
+               ; ("", "a\x80")
+               ; ("", "\xc0")
+               ; ("", "\xc1")
+               ; ("", "\xf5")
+               ; ("", "\xff")
+               ; ("\xed", "\xa0")
+               ; ("\xe0", "\x80")
+               ; ("\xc3", "\xa9\xe2\x82")
+               ; ("", "a\xc2")
+               ; ("\xc2", "\xa9b") ] ) )
+    ; prop ~count:2000 "the parts are correct exactly when the text is"
+        utf8_parts (fun g ->
           let parts = cut_parts g in
-          let correct = match fold_continue parts with None, "" -> true | _ -> false in
-          equal bool (String.is_valid_utf_8 (String.concat "" parts)) correct);
-      prop ~count:2000 "continue fails at the first part that cannot start correct UTF-8" utf8_parts
-        (fun g ->
-           let parts = cut_parts g in
-           let rec first i prefix = function
-           | [] -> None
-           | p :: ps ->
-               let prefix = prefix ^ p in
-               if can_start prefix then first (i + 1) prefix ps else Some i
-           in
-           equal (option int) (first 0 "" parts) (fst (fold_continue parts)));
-      test "an incorrect fragment gives 1007 before the end of the message" (fun () ->
+          let correct =
+            match fold_continue parts with None, "" -> true | _ -> false
+          in
+          equal bool (String.is_valid_utf_8 (String.concat "" parts)) correct )
+    ; prop ~count:2000
+        "continue fails at the first part that cannot start correct UTF-8"
+        utf8_parts (fun g ->
+          let parts = cut_parts g in
+          let rec first i prefix = function
+            | [] ->
+                None
+            | p :: ps ->
+                let prefix = prefix ^ p in
+                if can_start prefix then first (i + 1) prefix ps else Some i
+          in
+          equal (option int) (first 0 "" parts) (fst (fold_continue parts)) )
+    ; test "an incorrect fragment gives 1007 before the end of the message"
+        (fun () ->
           (* Autobahn 6.4.1: the last fragment does not come. *)
           expect
             (converse
-               (client ~fin:false Text (of_hex "cebae1bdb9cf83cebcceb5")
-                ^ client ~fin:false Continuation (of_hex "f4908080"))
-               echo)
-          @@ __POS_OF__ {|
+               ( client ~fin:false Text (of_hex "cebae1bdb9cf83cebcceb5")
+               ^ client ~fin:false Continuation (of_hex "f4908080") )
+               echo )
+          @@ __POS_OF__
+               {|
             closed 1007 "text is not UTF-8"
             --
             close 1007
-            |});
-      test "a byte that ends a sequence too early gives 1007 at once" (fun () ->
+            |} )
+    ; test "a byte that ends a sequence too early gives 1007 at once" (fun () ->
           (* Autobahn 6.4.2. *)
           expect
             (converse
-               (client ~fin:false Text (of_hex "cebae1bdb9cf83cebcceb5f4")
-                ^ client ~fin:false Continuation (of_hex "90"))
-               echo)
-          @@ __POS_OF__ {|
+               ( client ~fin:false Text (of_hex "cebae1bdb9cf83cebcceb5f4")
+               ^ client ~fin:false Continuation (of_hex "90") )
+               echo )
+          @@ __POS_OF__
+               {|
             closed 1007 "text is not UTF-8"
             --
             close 1007
-            |});
-      test "a character in three fragments is correct" (fun () ->
+            |} )
+    ; test "a character in three fragments is correct" (fun () ->
           expect
             (converse
-               (client ~fin:false Text "\xf0" ^ client ~fin:false Continuation "\x9d\x84"
-                ^ client Continuation "\x9e")
-               echo)
-          @@ __POS_OF__ {|
+               ( client ~fin:false Text "\xf0"
+               ^ client ~fin:false Continuation "\x9d\x84"
+               ^ client Continuation "\x9e" )
+               echo )
+          @@ __POS_OF__
+               {|
             text "\240\157\132\158"
             closed 1006 ""
             --
             text "\240\157\132\158"
-            |});
-      test "an incomplete character at the end of a message gives 1007" (fun () ->
-          expect (converse (client ~fin:false Text "a\xe2" ^ client Continuation "\x82") echo)
-          @@ __POS_OF__ {|
+            |} )
+    ; test "an incomplete character at the end of a message gives 1007"
+        (fun () ->
+          expect
+            (converse
+               (client ~fin:false Text "a\xe2" ^ client Continuation "\x82")
+               echo )
+          @@ __POS_OF__
+               {|
             closed 1007 "text is not UTF-8"
             --
             close 1007
-            |});
-      test "a binary message is not examined" (fun () ->
-          expect (converse (client ~fin:false Binary "\xff" ^ client Continuation "\x80") echo)
-          @@ __POS_OF__ {|
+            |} )
+    ; test "a binary message is not examined" (fun () ->
+          expect
+            (converse
+               (client ~fin:false Binary "\xff" ^ client Continuation "\x80")
+               echo )
+          @@ __POS_OF__
+               {|
             binary "\255\128"
             closed 1006 ""
             --
             binary "\255\128"
-            |}) ]
+            |} )
+    ]
 
 let connection_tests =
   group "Connection"
     [ test "messages, then a Close from the peer" (fun () ->
           expect
             (converse
-               (client Text "Hello" ^ client Binary "\x00\xff"
-                ^ client Close (code_reason 1000 "bye"))
-               echo)
-          @@ __POS_OF__ {|
+               ( client Text "Hello" ^ client Binary "\x00\xff"
+               ^ client Close (code_reason 1000 "bye") )
+               echo )
+          @@ __POS_OF__
+               {|
             text "Hello"
             binary "\000\255"
             closed 1000 "bye"
@@ -441,34 +620,40 @@ let connection_tests =
             text "Hello"
             binary "\000\255"
             close 1000
-            |});
-      test "fragments with control frames between them" (fun () ->
+            |} )
+    ; test "fragments with control frames between them" (fun () ->
           expect
             (converse
-               (client ~fin:false Text "H\xe2\x82" ^ client Ping "p"
-                ^ client ~fin:false Continuation "\xac" ^ client Pong "q"
-                ^ client Continuation "lo")
-               echo)
-          @@ __POS_OF__ {|
+               ( client ~fin:false Text "H\xe2\x82"
+               ^ client Ping "p"
+               ^ client ~fin:false Continuation "\xac"
+               ^ client Pong "q" ^ client Continuation "lo" )
+               echo )
+          @@ __POS_OF__
+               {|
             text "H\226\130\172lo"
             closed 1006 ""
             --
             pong "p"
             text "H\226\130\172lo"
-            |});
-      test "an empty Close" (fun () ->
-          expect (converse (client Close "") echo) @@ __POS_OF__ {|
+            |} )
+    ; test "an empty Close" (fun () ->
+          expect (converse (client Close "") echo)
+          @@ __POS_OF__
+               {|
             closed 1005 ""
             --
             close
-            |});
-      test "the Close codes that are permitted" (fun () ->
+            |} )
+    ; test "the Close codes that are permitted" (fun () ->
           expect
             (String.concat "\n"
                (List.map
-                  (fun code -> converse (client Close (code_reason code "")) echo)
-                  [ 1000; 1003; 1007; 1014; 3000; 4999 ]))
-          @@ __POS_OF__ {|
+                  (fun code ->
+                    converse (client Close (code_reason code "")) echo )
+                  [1000; 1003; 1007; 1014; 3000; 4999] ) )
+          @@ __POS_OF__
+               {|
             closed 1000 ""
             --
             close 1000
@@ -487,36 +672,52 @@ let connection_tests =
             closed 4999 ""
             --
             close 4999
-            |});
-      test "a peer that does not obey the protocol" (fun () ->
+            |} )
+    ; test "a peer that does not obey the protocol" (fun () ->
           let x n = String.make n 'x' in
           let cases =
-            [ ("reserved opcode", of_hex "83 80", None);
-              ("unmasked frame", of_hex "81 00", None);
-              ("frame too large", client Binary (x 200), Some 16);
-              ("text too large", client Text (x 20), Some 16);
-              ("fragments too large", client ~fin:false Binary (x 10) ^ client Continuation (x 10), Some 16);
-              ( "fragments too large, before the data",
-                client ~fin:false Binary (x 900) ^ String.sub (client Continuation (x 200)) 0 4,
-                Some 1000 );
-              ("continuation first", client Continuation "x", None);
-              ("message in a message", client ~fin:false Text "a" ^ client Text "b", None);
-              ("text not UTF-8", client Text "\xff", None);
-              ("fragments not UTF-8", client ~fin:false Text "\xe2\x82" ^ client Continuation "x", None);
-              ("close of 1 byte", client Close "\x03", None);
-              ("close reason not UTF-8", client Close (code_reason 1000 "\xff"), None) ]
+            [ ("reserved opcode", of_hex "83 80", None)
+            ; ("unmasked frame", of_hex "81 00", None)
+            ; ("frame too large", client Binary (x 200), Some 16)
+            ; ("text too large", client Text (x 20), Some 16)
+            ; ( "fragments too large"
+              , client ~fin:false Binary (x 10) ^ client Continuation (x 10)
+              , Some 16 )
+            ; ( "fragments too large, before the data"
+              , client ~fin:false Binary (x 900)
+                ^ String.sub (client Continuation (x 200)) 0 4
+              , Some 1000 )
+            ; ("continuation first", client Continuation "x", None)
+            ; ( "message in a message"
+              , client ~fin:false Text "a" ^ client Text "b"
+              , None )
+            ; ("text not UTF-8", client Text "\xff", None)
+            ; ( "fragments not UTF-8"
+              , client ~fin:false Text "\xe2\x82" ^ client Continuation "x"
+              , None )
+            ; ("close of 1 byte", client Close "\x03", None)
+            ; ( "close reason not UTF-8"
+              , client Close (code_reason 1000 "\xff")
+              , None ) ]
             @ List.map
-              (fun code -> (Printf.sprintf "close code %d" code, client Close (code_reason code ""), None))
-              [ 0; 999; 1004; 1005; 1006; 1015; 1016; 2999; 5000; 65535 ]
+                (fun code ->
+                  ( Printf.sprintf "close code %d" code
+                  , client Close (code_reason code "")
+                  , None ) )
+                [0; 999; 1004; 1005; 1006; 1015; 1016; 2999; 5000; 65535]
           in
           expect
             (String.concat "\n"
                (List.map
                   (fun (name, input, max_message) ->
-                     let lines = String.split_on_char '\n' (converse ?max_message input echo) in
-                     name ^ ": " ^ String.concat " | " lines)
-                  cases))
-          @@ __POS_OF__ {|
+                    let lines =
+                      String.split_on_char '\n'
+                        (converse ?max_message input echo)
+                    in
+                    name ^ ": " ^ String.concat " | " lines )
+                  cases ) )
+          @@ __POS_OF__
+               {|
             reserved opcode: closed 1002 "reserved opcode 3" | -- | close 1002
             unmasked frame: closed 1002 "unmasked frame" | -- | close 1002
             frame too large: closed 1009 "message is too large" | -- | close 1009
@@ -539,39 +740,54 @@ let connection_tests =
             close code 2999: closed 1002 "close code 2999" | -- | close 1002
             close code 5000: closed 1002 "close code 5000" | -- | close 1002
             close code 65535: closed 1002 "close code 65535" | -- | close 1002
-            |});
-      test "control frames do not count in the size of a message" (fun () ->
+            |} )
+    ; test "control frames do not count in the size of a message" (fun () ->
           expect
             (converse ~max_message:16
-               (client ~fin:false Binary (String.make 16 'x') ^ client Ping (String.make 100 'p')
-                ^ client Continuation "")
-               (fun note c -> match Ws.recv c with
-                 | Binary s -> note (Printf.sprintf "binary of %d bytes" (String.length s))
-                 | Text _ -> note "text"
-                 | exception e -> note_closed note e))
-          @@ __POS_OF__ {|
+               ( client ~fin:false Binary (String.make 16 'x')
+               ^ client Ping (String.make 100 'p')
+               ^ client Continuation "" )
+               (fun note c ->
+                 match Ws.recv c with
+                 | Binary s ->
+                     note
+                       (Printf.sprintf "binary of %d bytes" (String.length s))
+                 | Text _ ->
+                     note "text"
+                 | exception e ->
+                     note_closed note e ) )
+          @@ __POS_OF__
+               {|
             binary of 16 bytes
             --
             pong "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
-            |});
-      test "the size of a message counts all of its fragments" (fun () ->
+            |} )
+    ; test "the size of a message counts all of its fragments" (fun () ->
           expect
             (converse ~max_message:10
-               (client ~fin:false Binary "aaaa" ^ client ~fin:false Continuation "bbbb"
-                ^ client Continuation "cccc")
-               (fun note c -> match Ws.recv c with
-                 | Binary s -> note (Printf.sprintf "binary of %d bytes" (String.length s))
-                 | Text _ -> note "text"
-                 | exception e -> note_closed note e))
-          @@ __POS_OF__ {|
+               ( client ~fin:false Binary "aaaa"
+               ^ client ~fin:false Continuation "bbbb"
+               ^ client Continuation "cccc" )
+               (fun note c ->
+                 match Ws.recv c with
+                 | Binary s ->
+                     note
+                       (Printf.sprintf "binary of %d bytes" (String.length s))
+                 | Text _ ->
+                     note "text"
+                 | exception e ->
+                     note_closed note e ) )
+          @@ __POS_OF__
+               {|
             closed 1009 "message is too large"
             --
             close 1009
-            |});
-      test "empty fragments do not make the heap grow" (fun () ->
-          (* 300 000 empty Continuation frames, then the last fragment.
-             The read function records the largest heap. *)
-          let first = client ~fin:false Binary "x" and empty = client ~fin:false Continuation "" in
+            |} )
+    ; test "empty fragments do not make the heap grow" (fun () ->
+          (* 300 000 empty Continuation frames, then the last fragment. The read
+             function records the largest heap. *)
+          let first = client ~fin:false Binary "x"
+          and empty = client ~fin:false Continuation "" in
           let last = client Continuation "y" and count = 300_000 in
           let size = String.length empty in
           let body = count * size in
@@ -579,160 +795,212 @@ let connection_tests =
           let pos = ref 0 and top = ref 0 in
           let byte i =
             if i < String.length first then first.[i]
-            else if i < String.length first + body then empty.[(i - String.length first) mod size]
+            else if i < String.length first + body then
+              empty.[(i - String.length first) mod size]
             else last.[i - String.length first - body]
           in
           let read buf off len =
-            top := Int.max !top (Gc.quick_stat ()).heap_words;
+            top := Int.max !top (Gc.quick_stat ()).heap_words ;
             let n = Int.min len (total - !pos) in
-            for i = 0 to n - 1 do Bytes.set buf (off + i) (byte (!pos + i)) done;
-            pos := !pos + n;
+            for i = 0 to n - 1 do
+              Bytes.set buf (off + i) (byte (!pos + i))
+            done ;
+            pos := !pos + n ;
             n
           in
           let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
           let flow =
-            Caravan.Flow.make ~read ~read_now:(fun b o l -> Some (read b o l))
-              ~write:(fun _ _ _ -> ()) ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
-              ~close:ignore ~set_read_deadline:ignore_deadline ~set_write_deadline:ignore_deadline ()
+            Caravan.Flow.make ~read
+              ~read_now:(fun b o l -> Some (read b o l))
+              ~write:(fun _ _ _ -> ())
+              ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
+              ~close:ignore ~set_read_deadline:ignore_deadline
+              ~set_write_deadline:ignore_deadline ()
           in
           let start = (Gc.quick_stat ()).heap_words in
           Affect_unix.Unix.main ~domain_count:1 (fun () ->
-              is_true (Ws.recv (Ws.Private.of_flow flow) = Binary "xy"));
+              is_true (Ws.recv (Ws.Private.of_flow flow) = Binary "xy") ) ;
           let grew = (!top - start) * (Sys.word_size / 8) in
-          is_true ~msg:(Printf.sprintf "the heap grew by %d bytes" grew) (grew < 4_000_000));
-      test "small frames take one read of the input" (fun () ->
-          let input = client Binary "hello" ^ client Text "hi" and pos = ref 0 and reads = ref 0 in
+          is_true
+            ~msg:(Printf.sprintf "the heap grew by %d bytes" grew)
+            (grew < 4_000_000) )
+    ; test "small frames take one read of the input" (fun () ->
+          let input = client Binary "hello" ^ client Text "hi"
+          and pos = ref 0
+          and reads = ref 0 in
           let read buf off len =
-            incr reads;
+            incr reads ;
             let n = Int.min len (String.length input - !pos) in
-            Bytes.blit_string input !pos buf off n;
-            pos := !pos + n;
+            Bytes.blit_string input !pos buf off n ;
+            pos := !pos + n ;
             n
           in
           let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
           let flow =
-            Caravan.Flow.make ~read ~read_now:(fun b o l -> Some (read b o l))
-              ~write:(fun _ _ _ -> ()) ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
-              ~close:ignore ~set_read_deadline:ignore_deadline ~set_write_deadline:ignore_deadline ()
+            Caravan.Flow.make ~read
+              ~read_now:(fun b o l -> Some (read b o l))
+              ~write:(fun _ _ _ -> ())
+              ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
+              ~close:ignore ~set_read_deadline:ignore_deadline
+              ~set_write_deadline:ignore_deadline ()
           in
           Affect_unix.Unix.main ~domain_count:1 (fun () ->
               let c = Ws.Private.of_flow flow in
-              is_true (Ws.recv c = Binary "hello");
-              is_true (Ws.recv c = Text "hi"));
-          equal int 1 !reads);
-      test "the buffer of a fragmented message stays within max_message" (fun () ->
+              is_true (Ws.recv c = Binary "hello") ;
+              is_true (Ws.recv c = Text "hi") ) ;
+          equal int 1 !reads )
+    ; test "the buffer of a fragmented message stays within max_message"
+        (fun () ->
           (* What recv allocates for a message of [m] bytes in fragments of
-             [sizes], more than for the same message in one frame. The
-             expected message is made before the measure. *)
+             [sizes], more than for the same message in one frame. The expected
+             message is made before the measure. *)
           let m = 1024 * 1024 in
           let expected = String.make m 'x' in
           let allocated frames =
-            let flow = Caravan.Flow.of_string (String.concat "" frames) (Buffer.create 16) in
+            let flow =
+              Caravan.Flow.of_string (String.concat "" frames)
+                (Buffer.create 16)
+            in
             let used = ref 0. in
             Affect_unix.Unix.main ~domain_count:1 (fun () ->
                 let c = Ws.Private.of_flow ~max_message:m flow in
                 let before = Gc.allocated_bytes () in
                 let msg = Ws.recv c in
-                used := Gc.allocated_bytes () -. before;
-                is_true (msg = Binary expected));
+                used := Gc.allocated_bytes () -. before ;
+                is_true (msg = Binary expected) ) ;
             !used
           in
-          let whole = allocated [ client Binary expected ] in
+          let whole = allocated [client Binary expected] in
           let more sizes =
             let rec frames first = function
-            | [] -> []
-            | [ n ] -> [ client (if first then Binary else Continuation) (String.make n 'x') ]
-            | n :: rest ->
-                client ~fin:false (if first then Binary else Continuation) (String.make n 'x')
-                :: frames false rest
+              | [] ->
+                  []
+              | [n] ->
+                  [ client
+                      (if first then Binary else Continuation)
+                      (String.make n 'x') ]
+              | n :: rest ->
+                  client ~fin:false
+                    (if first then Binary else Continuation)
+                    (String.make n 'x')
+                  :: frames false rest
             in
             (allocated (frames true sizes) -. whole) /. Float.of_int m
           in
-          (* At most one buffer of [m] bytes, and the copy when it grows:
-             1.50 m at this time. A buffer of 2 times the first fragment
-             gave 2.00 m to 4.44 m. A full first fragment and an empty last
-             fragment do not cause a copy. In the last three cases, the
-             double size is more than [m]: without the limit, they give
-             2.44 m to 3.00 m. *)
+          (* At most one buffer of [m] bytes, and the copy when it grows: 1.50 m
+             at this time. A buffer of 2 times the first fragment gave 2.00 m to
+             4.44 m. A full first fragment and an empty last fragment do not
+             cause a copy. In the last three cases, the double size is more than
+             [m]: without the limit, they give 2.44 m to 3.00 m. *)
           List.iter
             (fun (sizes, limit) ->
-               let r = more sizes in
-               is_true
-                 ~msg:(Printf.sprintf "%s: %.2f m" (String.concat " + " (List.map string_of_int sizes)) r)
-                 (r < limit))
-            [ ([ m; 0 ], 0.5); ([ (m / 2) - 1; (m / 2) + 1 ], 1.75); ([ 3; m - 3 ], 1.75);
-              ([ m - 1; 1 ], 1.75); ([ (m / 2) + 1; (m / 2) - 1 ], 1.75);
-              ([ 6 * m / 10; m / 10; m - (6 * m / 10) - (m / 10) ], 1.75) ]);
-      test "a connection that stops inside a frame" (fun () ->
-          expect (converse (String.sub (client Text "Hello") 0 4) echo) @@ __POS_OF__ {|
+              let r = more sizes in
+              is_true
+                ~msg:
+                  (Printf.sprintf "%s: %.2f m"
+                     (String.concat " + " (List.map string_of_int sizes))
+                     r )
+                (r < limit) )
+            [ ([m; 0], 0.5)
+            ; ([(m / 2) - 1; (m / 2) + 1], 1.75)
+            ; ([3; m - 3], 1.75)
+            ; ([m - 1; 1], 1.75)
+            ; ([(m / 2) + 1; (m / 2) - 1], 1.75)
+            ; ([6 * m / 10; m / 10; m - (6 * m / 10) - (m / 10)], 1.75) ] )
+    ; test "a connection that stops inside a frame" (fun () ->
+          expect (converse (String.sub (client Text "Hello") 0 4) echo)
+          @@ __POS_OF__
+               {|
             closed 1006 ""
             --
-            |});
-      test "a closed connection raises Closed again" (fun () ->
+            |} )
+    ; test "a closed connection raises Closed again" (fun () ->
           expect
-            (converse (client Close (code_reason 1001 "away")) (fun note c ->
+            (converse
+               (client Close (code_reason 1001 "away"))
+               (fun note c ->
                  List.iter
                    (fun f -> try f () with e -> note_closed note e)
-                   [ (fun () -> ignore (Ws.recv c)); (fun () -> ignore (Ws.recv c));
-                     (fun () -> Ws.send c (Text "x")); (fun () -> Ws.ping c "") ]))
-          @@ __POS_OF__ {|
+                   [ (fun () -> ignore (Ws.recv c))
+                   ; (fun () -> ignore (Ws.recv c))
+                   ; (fun () -> Ws.send c (Text "x"))
+                   ; (fun () -> Ws.ping c "") ] ) )
+          @@ __POS_OF__
+               {|
             closed 1001 "away"
             closed 1001 "away"
             closed 1001 "away"
             closed 1001 "away"
             --
             close 1001
-            |});
-      test "send and ping examine their arguments" (fun () ->
+            |} )
+    ; test "send and ping examine their arguments" (fun () ->
           expect
             (converse "" (fun _ c ->
-                 raises_match is_invalid_arg (fun () -> Ws.send c (Text "\xff"));
-                 raises_match is_invalid_arg (fun () -> Ws.ping c (String.make 126 'p'));
-                 Ws.ping c (String.make 125 'p');
-                 Ws.send c (Binary "\xff")))
-          @@ __POS_OF__ {|
+                 raises_match is_invalid_arg (fun () -> Ws.send c (Text "\xff")) ;
+                 raises_match is_invalid_arg (fun () ->
+                     Ws.ping c (String.make 126 'p') ) ;
+                 Ws.ping c (String.make 125 'p') ;
+                 Ws.send c (Binary "\xff") ) )
+          @@ __POS_OF__
+               {|
             --
             ping "ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
             binary "\255"
-            |});
-      prop "recv joins fragments and answers Pings"
+            |} )
+    ; prop "recv joins fragments and answers Pings"
         Gen.(
           list ~size:(int_range 0 4)
             (triple bool
-               (list ~size:(int_range 0 6) (of_list [ "a"; "\xc3\xa9"; "\xe2\x82\xac"; "\xf0\x9d\x84\x9e"; "\x00" ]))
-               (list ~size:(int_range 0 4) (int_range 0 5))))
+               (list ~size:(int_range 0 6)
+                  (of_list
+                     [ "a"
+                     ; "\xc3\xa9"
+                     ; "\xe2\x82\xac"
+                     ; "\xf0\x9d\x84\x9e"
+                     ; "\x00" ] ) )
+               (list ~size:(int_range 0 4) (int_range 0 5)) ) )
         (fun messages ->
-           (* Cut [s] in fragments of the given sizes and a last fragment. *)
-           let rec cut s = function
-           | [] -> [ s ]
-           | n :: ns ->
-               let n = Int.min n (String.length s) in
-               String.sub s 0 n :: cut (String.sub s n (String.length s - n)) ns
-           in
-           let input = Buffer.create 64 and expected = ref [] and log = ref [] in
-           List.iteri
-             (fun i (text, pieces, sizes) ->
-                let payload = String.concat "" pieces in
-                let fragments = cut payload sizes in
-                let last = List.length fragments - 1 in
-                List.iteri
-                  (fun j f ->
-                     let op : Frame.opcode = if j > 0 then Continuation else if text then Text else Binary in
-                     Buffer.add_string input (client ~fin:(j = last) op f);
-                     if j < last && j mod 2 = 0
-                     then begin
-                       let p = Printf.sprintf "%d.%d" i j in
-                       Buffer.add_string input (client Ping p);
-                       expected := Printf.sprintf "pong %S" p :: !expected
-                     end)
-                  fragments;
-                let m = if text then Printf.sprintf "text %S" payload else Printf.sprintf "binary %S" payload in
-                log := m :: !log;
-                expected := m :: !expected)
-             messages;
-           equal string
-             (String.concat "\n" (List.rev !log @ [ "closed 1006 \"\""; "--" ] @ List.rev !expected))
-             (converse (Buffer.contents input) echo)) ]
+          (* Cut [s] in fragments of the given sizes and a last fragment. *)
+          let rec cut s = function
+            | [] ->
+                [s]
+            | n :: ns ->
+                let n = Int.min n (String.length s) in
+                String.sub s 0 n
+                :: cut (String.sub s n (String.length s - n)) ns
+          in
+          let input = Buffer.create 64 and expected = ref [] and log = ref [] in
+          List.iteri
+            (fun i (text, pieces, sizes) ->
+              let payload = String.concat "" pieces in
+              let fragments = cut payload sizes in
+              let last = List.length fragments - 1 in
+              List.iteri
+                (fun j f ->
+                  let op : Frame.opcode =
+                    if j > 0 then Continuation
+                    else if text then Text
+                    else Binary
+                  in
+                  Buffer.add_string input (client ~fin:(j = last) op f) ;
+                  if j < last && j mod 2 = 0 then begin
+                    let p = Printf.sprintf "%d.%d" i j in
+                    Buffer.add_string input (client Ping p) ;
+                    expected := Printf.sprintf "pong %S" p :: !expected
+                  end )
+                fragments ;
+              let m =
+                if text then Printf.sprintf "text %S" payload
+                else Printf.sprintf "binary %S" payload
+              in
+              log := m :: !log ;
+              expected := m :: !expected )
+            messages ;
+          equal string
+            (String.concat "\n"
+               (List.rev !log @ ["closed 1006 \"\""; "--"] @ List.rev !expected) )
+            (converse (Buffer.contents input) echo) ) ]
 
 let close_tests =
   let try_note note f = try f () with e -> note_closed note e in
@@ -740,67 +1008,84 @@ let close_tests =
     [ test "close sends a Close frame and reads until the reply" (fun () ->
           expect
             (converse
-               (client Text "discarded" ^ client Ping "no pong"
-                ^ client Close (code_reason 1000 "ok"))
+               ( client Text "discarded" ^ client Ping "no pong"
+               ^ client Close (code_reason 1000 "ok") )
                (fun note c ->
-                  Ws.close ~code:1001 ~reason:"bye" c;
-                  note "close ended";
-                  try_note note (fun () -> ignore (Ws.recv c))))
-          @@ __POS_OF__ {|
+                 Ws.close ~code:1001 ~reason:"bye" c ;
+                 note "close ended" ;
+                 try_note note (fun () -> ignore (Ws.recv c)) ) )
+          @@ __POS_OF__
+               {|
             close ended
             closed 1000 "ok"
             --
             close 1001 "bye"
-            |});
-      test "after close, close does nothing and send raises Closed" (fun () ->
+            |} )
+    ; test "after close, close does nothing and send raises Closed" (fun () ->
           expect
             (converse (client Close "") (fun note c ->
-                 Ws.close c;
-                 Ws.close ~code:3000 c;
-                 try_note note (fun () -> Ws.send c (Text "x"));
-                 try_note note (fun () -> Ws.ping c "")))
-          @@ __POS_OF__ {|
+                 Ws.close c ;
+                 Ws.close ~code:3000 c ;
+                 try_note note (fun () -> Ws.send c (Text "x")) ;
+                 try_note note (fun () -> Ws.ping c "") ) )
+          @@ __POS_OF__
+               {|
             closed 1005 ""
             closed 1005 ""
             --
             close 1000
-            |});
-      test "a peer that goes before its reply" (fun () ->
+            |} )
+    ; test "a peer that goes before its reply" (fun () ->
           expect
             (converse "" (fun note c ->
-                 Ws.close c;
-                 try_note note (fun () -> ignore (Ws.recv c))))
-          @@ __POS_OF__ {|
+                 Ws.close c ;
+                 try_note note (fun () -> ignore (Ws.recv c)) ) )
+          @@ __POS_OF__
+               {|
             closed 1006 ""
             --
             close 1000
-            |});
-      test "close stops at the time limit if the peer sends without a stop" (fun () ->
-          (* A flow that always has bytes: a read never waits for its
-             deadline. The peer sends 100 000 000 frames, then ends. A read
-             of all of them takes many seconds. *)
+            |} )
+    ; test "close stops at the time limit if the peer sends without a stop"
+        (fun () ->
+          (* A flow that always has bytes: a read never waits for its deadline.
+             The peer sends 100 000 000 frames, then ends. A read of all of them
+             takes many seconds. *)
           let frame = client Binary "" and count = 100_000_000 in
           let size = String.length frame in
           let total = count * size and pos = ref 0 in
           let read buf off len =
             let n = Int.min len (total - !pos) in
-            for i = 0 to n - 1 do Bytes.set buf (off + i) frame.[(!pos + i) mod size] done;
-            pos := !pos + n;
+            for i = 0 to n - 1 do
+              Bytes.set buf (off + i) frame.[(!pos + i) mod size]
+            done ;
+            pos := !pos + n ;
             n
           in
           let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
           let flow =
-            Caravan.Flow.make ~read ~read_now:(fun b o l -> Some (read b o l))
-              ~write:(fun _ _ _ -> ()) ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
-              ~close:ignore ~set_read_deadline:ignore_deadline ~set_write_deadline:ignore_deadline ()
+            Caravan.Flow.make ~read
+              ~read_now:(fun b o l -> Some (read b o l))
+              ~write:(fun _ _ _ -> ())
+              ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
+              ~close:ignore ~set_read_deadline:ignore_deadline
+              ~set_write_deadline:ignore_deadline ()
           in
           let t = Affect_unix.Mtime.counter () in
           Affect_unix.Unix.main ~domain_count:1 (fun () ->
-              Ws.close (Ws.Private.of_flow ~close_timeout:Affect_unix.Mtime.Span.(50 * ms) flow));
-          let took = Affect_unix.Mtime.Span.to_float_ns (Affect_unix.Mtime.count t) /. 1e6 in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 2000.);
-          is_true ~msg:(Printf.sprintf "read %d of %d bytes" !pos total) (!pos < total));
-      test "close examines its code and its reason" (fun () ->
+              Ws.close
+                (Ws.Private.of_flow
+                   ~close_timeout:Affect_unix.Mtime.Span.(50 * ms)
+                   flow ) ) ;
+          let took =
+            Affect_unix.Mtime.Span.to_float_ns (Affect_unix.Mtime.count t)
+            /. 1e6
+          in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 2000.) ;
+          is_true
+            ~msg:(Printf.sprintf "read %d of %d bytes" !pos total)
+            (!pos < total) )
+    ; test "close examines its code and its reason" (fun () ->
           (* The largest reason: 123 bytes of UTF-8. *)
           let reason = String.make 120 'x' ^ "\xe2\x82\xac" in
           equal string
@@ -808,503 +1093,664 @@ let close_tests =
             (converse "" (fun _ c ->
                  List.iter
                    (fun (code, reason) ->
-                      raises_match is_invalid_arg (fun () -> Ws.close ~code ~reason c))
-                   [ (999, ""); (1004, ""); (1005, ""); (1006, ""); (1015, ""); (2999, "");
-                     (5000, ""); (1000, reason ^ "x"); (1000, "\xff") ];
-                 Ws.close ~code:4999 ~reason c))) ]
+                     raises_match is_invalid_arg (fun () ->
+                         Ws.close ~code ~reason c ) )
+                   [ (999, "")
+                   ; (1004, "")
+                   ; (1005, "")
+                   ; (1006, "")
+                   ; (1015, "")
+                   ; (2999, "")
+                   ; (5000, "")
+                   ; (1000, reason ^ "x")
+                   ; (1000, "\xff") ] ;
+                 Ws.close ~code:4999 ~reason c ) ) ) ]
 
-(* Runs [f] with the flows of the server and of the peer of a TCP
-   connection. *)
+(* Runs [f] with the flows of the server and of the peer of a TCP connection. *)
 let with_flows = Server_support.with_flows
 
 (* Runs [f] with a server connection and the flow of its peer, on a TCP
    connection. *)
 let with_socket ?close_timeout ?write_timeout ?read_timeout ?idle_timeout f =
   with_flows (fun server peer ->
-      f (Ws.Private.of_flow ?close_timeout ?write_timeout ?read_timeout ?idle_timeout server) peer)
+      f
+        (Ws.Private.of_flow ?close_timeout ?write_timeout ?read_timeout
+           ?idle_timeout server )
+        peer )
 
 let ms n = Affect_unix.Mtime.Span.(n * ms)
-let elapsed_ms c = Affect_unix.Mtime.Span.to_float_ns (Affect_unix.Mtime.count c) /. 1e6
 
-(* [f ()], in a call that must end in 2 s. If not, the test cancels the
-   call and fails, so that a regression does not stop the suite. *)
+let elapsed_ms c =
+  Affect_unix.Mtime.Span.to_float_ns (Affect_unix.Mtime.count c) /. 1e6
+
+(* [f ()], in a call that must end in 2 s. If not, the test cancels the call and
+   fails, so that a regression does not stop the suite. *)
 let within_2s f = Server_support.within_2s f
 
 (* The code of the [Closed] exception that [f] raises. *)
 let closed_code f =
   match f () with
-  | _ -> fail "no Closed exception"
-  | exception Ws.Closed { code; _ } -> code
+  | _ ->
+      fail "no Closed exception"
+  | exception Ws.Closed {code; _} ->
+      code
 
 (* Waits at most 2 s until a close starts on [c]. *)
 let wait_closing c =
   let rec wait n =
-    if (not (is_closing c)) && n > 0 then (Affect_unix.Mtime.wait_for (ms 5); wait (n - 1))
+    if (not (is_closing c)) && n > 0 then (
+      Affect_unix.Mtime.wait_for (ms 5) ;
+      wait (n - 1) )
   in
-  wait 400;
+  wait 400 ;
   is_true ~msg:"a close started" (is_closing c)
 
 let socket_tests =
   group "Connection on a socket"
-    [ test ~timeout:30. "fibers that send at the same time do not mix their frames" (fun () ->
+    [ test ~timeout:30.
+        "fibers that send at the same time do not mix their frames" (fun () ->
           let open Affect in
-          with_socket @@ fun c peer ->
+          with_socket
+          @@ fun c peer ->
           (* Some messages are larger than a socket buffer: they need many
              writes. *)
-          let body name i = String.make (if i mod 50 = 0 then 100_000 else i) name in
+          let body name i =
+            String.make (if i mod 50 = 0 then 100_000 else i) name
+          in
           let sender name =
             Fun.Async.call (fun () ->
                 for i = 1 to 200 do
-                  Ws.send c (Binary (Printf.sprintf "%c %d %s" name i (body name i)))
-                done)
+                  Ws.send c
+                    (Binary (Printf.sprintf "%c %d %s" name i (body name i)))
+                done )
           in
           let a = sender 'a' and b = sender 'b' in
           let r = Buf_reader.of_flow peer and last = Hashtbl.create 2 in
           for _ = 1 to 400 do
             let f = Frame.read r ~masked:false ~max:max_int in
             match String.split_on_char ' ' f.payload with
-            | [ name; i; data ] ->
-                let i = int_of_string i and prev = Option.value ~default:0 (Hashtbl.find_opt last name) in
-                equal int ~msg:name (prev + 1) i;
-                is_true ~msg:"intact" (data = body name.[0] i);
+            | [name; i; data] ->
+                let i = int_of_string i
+                and prev =
+                  Option.value ~default:0 (Hashtbl.find_opt last name)
+                in
+                equal int ~msg:name (prev + 1) i ;
+                is_true ~msg:"intact" (data = body name.[0] i) ;
                 Hashtbl.replace last name i
-            | _ -> fail "a message with incorrect content"
-          done;
-          Fun.Async.get a;
-          Fun.Async.get b);
-      test "close stops at the time limit if the peer does not reply" (fun () ->
-          with_socket ~close_timeout:(ms 50) @@ fun c peer ->
+            | _ ->
+                fail "a message with incorrect content"
+          done ;
+          Fun.Async.get a ;
+          Fun.Async.get b )
+    ; test "close stops at the time limit if the peer does not reply" (fun () ->
+          with_socket ~close_timeout:(ms 50)
+          @@ fun c peer ->
           let t = Affect_unix.Mtime.counter () in
-          within_2s (fun () -> Ws.close c);
+          within_2s (fun () -> Ws.close c) ;
           let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 2000.);
-          equal string "close 1000" (show_frame (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125));
-          equal int 1006 (closed_code (fun () -> Ws.recv c)));
-      test "a fiber in recv reads the reply to close" (fun () ->
+          is_true
+            ~msg:(Printf.sprintf "took %.0fms" took)
+            (took >= 40. && took < 2000.) ;
+          equal string "close 1000"
+            (show_frame
+               (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125) ) ;
+          equal int 1006 (closed_code (fun () -> Ws.recv c)) )
+    ; test "a fiber in recv reads the reply to close" (fun () ->
           let open Affect in
-          with_socket @@ fun c peer ->
-          let reader = Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c)) in
-          Affect_unix.Mtime.wait_for (ms 20);
+          with_socket
+          @@ fun c peer ->
+          let reader =
+            Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c))
+          in
+          Affect_unix.Mtime.wait_for (ms 20) ;
           let closer = Fun.Async.call (fun () -> Ws.close ~code:1001 c) in
-          equal string "close 1001" (show_frame (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125));
-          Caravan.Flow.write_string peer (client Close (code_reason 1001 ""));
-          Fun.Async.get closer;
-          equal int 1001 (Fun.Async.get reader));
-      test "a fiber in recv stops at the time limit of close" (fun () ->
+          equal string "close 1001"
+            (show_frame
+               (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125) ) ;
+          Caravan.Flow.write_string peer (client Close (code_reason 1001 "")) ;
+          Fun.Async.get closer ;
+          equal int 1001 (Fun.Async.get reader) )
+    ; test "a fiber in recv stops at the time limit of close" (fun () ->
           let open Affect in
-          with_socket ~close_timeout:(ms 50) @@ fun c _peer ->
-          let reader = Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c)) in
-          Affect_unix.Mtime.wait_for (ms 20);
+          with_socket ~close_timeout:(ms 50)
+          @@ fun c _peer ->
+          let reader =
+            Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c))
+          in
+          Affect_unix.Mtime.wait_for (ms 20) ;
           let t = Affect_unix.Mtime.counter () in
-          within_2s (fun () -> Ws.close c);
+          within_2s (fun () -> Ws.close c) ;
           let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 2000.);
-          equal int 1006 (Fun.Async.get reader));
-      test "a fiber blocked in send stops at the time limit of close" (fun () ->
+          is_true
+            ~msg:(Printf.sprintf "took %.0fms" took)
+            (took >= 40. && took < 2000.) ;
+          equal int 1006 (Fun.Async.get reader) )
+    ; test "a fiber blocked in send stops at the time limit of close" (fun () ->
           let open Affect in
-          with_socket ~close_timeout:(ms 50) @@ fun c _peer ->
+          with_socket ~close_timeout:(ms 50)
+          @@ fun c _peer ->
           (* The peer reads nothing: the sends fill the socket buffers. *)
           let sender =
             Fun.Async.call (fun () ->
                 closed_code (fun () ->
-                    while true do Ws.send c (Binary (String.make 1_000_000 'x')) done))
+                    while true do
+                      Ws.send c (Binary (String.make 1_000_000 'x'))
+                    done ) )
           in
-          Affect_unix.Mtime.wait_for (ms 50);
+          Affect_unix.Mtime.wait_for (ms 50) ;
           let t = Affect_unix.Mtime.counter () in
-          within_2s (fun () -> Ws.close c);
+          within_2s (fun () -> Ws.close c) ;
           let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 2000.);
-          equal int 1006 (Fun.Async.get sender));
-      test "a send that waits for a different send raises Closed after close" (fun () ->
+          is_true
+            ~msg:(Printf.sprintf "took %.0fms" took)
+            (took >= 40. && took < 2000.) ;
+          equal int 1006 (Fun.Async.get sender) )
+    ; test "a send that waits for a different send raises Closed after close"
+        (fun () ->
           let open Affect in
-          with_socket ~close_timeout:(ms 2000) @@ fun c peer ->
+          with_socket ~close_timeout:(ms 2000)
+          @@ fun c peer ->
           (* The peer reads nothing: [big] fills the socket buffers. *)
-          let big = Fun.Async.call (fun () -> Ws.send c (Binary (String.make 4_000_000 'x'))) in
-          Affect_unix.Mtime.wait_for (ms 50);
-          let late = Fun.Async.call (fun () -> closed_code (fun () -> Ws.send c (Text "late"))) in
-          Affect_unix.Mtime.wait_for (ms 20);
+          let big =
+            Fun.Async.call (fun () ->
+                Ws.send c (Binary (String.make 4_000_000 'x')) )
+          in
+          Affect_unix.Mtime.wait_for (ms 50) ;
+          let late =
+            Fun.Async.call (fun () ->
+                closed_code (fun () -> Ws.send c (Text "late")) )
+          in
+          Affect_unix.Mtime.wait_for (ms 20) ;
           let closer = Fun.Async.call (fun () -> Ws.close c) in
-          Affect_unix.Mtime.wait_for (ms 20);
+          Affect_unix.Mtime.wait_for (ms 20) ;
           let r = Buf_reader.of_flow peer in
           let next () = Frame.read r ~masked:false ~max:max_int in
-          equal int 4_000_000 (String.length (next ()).payload);
-          equal string "close 1000" (show_frame (next ()));
-          Caravan.Flow.write_string peer (client Close (code_reason 1000 ""));
-          Fun.Async.get big;
-          equal int 1000 (Fun.Async.get late);
-          Fun.Async.get closer);
-      test "a send to a peer that reads nothing stops at the write timeout" (fun () ->
+          equal int 4_000_000 (String.length (next ()).payload) ;
+          equal string "close 1000" (show_frame (next ())) ;
+          Caravan.Flow.write_string peer (client Close (code_reason 1000 "")) ;
+          Fun.Async.get big ;
+          equal int 1000 (Fun.Async.get late) ;
+          Fun.Async.get closer )
+    ; test "a send to a peer that reads nothing stops at the write timeout"
+        (fun () ->
           let open Affect in
-          with_socket ~write_timeout:(ms 50) @@ fun c _peer ->
+          with_socket ~write_timeout:(ms 50)
+          @@ fun c _peer ->
           let t = Affect_unix.Mtime.counter () in
           let send () = Ws.send c (Binary (String.make 10_000_000 'x')) in
           let sender = Fun.Async.call (fun () -> closed_code send) in
           let ended = Action.map (fun _ -> `Ended) (Fun.Async.get' sender) in
-          (match Action.invoke (Action.choose [ ended; Affect_unix.Mtime.wait_for' (ms 2000) `Late ]) with
-          | `Ended -> equal int 1006 (Fun.Async.get sender)
-          | `Late -> Fun.Async.cancel sender; fail "the send did not stop");
+          ( match
+              Action.invoke
+                (Action.choose
+                   [ended; Affect_unix.Mtime.wait_for' (ms 2000) `Late] )
+            with
+          | `Ended ->
+              equal int 1006 (Fun.Async.get sender)
+          | `Late ->
+              Fun.Async.cancel sender ;
+              fail "the send did not stop" ) ;
           let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 2000.));
-      test "a peer that sends no frame in the idle timeout gets Close 1001" (fun () ->
-          with_socket ~idle_timeout:(ms 50) @@ fun c peer ->
+          is_true
+            ~msg:(Printf.sprintf "took %.0fms" took)
+            (took >= 40. && took < 2000.) )
+    ; test "a peer that sends no frame in the idle timeout gets Close 1001"
+        (fun () ->
+          with_socket ~idle_timeout:(ms 50)
+          @@ fun c peer ->
           (* The connection does not wait for the reply of the peer. *)
           let t = Affect_unix.Mtime.counter () in
-          (match Ws.recv c with
-          | _ -> fail "a message"
-          | exception Ws.Closed { code; reason } ->
-              equal int 1001 code;
-              equal string "idle timeout" reason);
+          ( match Ws.recv c with
+          | _ ->
+              fail "a message"
+          | exception Ws.Closed {code; reason} ->
+              equal int 1001 code ;
+              equal string "idle timeout" reason ) ;
           let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 1000.);
-          equal string "close 1001" (show_frame (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125)));
-      test "a frame that stops in the middle gets Close 1001 at the read timeout" (fun () ->
+          is_true
+            ~msg:(Printf.sprintf "took %.0fms" took)
+            (took >= 40. && took < 1000.) ;
+          equal string "close 1001"
+            (show_frame
+               (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125) ) )
+    ; test
+        "a frame that stops in the middle gets Close 1001 at the read timeout"
+        (fun () ->
           let open Affect in
-          with_socket ~read_timeout:(ms 50) ~close_timeout:(ms 50) @@ fun c peer ->
-          Caravan.Flow.write_string peer (String.sub (client Text "hello") 0 3);
+          with_socket ~read_timeout:(ms 50) ~close_timeout:(ms 50)
+          @@ fun c peer ->
+          Caravan.Flow.write_string peer (String.sub (client Text "hello") 0 3) ;
           let reader = Fun.Async.call (fun () -> Ws.recv c) in
           let ended = Action.map (fun _ -> `Ended) (Fun.Async.get' reader) in
-          (match Action.invoke (Action.choose [ ended; Affect_unix.Mtime.wait_for' (ms 2000) `Late ]) with
-          | `Late -> Fun.Async.cancel reader; fail "no timeout after 2 s"
-          | `Ended -> fail "a message"
-          | exception Ws.Closed { code; reason } ->
-              equal int 1001 code;
-              equal string "read timeout" reason);
-          equal string "close 1001" (show_frame (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125)));
-      test "a slow frame with no long pause gets no timeout" (fun () ->
+          ( match
+              Action.invoke
+                (Action.choose
+                   [ended; Affect_unix.Mtime.wait_for' (ms 2000) `Late] )
+            with
+          | `Late ->
+              Fun.Async.cancel reader ;
+              fail "no timeout after 2 s"
+          | `Ended ->
+              fail "a message"
+          | exception Ws.Closed {code; reason} ->
+              equal int 1001 code ;
+              equal string "read timeout" reason ) ;
+          equal string "close 1001"
+            (show_frame
+               (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125) ) )
+    ; test "a slow frame with no long pause gets no timeout" (fun () ->
           let open Affect in
-          with_socket ~read_timeout:(ms 200) ~idle_timeout:(ms 200) @@ fun c peer ->
+          with_socket ~read_timeout:(ms 200) ~idle_timeout:(ms 200)
+          @@ fun c peer ->
           (* 2 006 bytes, 100 bytes each 20 ms: about 420 ms in all. *)
           let frame = client Binary (String.make 2000 'x') in
           let writer =
             Fun.Async.call (fun () ->
                 let rec loop off =
-                  if off < String.length frame
-                  then begin
+                  if off < String.length frame then begin
                     let n = Int.min 100 (String.length frame - off) in
-                    Caravan.Flow.write_string peer (String.sub frame off n);
-                    Affect_unix.Mtime.wait_for (ms 20);
+                    Caravan.Flow.write_string peer (String.sub frame off n) ;
+                    Affect_unix.Mtime.wait_for (ms 20) ;
                     loop (off + n)
                   end
                 in
-                loop 0)
+                loop 0 )
           in
-          is_true (Ws.recv c = Binary (String.make 2000 'x'));
-          Fun.Async.get writer);
-      test "a frame that is in part in the buffer gets the read timeout" (fun () ->
-          with_socket ~read_timeout:(ms 50) ~close_timeout:(ms 50) @@ fun c peer ->
-          (* One read gets the first frame and 1 byte of the next frame.
-             Without an idle timeout, only the read timeout stops the wait. *)
-          Caravan.Flow.write_string peer (client Text "one" ^ String.sub (client Text "two") 0 1);
-          Affect_unix.Mtime.wait_for (ms 20);
-          is_true (Ws.recv c = Text "one");
+          is_true (Ws.recv c = Binary (String.make 2000 'x')) ;
+          Fun.Async.get writer )
+    ; test "a frame that is in part in the buffer gets the read timeout"
+        (fun () ->
+          with_socket ~read_timeout:(ms 50) ~close_timeout:(ms 50)
+          @@ fun c peer ->
+          (* One read gets the first frame and 1 byte of the next frame. Without
+             an idle timeout, only the read timeout stops the wait. *)
+          Caravan.Flow.write_string peer
+            (client Text "one" ^ String.sub (client Text "two") 0 1) ;
+          Affect_unix.Mtime.wait_for (ms 20) ;
+          is_true (Ws.recv c = Text "one") ;
           match within_2s (fun () -> Ws.recv c) with
-          | _ -> fail "a message"
-          | exception Ws.Closed { code; reason } ->
-              equal int 1001 code;
-              equal string "read timeout" reason);
-      test "the read timeout does not apply between frames" (fun () ->
-          with_socket ~read_timeout:(ms 50) @@ fun c peer ->
+          | _ ->
+              fail "a message"
+          | exception Ws.Closed {code; reason} ->
+              equal int 1001 code ;
+              equal string "read timeout" reason )
+    ; test "the read timeout does not apply between frames" (fun () ->
+          with_socket ~read_timeout:(ms 50)
+          @@ fun c peer ->
           (* A read inside the first frame sets the read timeout. *)
           let frame = client Text "one" in
-          Caravan.Flow.write_string peer (String.sub frame 0 2);
+          Caravan.Flow.write_string peer (String.sub frame 0 2) ;
           let first = Affect.Fun.Async.call (fun () -> Ws.recv c) in
-          Affect_unix.Mtime.wait_for (ms 20);
-          Caravan.Flow.write_string peer (String.sub frame 2 (String.length frame - 2));
-          is_true (Affect.Fun.Async.get first = Text "one");
+          Affect_unix.Mtime.wait_for (ms 20) ;
+          Caravan.Flow.write_string peer
+            (String.sub frame 2 (String.length frame - 2)) ;
+          is_true (Affect.Fun.Async.get first = Text "one") ;
           (* recv waits for 150 ms, more than the read timeout. *)
           let second = Affect.Fun.Async.call (fun () -> Ws.recv c) in
-          Affect_unix.Mtime.wait_for (ms 150);
-          Caravan.Flow.write_string peer (client Text "two");
-          is_true (Affect.Fun.Async.get second = Text "two"));
-      test "each frame gets a new idle timeout" (fun () ->
+          Affect_unix.Mtime.wait_for (ms 150) ;
+          Caravan.Flow.write_string peer (client Text "two") ;
+          is_true (Affect.Fun.Async.get second = Text "two") )
+    ; test "each frame gets a new idle timeout" (fun () ->
           let open Affect in
-          with_socket ~idle_timeout:(ms 100) @@ fun c peer ->
+          with_socket ~idle_timeout:(ms 100)
+          @@ fun c peer ->
           let writer =
             Fun.Async.call (fun () ->
                 for _ = 1 to 5 do
-                  Affect_unix.Mtime.wait_for (ms 40);
+                  Affect_unix.Mtime.wait_for (ms 40) ;
                   Caravan.Flow.write_string peer (client Ping "")
-                done;
-                Caravan.Flow.write_string peer (client Text "end"))
+                done ;
+                Caravan.Flow.write_string peer (client Text "end") )
           in
-          is_true (Ws.recv c = Text "end");
-          Fun.Async.get writer);
-      test "close stops at a shorter idle timeout" (fun () ->
-          with_socket ~close_timeout:(ms 1000) ~idle_timeout:(ms 50) @@ fun c _peer ->
+          is_true (Ws.recv c = Text "end") ;
+          Fun.Async.get writer )
+    ; test "close stops at a shorter idle timeout" (fun () ->
+          with_socket ~close_timeout:(ms 1000) ~idle_timeout:(ms 50)
+          @@ fun c _peer ->
           let t = Affect_unix.Mtime.counter () in
-          within_2s (fun () -> Ws.close c);
+          within_2s (fun () -> Ws.close c) ;
           let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 500.));
-      test "close keeps the shorter write timeout of a send that waits" (fun () ->
+          is_true
+            ~msg:(Printf.sprintf "took %.0fms" took)
+            (took >= 40. && took < 500.) )
+    ; test "close keeps the shorter write timeout of a send that waits"
+        (fun () ->
           let open Affect in
           with_socket ~close_timeout:(ms 1000) ~write_timeout:(ms 100)
           @@ fun c peer ->
-          (* The peer reads only the first bytes: the send waits until its
-             write timeout. When the first bytes come, the send is in its
-             frame. *)
+          (* The peer reads only the first bytes: the send waits until its write
+             timeout. When the first bytes come, the send is in its frame. *)
           let t = Affect_unix.Mtime.counter () in
           let sender =
-            Fun.Async.call (fun () -> closed_code (fun () -> Ws.send c (Binary (String.make 10_000_000 'x'))))
+            Fun.Async.call (fun () ->
+                closed_code (fun () ->
+                    Ws.send c (Binary (String.make 10_000_000 'x')) ) )
           in
-          is_false (Buf_reader.peek_eof (Buf_reader.of_flow peer));
+          is_false (Buf_reader.peek_eof (Buf_reader.of_flow peer)) ;
           let closer = Fun.Async.call (fun () -> Ws.close c) in
-          equal int 1006 (Fun.Async.get sender);
+          equal int 1006 (Fun.Async.get sender) ;
           let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 90. && took < 500.);
-          Fun.Async.get closer);
-      test "close keeps its time limit with a long idle timeout" (fun () ->
-          with_socket ~close_timeout:(ms 50) ~idle_timeout:(ms 1000) @@ fun c _peer ->
+          is_true
+            ~msg:(Printf.sprintf "took %.0fms" took)
+            (took >= 90. && took < 500.) ;
+          Fun.Async.get closer )
+    ; test "close keeps its time limit with a long idle timeout" (fun () ->
+          with_socket ~close_timeout:(ms 50) ~idle_timeout:(ms 1000)
+          @@ fun c _peer ->
           let t = Affect_unix.Mtime.counter () in
-          within_2s (fun () -> Ws.close c);
+          within_2s (fun () -> Ws.close c) ;
           let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 40. && took < 500.));
-      test "after a protocol error, the peer gets the Close frame and the end of the stream"
-        (fun () ->
-           let open Affect in
-           with_socket @@ fun c peer ->
-           let reader = Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c)) in
-           (* A frame of 20 MiB, over the limit of 8 MiB: the server reads
-              only its header, and 1 MiB stays unread. *)
-           let header = of_hex "82ff" ^ "\x00\x00\x00\x00\x01\x40\x00\x00" ^ "\x01\x02\x03\x04" in
-           Caravan.Flow.write_string peer (header ^ String.make 1_000_000 'x');
-           let r = Buf_reader.of_flow peer in
-           equal string "close 1009" (show_frame (Frame.read r ~masked:false ~max:125));
-           raises End_of_file (fun () -> Frame.read r ~masked:false ~max:125);
-           Caravan.Flow.close peer;
-           equal int 1009 (Fun.Async.get reader));
-      test "a second close waits for the end of the first closing handshake" (fun () ->
+          is_true
+            ~msg:(Printf.sprintf "took %.0fms" took)
+            (took >= 40. && took < 500.) )
+    ; test
+        "after a protocol error, the peer gets the Close frame and the end of \
+         the stream" (fun () ->
           let open Affect in
-          with_socket ~close_timeout:(ms 2000) @@ fun c peer ->
+          with_socket
+          @@ fun c peer ->
+          let reader =
+            Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c))
+          in
+          (* A frame of 20 MiB, over the limit of 8 MiB: the server reads only
+             its header, and 1 MiB stays unread. *)
+          let header =
+            of_hex "82ff" ^ "\x00\x00\x00\x00\x01\x40\x00\x00"
+            ^ "\x01\x02\x03\x04"
+          in
+          Caravan.Flow.write_string peer (header ^ String.make 1_000_000 'x') ;
+          let r = Buf_reader.of_flow peer in
+          equal string "close 1009"
+            (show_frame (Frame.read r ~masked:false ~max:125)) ;
+          raises End_of_file (fun () -> Frame.read r ~masked:false ~max:125) ;
+          Caravan.Flow.close peer ;
+          equal int 1009 (Fun.Async.get reader) )
+    ; test "a second close waits for the end of the first closing handshake"
+        (fun () ->
+          let open Affect in
+          with_socket ~close_timeout:(ms 2000)
+          @@ fun c peer ->
           let first = Fun.Async.call (fun () -> Ws.close ~code:1001 c) in
           let r = Buf_reader.of_flow peer in
-          equal string "close 1001" (show_frame (Frame.read r ~masked:false ~max:125));
+          equal string "close 1001"
+            (show_frame (Frame.read r ~masked:false ~max:125)) ;
           let second =
             Fun.Async.call (fun () ->
                 let t = Affect_unix.Mtime.counter () in
-                Ws.close c;
-                elapsed_ms t)
+                Ws.close c ; elapsed_ms t )
           in
           (* The peer replies after 100 ms. *)
-          Affect_unix.Mtime.wait_for (ms 100);
-          Caravan.Flow.write_string peer (client Close (code_reason 1001 ""));
-          within_2s (fun () -> Fun.Async.get first);
+          Affect_unix.Mtime.wait_for (ms 100) ;
+          Caravan.Flow.write_string peer (client Close (code_reason 1001 "")) ;
+          within_2s (fun () -> Fun.Async.get first) ;
           let took = within_2s (fun () -> Fun.Async.get second) in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 50.);
-          raises End_of_file (fun () -> Frame.read r ~masked:false ~max:125));
-      test "a cancel in the reply to a Close frame closes the connection" (fun () ->
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 50.) ;
+          raises End_of_file (fun () -> Frame.read r ~masked:false ~max:125) )
+    ; test "a cancel in the reply to a Close frame closes the connection"
+        (fun () ->
           let open Affect in
-          with_socket @@ fun c peer ->
+          with_socket
+          @@ fun c peer ->
           (* The peer reads only the first bytes: the send holds the writer
              until the connection closes. *)
           let sender =
-            Fun.Async.call (fun () -> closed_code (fun () -> Ws.send c (Binary (String.make 10_000_000 'x'))))
+            Fun.Async.call (fun () ->
+                closed_code (fun () ->
+                    Ws.send c (Binary (String.make 10_000_000 'x')) ) )
           in
-          is_false (Buf_reader.peek_eof (Buf_reader.of_flow peer));
+          is_false (Buf_reader.peek_eof (Buf_reader.of_flow peer)) ;
           let reader = Fun.Async.call (fun () -> Ws.recv c) in
-          Caravan.Flow.write_string peer (client Close (code_reason 1000 ""));
+          Caravan.Flow.write_string peer (client Close (code_reason 1000 "")) ;
           (* The reply to the Close frame waits for the writer. *)
-          wait_closing c;
-          Fun.Async.cancel reader;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
-          within_2s (fun () -> Ws.close c);
-          equal int 1000 (closed_code (fun () -> Ws.recv c));
-          ignore (Fun.Async.get sender));
-      test "close keeps its time limit when the reply to the peer waits for a send" (fun () ->
+          wait_closing c ;
+          Fun.Async.cancel reader ;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader) ;
+          within_2s (fun () -> Ws.close c) ;
+          equal int 1000 (closed_code (fun () -> Ws.recv c)) ;
+          ignore (Fun.Async.get sender) )
+    ; test
+        "close keeps its time limit when the reply to the peer waits for a send"
+        (fun () ->
           let open Affect in
-          with_socket ~close_timeout:(ms 100) ~write_timeout:(ms 1500) @@ fun c peer ->
+          with_socket ~close_timeout:(ms 100) ~write_timeout:(ms 1500)
+          @@ fun c peer ->
           (* The peer reads only the first bytes: the send holds the writer
              until its write timeout. *)
           let sender =
-            Fun.Async.call (fun () -> closed_code (fun () -> Ws.send c (Binary (String.make 10_000_000 'x'))))
+            Fun.Async.call (fun () ->
+                closed_code (fun () ->
+                    Ws.send c (Binary (String.make 10_000_000 'x')) ) )
           in
-          is_false (Buf_reader.peek_eof (Buf_reader.of_flow peer));
-          let reader = Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c)) in
-          Caravan.Flow.write_string peer (client Close (code_reason 1000 ""));
-          wait_closing c;
+          is_false (Buf_reader.peek_eof (Buf_reader.of_flow peer)) ;
+          let reader =
+            Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c))
+          in
+          Caravan.Flow.write_string peer (client Close (code_reason 1000 "")) ;
+          wait_closing c ;
           let t = Affect_unix.Mtime.counter () in
-          within_2s (fun () -> Ws.close c);
+          within_2s (fun () -> Ws.close c) ;
           let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 500.);
-          ignore (Fun.Async.get reader);
-          ignore (Fun.Async.get sender));
-      test "a second close does not make the close deadline later" (fun () ->
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 500.) ;
+          ignore (Fun.Async.get reader) ;
+          ignore (Fun.Async.get sender) )
+    ; test "a second close does not make the close deadline later" (fun () ->
           let open Affect in
-          with_socket ~close_timeout:(ms 300) @@ fun c peer ->
-          (* The peer sends a message each 10 ms and does not reply: each
-             read gets the deadline again. The second close starts 200 ms
-             after the first: with a new deadline, the first close takes
-             500 ms. *)
+          with_socket ~close_timeout:(ms 300)
+          @@ fun c peer ->
+          (* The peer sends a message each 10 ms and does not reply: each read
+             gets the deadline again. The second close starts 200 ms after the
+             first: with a new deadline, the first close takes 500 ms. *)
           let stop = Atomic.make false in
           let sender =
             Fun.Async.call (fun () ->
                 try
                   while not (Atomic.get stop) do
-                    Caravan.Flow.write_string peer (client Text "x");
+                    Caravan.Flow.write_string peer (client Text "x") ;
                     Affect_unix.Mtime.wait_for (ms 10)
                   done
-                with Caravan.Flow.Closed -> ())
+                with Caravan.Flow.Closed -> () )
           in
           let t = Affect_unix.Mtime.counter () in
-          let first = Fun.Async.call (fun () -> Ws.close c; elapsed_ms t) in
-          Affect_unix.Mtime.wait_for (ms 200);
-          within_2s (fun () -> Ws.close c);
+          let first = Fun.Async.call (fun () -> Ws.close c ; elapsed_ms t) in
+          Affect_unix.Mtime.wait_for (ms 200) ;
+          within_2s (fun () -> Ws.close c) ;
           let took = within_2s (fun () -> Fun.Async.get first) in
-          Atomic.set stop true;
-          Fun.Async.get sender;
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 290. && took < 450.));
-      test "the end of the handler does not stop the closing handshake of a stop" (fun () ->
+          Atomic.set stop true ;
+          Fun.Async.get sender ;
+          is_true
+            ~msg:(Printf.sprintf "took %.0fms" took)
+            (took >= 290. && took < 450.) )
+    ; test
+        "the end of the handler does not stop the closing handshake of a stop"
+        (fun () ->
           let open Affect in
-          with_flows @@ fun server peer ->
+          with_flows
+          @@ fun server peer ->
           let stop = Cell.Once.make () and raised = Cell.Once.make () in
           let handler =
             Fun.Async.call (fun () ->
-                run_handler ~stopping:(Cell.Once.get' stop) ~close_timeout:(ms 1000)
+                run_handler ~stopping:(Cell.Once.get' stop)
+                  ~close_timeout:(ms 1000)
                   (fun c ->
-                     (* The peer does not read yet: the send holds the writer,
-                        and the Close frame of the stop waits for it. *)
-                     ignore
-                       (Fun.Async.call (fun () ->
-                            try Ws.send c (Binary (String.make 4_000_000 'x')) with Ws.Closed _ -> ()));
-                     Cell.Once.get stop;
-                     wait_closing c;
-                     Cell.Once.try_set raised ();
-                     raise (Ws.Closed { code = 1001; reason = "server shutdown" }))
-                  server)
+                    (* The peer does not read yet: the send holds the writer,
+                       and the Close frame of the stop waits for it. *)
+                    ignore
+                      (Fun.Async.call (fun () ->
+                           try Ws.send c (Binary (String.make 4_000_000 'x'))
+                           with Ws.Closed _ -> () ) ) ;
+                    Cell.Once.get stop ;
+                    wait_closing c ;
+                    Cell.Once.try_set raised () ;
+                    raise (Ws.Closed {code= 1001; reason= "server shutdown"}) )
+                  server )
           in
           let r = Buf_reader.of_flow peer in
-          is_false (Buf_reader.peek_eof r);
-          Cell.Once.try_set stop ();
-          (* The peer reads after the end of the handler. The wait of 50 ms
-             only gives the end of the handler time to act: the result of
-             correct code does not depend on it. *)
-          within_2s (fun () -> Cell.Once.get raised);
-          Affect_unix.Mtime.wait_for (ms 50);
+          is_false (Buf_reader.peek_eof r) ;
+          Cell.Once.try_set stop () ;
+          (* The peer reads after the end of the handler. The wait of 50 ms only
+             gives the end of the handler time to act: the result of correct
+             code does not depend on it. *)
+          within_2s (fun () -> Cell.Once.get raised) ;
+          Affect_unix.Mtime.wait_for (ms 50) ;
           let first = Frame.read r ~masked:false ~max:max_int in
           let second =
             match Frame.read r ~masked:false ~max:125 with
             | f ->
-                Caravan.Flow.write_string peer (client Close f.payload);
+                Caravan.Flow.write_string peer (client Close f.payload) ;
                 show_frame f
-            | exception End_of_file -> "end of the stream"
+            | exception End_of_file ->
+                "end of the stream"
           in
-          within_2s (fun () -> Fun.Async.get handler);
-          equal (list string) [ "binary"; "close 1001 \"server shutdown\"" ]
-            [ opcode_name first.opcode; second ]);
-      test "a cancel in the linger after a protocol error closes the connection" (fun () ->
+          within_2s (fun () -> Fun.Async.get handler) ;
+          equal (list string)
+            ["binary"; "close 1001 \"server shutdown\""]
+            [opcode_name first.opcode; second] )
+    ; test "a cancel in the linger after a protocol error closes the connection"
+        (fun () ->
           let open Affect in
-          with_socket ~close_timeout:(ms 1000) @@ fun c peer ->
+          with_socket ~close_timeout:(ms 1000)
+          @@ fun c peer ->
           (* The peer does not close: the linger waits. *)
           let reader = Fun.Async.call (fun () -> Ws.recv c) in
-          Caravan.Flow.write_string peer (client Continuation "x");
-          (* The end of the stream comes after the Close frame: the server
-             is in the linger. *)
+          Caravan.Flow.write_string peer (client Continuation "x") ;
+          (* The end of the stream comes after the Close frame: the server is in
+             the linger. *)
           let r = Buf_reader.of_flow peer in
-          equal string "close 1002" (show_frame (Frame.read r ~masked:false ~max:125));
-          is_true (Buf_reader.peek_eof r);
-          Fun.Async.cancel reader;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
+          equal string "close 1002"
+            (show_frame (Frame.read r ~masked:false ~max:125)) ;
+          is_true (Buf_reader.peek_eof r) ;
+          Fun.Async.cancel reader ;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader) ;
           let t = Affect_unix.Mtime.counter () in
-          equal int 1002 (within_2s (fun () -> closed_code (fun () -> Ws.recv c)));
+          equal int 1002
+            (within_2s (fun () -> closed_code (fun () -> Ws.recv c))) ;
           let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 500.));
-      test "the linger after a protocol error discards at most 1 MiB" (fun () ->
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 500.) )
+    ; test "the linger after a protocol error discards at most 1 MiB" (fun () ->
           let open Affect in
-          with_socket @@ fun c peer ->
+          with_socket
+          @@ fun c peer ->
           let t = Affect_unix.Mtime.counter () in
-          let reader = Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c)) in
-          (* The peer sends 3 MiB after a frame that is too large, and does
-             not close. The server stops before its close timeout of 5 s. *)
-          let header = of_hex "82ff" ^ "\x00\x00\x00\x00\x01\x40\x00\x00" ^ "\x01\x02\x03\x04" in
+          let reader =
+            Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c))
+          in
+          (* The peer sends 3 MiB after a frame that is too large, and does not
+             close. The server stops before its close timeout of 5 s. *)
+          let header =
+            of_hex "82ff" ^ "\x00\x00\x00\x00\x01\x40\x00\x00"
+            ^ "\x01\x02\x03\x04"
+          in
           let writer =
             Fun.Async.call (fun () ->
-                try Caravan.Flow.write_string peer (header ^ String.make (3 * 1024 * 1024) 'x')
-                with Caravan.Flow.Closed -> ())
+                try
+                  Caravan.Flow.write_string peer
+                    (header ^ String.make (3 * 1024 * 1024) 'x')
+                with Caravan.Flow.Closed -> () )
           in
-          equal int 1009 (Fun.Async.get reader);
+          equal int 1009 (Fun.Async.get reader) ;
           let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 2000.);
-          Caravan.Flow.close peer;
-          Fun.Async.get writer);
-      (* A cancel in the middle of a frame closes the connection, because
-         the stream is out of step. A cancel between messages does not. *)
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 2000.) ;
+          Caravan.Flow.close peer ;
+          Fun.Async.get writer )
+    ; (* A cancel in the middle of a frame closes the connection, because the
+         stream is out of step. A cancel between messages does not. *)
       test "a cancel in the middle of a send closes with 1006" (fun () ->
           let open Affect in
-          with_socket @@ fun c peer ->
-          let sender = Fun.Async.call (fun () -> Ws.send c (Binary (String.make 10_000_000 'x'))) in
+          with_socket
+          @@ fun c peer ->
+          let sender =
+            Fun.Async.call (fun () ->
+                Ws.send c (Binary (String.make 10_000_000 'x')) )
+          in
           (* When the first bytes come, the send is in its frame. *)
           let r = Buf_reader.of_flow peer in
-          is_false (Buf_reader.peek_eof r);
-          Fun.Async.cancel sender;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get sender);
-          equal int 1006 (closed_code (fun () -> Ws.send c (Text "hello")));
-          raises End_of_file (fun () -> Frame.read r ~masked:false ~max:max_int));
-      test "a cancel between messages does not close" (fun () ->
+          is_false (Buf_reader.peek_eof r) ;
+          Fun.Async.cancel sender ;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get sender) ;
+          equal int 1006 (closed_code (fun () -> Ws.send c (Text "hello"))) ;
+          raises End_of_file (fun () -> Frame.read r ~masked:false ~max:max_int) )
+    ; test "a cancel between messages does not close" (fun () ->
           let open Affect in
-          with_socket @@ fun c peer ->
+          with_socket
+          @@ fun c peer ->
           let reader = Fun.Async.call (fun () -> Ws.recv c) in
-          Affect_unix.Mtime.wait_for (ms 20);
-          Fun.Async.cancel reader;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
-          Caravan.Flow.write_string peer (client Text "hello");
-          is_true (Ws.recv c = Text "hello"));
-      test "a cancel in the middle of a received frame closes with 1006" (fun () ->
+          Affect_unix.Mtime.wait_for (ms 20) ;
+          Fun.Async.cancel reader ;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader) ;
+          Caravan.Flow.write_string peer (client Text "hello") ;
+          is_true (Ws.recv c = Text "hello") )
+    ; test "a cancel in the middle of a received frame closes with 1006"
+        (fun () ->
           let open Affect in
-          with_socket @@ fun c peer ->
+          with_socket
+          @@ fun c peer ->
           let reader = Fun.Async.call (fun () -> Ws.recv c) in
           let frame = client Text "hello" in
-          Caravan.Flow.write_string peer (String.sub frame 0 3);
-          Affect_unix.Mtime.wait_for (ms 20);
-          Fun.Async.cancel reader;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
-          Caravan.Flow.write_string peer (String.sub frame 3 (String.length frame - 3) ^ client Text "next");
-          equal int 1006 (closed_code (fun () -> Ws.recv c)));
-      test "a cancel in the wait to send a Pong inside a fragmented message closes with 1006"
-        (fun () ->
-           let open Affect in
-           (* Without the fix, the next recv waits for the write timeout of
-              [big]: 1 s. *)
-           with_socket ~write_timeout:Affect_unix.Mtime.Span.(1 * s) @@ fun c peer ->
-           (* The peer reads nothing: [big] keeps the writer semaphore. *)
-           let big =
-             Fun.Async.call (fun () ->
-                 try Ws.send c (Binary (String.make 10_000_000 'x')) with Ws.Closed _ -> ())
-           in
-           Affect_unix.Mtime.wait_for (ms 50);
-           let reader = Fun.Async.call (fun () -> Ws.recv c) in
-           Caravan.Flow.write_string peer (client ~fin:false Text "Hel" ^ client Ping "p");
-           Affect_unix.Mtime.wait_for (ms 20);
-           Fun.Async.cancel reader;
-           raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
-           Caravan.Flow.write_string peer (client Continuation "lo");
-           let t = Affect_unix.Mtime.counter () in
-           equal int 1006 (closed_code (fun () -> Ws.recv c));
-           let took = elapsed_ms t in
-           is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 500.);
-           Fun.Async.get big);
-      test "a cancel inside a fragmented message closes with 1006" (fun () ->
+          Caravan.Flow.write_string peer (String.sub frame 0 3) ;
+          Affect_unix.Mtime.wait_for (ms 20) ;
+          Fun.Async.cancel reader ;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader) ;
+          Caravan.Flow.write_string peer
+            (String.sub frame 3 (String.length frame - 3) ^ client Text "next") ;
+          equal int 1006 (closed_code (fun () -> Ws.recv c)) )
+    ; test
+        "a cancel in the wait to send a Pong inside a fragmented message \
+         closes with 1006" (fun () ->
           let open Affect in
-          with_socket @@ fun c peer ->
+          (* Without the fix, the next recv waits for the write timeout of
+             [big]: 1 s. *)
+          with_socket ~write_timeout:Affect_unix.Mtime.Span.(1 * s)
+          @@ fun c peer ->
+          (* The peer reads nothing: [big] keeps the writer semaphore. *)
+          let big =
+            Fun.Async.call (fun () ->
+                try Ws.send c (Binary (String.make 10_000_000 'x'))
+                with Ws.Closed _ -> () )
+          in
+          Affect_unix.Mtime.wait_for (ms 50) ;
           let reader = Fun.Async.call (fun () -> Ws.recv c) in
-          Caravan.Flow.write_string peer (client ~fin:false Text "Hel");
-          Affect_unix.Mtime.wait_for (ms 20);
-          Fun.Async.cancel reader;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader);
-          Caravan.Flow.write_string peer (client Continuation "lo");
-          equal int 1006 (closed_code (fun () -> Ws.recv c))) ]
+          Caravan.Flow.write_string peer
+            (client ~fin:false Text "Hel" ^ client Ping "p") ;
+          Affect_unix.Mtime.wait_for (ms 20) ;
+          Fun.Async.cancel reader ;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader) ;
+          Caravan.Flow.write_string peer (client Continuation "lo") ;
+          let t = Affect_unix.Mtime.counter () in
+          equal int 1006 (closed_code (fun () -> Ws.recv c)) ;
+          let took = elapsed_ms t in
+          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 500.) ;
+          Fun.Async.get big )
+    ; test "a cancel inside a fragmented message closes with 1006" (fun () ->
+          let open Affect in
+          with_socket
+          @@ fun c peer ->
+          let reader = Fun.Async.call (fun () -> Ws.recv c) in
+          Caravan.Flow.write_string peer (client ~fin:false Text "Hel") ;
+          Affect_unix.Mtime.wait_for (ms 20) ;
+          Fun.Async.cancel reader ;
+          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader) ;
+          Caravan.Flow.write_string peer (client Continuation "lo") ;
+          equal int 1006 (closed_code (fun () -> Ws.recv c)) ) ]
 
 (* The fields of the RFC 6455 §1.3 example, without [Origin]. *)
 let request_fields =
-  [ ("Host", "server.example.com"); ("Upgrade", "websocket"); ("Connection", "Upgrade");
-    ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="); ("Sec-WebSocket-Version", "13") ]
+  [ ("Host", "server.example.com")
+  ; ("Upgrade", "websocket")
+  ; ("Connection", "Upgrade")
+  ; ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+  ; ("Sec-WebSocket-Version", "13") ]
 
 (* A request with [request_fields], where [fields] replace the fields of the
    same names and add the others. [""] removes a field. *)
 let request ?(meth = Caravan.Method.GET) ?(version = Caravan.Version.Http_1_1)
     ?(authority = "server.example.com") fields =
   let set h (name, value) =
-    if value = "" then Caravan.Headers.remove name h else Caravan.Headers.set name value h
+    if value = "" then Caravan.Headers.remove name h
+    else Caravan.Headers.set name value h
   in
-  let headers = List.fold_left set (Caravan.Headers.of_list request_fields) fields in
+  let headers =
+    List.fold_left set (Caravan.Headers.of_list request_fields) fields
+  in
   Caravan.Request.make ~version ~authority ~headers meth "/chat"
 
 (* The status and the fields of the response to [req], and its body. *)
@@ -1312,8 +1758,10 @@ let answer ?protocols ?origin req =
   let r = Ws.accept ?protocols ?origin req (fun _ -> ()) in
   let body =
     match Caravan.Response.kind r with
-    | Body b -> Caravan.Body.to_string b
-    | Upgrade _ -> ""
+    | Body b ->
+        Caravan.Body.to_string b
+    | Upgrade _ ->
+        ""
   in
   String.trim (Format.asprintf "%a@.%s" Caravan.Response.pp r body)
 
@@ -1321,43 +1769,50 @@ let handshake_tests =
   group "Handshake"
     [ test "accept_key answers the RFC 6455 example" (fun () ->
           equal string "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-            (Caravan_websocket.accept_key "dGhlIHNhbXBsZSBub25jZQ=="));
-      test "accept answers a correct request with 101" (fun () ->
-          expect (answer (request [])) @@ __POS_OF__ {|
+            (Caravan_websocket.accept_key "dGhlIHNhbXBsZSBub25jZQ==") )
+    ; test "accept answers a correct request with 101" (fun () ->
+          expect (answer (request []))
+          @@ __POS_OF__
+               {|
             101 Switching Protocols (upgrade)
             Upgrade: websocket
             Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
-            |};
+            |} ;
           (* Tokens are case-insensitive, and a list can hold them. *)
           expect
             (answer
-               (request [ ("Upgrade", "WebSocket"); ("Connection", "keep-alive, upgrade") ]))
-          @@ __POS_OF__ {|
+               (request
+                  [ ("Upgrade", "WebSocket")
+                  ; ("Connection", "keep-alive, upgrade") ] ) )
+          @@ __POS_OF__
+               {|
             101 Switching Protocols (upgrade)
             Upgrade: websocket
             Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
-            |});
-      test "accept refuses an incorrect request" (fun () ->
+            |} )
+    ; test "accept refuses an incorrect request" (fun () ->
           let first_line s = List.hd (String.split_on_char '\n' s) in
           let cases =
-            [ ("POST", request ~meth:Caravan.Method.POST []);
-              ("HTTP/1.0", request ~version:Caravan.Version.Http_1_0 []);
-              ("no Upgrade", request [ ("Upgrade", "") ]);
-              ("Upgrade: h2c", request [ ("Upgrade", "h2c") ]);
-              ("no Connection token", request [ ("Connection", "keep-alive") ]);
-              ("no key", request [ ("Sec-WebSocket-Key", "") ]);
-              ("key of 5 bytes", request [ ("Sec-WebSocket-Key", "aGVsbG8=") ]);
-              ("key not base64", request [ ("Sec-WebSocket-Key", "not base64 at all!!!") ]) ]
+            [ ("POST", request ~meth:Caravan.Method.POST [])
+            ; ("HTTP/1.0", request ~version:Caravan.Version.Http_1_0 [])
+            ; ("no Upgrade", request [("Upgrade", "")])
+            ; ("Upgrade: h2c", request [("Upgrade", "h2c")])
+            ; ("no Connection token", request [("Connection", "keep-alive")])
+            ; ("no key", request [("Sec-WebSocket-Key", "")])
+            ; ("key of 5 bytes", request [("Sec-WebSocket-Key", "aGVsbG8=")])
+            ; ( "key not base64"
+              , request [("Sec-WebSocket-Key", "not base64 at all!!!")] ) ]
           in
           expect
             (String.concat "\n"
                (List.map
                   (fun (name, req) ->
-                     let a = answer req in
-                     name ^ ": " ^ first_line a ^ " | "
-                     ^ List.nth (String.split_on_char '\n' a) 2)
-                  cases))
-          @@ __POS_OF__ {|
+                    let a = answer req in
+                    name ^ ": " ^ first_line a ^ " | "
+                    ^ List.nth (String.split_on_char '\n' a) 2 )
+                  cases ) )
+          @@ __POS_OF__
+               {|
             POST: 400 Bad Request | WebSocket handshake: the method is not GET
             HTTP/1.0: 400 Bad Request | WebSocket handshake: the version is not HTTP/1.1
             no Upgrade: 400 Bad Request | WebSocket handshake: no Upgrade: websocket
@@ -1366,84 +1821,115 @@ let handshake_tests =
             no key: 400 Bad Request | WebSocket handshake: no Sec-WebSocket-Key
             key of 5 bytes: 400 Bad Request | WebSocket handshake: the key is not 16 bytes in base64
             key not base64: 400 Bad Request | WebSocket handshake: the key is not 16 bytes in base64
-            |});
-      test "a negative max_message is not permitted" (fun () ->
-          raises_match is_invalid_arg (fun () -> Ws.accept ~max_message:(-1) (request []) ignore);
+            |} )
+    ; test "a negative max_message is not permitted" (fun () ->
           raises_match is_invalid_arg (fun () ->
-              Ws.Private.of_flow ~max_message:(-1) (Caravan.Flow.of_string "" (Buffer.create 16)));
-          ignore (Ws.accept ~max_message:0 (request []) ignore);
-          ignore (Ws.Private.of_flow ~max_message:0 (Caravan.Flow.of_string "" (Buffer.create 16))));
-      test "accept asks for version 13" (fun () ->
-          expect (answer (request [ ("Sec-WebSocket-Version", "8") ])) @@ __POS_OF__ {|
+              Ws.accept ~max_message:(-1) (request []) ignore ) ;
+          raises_match is_invalid_arg (fun () ->
+              Ws.Private.of_flow ~max_message:(-1)
+                (Caravan.Flow.of_string "" (Buffer.create 16)) ) ;
+          ignore (Ws.accept ~max_message:0 (request []) ignore) ;
+          ignore
+            (Ws.Private.of_flow ~max_message:0
+               (Caravan.Flow.of_string "" (Buffer.create 16)) ) )
+    ; test "accept asks for version 13" (fun () ->
+          expect (answer (request [("Sec-WebSocket-Version", "8")]))
+          @@ __POS_OF__
+               {|
             426 Upgrade Required
             Sec-WebSocket-Version: 13
             Content-Type: text/plain; charset=utf-8
             WebSocket handshake: the version must be 13
-            |};
-          expect (answer (request [ ("Sec-WebSocket-Version", "") ])) @@ __POS_OF__ {|
+            |} ;
+          expect (answer (request [("Sec-WebSocket-Version", "")]))
+          @@ __POS_OF__
+               {|
             426 Upgrade Required
             Sec-WebSocket-Version: 13
             Content-Type: text/plain; charset=utf-8
             WebSocket handshake: the version must be 13
-            |});
-      test "accept permits only the origin of the request by default" (fun () ->
+            |} )
+    ; test "accept permits only the origin of the request by default" (fun () ->
           let status ?origin ?authority ?scheme o =
-            let req = request ?authority [ ("Origin", o) ] in
+            let req = request ?authority [("Origin", o)] in
             let req =
               match scheme with
-              | None -> req
+              | None ->
+                  req
               | Some scheme ->
-                  Caravan.Request.make ~scheme ?authority:(Caravan.Request.authority req)
-                    ~headers:(Caravan.Request.headers req) Caravan.Method.GET "/chat"
+                  Caravan.Request.make ~scheme
+                    ?authority:(Caravan.Request.authority req)
+                    ~headers:(Caravan.Request.headers req)
+                    Caravan.Method.GET "/chat"
             in
             List.hd (String.split_on_char ' ' (answer ?origin req))
           in
           expect
             (String.concat " "
-               [ status "http://server.example.com"; status "https://SERVER.example.com";
-                 status "http://server.example.com:8080"; status "http://evil.example.com";
-                 status "null"; status "server.example.com"; status "http:"; status "http:/";
-                 status "http:/xserver.example.com";
-                 status ~authority:"server.example.com:8080" "http://server.example.com:8080";
-                 status ~origin:(fun o -> o = "null") "null";
-                 status ~origin:(fun _ -> false) "http://server.example.com" ])
-          @@ __POS_OF__ {|101 101 403 403 403 403 403 403 403 101 101 403|};
+               [ status "http://server.example.com"
+               ; status "https://SERVER.example.com"
+               ; status "http://server.example.com:8080"
+               ; status "http://evil.example.com"
+               ; status "null"
+               ; status "server.example.com"
+               ; status "http:"
+               ; status "http:/"
+               ; status "http:/xserver.example.com"
+               ; status ~authority:"server.example.com:8080"
+                   "http://server.example.com:8080"
+               ; status ~origin:(fun o -> o = "null") "null"
+               ; status ~origin:(fun _ -> false) "http://server.example.com" ] )
+          @@ __POS_OF__ {|101 101 403 403 403 403 403 403 403 101 101 403|} ;
           (* Default ports, and the scheme of the request. *)
           expect
             (String.concat " "
-               [ status ~authority:"server.example.com:443" "https://server.example.com";
-                 status "https://server.example.com:443"; status "http://server.example.com:80";
-                 status ~authority:"server.example.com:80" "http://server.example.com";
-                 status ~authority:"server.example.com:443" "http://server.example.com";
-                 status ~authority:"server.example.com:80" "https://server.example.com";
-                 status "ftp://server.example.com";
-                 status ~scheme:"https" "https://server.example.com";
-                 status ~scheme:"https" "http://server.example.com" ])
-          @@ __POS_OF__ {|101 101 101 101 403 403 403 101 403|});
-      test "accept chooses the first subprotocol of the server that the client offers"
-        (fun () ->
-           let chosen ?protocols offered =
-             let a = answer ?protocols (request [ ("Sec-WebSocket-Protocol", offered) ]) in
-             match
-               List.find_opt
-                 (String.starts_with ~prefix:"Sec-WebSocket-Protocol")
-                 (String.split_on_char '\n' a)
-             with
-             | Some line -> line
-             | None -> "none"
-           in
-           expect
-             (String.concat "\n"
-                [ chosen ~protocols:[ "superchat"; "chat" ] "chat, superchat";
-                  chosen ~protocols:[ "chat" ] "Chat, superchat"; chosen ~protocols:[ "mqtt" ] "chat";
-                  chosen ~protocols:[ "chat" ] ""; chosen "chat" ])
-           @@ __POS_OF__ {|
+               [ status ~authority:"server.example.com:443"
+                   "https://server.example.com"
+               ; status "https://server.example.com:443"
+               ; status "http://server.example.com:80"
+               ; status ~authority:"server.example.com:80"
+                   "http://server.example.com"
+               ; status ~authority:"server.example.com:443"
+                   "http://server.example.com"
+               ; status ~authority:"server.example.com:80"
+                   "https://server.example.com"
+               ; status "ftp://server.example.com"
+               ; status ~scheme:"https" "https://server.example.com"
+               ; status ~scheme:"https" "http://server.example.com" ] )
+          @@ __POS_OF__ {|101 101 101 101 403 403 403 101 403|} )
+    ; test
+        "accept chooses the first subprotocol of the server that the client \
+         offers" (fun () ->
+          let chosen ?protocols offered =
+            let a =
+              answer ?protocols (request [("Sec-WebSocket-Protocol", offered)])
+            in
+            match
+              List.find_opt
+                (String.starts_with ~prefix:"Sec-WebSocket-Protocol")
+                (String.split_on_char '\n' a)
+            with
+            | Some line ->
+                line
+            | None ->
+                "none"
+          in
+          expect
+            (String.concat "\n"
+               [ chosen ~protocols:["superchat"; "chat"] "chat, superchat"
+               ; chosen ~protocols:["chat"] "Chat, superchat"
+               ; chosen ~protocols:["mqtt"] "chat"
+               ; chosen ~protocols:["chat"] ""
+               ; chosen "chat" ] )
+          @@ __POS_OF__
+               {|
              Sec-WebSocket-Protocol: superchat
              none
              none
              none
              none
-             |}) ]
+             |} )
+    ]
 
 (* What recv raised in the handler of "/record". *)
 let recorded = Atomic.make None
@@ -1453,88 +1939,111 @@ let started = ref (Affect.Cell.Once.make ())
 
 let echo c =
   let rec loop () =
-    Ws.send c (Ws.recv c);
+    Ws.send c (Ws.recv c) ;
     loop ()
   in
   loop ()
 
 let server_handler req =
   match Caravan.Request.path_only req with
-  | "/echo" -> Ws.accept req echo
-  | "/echo-fast" -> Ws.accept ~close_timeout:(ms 100) req echo
-  | "/wait" -> Ws.accept req (fun _ -> Affect_unix.Mtime.wait_for (ms 10_000))
+  | "/echo" ->
+      Ws.accept req echo
+  | "/echo-fast" ->
+      Ws.accept ~close_timeout:(ms 100) req echo
+  | "/wait" ->
+      Ws.accept req (fun _ -> Affect_unix.Mtime.wait_for (ms 10_000))
   | "/wait-slow-close" ->
-      Ws.accept ~close_timeout:(ms 2000) req (fun _ -> Affect_unix.Mtime.wait_for (ms 10_000))
+      Ws.accept ~close_timeout:(ms 2000) req (fun _ ->
+          Affect_unix.Mtime.wait_for (ms 10_000) )
   | "/ticker" ->
       Ws.accept ~close_timeout:(ms 300) req (fun c ->
           let rec loop () =
-            Ws.send c (Text "tick");
-            Affect.Cell.Once.try_set !started ();
-            Affect_unix.Mtime.wait_for (ms 10);
+            Ws.send c (Text "tick") ;
+            Affect.Cell.Once.try_set !started () ;
+            Affect_unix.Mtime.wait_for (ms 10) ;
             loop ()
           in
-          loop ())
+          loop () )
   | "/late" ->
-      Affect.Cell.Once.try_set !started ();
-      Affect.Action.invoke (Caravan.Conn_info.stopping (Option.get (Caravan.Request.conn req)));
+      Affect.Cell.Once.try_set !started () ;
+      Affect.Action.invoke
+        (Caravan.Conn_info.stopping (Option.get (Caravan.Request.conn req))) ;
       Ws.accept req echo
   | "/protocol" ->
-      Ws.accept ~protocols:[ "chat"; "echo" ] req (fun c ->
-          Ws.send c (Text (Option.value ~default:"none" (Ws.protocol c))))
-  | "/boom" -> Ws.accept req (fun _ -> failwith "boom")
+      Ws.accept ~protocols:["chat"; "echo"] req (fun c ->
+          Ws.send c (Text (Option.value ~default:"none" (Ws.protocol c))) )
+  | "/boom" ->
+      Ws.accept req (fun _ -> failwith "boom")
   | "/record" ->
       Ws.accept req (fun c ->
           match Ws.recv c with
-          | _ -> ()
+          | _ ->
+              ()
           | exception e ->
-              Atomic.set recorded (Some (Printexc.to_string e));
-              raise e)
+              Atomic.set recorded (Some (Printexc.to_string e)) ;
+              raise e )
   | "/other" ->
-      (* A Closed of a different connection is an exception of the
-         handler. *)
+      (* A Closed of a different connection is an exception of the handler. *)
       Ws.accept req (fun _ ->
           let input = client Close (code_reason 1000 "") in
-          let other = Ws.Private.of_flow (Caravan.Flow.of_string input (Buffer.create 16)) in
-          ignore (Ws.recv other))
+          let other =
+            Ws.Private.of_flow (Caravan.Flow.of_string input (Buffer.create 16))
+          in
+          ignore (Ws.recv other) )
   | "/child" ->
       (* The Cancelled of a child call is not a stop of the server. *)
       Ws.accept req (fun _ ->
           let open Affect in
-          let child = Fun.Async.call (fun () -> Affect_unix.Mtime.wait_for (ms 10_000)) in
-          Fun.Async.cancel child;
-          Fun.Async.get child)
-  | _ -> Caravan.Handler.not_found req
+          let child =
+            Fun.Async.call (fun () -> Affect_unix.Mtime.wait_for (ms 10_000))
+          in
+          Fun.Async.cancel child ; Fun.Async.get child )
+  | _ ->
+      Caravan.Handler.not_found req
 
-(* A WebSocket session with a server: the request for [path], with [first]
-   in the same write; then [after], then [during ()]. The result is the
-   response head, a "--" line, and the frames from the server until it
-   closes the connection. If [reply], we answer a Close frame of the
-   server. *)
+(* A WebSocket session with a server: the request for [path], with [first] in
+   the same write; then [after], then [during ()]. The result is the response
+   head, a "--" line, and the frames from the server until it closes the
+   connection. If [reply], we answer a Close frame of the server. *)
 let upgrade_request ?(first = "") path =
   String.concat "\r\n"
-    [ "GET " ^ path ^ " HTTP/1.1"; "Host: x"; "Upgrade: websocket"; "Connection: Upgrade";
-      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="; "Sec-WebSocket-Version: 13";
-      "Sec-WebSocket-Protocol: echo"; ""; first ]
+    [ "GET " ^ path ^ " HTTP/1.1"
+    ; "Host: x"
+    ; "Upgrade: websocket"
+    ; "Connection: Upgrade"
+    ; "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="
+    ; "Sec-WebSocket-Version: 13"
+    ; "Sec-WebSocket-Protocol: echo"
+    ; ""
+    ; first ]
 
 let response_head r =
   let rec head acc =
-    match Buf_reader.read_line r ~max:1000 with "" -> List.rev acc | l -> head (l :: acc)
+    match Buf_reader.read_line r ~max:1000 with
+    | "" ->
+        List.rev acc
+    | l ->
+        head (l :: acc)
   in
   head []
 
-let session ?first ?(after = "") ?(during = ignore) ?(reply = true) server path =
+let session ?first ?(after = "") ?(during = ignore) ?(reply = true) server path
+    =
   let flow = Caravan.Tcp.connect (Caravan.Server.local_addr server) in
-  Stdlib.Fun.protect ~finally:(fun () -> Caravan.Flow.close flow) @@ fun () ->
-  Caravan.Flow.write_string flow (upgrade_request ?first path);
+  Stdlib.Fun.protect ~finally:(fun () -> Caravan.Flow.close flow)
+  @@ fun () ->
+  Caravan.Flow.write_string flow (upgrade_request ?first path) ;
   let r = Buf_reader.of_flow flow in
   let head = response_head r in
-  Caravan.Flow.write_string flow after;
-  during ();
+  Caravan.Flow.write_string flow after ;
+  during () ;
   let rec frames acc =
     match Frame.read r ~masked:false ~max:max_int with
-    | exception End_of_file -> List.rev acc
+    | exception End_of_file ->
+        List.rev acc
     | f ->
-        if reply && f.opcode = Close then Caravan.Flow.write_string flow (client Close f.payload);
+        if reply && f.opcode = Close then
+          Caravan.Flow.write_string flow (client Close f.payload) ;
         frames (show_frame f :: acc)
   in
   String.concat "\n" (head @ ("--" :: frames []))
@@ -1544,11 +2053,13 @@ let server_tests =
     [ test "an echo, with a first frame in the write of the request" (fun () ->
           expect
             (Server_support.with_server ~handler:server_handler (fun server ->
-                 session server "/echo" ~first:(client Text "early") ~reply:false
+                 session server "/echo" ~first:(client Text "early")
+                   ~reply:false
                    ~after:
-                     (client Text "hi" ^ client Binary "\x01"
-                      ^ client Close (code_reason 1000 "bye"))))
-          @@ __POS_OF__ {|
+                     ( client Text "hi" ^ client Binary "\x01"
+                     ^ client Close (code_reason 1000 "bye") ) ) )
+          @@ __POS_OF__
+               {|
             HTTP/1.1 101 Switching Protocols
             Upgrade: websocket
             Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
@@ -1558,12 +2069,13 @@ let server_tests =
             text "hi"
             binary "\001"
             close 1000
-            |});
-      test "a handler that ends closes with 1000" (fun () ->
+            |} )
+    ; test "a handler that ends closes with 1000" (fun () ->
           expect
             (Server_support.with_server ~handler:server_handler (fun server ->
-                 session server "/protocol"))
-          @@ __POS_OF__ {|
+                 session server "/protocol" ) )
+          @@ __POS_OF__
+               {|
             HTTP/1.1 101 Switching Protocols
             Upgrade: websocket
             Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
@@ -1572,229 +2084,290 @@ let server_tests =
             --
             text "echo"
             close 1000
-            |});
-      test "a handler that raises closes with 1011, and the server reports it" (fun () ->
-          let errors = ref [] in
-          let config =
-            { Server_support.config with
-              on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
-          in
-          expect
-            (Server_support.with_server ~config ~handler:server_handler (fun server ->
-                 session server "/boom"))
-          @@ __POS_OF__ {|
-            HTTP/1.1 101 Switching Protocols
-            Upgrade: websocket
-            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
-            Connection: Upgrade
-            --
-            close 1011
-            |};
-          equal (list string) [ "Failure(\"boom\")" ] !errors);
-      test "a Cancelled from a child call closes with 1011, and the server reports it" (fun () ->
-          let errors = ref [] in
-          let config =
-            { Server_support.config with
-              on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
-          in
-          expect
-            (Server_support.with_server ~config ~handler:server_handler (fun server ->
-                 session server "/child"))
-          @@ __POS_OF__ {|
-            HTTP/1.1 101 Switching Protocols
-            Upgrade: websocket
-            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
-            Connection: Upgrade
-            --
-            close 1011
-            |};
-          equal (list string)
-            [ "Failure(\"Caravan_websocket: a call of the handler was cancelled\")" ]
-            !errors);
-      test "a Closed of a different connection closes with 1011, and the server reports it"
+            |} )
+    ; test "a handler that raises closes with 1011, and the server reports it"
         (fun () ->
-           let errors = ref [] in
-           let config =
-             { Server_support.config with
-               on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
-           in
-           expect
-             (Server_support.with_server ~config ~handler:server_handler (fun server ->
-                  session server "/other"))
-           @@ __POS_OF__ {|
+          let errors = ref [] in
+          let config =
+            { Server_support.config with
+              on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
+            }
+          in
+          expect
+            (Server_support.with_server ~config ~handler:server_handler
+               (fun server -> session server "/boom" ) )
+          @@ __POS_OF__
+               {|
             HTTP/1.1 101 Switching Protocols
             Upgrade: websocket
             Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
             Connection: Upgrade
             --
             close 1011
-            |};
-           equal int 1 (List.length !errors));
-      test "a peer that leaves without a Close frame is not an error" (fun () ->
+            |} ;
+          equal (list string) ["Failure(\"boom\")"] !errors )
+    ; test
+        "a Cancelled from a child call closes with 1011, and the server \
+         reports it" (fun () ->
           let errors = ref [] in
           let config =
             { Server_support.config with
-              on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
+              on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
+            }
           in
-          Atomic.set recorded None;
-          Server_support.with_server ~config ~handler:server_handler (fun server ->
-              let flow = Caravan.Tcp.connect (Caravan.Server.local_addr server) in
-              Caravan.Flow.write_string flow (upgrade_request "/record");
-              equal string "HTTP/1.1 101 Switching Protocols"
-                (List.hd (response_head (Buf_reader.of_flow flow)));
-              Caravan.Flow.close flow;
-              (* Waits at most 2 s for the handler to get Closed 1006. Then
-                 the server stops: it waits for the end of the handler. *)
-              let rec wait n =
-                if Atomic.get recorded = None && n > 0
-                then (Affect_unix.Mtime.wait_for (ms 10); wait (n - 1))
+          expect
+            (Server_support.with_server ~config ~handler:server_handler
+               (fun server -> session server "/child" ) )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 101 Switching Protocols
+            Upgrade: websocket
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+            Connection: Upgrade
+            --
+            close 1011
+            |} ;
+          equal (list string)
+            [ "Failure(\"Caravan_websocket: a call of the handler was \
+               cancelled\")" ]
+            !errors )
+    ; test
+        "a Closed of a different connection closes with 1011, and the server \
+         reports it" (fun () ->
+          let errors = ref [] in
+          let config =
+            { Server_support.config with
+              on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
+            }
+          in
+          expect
+            (Server_support.with_server ~config ~handler:server_handler
+               (fun server -> session server "/other" ) )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 101 Switching Protocols
+            Upgrade: websocket
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+            Connection: Upgrade
+            --
+            close 1011
+            |} ;
+          equal int 1 (List.length !errors) )
+    ; test "a peer that leaves without a Close frame is not an error" (fun () ->
+          let errors = ref [] in
+          let config =
+            { Server_support.config with
+              on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
+            }
+          in
+          Atomic.set recorded None ;
+          Server_support.with_server ~config ~handler:server_handler
+            (fun server ->
+              let flow =
+                Caravan.Tcp.connect (Caravan.Server.local_addr server)
               in
-              wait 200);
+              Caravan.Flow.write_string flow (upgrade_request "/record") ;
+              equal string "HTTP/1.1 101 Switching Protocols"
+                (List.hd (response_head (Buf_reader.of_flow flow))) ;
+              Caravan.Flow.close flow ;
+              (* Waits at most 2 s for the handler to get Closed 1006. Then the
+                 server stops: it waits for the end of the handler. *)
+              let rec wait n =
+                if Atomic.get recorded = None && n > 0 then (
+                  Affect_unix.Mtime.wait_for (ms 10) ;
+                  wait (n - 1) )
+              in
+              wait 200 ) ;
           equal (option string)
             (Some "Caravan_websocket__Connection.Closed(1006, \"\")")
-            (Atomic.get recorded);
-          equal (list string) [] !errors);
-      test "a server that stops sends Close 1001, and the handler ends" (fun () ->
+            (Atomic.get recorded) ;
+          equal (list string) [] !errors )
+    ; test "a server that stops sends Close 1001, and the handler ends"
+        (fun () ->
           let errors = ref [] in
           let config =
             { Server_support.config with
-              shutdown_grace = ms 30_000;
-              on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
+              shutdown_grace= ms 30_000
+            ; on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
+            }
           in
           expect
-            (Server_support.with_server ~config ~handler:server_handler (fun server ->
+            (Server_support.with_server ~config ~handler:server_handler
+               (fun server ->
                  let s =
                    within_2s (fun () ->
-                       session server "/echo" ~during:(fun () -> Caravan.Server.shutdown server))
+                       session server "/echo" ~during:(fun () ->
+                           Caravan.Server.shutdown server ) )
                  in
                  (* The handler does not wait for the grace of 30 s. *)
-                 within_2s (fun () -> Caravan.Server.wait server);
-                 s))
-          @@ __POS_OF__ {|
+                 within_2s (fun () -> Caravan.Server.wait server) ;
+                 s ) )
+          @@ __POS_OF__
+               {|
             HTTP/1.1 101 Switching Protocols
             Upgrade: websocket
             Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
             Connection: Upgrade
             --
             close 1001 "server shutdown"
-            |};
-          equal (list string) [] !errors);
-      test "a handler that is in recv when the server stops gets Closed 1001" (fun () ->
-          let config = { Server_support.config with shutdown_grace = ms 30_000 } in
-          Atomic.set recorded None;
-          Server_support.with_server ~config ~handler:server_handler (fun server ->
+            |} ;
+          equal (list string) [] !errors )
+    ; test "a handler that is in recv when the server stops gets Closed 1001"
+        (fun () ->
+          let config = {Server_support.config with shutdown_grace= ms 30_000} in
+          Atomic.set recorded None ;
+          Server_support.with_server ~config ~handler:server_handler
+            (fun server ->
               ignore
                 (within_2s (fun () ->
-                     session server "/record" ~during:(fun () -> Caravan.Server.shutdown server))));
+                     session server "/record" ~during:(fun () ->
+                         Caravan.Server.shutdown server ) ) ) ) ;
           (* The server waits for the handler. *)
           equal (option string)
-            (Some "Caravan_websocket__Connection.Closed(1001, \"server shutdown\")")
-            (Atomic.get recorded));
-      test "a handler that does not use the connection gets Close 1001, then the cancel" (fun () ->
+            (Some
+               "Caravan_websocket__Connection.Closed(1001, \"server shutdown\")"
+            ) (Atomic.get recorded) )
+    ; test
+        "a handler that does not use the connection gets Close 1001, then the \
+         cancel" (fun () ->
           let errors = ref [] in
           let config =
             { Server_support.config with
-              shutdown_grace = ms 300;
-              on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
+              shutdown_grace= ms 300
+            ; on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
+            }
           in
           let t = ref (Affect_unix.Mtime.counter ()) in
           let s =
-            Server_support.with_server ~config ~handler:server_handler (fun server ->
+            Server_support.with_server ~config ~handler:server_handler
+              (fun server ->
                 within_2s (fun () ->
                     session server "/wait" ~during:(fun () ->
-                        t := Affect_unix.Mtime.counter ();
-                        Caravan.Server.shutdown server)))
+                        t := Affect_unix.Mtime.counter () ;
+                        Caravan.Server.shutdown server ) ) )
           in
           let took = elapsed_ms !t in
-          equal string "close 1001 \"server shutdown\"" (List.nth (String.split_on_char '\n' s) 5);
-          is_true ~msg:(Printf.sprintf "stopped after %.0fms" took) (took >= 290.);
-          equal (list string) [] !errors);
-      test "a cancel at the grace while the stop waits for the reply is not an error" (fun () ->
+          equal string "close 1001 \"server shutdown\""
+            (List.nth (String.split_on_char '\n' s) 5) ;
+          is_true
+            ~msg:(Printf.sprintf "stopped after %.0fms" took)
+            (took >= 290.) ;
+          equal (list string) [] !errors )
+    ; test
+        "a cancel at the grace while the stop waits for the reply is not an \
+         error" (fun () ->
           let errors = ref [] in
           let config =
             { Server_support.config with
-              shutdown_grace = ms 300;
-              on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
+              shutdown_grace= ms 300
+            ; on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
+            }
           in
           let s =
-            Server_support.with_server ~config ~handler:server_handler (fun server ->
+            Server_support.with_server ~config ~handler:server_handler
+              (fun server ->
                 within_2s (fun () ->
-                    session server "/wait-slow-close" ~reply:false ~during:(fun () ->
-                        Caravan.Server.shutdown server)))
+                    session server "/wait-slow-close" ~reply:false
+                      ~during:(fun () -> Caravan.Server.shutdown server ) ) )
           in
-          equal string "close 1001 \"server shutdown\"" (List.nth (String.split_on_char '\n' s) 5);
-          equal (list string) [] !errors);
-      test "a peer that does not reply to Close 1001 gets the end of the stream at the close timeout"
-        (fun () ->
-           let t = ref (Affect_unix.Mtime.counter ()) and took = ref 0. in
-           let s =
-             Server_support.with_server ~handler:server_handler (fun server ->
-                 let s =
-                   within_2s (fun () ->
-                       session server "/echo-fast" ~reply:false ~during:(fun () ->
-                           t := Affect_unix.Mtime.counter ();
-                           Caravan.Server.shutdown server))
-                 in
-                 took := elapsed_ms !t;
-                 s)
-           in
-           equal string "close 1001 \"server shutdown\"" (List.nth (String.split_on_char '\n' s) 5);
-           is_true ~msg:(Printf.sprintf "ended after %.0fms" !took) (!took >= 90.));
-      test "a handler that only sends gets the full closing handshake" (fun () ->
-          let errors = ref [] in
-          let config =
-            { Server_support.config with
-              shutdown_grace = ms 30_000;
-              on_error = (fun e _ -> errors := Printexc.to_string e :: !errors) }
-          in
-          started := Affect.Cell.Once.make ();
+          equal string "close 1001 \"server shutdown\""
+            (List.nth (String.split_on_char '\n' s) 5) ;
+          equal (list string) [] !errors )
+    ; test
+        "a peer that does not reply to Close 1001 gets the end of the stream \
+         at the close timeout" (fun () ->
           let t = ref (Affect_unix.Mtime.counter ()) and took = ref 0. in
           let s =
-            Server_support.with_server ~config ~handler:server_handler (fun server ->
+            Server_support.with_server ~handler:server_handler (fun server ->
+                let s =
+                  within_2s (fun () ->
+                      session server "/echo-fast" ~reply:false
+                        ~during:(fun () ->
+                          t := Affect_unix.Mtime.counter () ;
+                          Caravan.Server.shutdown server ) )
+                in
+                took := elapsed_ms !t ;
+                s )
+          in
+          equal string "close 1001 \"server shutdown\""
+            (List.nth (String.split_on_char '\n' s) 5) ;
+          is_true ~msg:(Printf.sprintf "ended after %.0fms" !took) (!took >= 90.) )
+    ; test "a handler that only sends gets the full closing handshake"
+        (fun () ->
+          let errors = ref [] in
+          let config =
+            { Server_support.config with
+              shutdown_grace= ms 30_000
+            ; on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
+            }
+          in
+          started := Affect.Cell.Once.make () ;
+          let t = ref (Affect_unix.Mtime.counter ()) and took = ref 0. in
+          let s =
+            Server_support.with_server ~config ~handler:server_handler
+              (fun server ->
                 let s =
                   within_2s (fun () ->
                       session server "/ticker" ~reply:false ~during:(fun () ->
-                          within_2s (fun () -> Affect.Cell.Once.get !started);
-                          t := Affect_unix.Mtime.counter ();
-                          Caravan.Server.shutdown server))
+                          within_2s (fun () -> Affect.Cell.Once.get !started) ;
+                          t := Affect_unix.Mtime.counter () ;
+                          Caravan.Server.shutdown server ) )
                 in
-                took := elapsed_ms !t;
-                s)
+                took := elapsed_ms !t ;
+                s )
           in
           let frames =
             List.filteri (fun i _ -> i > 4) (String.split_on_char '\n' s)
           in
-          is_true ~msg:"one or more ticks" (List.hd frames = "text \"tick\"");
-          equal (list string) [ "close 1001 \"server shutdown\"" ]
-            (List.filter (fun f -> f <> "text \"tick\"") frames);
-          equal string "close 1001 \"server shutdown\"" (List.nth frames (List.length frames - 1));
-          is_true ~msg:(Printf.sprintf "ended after %.0fms" !took) (!took >= 290.);
-          equal (list string) [] !errors);
-      test "a stop before the handler starts sends the 101, then Close 1001" (fun () ->
+          is_true ~msg:"one or more ticks" (List.hd frames = "text \"tick\"") ;
+          equal (list string)
+            ["close 1001 \"server shutdown\""]
+            (List.filter (fun f -> f <> "text \"tick\"") frames) ;
+          equal string "close 1001 \"server shutdown\""
+            (List.nth frames (List.length frames - 1)) ;
+          is_true
+            ~msg:(Printf.sprintf "ended after %.0fms" !took)
+            (!took >= 290.) ;
+          equal (list string) [] !errors )
+    ; test "a stop before the handler starts sends the 101, then Close 1001"
+        (fun () ->
           let open Affect in
-          started := Cell.Once.make ();
-          let config = { Server_support.config with shutdown_grace = ms 30_000 } in
+          started := Cell.Once.make () ;
+          let config = {Server_support.config with shutdown_grace= ms 30_000} in
           expect
-            (Server_support.with_server ~config ~handler:server_handler (fun server ->
+            (Server_support.with_server ~config ~handler:server_handler
+               (fun server ->
                  (* The response comes only after the stop. *)
                  let s = Fun.Async.call (fun () -> session server "/late") in
-                 within_2s (fun () -> Cell.Once.get !started);
-                 Caravan.Server.shutdown server;
-                 within_2s (fun () -> Fun.Async.get s)))
-          @@ __POS_OF__ {|
+                 within_2s (fun () -> Cell.Once.get !started) ;
+                 Caravan.Server.shutdown server ;
+                 within_2s (fun () -> Fun.Async.get s) ) )
+          @@ __POS_OF__
+               {|
             HTTP/1.1 101 Switching Protocols
             Upgrade: websocket
             Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
             Connection: Upgrade
             --
             close 1001 "server shutdown"
-            |});
-      test "the end of the handler stops the wait for the stop" (fun () ->
+            |} )
+    ; test "the end of the handler stops the wait for the stop" (fun () ->
           let input = client Close (code_reason 1000 "") in
           let out = Buffer.create 16 in
           Affect_unix.Unix.main ~domain_count:1 (fun () ->
               within_2s (fun () ->
-                  run_handler (fun _ -> ()) (Caravan.Flow.of_string input out)));
-          equal (list string) [ "close 1000" ] (frames (Buffer.contents out))) ]
+                  run_handler (fun _ -> ()) (Caravan.Flow.of_string input out) ) ) ;
+          equal (list string) ["close 1000"] (frames (Buffer.contents out)) ) ]
 
-let () = exit (run "websocket" [ sha1_tests; base64_tests; frame_tests; utf8_tests; connection_tests; close_tests; socket_tests; handshake_tests; server_tests ])
+let () =
+  exit
+    (run "websocket"
+       [ sha1_tests
+       ; base64_tests
+       ; frame_tests
+       ; utf8_tests
+       ; connection_tests
+       ; close_tests
+       ; socket_tests
+       ; handshake_tests
+       ; server_tests ] )

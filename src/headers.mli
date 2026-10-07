@@ -1,12 +1,12 @@
-(** HTTP header fields ({{:https://www.rfc-editor.org/rfc/rfc9110#section-5}
-    RFC 9110 §5}).
+(** HTTP header fields
+    ({{:https://www.rfc-editor.org/rfc/rfc9110#section-5} RFC 9110 §5}).
 
     Fields keep the order, name case and duplicates they were given, so that a
-    proxy can forward them faithfully. Lookups compare names
-    case-insensitively. *)
+    proxy can forward them faithfully. Lookups compare names case-insensitively.
+*)
 
-type t
 (** The type for ordered collections of header fields. *)
+type t
 
 val empty : t
 (** [empty] has no fields. *)
@@ -20,8 +20,9 @@ val length : t -> int
 val of_list : (string * string) list -> t
 (** [of_list fields] are the [(name, value)] [fields] in order.
 
-    @raise Invalid_argument if a name or a value is not valid, see
-    {!is_valid_name} and {!is_valid_value}. *)
+    @raise Invalid_argument
+      if a name or a value is not valid, see {!is_valid_name} and
+      {!is_valid_value}. *)
 
 val to_list : t -> (string * string) list
 (** [to_list h] are the fields of [h] in order, with their names as given. *)
@@ -46,8 +47,8 @@ val remove : string -> t -> t
 (** {1:lookup Lookup} *)
 
 val find : string -> t -> string option
-(** [find name h] is the value of the first field of [h] named [name], if
-    any. *)
+(** [find name h] is the value of the first field of [h] named [name], if any.
+*)
 
 val find_all : string -> t -> string list
 (** [find_all name h] are the values of the fields of [h] named [name], in
@@ -67,23 +68,23 @@ val iter : (string -> string -> unit) -> t -> unit
 val tokens : string -> t -> string list
 (** [tokens name h] are the elements of the
     {{:https://www.rfc-editor.org/rfc/rfc9110#section-5.6.1}comma-separated
-    lists} in the fields of [h] named [name], in order, with surrounding
+     lists} in the fields of [h] named [name], in order, with surrounding
     whitespace trimmed and empty elements dropped. For example, with the fields
-    [Connection: keep-alive, Upgrade] and [Connection: close], [tokens
-    "connection" h] is [["keep-alive"; "Upgrade"; "close"]]. *)
+    [Connection: keep-alive, Upgrade] and [Connection: close],
+    [tokens "connection" h] is [["keep-alive"; "Upgrade"; "close"]]. *)
 
 val has_token : string -> string -> t -> bool
 (** [has_token name token h] is [true] iff [token] is in [tokens name h],
-    compared case-insensitively. For example [has_token "connection" "close"
-    h]. *)
+    compared case-insensitively. For example [has_token "connection" "close" h].
+*)
 
 val remove_hop_by_hop : t -> t
 (** [remove_hop_by_hop h] is [h] without its
-    {{:https://www.rfc-editor.org/rfc/rfc9110#section-7.6.1}hop-by-hop
-    fields}: [Connection], every field that [Connection] names, and
-    [Keep-Alive], [Proxy-Connection], [Proxy-Authenticate],
-    [Proxy-Authorization], [TE], [Trailer], [Transfer-Encoding] and [Upgrade].
-    A proxy applies it before forwarding a message. *)
+    {{:https://www.rfc-editor.org/rfc/rfc9110#section-7.6.1}hop-by-hop fields}:
+    [Connection], every field that [Connection] names, and [Keep-Alive],
+    [Proxy-Connection], [Proxy-Authenticate], [Proxy-Authorization], [TE],
+    [Trailer], [Transfer-Encoding] and [Upgrade]. A proxy applies it before
+    forwarding a message. *)
 
 (** {1:validity Validity} *)
 
@@ -94,8 +95,8 @@ val is_valid_name : string -> bool
 val is_valid_value : string -> bool
 (** [is_valid_value s] is [true] iff [s] is a
     {{:https://www.rfc-editor.org/rfc/rfc9110#section-5.5}field value}: it has
-    no control characters other than horizontal tab, so no CR, LF or NUL, and
-    it does not start or end with a space or a tab. It may be empty. *)
+    no control characters other than horizontal tab, so no CR, LF or NUL, and it
+    does not start or end with a space or a tab. It may be empty. *)
 
 (** {1:fmt Comparing and formatting} *)
 
