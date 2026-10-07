@@ -785,6 +785,200 @@ let accept_error_tests =
             |} )
     ]
 
+(* The accept loop, with a fake listener. A real socket cannot make accept(2)
+   fail on demand: EMFILE needs a process without free descriptors, and Linux
+   does not give ECONNABORTED for a reset queued connection. *)
+
+(* A listener without a socket. [try_accept] gives its steps in order. After the
+   last step, it waits for clients that never come. But if the server does not
+   stop in 2 s, it raises ETIMEDOUT, so that a test that does not stop the
+   server ends: the acceptor stops on this error. *)
+module Fake_listener = struct
+  (* A step: a connection, an accept(2) error, or a gate that holds the next
+     steps until its action is enabled. *)
+  type step =
+    | Conn of Unix.file_descr
+    | Error of Unix.error
+    | Gate of unit Action.t
+
+  type t =
+    { mutable steps: step list (* Only the acceptor changes it. *)
+    ; calls: Mtime.t list Atomic.t (* When try_accept ran, the last first. *)
+    ; closed: bool Atomic.t
+    ; deadline: Mtime.t }
+
+  let make steps =
+    { steps
+    ; calls= Atomic.make []
+    ; closed= Atomic.make false
+    ; deadline= deadline_in 2000 }
+
+  let is_late l = not (Mtime.is_earlier (Mtime.now ()) ~than:l.deadline)
+
+  let addr _ = Unix.ADDR_UNIX "fake"
+
+  let wait_acceptable l tag =
+    match l.steps with
+    | [] ->
+        if is_late l then Action.always tag
+        else Mtime.wait_for' (Mtime.span (Mtime.now ()) l.deadline) tag
+    | Gate gate :: _ ->
+        Action.map (fun () -> tag) gate
+    | (Conn _ | Error _) :: _ ->
+        Action.always tag
+
+  let try_accept l =
+    Atomic.set l.calls (Mtime.now () :: Atomic.get l.calls) ;
+    match l.steps with
+    | [] ->
+        if is_late l then
+          raise (Unix.Unix_error (ETIMEDOUT, "Fake_listener", "no stop in 2 s"))
+        else None
+    | Gate _ :: rest ->
+        (* A spurious readiness. *)
+        l.steps <- rest ;
+        None
+    | Conn fd :: rest ->
+        l.steps <- rest ;
+        Some (fd, addr l)
+    | Error e :: rest ->
+        l.steps <- rest ;
+        raise (Unix.Unix_error (e, "accept", ""))
+
+  let close l = Atomic.set l.closed true
+end
+
+(* The server end, as the listener gives it, and the client flow of a
+   connection. *)
+let socket_pair () =
+  let server, client =
+    Unix.socketpair ~cloexec:true Unix.PF_UNIX Unix.SOCK_STREAM 0
+  in
+  Unix.set_nonblock server ;
+  Unix.set_nonblock client ;
+  (server, Tcp.flow client)
+
+(* Serves [handler] on a [Fake_listener] with [steps]. [f] gets the listener,
+   the server and the errors that [on_error] got. Then the server stops, if it
+   did not before, and the [clients] flows and the connections that the server
+   did not take close. A server that does not stop makes the test fail after 2 s
+   with ETIMEDOUT. *)
+let with_fake_listener ?(clients = []) steps f =
+  let errors = Atomic.make [] in
+  let config =
+    { quiet with
+      on_error= (fun e _ -> Atomic.set errors (e :: Atomic.get errors)) }
+  in
+  in_main
+  @@ fun () ->
+  let l = Fake_listener.make steps in
+  let server = Server.start_with ~config (module Fake_listener) l handler in
+  Fun.protect
+    ~finally:(fun () ->
+      List.iter Flow.close clients ;
+      Server.abort server ;
+      (* The acceptor stopped: the steps do not change. *)
+      Fun.protect
+        ~finally:(fun () ->
+          List.iter
+            (function
+              | Fake_listener.Conn fd -> Unix.close fd | Error _ | Gate _ -> () )
+            l.steps )
+        (fun () ->
+          (* The error of a test that stops the server with EBADF. *)
+          try Server.wait server with Unix.Unix_error (EBADF, _, _) -> () ) )
+    (fun () -> f l server errors)
+
+(* All that [c] gets until it ends, in 2 s at most. Then [c] closes, so that the
+   server does not linger on the connection. *)
+let response c =
+  Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+  Fun.protect ~finally:(fun () -> Flow.close c) (fun () -> read_all c)
+
+let ends_with suffix s = is_true ~msg:s (String.ends_with ~suffix s)
+
+let contains s sub =
+  let n = String.length sub in
+  let rec at i =
+    i + n <= String.length s && (String.sub s i n = sub || at (i + 1))
+  in
+  at 0
+
+let accept_loop_tests =
+  group "Accept loop"
+    [ test "EMFILE is reported, then the server waits 100 ms and accepts again"
+        (fun () ->
+          let fd, c = socket_pair () in
+          with_fake_listener ~clients:[c] [Error EMFILE; Conn fd]
+          @@ fun l server errors ->
+          Flow.write_string c (get ~close:true "/") ;
+          ends_with "hello" (response c) ;
+          is_true ~msg:"one EMFILE reported"
+            ( match Atomic.get errors with
+            | [Unix.Unix_error (EMFILE, "accept", _)] ->
+                true
+            | _ ->
+                false ) ;
+          ( match Atomic.get l.calls with
+          | [conn; emfile] ->
+              let pause = Mtime.span emfile conn in
+              is_false
+                ~msg:(Format.asprintf "a pause of %a" Mtime.Span.pp pause)
+                (Mtime.Span.is_shorter pause ~than:Mtime.Span.(100 * ms))
+          | calls ->
+              fail (Printf.sprintf "%d calls of try_accept" (List.length calls))
+          ) ;
+          equal bool true (Server.local_addr server = Unix.ADDR_UNIX "fake") )
+    ; (* A test does not prove that the retry has no pause: a limit on the time
+         makes a test fail on a slow machine. *)
+      test "ECONNABORTED is not reported, and the server accepts again"
+        (fun () ->
+          let fd, c = socket_pair () in
+          with_fake_listener ~clients:[c] [Error ECONNABORTED; Conn fd]
+          @@ fun _ _ errors ->
+          Flow.write_string c (get ~close:true "/") ;
+          ends_with "hello" (response c) ;
+          equal int 0 (List.length (Atomic.get errors)) )
+    ; test
+        "EBADF stops the server: the listener closes, a request in progress \
+         finishes, and wait raises EBADF" (fun () ->
+          started := Cell.Once.make () ;
+          let fd, c = socket_pair () in
+          with_fake_listener ~clients:[c]
+            [Conn fd; Gate (Cell.Once.get' !started); Error EBADF]
+          @@ fun l server errors ->
+          Flow.write_string c (get "/pause") ;
+          let r = response c in
+          ends_with "done" r ;
+          is_true ~msg:"the response ends the connection"
+            (contains r "\r\nConnection: close\r\n") ;
+          raises_match
+            (function
+              | Unix.Unix_error (EBADF, "accept", _) -> true | _ -> false )
+            (fun () -> Server.wait server) ;
+          is_true ~msg:"listener closed" (Atomic.get l.closed) ;
+          equal int ~msg:"calls of try_accept: no call after EBADF" 3
+            (List.length (Atomic.get l.calls)) ;
+          equal int 0 (List.length (Atomic.get errors)) )
+    ; test "a server that cannot start closes the listener" (fun () ->
+          in_main
+          @@ fun () ->
+          let l = Fake_listener.make [] in
+          raises_match
+            (function Invalid_argument _ -> true | _ -> false)
+            (fun () ->
+              Server.start_with
+                ~config:{quiet with max_connections= -1}
+                (module Fake_listener)
+                l handler ) ;
+          is_true ~msg:"listener closed" (Atomic.get l.closed) )
+    ; test "a shutdown closes the listener" (fun () ->
+          with_fake_listener []
+          @@ fun l server _ ->
+          Server.shutdown server ;
+          Server.wait server ;
+          is_true ~msg:"listener closed" (Atomic.get l.closed) ) ]
+
 (* Stop_signal. Only installing: delivering a signal to the test process could
    kill it, see test_server.ml for that. SIGUSR2 is never sent. *)
 
@@ -840,5 +1034,6 @@ let () =
        ; server_tests
        ; race_tests
        ; accept_error_tests
+       ; accept_loop_tests
        ; stop_signal_tests
        ; date_tests ] )
