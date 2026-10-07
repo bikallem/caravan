@@ -109,7 +109,7 @@ Caravan_client.with_response client
 ## Development
 
 The repository includes a Nix flake that provides OCaml 5.5, dune,
-affect, http-date, windtrap, ocaml-lsp, utop, ocp-indent and odoc.
+affect, http-date, windtrap, ocaml-lsp, utop, ocamlformat and odoc.
 
 With [direnv](https://direnv.net) and
 [nix-direnv](https://github.com/nix-community/nix-direnv) installed,
@@ -131,7 +131,7 @@ Then:
 ```sh
 make build      # dune build
 make test       # all test suites
-make fmt        # indent with ocp-indent
+make fmt        # format with ocamlformat (dune fmt)
 make mutate     # mutation testing across all suites, in parallel
 make mutate MUTATE=websocket/   # only the mutants of the files under a prefix
 make coverage   # test coverage report

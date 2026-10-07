@@ -1,5 +1,3 @@
-ML_FILES = $(shell find . \( -path ./_build -o -path ./.direnv -o -path ./.git \) -prune \
-	-o \( -name '*.ml' -o -name '*.mli' \) -print)
 
 # Test suites with mutation results to merge.
 SUITES = test_core test_h1 test_h1_server test_net test_server test_server_stateful \
@@ -11,7 +9,7 @@ build:
 	dune build
 
 fmt:
-	ocp-indent -i $(ML_FILES)
+	dune fmt
 
 test:
 	dune test --force
