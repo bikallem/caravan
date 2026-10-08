@@ -858,21 +858,25 @@ let socket_pair () =
   Unix.set_nonblock client ;
   (server, Tcp.flow client)
 
-(* Serves [handler] on a [Fake_listener] with [steps]. [f] gets the listener,
-   the server and the errors that [on_error] got. Then the server stops, if it
-   did not before, and the [clients] flows and the connections that the server
-   did not take close. A server that does not stop makes the test fail after 2 s
-   with ETIMEDOUT. *)
-let with_fake_listener ?(clients = []) steps f =
+(* Serves [handler] with [config] and [engine] on a [Fake_listener] with
+   [steps]. [f] gets the listener, the server and the errors that [on_error]
+   got: the helper sets [on_error] of [config]. Then the server stops, if it did
+   not before, and the [clients] flows and the connections that the server did
+   not take close. A server that does not stop makes the test fail after 2 s
+   with ETIMEDOUT, unless the last step is a gate that is never enabled. *)
+let with_fake_listener ?(clients = []) ?(config = quiet) ?(handler = handler)
+    ?engine steps f =
   let errors = Atomic.make [] in
   let config =
-    { quiet with
+    { config with
       on_error= (fun e _ -> Atomic.set errors (e :: Atomic.get errors)) }
   in
   in_main
   @@ fun () ->
   let l = Fake_listener.make steps in
-  let server = Server.start_with ~config (module Fake_listener) l handler in
+  let server =
+    Server.start_with ~config ?engine (module Fake_listener) l handler
+  in
   Fun.protect
     ~finally:(fun () ->
       List.iter Flow.close clients ;
