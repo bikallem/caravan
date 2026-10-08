@@ -12,8 +12,11 @@ let of_unix_time t =
 let cache = Atomic.make (min_int, "")
 
 let of_posix p =
-  let t = Float.floor (Affect_unix.Ptime.to_float_s p) in
-  let second = Float.to_int t in
+  (* The exact floor of the second. A float can round a fraction near 1 s up to
+     the next second. *)
+  let span = Affect_unix.Ptime.to_span p in
+  let second = Option.get (Affect_unix.Ptime.Span.to_int_s span) in
+  let t = Float.of_int second in
   let cached_second, cached = Atomic.get cache in
   if second = cached_second then cached
   else begin

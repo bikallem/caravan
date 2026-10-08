@@ -44,8 +44,9 @@ let log st entry =
   changed
 
 (* The mono deadline at which affect checks the POSIX time again for the POSIX
-   deadline [p], after [posix_now]: the span to [p], rounded up to the ns. A
-   span of 0 ns would give a deadline at [mono_now]. Under the lock. *)
+   deadline [p], after [posix_now]: the span to [p], rounded up to the ns. The
+   round up only keeps the deadline after [mono_now]: the one partition of
+   [advance] already prevents a loop. Under the lock. *)
 let check_at st p =
   let span = Ptime.diff p st.posix_now in
   let ns =

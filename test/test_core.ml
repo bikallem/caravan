@@ -389,7 +389,14 @@ let date_tests =
           equal string "Wed, 31 Dec 1969 23:59:59 GMT"
             (Date.of_posix (posix (-0.5))) ;
           equal string "Wed, 31 Dec 1969 23:59:59 GMT"
-            (Date.of_posix (posix (-1.))) ) ]
+            (Date.of_posix (posix (-1.))) )
+    ; test "of_posix drops a fraction near 1 s" (fun () ->
+          (* 100 ns before midnight: a float rounds it up to the next second. *)
+          let p =
+            Affect_unix.Ptime.(
+              Option.get (of_span (Span.v (20500, 86_399_999_999_900_000L))) )
+          in
+          equal string "Mon, 16 Feb 2026 23:59:59 GMT" (Date.of_posix p) ) ]
 
 (* Flow *)
 
@@ -1152,7 +1159,17 @@ let time_tests =
           let module Ptime = Affect_unix.Ptime in
           let d = Ptime.diff (Time.now Time.posix) (Ptime.now ()) in
           is_true ~msg:"within 2 s"
-            Ptime.Span.(is_shorter (abs d) ~than:(of_int_s 2)) )
+            Ptime.Span.(is_shorter (abs d) ~than:(of_int_s 2)) ;
+          let t = Time.now Time.posix in
+          let d = Option.get (Time.after Time.posix (Ptime.Span.of_int_s 1)) in
+          is_false ~msg:"after adds the span"
+            Ptime.(
+              is_earlier d ~than:(Option.get (add_span t (Span.of_int_s 1))) ) ;
+          is_true ~msg:"within 2 s of the span"
+            Ptime.(
+              is_earlier d ~than:(Option.get (add_span t (Span.of_int_s 3))) ) ;
+          is_true ~msg:"the default of the config"
+            (Config.default.posix_time == Time.posix) )
     ; test "a POSIX deadline that has passed is enabled at once" (fun () ->
           let now = Affect_unix.Ptime.now () in
           is_true (enabled_within_50ms (Time.at Time.posix (Some now) ())) )
@@ -1354,8 +1371,7 @@ let fake_posix_tests =
           is_false ~msg:"at the deadline - 1 ns" (ends_within_50ms c) ;
           Fake.advance f Affect_unix.Mtime.Span.ns ;
           is_true ~msg:"at the deadline" (ends_within_2s c) )
-    ; test "a POSIX deadline with picoseconds is enabled at the next ns"
-        (fun () ->
+    ; test "a POSIX deadline with picoseconds is enabled after it" (fun () ->
           fake_main
           @@ fun () ->
           let f = Fake.make () in
@@ -1365,6 +1381,31 @@ let fake_posix_tests =
           is_false ~msg:"1 ps before the deadline" (ends_within_50ms c) ;
           Fake.advance f Affect_unix.Mtime.Span.ns ;
           is_true ~msg:"after the deadline" (ends_within_2s c) )
+    ; test "a POSIX timer at the POSIX time is enabled at once" (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let c = waiting_posix_call f (Fake.posix_now f) in
+          is_true (ends_within_2s c) )
+    ; test "a POSIX wait that a step back made longer gets a new mono deadline"
+        (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let p = Fake.posix_now f +:: psec 10 in
+          let c = waiting_posix_call f p in
+          Fake.jump_posix f (Ptime.Span.neg (psec 3600)) ;
+          Fake.advance f (sec 10) ;
+          is_false ~msg:"at the first mono deadline" (ends_within_50ms c) ;
+          (* The new mono deadline is 1 h after the first one. A step forward
+             does not make it shorter. *)
+          Fake.jump_posix f (psec 7200) ;
+          Fake.advance f Affect_unix.Mtime.Span.ns ;
+          is_false ~msg:"after a step forward" (ends_within_50ms c) ;
+          Fake.advance f Affect_unix.Mtime.Span.((60 * min) - (2 * ns)) ;
+          is_false ~msg:"1 ns before the new mono deadline" (ends_within_50ms c) ;
+          Fake.advance f Affect_unix.Mtime.Span.ns ;
+          is_true ~msg:"at the new mono deadline" (ends_within_2s c) )
     ; test "a step back of the clock makes a POSIX wait longer" (fun () ->
           fake_main
           @@ fun () ->
@@ -1403,18 +1444,29 @@ let fake_posix_tests =
           is_true ~msg:"enabled at once" (ends_within_2s c) )
     ; test "a mono timer and a POSIX timer at one mono deadline do not share"
         (fun () ->
-          fake_main
-          @@ fun () ->
-          let f = Fake.make () in
-          let p = Fake.posix_now f +:: psec 10
-          and d = Fake.mono_now f +: sec 10 in
-          (* The POSIX timer checks the POSIX time at the mono deadline [d]. *)
-          let posix = waiting_posix_call f p in
-          let mono = waiting_call f d in
-          Fake.jump_posix f (Ptime.Span.neg (psec 3600)) ;
-          Fake.advance f (sec 10) ;
-          is_true ~msg:"the mono timer" (ends_within_2s mono) ;
-          is_false ~msg:"the POSIX timer" (ends_within_50ms posix) )
+          (* The two orders: each timer can find the entry of the other. *)
+          List.iter
+            (fun posix_first ->
+              fake_main
+              @@ fun () ->
+              let f = Fake.make () in
+              let p = Fake.posix_now f +:: psec 10
+              and d = Fake.mono_now f +: sec 10 in
+              (* The POSIX timer checks the POSIX time at the mono deadline
+                 [d]. *)
+              let posix, mono =
+                if posix_first then
+                  let posix = waiting_posix_call f p in
+                  (posix, waiting_call f d)
+                else
+                  let mono = waiting_call f d in
+                  (waiting_posix_call f p, mono)
+              in
+              Fake.jump_posix f (Ptime.Span.neg (psec 3600)) ;
+              Fake.advance f (sec 10) ;
+              is_true ~msg:"the mono timer" (ends_within_2s mono) ;
+              is_false ~msg:"the POSIX timer" (ends_within_50ms posix) )
+            [true; false] )
     ; test "advance moves the two time lines" (fun () ->
           let f = Fake.make () in
           let m0 = Fake.mono_now f and p0 = Fake.posix_now f in
@@ -1429,9 +1481,12 @@ let fake_posix_tests =
           fake_main
           @@ fun () ->
           let f = Fake.make () in
+          let p_start = Fake.posix_now f in
           raises_match
             (function Invalid_argument _ -> true | _ -> false)
             (fun () -> Fake.jump_posix f (Ptime.Span.v (4_000_000, 0L))) ;
+          is_true ~msg:"POSIX after the jump"
+            (Ptime.equal (Fake.posix_now f) p_start) ;
           let p_last = Option.get (Ptime.sub_span Ptime.max_stamp (psec 1)) in
           Fake.jump_posix f (Ptime.diff p_last (Fake.posix_now f)) ;
           let m0 = Fake.mono_now f and p0 = Fake.posix_now f in
