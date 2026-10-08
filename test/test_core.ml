@@ -1143,6 +1143,37 @@ let time_tests =
           List.iter
             (fun file -> check "websocket" file (direct @ injected))
             websocket )
+    ; test "the POSIX time line reads the system clock" (fun () ->
+          let module Ptime = Affect_unix.Ptime in
+          let d = Ptime.diff (Time.now Time.posix) (Ptime.now ()) in
+          is_true ~msg:"within 2 s"
+            Ptime.Span.(is_shorter (abs d) ~than:(of_int_s 2)) )
+    ; test "a POSIX deadline that has passed is enabled at once" (fun () ->
+          let now = Affect_unix.Ptime.now () in
+          is_true (enabled_within_50ms (Time.at Time.posix (Some now) ())) )
+    ; test "a POSIX timer is enabled at its deadline" (fun () ->
+          let module Ptime = Affect_unix.Ptime in
+          let module Mtime = Affect_unix.Mtime in
+          in_main
+          @@ fun () ->
+          let t0 = Mtime.now () in
+          let span = Ptime.Span.of_mtime_span Mtime.Span.(20 * ms) in
+          let p = Option.get (Ptime.add_span (Ptime.now ()) span) in
+          ( match
+              Affect.Action.invoke
+                (Affect.Action.choose
+                   [ Time.at Time.posix (Some p) `Enabled
+                   ; Mtime.wait_for' Mtime.Span.(2 * s) `Late ] )
+            with
+          | `Enabled ->
+              ()
+          | `Late ->
+              fail "not enabled after 2 s" ) ;
+          is_false ~msg:"the POSIX clock before the deadline"
+            (Ptime.is_earlier (Ptime.now ()) ~than:p) ;
+          is_false ~msg:"less than 20 ms"
+            Mtime.Span.(
+              is_shorter (Mtime.span t0 (Mtime.now ())) ~than:(20 * ms) ) )
     ; test "a sleep waits for its span" (fun () ->
           in_main
           @@ fun () ->

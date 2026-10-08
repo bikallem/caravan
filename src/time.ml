@@ -1,5 +1,6 @@
 open Affect
 module Mtime = Affect_unix.Mtime
+module Ptime = Affect_unix.Ptime
 
 module type CLOCK = sig
   type t
@@ -79,3 +80,29 @@ module Mono_span = struct
 end
 
 let mono = make (module Mono_clock) (module Mono_timer) (module Mono_span)
+
+type posix = (Ptime.t, Ptime.Span.t) t
+
+module Posix_clock = struct
+  type t = Ptime.t
+
+  let now = Ptime.now
+end
+
+(* affect converts the deadline to a monotonic deadline when the call blocks,
+   and reads the POSIX clock again at that deadline. *)
+module Posix_timer = struct
+  type time = Ptime.t
+
+  let at = Ptime.wait_until'
+end
+
+module Posix_span = struct
+  type time = Ptime.t
+
+  type t = Ptime.Span.t
+
+  let add = Ptime.add_span
+end
+
+let posix = make (module Posix_clock) (module Posix_timer) (module Posix_span)

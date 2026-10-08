@@ -22,7 +22,7 @@ module type TIMER = sig
   val at : time -> 'tag -> 'tag Affect.Action.t
   (** [at d tag] is enabled with [tag] when the time line is at [d] or later, at
       once if it is already. It reads its time line at each invoke, not when the
-      action is made. It can be enabled late. *)
+      action is made. It can be enabled late (see {!posix}). *)
 end
 
 (** The spans of a time line and their addition to its times. *)
@@ -74,3 +74,18 @@ val mono : mono
 (** The monotonic clock of the system and the timers of affect. Use it for
     durations: time-outs, retries and graces. A deadline 2{^ 63} ns or more
     after the invoke of its timer is never enabled. *)
+
+(** The type for POSIX time lines. *)
+type posix = (Affect_unix.Ptime.t, Affect_unix.Ptime.Span.t) t
+
+val posix : posix
+(** The POSIX clock of the system and the POSIX timers of affect. Use it for
+    calendar times, for example the start of a meeting. Use {!mono} for
+    durations. A timer that waits when the system clock steps:
+    - A step back makes the wait longer, until the POSIX clock is at the
+      deadline.
+    - A step forward does not make the wait shorter: the timer is enabled at the
+      monotonic deadline that affect computed when the call blocked. Thus it can
+      be enabled late.
+
+    A timer invoked after the step uses the new time. *)
