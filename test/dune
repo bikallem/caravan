@@ -17,7 +17,8 @@
   test_server_stateful
   test_websocket
   test_client
-  server_support)
+  server_support
+  fake_time)
  (libraries
   caravan
   caravan.websocket

@@ -1079,6 +1079,121 @@ let time_tests =
           is_false ~msg:"at least 20 ms"
             Affect_unix.Mtime.Span.(is_shorter slept ~than:(20 * ms)) ) ]
 
+(* Fake time *)
+
+module Fake = Fake_time
+
+let ms n = Affect_unix.Mtime.Span.(n * ms)
+
+let sec n = Affect_unix.Mtime.Span.(n * s)
+
+let ( +: ) t span = Option.get (Affect_unix.Mtime.add_span t span)
+
+(* The calls of a test. A test that fails must not leave a call that waits for
+   ever: [Unix.main] would wait for it. *)
+let calls = ref []
+
+(* [f] in [Unix.main]. At its end, the calls of the test are cancelled. *)
+let fake_main ?(domain_count = 1) f =
+  calls := [] ;
+  Affect_unix.Unix.main ~domain_count
+  @@ fun () ->
+  Fun.protect ~finally:(fun () -> List.iter Affect.Fun.Async.cancel !calls) f
+
+(* A call that waits for the fake timer at [d]. *)
+let timer_call f d =
+  let c =
+    Affect.Fun.Async.call (fun () ->
+        Affect.Action.invoke (Time.at (Fake.mono f) (Some d) ()) )
+  in
+  calls := c :: !calls ;
+  c
+
+(* A call that waits for the fake timer at [d], made after a mark, and the proof
+   that the call made its timer. *)
+let waiting_call f d =
+  let m = Fake.mark f in
+  let c = timer_call f d in
+  Fake.wait_mono_timer f ~since:m d ;
+  c
+
+(* Whether [c] ends within 50 ms of real time. *)
+let ends_within_50ms c =
+  Affect.Action.invoke
+    (Affect.Action.choose
+       [ Affect.Action.map (fun () -> true) (Affect.Fun.Async.get' c)
+       ; Affect_unix.Mtime.wait_for' (ms 50) false ] )
+
+(* Whether [c] ends within 2 s of real time. *)
+let ends_within_2s c =
+  Affect.Action.invoke
+    (Affect.Action.choose
+       [ Affect.Action.map (fun () -> true) (Affect.Fun.Async.get' c)
+       ; Affect_unix.Mtime.wait_for' (sec 2) false ] )
+
+let fake_time_tests =
+  group "Fake time"
+    [ test "a timer is enabled when the time reaches its deadline" (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let d = Fake.now f +: sec 10 in
+          let c = waiting_call f d in
+          Fake.advance f Affect_unix.Mtime.Span.(sec 10 - ns) ;
+          is_false ~msg:"at the deadline - 1 ns" (ends_within_50ms c) ;
+          Fake.advance f Affect_unix.Mtime.Span.ns ;
+          is_true ~msg:"at the deadline" (ends_within_2s c) ;
+          (* The timer is first: it is enabled, so it wins. *)
+          let d = Fake.now f +: sec 1 in
+          Fake.advance f (sec 1) ;
+          let first =
+            Affect.Action.invoke
+              (Affect.Action.choose
+                 [ Time.at (Fake.mono f) (Some d) `Timer
+                 ; Affect.Action.always `Always ] )
+          in
+          is_true ~msg:"the timer wins" (first = `Timer) )
+    ; test "a timer made after its deadline is enabled at once" (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let d = Fake.now f +: ms 500 in
+          Fake.advance f (sec 1) ;
+          is_true (ends_within_2s (timer_call f d)) )
+    ; test "a wait for a timer sees only the timers after its mark" (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let d = Fake.now f +: sec 10 in
+          let c1 = waiting_call f d in
+          let m = Fake.mark f in
+          ( match Fake.wait_mono_timer ~guard:(ms 50) f ~since:m d with
+          | () ->
+              fail "a timer before the mark"
+          | exception Fake.No_timer _ ->
+              () ) ;
+          let c2 = waiting_call f d in
+          Fake.advance f (sec 10) ;
+          is_true (ends_within_2s c1) ;
+          is_true (ends_within_2s c2) )
+    ; test "one advance wakes the calls on all domains" (fun () ->
+          fake_main ~domain_count:4
+          @@ fun () ->
+          let f = Fake.make () in
+          let d = Fake.now f +: sec 10 in
+          let calls = List.init 8 (fun _ -> waiting_call f d) in
+          Fake.advance f (sec 10) ;
+          List.iter (fun c -> is_true (ends_within_2s c)) calls )
+    ; test "the fake time works outside Unix.main" (fun () ->
+          let f = Fake.make () in
+          let t0 = Time.now (Fake.mono f) in
+          is_true ~msg:"one day after the real time"
+            Affect_unix.Mtime.(is_later t0 ~than:(now () +: Span.hour)) ;
+          Fake.advance f (sec 3) ;
+          is_true ~msg:"3 s later"
+            (Affect_unix.Mtime.equal (Time.now (Fake.mono f)) (t0 +: sec 3)) ;
+          is_true ~msg:"the same value" (Fake.mono f == Fake.mono f) ) ]
+
 let () =
   exit
     (run "core"
@@ -1095,4 +1210,5 @@ let () =
        ; request_tests
        ; response_tests
        ; handler_tests
-       ; time_tests ] )
+       ; time_tests
+       ; fake_time_tests ] )

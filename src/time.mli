@@ -41,6 +41,14 @@ end
 (** The type for a clock, a timer and the span addition of one time line. *)
 type ('time, 'span) t
 
+val make :
+     (module CLOCK with type t = 'time)
+  -> (module TIMER with type time = 'time)
+  -> (module SPAN with type time = 'time and type t = 'span)
+  -> ('time, 'span) t
+(** [make clock timer span] is a time line. The timer must use the time line of
+    the clock: nothing checks this. *)
+
 val now : ('time, _) t -> 'time
 (** [now t] is the current time of the clock of [t]. *)
 
