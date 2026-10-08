@@ -1031,6 +1031,215 @@ let date_tests =
           in
           ignore (Fun.Async.get_all (List.init 8 worker)) ) ]
 
+(* The server on a fake time line *)
+
+module Fake = Fake_time
+
+let ( +: ) t span = Option.get (Mtime.add_span t span)
+
+(* The spans of the fake time tests. A test advances only to deadlines that it
+   proved with [Fake.wait_mono_timer]. *)
+let header_h = Mtime.Span.(3 * s)
+
+let idle_i = Mtime.Span.(5 * s)
+
+let grace_g = Mtime.Span.(7 * s)
+
+let linger_l = Mtime.Span.(11 * s)
+
+let fake_config f =
+  { quiet with
+    mono_time= Fake.mono f
+  ; header_timeout= header_h
+  ; idle_timeout= idle_i
+  ; read_timeout= Mtime.Span.(13 * s)
+  ; write_timeout= Mtime.Span.(17 * s)
+  ; shutdown_grace= grace_g
+  ; linger_timeout= linger_l }
+
+let within_2s = Server_support.within_2s
+
+(* [with_fake_listener] with the fake time [f]. When [f] ends, also by a
+   failure, the fake time advances one day: then each wait on it ends, for
+   example an accept pause, and the server can stop. *)
+let with_fake_server f ?handler ?engine ~clients steps test =
+  with_fake_listener ~config:(fake_config f) ?handler ?engine ~clients steps
+  @@ fun l server errors ->
+  Fun.protect
+    ~finally:(fun () -> Fake.advance f Mtime.Span.day)
+    (fun () -> test l server errors)
+
+(* The steps before a header timeout: the connection opened at t0 and waits for
+   its first request until t0 + H. At t0 + 1 s, half a head comes, and the
+   engine reads it: it waits for the rest until t0 + 1 s + H. *)
+let half_head f c ~t0 ~since =
+  Fake.wait_mono_timer f ~since (t0 +: header_h) ;
+  Fake.advance f Mtime.Span.s ;
+  let m = Fake.mark f in
+  Flow.write_string c "GET / HTTP/1.1\r\n" ;
+  Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.s +: header_h)
+
+let status_is code (status, _) =
+  is_true ~msg:status (String.starts_with ~prefix:("HTTP/1.1 " ^ code) status)
+
+let fake_time_tests =
+  group "Server on a fake time line"
+    [ test "EMFILE pauses the accepts for 100 ms" (fun () ->
+          let f = Fake.make () in
+          let t0 = Fake.now f and m = Fake.mark f in
+          let fd, c = socket_pair () in
+          with_fake_server f ~clients:[c]
+            [Error EMFILE; Conn fd; Gate Action.never]
+          @@ fun l _ _ ->
+          Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.(100 * ms)) ;
+          equal int ~msg:"calls of try_accept in the pause" 1
+            (List.length (Atomic.get l.calls)) ;
+          Fake.advance f Mtime.Span.(100 * ms) ;
+          Flow.write_string c (get ~close:true "/") ;
+          ends_with "hello" (response c) )
+    ; test "a head that completes 1 ns before the header timeout gets 200"
+        (fun () ->
+          let f = Fake.make () in
+          let t0 = Fake.now f and m = Fake.mark f in
+          let fd, c = socket_pair () in
+          with_fake_server f ~clients:[c] [Conn fd; Gate Action.never]
+          @@ fun _ _ _ ->
+          half_head f c ~t0 ~since:m ;
+          Fake.advance f Mtime.Span.(header_h - ns) ;
+          Flow.write_string c "Host: x\r\n\r\n" ;
+          status_is "200" (read_response c) )
+    ; test "a head that is not complete at the header timeout gets 408"
+        (fun () ->
+          let f = Fake.make () in
+          let t0 = Fake.now f and m = Fake.mark f in
+          let fd, c = socket_pair () in
+          with_fake_server f ~clients:[c] [Conn fd; Gate Action.never]
+          @@ fun _ _ _ ->
+          half_head f c ~t0 ~since:m ;
+          Fake.advance f header_h ;
+          let r = response c in
+          is_true ~msg:r (String.starts_with ~prefix:"HTTP/1.1 408" r) )
+    ; test "a kept-alive connection closes at the idle timeout" (fun () ->
+          let f = Fake.make () in
+          let t0 = Fake.now f and m = Fake.mark f in
+          let fd, c = socket_pair () in
+          with_fake_server f ~clients:[c] [Conn fd; Gate Action.never]
+          @@ fun _ _ _ ->
+          Fake.wait_mono_timer f ~since:m (t0 +: header_h) ;
+          let r = Private.Buf_reader.of_flow c in
+          let m = Fake.mark f in
+          Flow.write_string c (get "/") ;
+          status_is "200" (read_response_from r) ;
+          Fake.wait_mono_timer f ~since:m (t0 +: idle_i) ;
+          Fake.advance f Mtime.Span.(idle_i - ns) ;
+          let m = Fake.mark f in
+          Flow.write_string c (get "/") ;
+          status_is "200" (read_response_from r) ;
+          let t2 = t0 +: Mtime.Span.(idle_i - ns) in
+          Fake.wait_mono_timer f ~since:m (t2 +: idle_i) ;
+          Fake.advance f idle_i ;
+          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+          equal int ~msg:"the end of the stream" 0
+            (Private.Buf_reader.read_into r (Bytes.create 1) 0 1) )
+    ; test "a stop gives the requests in progress the shutdown grace" (fun () ->
+          let f = Fake.make () in
+          let t0 = Fake.now f in
+          let started_a = Cell.Once.make ()
+          and started_b = Cell.Once.make ()
+          and release_a = Cell.Once.make ()
+          and release_b = Cell.Once.make ()
+          and cancelled_a = Cell.Once.make () in
+          let handler req =
+            match Request.path_only req with
+            | "/a" -> (
+                Cell.Once.try_set started_a () ;
+                match Cell.Once.get release_a with
+                | () ->
+                    Response.string "a"
+                | exception Fun.Async.Cancelled ->
+                    Cell.Once.try_set cancelled_a () ;
+                    raise Fun.Async.Cancelled )
+            | _ ->
+                Cell.Once.try_set started_b () ;
+                Cell.Once.get release_b ;
+                Response.string "b"
+          in
+          let fd1, c1 = socket_pair () and fd2, c2 = socket_pair () in
+          with_fake_server f ~handler ~clients:[c1; c2]
+            [Conn fd1; Conn fd2; Gate Action.never]
+          @@ fun _ server _ ->
+          Flow.write_string c1 (get "/a") ;
+          Flow.write_string c2 (get "/b") ;
+          within_2s (fun () ->
+              Cell.Once.get started_a ; Cell.Once.get started_b ) ;
+          (* The grace starts at the stop, not at the start of the server. *)
+          Fake.advance f Mtime.Span.s ;
+          let m = Fake.mark f in
+          Server.shutdown server ;
+          Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.s +: grace_g) ;
+          Fake.advance f Mtime.Span.(grace_g - ns) ;
+          Cell.Once.try_set release_b () ;
+          let r = response c2 in
+          ends_with "b" r ;
+          is_true ~msg:"the response ends the connection"
+            (contains r "\r\nConnection: close\r\n") ;
+          Fake.advance f Mtime.Span.ns ;
+          within_2s (fun () -> Server.wait server) ;
+          is_true ~msg:"the request in progress is cancelled"
+            (Cell.Once.is_set cancelled_a) )
+    ; test "a connection that the server ends lingers for the linger timeout"
+        (fun () ->
+          let f = Fake.make () in
+          let t0 = Fake.now f and m = Fake.mark f in
+          let served = Cell.Once.make () in
+          let engine ctx flow handler =
+            Fun.protect
+              ~finally:(fun () -> Cell.Once.try_set served ())
+              (fun () -> Private.H1_server.serve ctx flow handler)
+          in
+          let fd, c = socket_pair () in
+          with_fake_server f ~engine ~clients:[c] [Conn fd; Gate Action.never]
+          @@ fun _ _ _ ->
+          Flow.write_string c (get ~close:true "/") ;
+          (* The server half-closes at once: the client gets the response and
+             the end of the stream, and keeps its socket open. *)
+          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+          ends_with "hello" (read_all c) ;
+          Fake.wait_mono_timer f ~since:m (t0 +: linger_l) ;
+          Fake.advance f Mtime.Span.(linger_l - ns) ;
+          let m = Fake.mark f in
+          Flow.write_string c "more" ;
+          (* The linger read the bytes and waits again, to the same deadline. *)
+          Fake.wait_mono_timer f ~since:m (t0 +: linger_l) ;
+          is_false ~msg:"the engine ended" (Cell.Once.is_set served) ;
+          Fake.advance f Mtime.Span.ns ;
+          within_2s (fun () -> Cell.Once.get served) )
+    ; test "the engine uses the time line of its flow" (fun () ->
+          in_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let fd, c = socket_pair () in
+          let flow = Tcp.flow ~time:(Fake.mono f) fd in
+          let ctx =
+            { Engine.config= {(fake_config f) with mono_time= Time.mono}
+            ; conn=
+                Conn_info.make ~id:1 ~peer:(Unix.ADDR_UNIX "peer")
+                  ~local:(Unix.ADDR_UNIX "local") ()
+            ; stopping= Action.never
+            ; is_stopping= (fun () -> false) }
+          in
+          let t0 = Fake.now f and m = Fake.mark f in
+          let serving =
+            Fun.Async.call (fun () -> Private.H1_server.serve ctx flow handler)
+          in
+          Fun.protect ~finally:(fun () ->
+              Fun.Async.cancel serving ; Flow.close c ; Flow.close flow )
+          @@ fun () ->
+          half_head f c ~t0 ~since:m ;
+          Fake.advance f header_h ;
+          let r = response c in
+          is_true ~msg:r (String.starts_with ~prefix:"HTTP/1.1 408" r) ) ]
+
 let () =
   exit
     (run "net"
@@ -1039,5 +1248,6 @@ let () =
        ; race_tests
        ; accept_error_tests
        ; accept_loop_tests
+       ; fake_time_tests
        ; stop_signal_tests
        ; date_tests ] )

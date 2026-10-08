@@ -37,7 +37,7 @@ let accept config (module L : LISTENER) listener =
         None
     | `Resources ->
         report config e ;
-        Time.sleep Time.mono Mtime.Span.(100 * ms) ;
+        Time.sleep config.Config.mono_time Mtime.Span.(100 * ms) ;
         None
     | `Listener ->
         raise e )
@@ -109,7 +109,7 @@ let supervisor config engine handler ~stopping ~slots handoff =
         ()
     | `Conn conn ->
         Fun.Async.call_trap_exn (fun () ->
-            let flow = Tcp.flow (fst conn) in
+            let flow = Tcp.flow ~time:config.Config.mono_time (fst conn) in
             Fun.Async.protect
               ~finally:(fun () -> Flow.close flow ; Semaphore.release slots)
               (fun () ->
@@ -152,8 +152,8 @@ let start_with ?(config = Config.default) ?(engine = H1_server.serve)
         in
         (* The grace starts at the stop. *)
         let expired =
-          Time.at Time.mono
-            (Time.after Time.mono config.shutdown_grace)
+          Time.at config.mono_time
+            (Time.after config.mono_time config.shutdown_grace)
             `Expired
         in
         match Action.invoke (Action.choose [finished; expired]) with

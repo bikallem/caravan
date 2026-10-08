@@ -1070,6 +1070,36 @@ let time_tests =
     ; test "the last time is never enabled" (fun () ->
           let d = Some Affect_unix.Mtime.max_stamp in
           is_false (enabled_within_50ms (Time.at Time.mono d ())) )
+    ; test "src/ reads the time and waits only through Time" (fun () ->
+          (* dune runs the test in _build/default/test; dune exec in the
+             root. *)
+          let dir =
+            if Sys.file_exists "../src/time.ml" then "../src" else "src"
+          in
+          let read file =
+            In_channel.with_open_bin (Filename.concat dir file)
+              In_channel.input_all
+          in
+          let contains s sub =
+            let n = String.length sub in
+            let rec at i =
+              i + n <= String.length s && (String.sub s i n = sub || at (i + 1))
+            in
+            at 0
+          in
+          let direct =
+            ["Mtime.now"; "Mtime.wait_for"; "Unix.time"; "Unix.gettimeofday"]
+          in
+          Sys.readdir dir |> Array.to_list
+          |> List.filter (fun file ->
+              Filename.check_suffix file ".ml"
+              && not (List.mem file ["time.ml"; "date.ml"]) )
+          |> List.iter (fun file ->
+              let text = read file in
+              List.iter
+                (fun call ->
+                  is_false ~msg:(file ^ " calls " ^ call) (contains text call) )
+                direct ) )
     ; test "a sleep waits for its span" (fun () ->
           in_main
           @@ fun () ->

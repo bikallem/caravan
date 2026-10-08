@@ -16,6 +16,7 @@ type t =
   ; write_timeout: Mtime.Span.t
   ; linger_timeout: Mtime.Span.t
   ; shutdown_grace: Mtime.Span.t
+  ; mono_time: Time.mono
   ; date_header: bool
   ; cancel_on_disconnect: bool
   ; on_error: exn -> Printexc.raw_backtrace -> unit }
@@ -40,6 +41,7 @@ let default =
   ; write_timeout= Mtime.Span.(30 * s)
   ; linger_timeout= Mtime.Span.(2 * s)
   ; shutdown_grace= Mtime.Span.(10 * s)
+  ; mono_time= Time.mono
   ; date_header= true
   ; cancel_on_disconnect= true
   ; on_error= print_error }

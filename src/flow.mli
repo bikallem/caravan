@@ -59,9 +59,9 @@ val make :
 *)
 
 val time : t -> Time.mono
-(** [time flow] is the monotonic time line of the deadlines of [flow]. Compute
-    the deadlines of [flow] with it, for example
-    [Time.after (Flow.time flow) span]. *)
+(** [time flow] is the monotonic time line of the deadlines of [flow], and of
+    the waits of the engine that serves it. Compute the deadlines of [flow] with
+    it, for example [Time.after (Flow.time flow) span]. *)
 
 (** {1:reading Reading} *)
 

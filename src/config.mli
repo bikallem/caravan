@@ -47,6 +47,11 @@ type t =
             the server cancels them. A handler can see the stop with
             {!Conn_info.stopping}. A grace of about 292 years or more never
             ends. *)
+  ; mono_time: Time.mono
+        (** The monotonic time line of the server: the time line of its
+            connections, their deadlines and timeouts, its pause after an accept
+            error and its shutdown grace. Its clock must be monotonic. Tests
+            give a fake time line. *)
   ; date_header: bool  (** Whether responses get a [Date] field. *)
   ; cancel_on_disconnect: bool
         (** Whether a handler is cancelled when its client closes the connection
