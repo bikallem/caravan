@@ -385,14 +385,16 @@ let get ?(close = false) path =
   Printf.sprintf "GET %s HTTP/1.1\r\nHost: x\r\n%s\r\n" path
     (if close then "Connection: close\r\n" else "")
 
-(* Reads one response with a Content-Length body from [r]. *)
-let read_response_from r =
+(* Reads one response with a Content-Length body from [r]. [field] gets each
+   field line. *)
+let read_response_from ?(field = ignore) r =
   let status = Private.Buf_reader.read_line r ~max:1000 in
   let rec headers len =
     match Private.Buf_reader.read_line r ~max:1000 with
     | "" ->
         len
     | line ->
+        field line ;
         let lower = String.lowercase_ascii line in
         if String.starts_with ~prefix:"content-length: " lower then
           headers (int_of_string (String.sub line 16 (String.length line - 16)))
@@ -1024,7 +1026,8 @@ let date_tests =
                 for i = 0 to 20_000 do
                   (* A new second each time, so that every call formats. *)
                   let t = Float.of_int ((i * 8) + k) in
-                  if Private.Date.now_at t <> expected t then
+                  let p = Option.get (Affect_unix.Ptime.of_float_s t) in
+                  if Private.Date.of_posix p <> expected t then
                     failwith (Printf.sprintf "wrong date for %.0f" t) ;
                   if i mod 1000 = 0 then Fun.Async.yield ()
                 done )
@@ -1054,6 +1057,7 @@ let write_w = Mtime.Span.(17 * s)
 let fake_config f =
   { quiet with
     mono_time= Fake.mono f
+  ; posix_time= Fake.posix f
   ; header_timeout= header_h
   ; idle_timeout= idle_i
   ; read_timeout= read_r
@@ -1063,11 +1067,13 @@ let fake_config f =
 
 let within_2s = Server_support.within_2s
 
-(* [with_fake_listener] with the fake time [f]. When [test] ends, also by a
-   failure, the fake time advances one day: then each wait on it ends, for
-   example an accept pause, and the server can stop. *)
-let with_fake_server f ?handler ?engine ~clients steps test =
-  with_fake_listener ~config:(fake_config f) ?handler ?engine ~clients steps
+(* [with_fake_listener] with the fake time [f] and the config [config] (default
+   [fake_config f]). When [test] ends, also by a failure, the fake time advances
+   one day: then each wait on it ends, for example an accept pause, and the
+   server can stop. *)
+let with_fake_server f ?(config = fake_config f) ?handler ?engine ~clients steps
+    test =
+  with_fake_listener ~config ?handler ?engine ~clients steps
   @@ fun l server errors ->
   Fun.protect
     ~finally:(fun () -> Fake.advance f Mtime.Span.day)
@@ -1147,6 +1153,30 @@ let fake_time_tests =
           Flow.set_read_deadline c (Some (deadline_in 2000)) ;
           equal int ~msg:"the end of the stream" 0
             (Private.Buf_reader.read_into r (Bytes.create 1) 0 1) )
+    ; test "the Date field is on the POSIX time line of the config" (fun () ->
+          let f = Fake.make () in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          let fd, c = socket_pair () in
+          let config = {(fake_config f) with date_header= true} in
+          with_fake_server f ~config ~clients:[c] [Conn fd; Gate Action.never]
+          @@ fun _ _ _ ->
+          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+          let r = Private.Buf_reader.of_flow c in
+          let date () =
+            let date = ref "none" in
+            let field line =
+              if String.starts_with ~prefix:"Date: " line then date := line
+            in
+            Flow.write_string c (get "/") ;
+            status_is "200" (read_response_from ~field r) ;
+            !date
+          in
+          equal string "Date: Sun, 06 Nov 1994 08:49:37 GMT" (date ()) ;
+          (* The connection waits for the next request until t0 + I. An advance
+             of 1 s is before each deadline of the test. *)
+          Fake.wait_mono_timer f ~since:m (t0 +: idle_i) ;
+          Fake.advance f Mtime.Span.s ;
+          equal string "Date: Sun, 06 Nov 1994 08:49:38 GMT" (date ()) )
     ; test "a body read that waits until the read timeout gets 408" (fun () ->
           let f = Fake.make () in
           let t0 = Fake.mono_now f and m = Fake.mark f in

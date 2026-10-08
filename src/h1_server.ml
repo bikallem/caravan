@@ -105,7 +105,10 @@ let serve : Engine.t =
     match Conn_info.scheme ctx.conn with `Http -> "http" | `Https -> "https"
   in
   let report e = config.on_error e (Printexc.get_raw_backtrace ()) in
-  let date () = if config.date_header then Some (Date.now ()) else None in
+  let date () =
+    if config.date_header then Some (Date.of_posix (Time.now config.posix_time))
+    else None
+  in
   let error ?meth e = error_response ?date:(date ()) ?meth w e in
   (* Waits at most [idle] for the next request. A stopping server takes no new
      request, even one already received. *)

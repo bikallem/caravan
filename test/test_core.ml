@@ -373,26 +373,23 @@ let date_tests =
         (fun t ->
           let d = Date.of_unix_time (Float.of_int t) in
           equal http_date d (Http_date.decode (Http_date.encode d)) )
-    ; test "now_at caches one string per second" (fun () ->
+    ; test "of_posix caches one string per second" (fun () ->
           let enc t = Http_date.encode (Date.of_unix_time t) in
-          let a = Date.now_at 1000. in
-          let b = Date.now_at 1000.5 in
+          let posix t = Option.get (Affect_unix.Ptime.of_float_s t) in
+          let a = Date.of_posix (posix 1000.) in
+          let b = Date.of_posix (posix 1000.5) in
           equal string (enc 1000.) a ;
           is_true ~msg:"same second reuses the string" (a == b) ;
-          equal string (enc 1001.) (Date.now_at 1001.) ;
-          equal string (enc 1000.) (Date.now_at 1000.) )
-    ; test "now is the current IMF date" (fun () ->
-          let before = Unix.time () in
-          let s = Date.now () in
-          let after = Unix.time () in
-          let candidates =
-            List.map
-              (fun t -> Http_date.encode (Date.of_unix_time t))
-              [before; after]
-          in
-          is_true ~msg:"matches the clock" (List.mem s candidates) ;
-          is_true ~msg:"decodes as IMF"
-            (match Http_date.decode s with `IMF _ -> true | _ -> false) ) ]
+          equal string (enc 1001.) (Date.of_posix (posix 1001.)) ;
+          equal string (enc 1000.) (Date.of_posix (posix 1000.)) )
+    ; test "of_posix drops the fraction of a time before 1970" (fun () ->
+          let posix t = Option.get (Affect_unix.Ptime.of_float_s t) in
+          equal string "Thu, 01 Jan 1970 00:00:00 GMT"
+            (Date.of_posix (posix 0.5)) ;
+          equal string "Wed, 31 Dec 1969 23:59:59 GMT"
+            (Date.of_posix (posix (-0.5))) ;
+          equal string "Wed, 31 Dec 1969 23:59:59 GMT"
+            (Date.of_posix (posix (-1.))) ) ]
 
 (* Flow *)
 
@@ -1096,12 +1093,20 @@ let time_tests =
             ; "Unix.time"
             ; "Unix.gettimeofday"
             ; "Unix.sleep"
-            ; "Unix.select" ]
+            ; "Unix.select"
+            ; "Ptime.now"
+            ; "Ptime.wait_until"
+            ; "Ptime.observe_wait_until"
+            ; "Ptime.(" ]
           in
           (* The server, the client and the WebSocket use the time line of their
              config or of their flows. *)
           let injected =
-            ["Time.mono"; "Time.("; "open Time"; "open Caravan.Time"]
+            [ "Time.mono"
+            ; "Time.posix"
+            ; "Time.("
+            ; "open Time"
+            ; "open Caravan.Time" ]
           in
           let files dir ~except =
             Sys.readdir (Filename.concat root dir)
@@ -1109,7 +1114,7 @@ let time_tests =
             |> List.filter (fun file ->
                 Filename.check_suffix file ".ml" && not (List.mem file except) )
           in
-          let src = files "src" ~except:["time.ml"; "date.ml"]
+          let src = files "src" ~except:["time.ml"]
           and client = files "client" ~except:[]
           and websocket = files "websocket" ~except:[] in
           is_true ~msg:"the files of the server are found"
