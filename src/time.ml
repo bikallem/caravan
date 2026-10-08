@@ -44,6 +44,8 @@ let after (type time span) (t : (time, span) t) span =
   let module S = (val t.span) in
   S.add (now t) span
 
+let sleep t span = Action.invoke (at t (after t span) ())
+
 type mono = (Mtime.t, Mtime.Span.t) t
 
 module Mono_clock = struct
@@ -58,9 +60,14 @@ module Mono_timer = struct
   let at d tag =
     Action.guard (fun () ->
         let now = Mtime.now () in
-        if Mtime.is_earlier now ~than:d then
-          Mtime.wait_for' (Mtime.span now d) tag
-        else Action.always tag )
+        if not (Mtime.is_earlier now ~than:d) then Action.always tag
+        else
+          let span = Mtime.span now d in
+          (* affect ends a wait of 2^63 ns or more at once: it compares with a
+             signed comparison. Such a deadline is 292 years away. *)
+          if Int64.compare (Mtime.Span.to_uint64_ns span) 0L < 0 then
+            Action.never
+          else Mtime.wait_for' span tag )
 end
 
 module Mono_span = struct

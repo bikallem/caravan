@@ -52,6 +52,10 @@ val after : ('time, 'span) t -> 'span -> 'time option
 (** [after t span] is [now t] plus [span], [None] if the result is not
     representable. *)
 
+val sleep : (_, 'span) t -> 'span -> unit
+(** [sleep t span] waits until the deadline [after t span]. A span with no
+    representable end waits forever. *)
+
 (** {1:system System time lines} *)
 
 (** The type for monotonic time lines. *)
@@ -59,4 +63,5 @@ type mono = (Affect_unix.Mtime.t, Affect_unix.Mtime.Span.t) t
 
 val mono : mono
 (** The monotonic clock of the system and the timers of affect. Use it for
-    durations: time-outs, retries and graces. *)
+    durations: time-outs, retries and graces. A deadline 2{^ 63} ns or more
+    after the invoke of its timer is never enabled. *)

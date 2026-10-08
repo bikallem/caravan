@@ -34,7 +34,7 @@ let reaper (config : Config.t) pool =
   Affect.Fun.Async.call (fun () ->
       try
         while true do
-          Affect_unix.Mtime.wait_for half ;
+          Caravan.Time.(sleep mono half) ;
           Pool.reap pool
         done
       with Affect.Fun.Async.Cancelled -> () )

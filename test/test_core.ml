@@ -1025,6 +1025,48 @@ let handler_tests =
           in
           equal status Status.not_found (Response.status r) ) ]
 
+(* Time *)
+
+(* 2^63 ns + 1 s. [Time.after] can represent the deadline, and the span from the
+   invoke to the deadline stays 2^63 ns or more. affect ends a wait of 2^63 ns
+   or more at once: it compares with a signed comparison. *)
+let beyond_2_63_ns = Affect_unix.Mtime.Span.(add (of_uint64_ns Int64.min_int) s)
+
+(* Whether [action] is enabled within 50 ms. *)
+let enabled_within_50ms action =
+  in_main
+  @@ fun () ->
+  Affect.Action.invoke
+    (Affect.Action.choose
+       [ Affect.Action.map (fun () -> true) action
+       ; Affect_unix.Mtime.wait_for' Affect_unix.Mtime.Span.(50 * ms) false ] )
+
+let time_tests =
+  group "Time"
+    [ test "a deadline that has passed is enabled at once" (fun () ->
+          let d = Some (Affect_unix.Mtime.now ()) in
+          is_true (enabled_within_50ms (Time.at Time.mono d ())) )
+    ; test "a deadline 10 ms ahead is enabled" (fun () ->
+          let d = Time.after Time.mono Affect_unix.Mtime.Span.(10 * ms) in
+          is_true (enabled_within_50ms (Time.at Time.mono d ())) )
+    ; test "no deadline is never enabled" (fun () ->
+          is_false (enabled_within_50ms (Time.at Time.mono None ())) )
+    ; test "a deadline 2^63 ns or more ahead is never enabled" (fun () ->
+          let d = Time.after Time.mono beyond_2_63_ns in
+          is_true ~msg:"representable" (Option.is_some d) ;
+          is_false (enabled_within_50ms (Time.at Time.mono d ())) )
+    ; test "the last time is never enabled" (fun () ->
+          let d = Some Affect_unix.Mtime.max_stamp in
+          is_false (enabled_within_50ms (Time.at Time.mono d ())) )
+    ; test "a sleep waits for its span" (fun () ->
+          in_main
+          @@ fun () ->
+          let t0 = Affect_unix.Mtime.now () in
+          Time.sleep Time.mono Affect_unix.Mtime.Span.(20 * ms) ;
+          let slept = Affect_unix.Mtime.(span t0 (now ())) in
+          is_false ~msg:"at least 20 ms"
+            Affect_unix.Mtime.Span.(is_shorter slept ~than:(20 * ms)) ) ]
+
 let () =
   exit
     (run "core"
@@ -1040,4 +1082,5 @@ let () =
        ; conn_info_tests
        ; request_tests
        ; response_tests
-       ; handler_tests ] )
+       ; handler_tests
+       ; time_tests ] )

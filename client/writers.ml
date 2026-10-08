@@ -97,7 +97,7 @@ let finish t ~grace =
   let ended = Action.map (fun () -> `Ended) (Fun.Async.get' t.supervisor) in
   match
     Action.invoke
-      (Action.choose [ended; Affect_unix.Mtime.wait_for' grace `Late])
+      (Action.choose [ended; Caravan.Time.(at mono (after mono grace)) `Late])
   with
   | `Ended | `Late ->
       ()

@@ -631,6 +631,37 @@ let stop_tests =
           Server.shutdown server ;
           (* The handler gives "timeout" after 2 s without the stop. *)
           equal string {|200 "stopping" close|} (read_response ~head:false r) ;
+          Flow.close flow )
+    ; test "a grace of 2^63 ns or more does not cancel the handlers" (fun () ->
+          (* 2^63 ns + 1 s: affect ends a wait of 2^63 ns or more at once. *)
+          let grace = Mtime.Span.(add (of_uint64_ns Int64.min_int) s) in
+          let started = Cell.Once.make ()
+          and release = Cell.Once.make ()
+          and cancelled = Cell.Once.make () in
+          let handler _ =
+            Cell.Once.try_set started () ;
+            match Cell.Once.get release with
+            | () ->
+                Response.string "done"
+            | exception Fun.Async.Cancelled ->
+                Cell.Once.try_set cancelled () ;
+                raise Fun.Async.Cancelled
+          in
+          with_server ~config:{config with shutdown_grace= grace} ~handler
+          @@ fun server ->
+          let flow, r = connect server in
+          Flow.write_string flow (get "/hold") ;
+          within_2s (fun () -> Cell.Once.get started) ;
+          Server.shutdown server ;
+          let cancel =
+            Action.invoke
+              (Action.choose
+                 [ Action.map (fun () -> `Cancelled) (Cell.Once.get' cancelled)
+                 ; Mtime.wait_for' Mtime.Span.(50 * ms) `None ] )
+          in
+          is_true ~msg:"no cancel within 50 ms" (cancel = `None) ;
+          Cell.Once.try_set release () ;
+          equal string {|200 "done" close|} (read_response ~head:false r) ;
           Flow.close flow ) ]
 
 let () =

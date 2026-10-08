@@ -37,7 +37,7 @@ let accept config (module L : LISTENER) listener =
         None
     | `Resources ->
         report config e ;
-        Mtime.wait_for Mtime.Span.(100 * ms) ;
+        Time.sleep Time.mono Mtime.Span.(100 * ms) ;
         None
     | `Listener ->
         raise e )
@@ -150,7 +150,12 @@ let start_with ?(config = Config.default) ?(engine = H1_server.serve)
         let finished =
           Action.map (fun () -> `Finished) (Fun.Async.get' supervisor)
         in
-        let expired = Mtime.wait_for' config.shutdown_grace `Expired in
+        (* The grace starts at the stop. *)
+        let expired =
+          Time.at Time.mono
+            (Time.after Time.mono config.shutdown_grace)
+            `Expired
+        in
         match Action.invoke (Action.choose [finished; expired]) with
         | `Finished ->
             ()
