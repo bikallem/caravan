@@ -1090,7 +1090,7 @@ let fake_time_tests =
   group "Server on a fake time line"
     [ test "EMFILE pauses the accepts for 100 ms" (fun () ->
           let f = Fake.make () in
-          let t0 = Fake.now f and m = Fake.mark f in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           let fd, c = socket_pair () in
           with_fake_server f ~clients:[c]
             [Error EMFILE; Conn fd; Gate Action.never]
@@ -1104,7 +1104,7 @@ let fake_time_tests =
     ; test "a head that completes 1 ns before the header timeout gets 200"
         (fun () ->
           let f = Fake.make () in
-          let t0 = Fake.now f and m = Fake.mark f in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           let fd, c = socket_pair () in
           with_fake_server f ~clients:[c] [Conn fd; Gate Action.never]
           @@ fun _ _ _ ->
@@ -1116,7 +1116,7 @@ let fake_time_tests =
     ; test "a head that is not complete at the header timeout gets 408"
         (fun () ->
           let f = Fake.make () in
-          let t0 = Fake.now f and m = Fake.mark f in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           let fd, c = socket_pair () in
           with_fake_server f ~clients:[c] [Conn fd; Gate Action.never]
           @@ fun _ _ _ ->
@@ -1126,7 +1126,7 @@ let fake_time_tests =
           is_true ~msg:r (String.starts_with ~prefix:"HTTP/1.1 408" r) )
     ; test "a kept-alive connection closes at the idle timeout" (fun () ->
           let f = Fake.make () in
-          let t0 = Fake.now f and m = Fake.mark f in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           let fd, c = socket_pair () in
           with_fake_server f ~clients:[c] [Conn fd; Gate Action.never]
           @@ fun _ _ _ ->
@@ -1149,7 +1149,7 @@ let fake_time_tests =
             (Private.Buf_reader.read_into r (Bytes.create 1) 0 1) )
     ; test "a body read that waits until the read timeout gets 408" (fun () ->
           let f = Fake.make () in
-          let t0 = Fake.now f and m = Fake.mark f in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           let handler req =
             Response.string (Body.to_string (Request.body req))
           in
@@ -1173,7 +1173,7 @@ let fake_time_tests =
         "a response write that waits until the write timeout ends the \
          connection" (fun () ->
           let f = Fake.make () in
-          let t0 = Fake.now f and m = Fake.mark f in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           (* More than the buffers of the socket pair hold. *)
           let size = 8 * 1024 * 1024 in
           let handler _ = Response.string (String.make size 'x') in
@@ -1193,7 +1193,7 @@ let fake_time_tests =
             (String.length rest < size) )
     ; test "a stop gives the requests in progress the shutdown grace" (fun () ->
           let f = Fake.make () in
-          let t0 = Fake.now f in
+          let t0 = Fake.mono_now f in
           let started_a = Cell.Once.make ()
           and started_b = Cell.Once.make ()
           and release_a = Cell.Once.make ()
@@ -1240,7 +1240,7 @@ let fake_time_tests =
     ; test "a connection that the server ends lingers for the linger timeout"
         (fun () ->
           let f = Fake.make () in
-          let t0 = Fake.now f and m = Fake.mark f in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           let served = Cell.Once.make () in
           let engine ctx flow handler =
             Fun.protect
@@ -1278,7 +1278,7 @@ let fake_time_tests =
             ; stopping= Action.never
             ; is_stopping= (fun () -> false) }
           in
-          let t0 = Fake.now f and m = Fake.mark f in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           let serving =
             Fun.Async.call (fun () -> Private.H1_server.serve ctx flow handler)
           in

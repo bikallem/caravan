@@ -1246,14 +1246,14 @@ let fake_time_tests =
           fake_main
           @@ fun () ->
           let f = Fake.make () in
-          let d = Fake.now f +: sec 10 in
+          let d = Fake.mono_now f +: sec 10 in
           let c = waiting_call f d in
           Fake.advance f Affect_unix.Mtime.Span.(sec 10 - ns) ;
           is_false ~msg:"at the deadline - 1 ns" (ends_within_50ms c) ;
           Fake.advance f Affect_unix.Mtime.Span.ns ;
           is_true ~msg:"at the deadline" (ends_within_2s c) ;
           (* The timer is first: it is enabled, so it wins. *)
-          let d = Fake.now f +: sec 1 in
+          let d = Fake.mono_now f +: sec 1 in
           Fake.advance f (sec 1) ;
           let first =
             Affect.Action.invoke
@@ -1266,7 +1266,7 @@ let fake_time_tests =
           fake_main
           @@ fun () ->
           let f = Fake.make () in
-          let d = Fake.now f +: ms 500 in
+          let d = Fake.mono_now f +: ms 500 in
           Fake.advance f (sec 1) ;
           (* A timer that is due at once is in the log too. *)
           let m = Fake.mark f in
@@ -1277,7 +1277,7 @@ let fake_time_tests =
           fake_main
           @@ fun () ->
           let f = Fake.make () in
-          let d = Fake.now f +: sec 10 in
+          let d = Fake.mono_now f +: sec 10 in
           let c1 = waiting_call f d in
           let m = Fake.mark f in
           ( match Fake.wait_mono_timer ~guard:(ms 50) f ~since:m d with
@@ -1301,7 +1301,7 @@ let fake_time_tests =
           fake_main ~domain_count:4
           @@ fun () ->
           let f = Fake.make () in
-          let d = Fake.now f +: sec 10 in
+          let d = Fake.mono_now f +: sec 10 in
           let waiting = List.init 8 (fun _ -> waiting_call f d) in
           Fake.advance f (sec 10) ;
           List.iter (fun c -> is_true (ends_within_2s c)) waiting )
@@ -1314,6 +1314,153 @@ let fake_time_tests =
           is_true ~msg:"3 s later"
             (Affect_unix.Mtime.equal (Time.now (Fake.mono f)) (t0 +: sec 3)) ;
           is_true ~msg:"the same value" (Fake.mono f == Fake.mono f) ) ]
+
+(* The fake POSIX time line *)
+
+module Ptime = Affect_unix.Ptime
+
+let ( +:: ) p span = Option.get (Ptime.add_span p span)
+
+let psec n = Ptime.Span.of_int_s n
+
+(* A call that waits for the fake POSIX timer at [p], made after a mark, and the
+   proof that the call made its timer. *)
+let waiting_posix_call f p =
+  let m = Fake.mark f in
+  let c =
+    Affect.Fun.Async.call (fun () ->
+        Affect.Action.invoke (Time.at (Fake.posix f) (Some p) ()) )
+  in
+  calls := (fun () -> Affect.Fun.Async.cancel c) :: !calls ;
+  Fake.wait_posix_timer f ~since:m p ;
+  c
+
+let fake_posix_tests =
+  group "Fake POSIX time"
+    [ test "a POSIX timer is enabled when the POSIX time reaches its deadline"
+        (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let p = Fake.posix_now f +:: psec 10 in
+          let c = waiting_posix_call f p in
+          (* Only an advance can end the call. *)
+          Fake.advance f Affect_unix.Mtime.Span.(sec 10 - ns) ;
+          is_false ~msg:"at the deadline - 1 ns" (ends_within_50ms c) ;
+          Fake.advance f Affect_unix.Mtime.Span.ns ;
+          is_true ~msg:"at the deadline" (ends_within_2s c) )
+    ; test "a POSIX deadline with picoseconds is enabled at the next ns"
+        (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let p = Fake.posix_now f +:: psec 10 +:: Ptime.Span.v (0, 1L) in
+          let c = waiting_posix_call f p in
+          Fake.advance f (sec 10) ;
+          is_false ~msg:"1 ps before the deadline" (ends_within_50ms c) ;
+          Fake.advance f Affect_unix.Mtime.Span.ns ;
+          is_true ~msg:"after the deadline" (ends_within_2s c) )
+    ; test "a step back of the clock makes a POSIX wait longer" (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let p = Fake.posix_now f +:: psec 10 in
+          let c = waiting_posix_call f p in
+          Fake.jump_posix f (Ptime.Span.neg (psec 3600)) ;
+          (* At its mono deadline, the timer finds the POSIX time 1 h before its
+             deadline, and waits 1 h more. *)
+          Fake.advance f (sec 10) ;
+          is_false ~msg:"at the first mono deadline" (ends_within_50ms c) ;
+          Fake.advance f Affect_unix.Mtime.Span.((60 * min) - ns) ;
+          is_false ~msg:"1 ns before the deadline" (ends_within_50ms c) ;
+          Fake.advance f Affect_unix.Mtime.Span.ns ;
+          is_true ~msg:"at the deadline" (ends_within_2s c) )
+    ; test "a step forward of the clock does not end a POSIX wait" (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let p = Fake.posix_now f +:: psec 10 in
+          let c = waiting_posix_call f p in
+          Fake.jump_posix f (psec 3600) ;
+          is_false ~msg:"after the step" (ends_within_50ms c) ;
+          Fake.advance f Affect_unix.Mtime.Span.(sec 10 - ns) ;
+          is_false ~msg:"1 ns before the mono deadline" (ends_within_50ms c) ;
+          Fake.advance f Affect_unix.Mtime.Span.ns ;
+          is_true ~msg:"at the mono deadline" (ends_within_2s c) )
+    ; test "a POSIX timer made after a step forward uses the new time"
+        (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let p = Fake.posix_now f +:: psec 10 in
+          Fake.jump_posix f (psec 3600) ;
+          let c = waiting_posix_call f p in
+          is_true ~msg:"enabled at once" (ends_within_2s c) )
+    ; test "a mono timer and a POSIX timer at one mono deadline do not share"
+        (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let p = Fake.posix_now f +:: psec 10
+          and d = Fake.mono_now f +: sec 10 in
+          (* The POSIX timer checks the POSIX time at the mono deadline [d]. *)
+          let posix = waiting_posix_call f p in
+          let mono = waiting_call f d in
+          Fake.jump_posix f (Ptime.Span.neg (psec 3600)) ;
+          Fake.advance f (sec 10) ;
+          is_true ~msg:"the mono timer" (ends_within_2s mono) ;
+          is_false ~msg:"the POSIX timer" (ends_within_50ms posix) )
+    ; test "advance moves the two time lines" (fun () ->
+          let f = Fake.make () in
+          let m0 = Fake.mono_now f and p0 = Fake.posix_now f in
+          equal float_exact ~msg:"the POSIX start" 784111777.
+            (Ptime.to_float_s p0) ;
+          Fake.advance f (sec 3) ;
+          is_true ~msg:"mono"
+            (Affect_unix.Mtime.equal (Fake.mono_now f) (m0 +: sec 3)) ;
+          is_true ~msg:"POSIX" (Ptime.equal (Fake.posix_now f) (p0 +:: psec 3)) ;
+          is_true ~msg:"the same value" (Fake.posix f == Fake.posix f) )
+    ; test "a line that leaves its range changes nothing" (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          raises_match
+            (function Invalid_argument _ -> true | _ -> false)
+            (fun () -> Fake.jump_posix f (Ptime.Span.v (4_000_000, 0L))) ;
+          let p_last = Option.get (Ptime.sub_span Ptime.max_stamp (psec 1)) in
+          Fake.jump_posix f (Ptime.diff p_last (Fake.posix_now f)) ;
+          let m0 = Fake.mono_now f and p0 = Fake.posix_now f in
+          let c = waiting_call f (m0 +: sec 1) in
+          (* The POSIX line leaves its range, the mono line does not. *)
+          raises_match
+            (function Invalid_argument _ -> true | _ -> false)
+            (fun () -> Fake.advance f (sec 2)) ;
+          (* The mono line leaves its range, the POSIX line does not. *)
+          let f' = Fake.make () in
+          let p0' = Fake.posix_now f' in
+          raises_match
+            (function Invalid_argument _ -> true | _ -> false)
+            (fun () -> Fake.advance f' Affect_unix.Mtime.Span.max_span) ;
+          is_true ~msg:"mono" (Affect_unix.Mtime.equal (Fake.mono_now f) m0) ;
+          is_true ~msg:"POSIX" (Ptime.equal (Fake.posix_now f) p0) ;
+          is_false ~msg:"no timer enabled" (ends_within_50ms c) ;
+          is_true ~msg:"POSIX of the second"
+            (Ptime.equal (Fake.posix_now f') p0') )
+    ; test "No_timer shows the POSIX deadline" (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let p = Fake.posix_now f +:: psec 10 in
+          match
+            Fake.wait_posix_timer ~guard:(ms 10) f ~since:(Fake.mark f) p
+          with
+          | () ->
+              fail "a timer"
+          | exception Fake.No_timer text ->
+              equal string
+                "no timer at posix now +10.000000000s; the timers after the \
+                 mark: []"
+                text ) ]
 
 (* The time line of flows *)
 
@@ -1429,4 +1576,5 @@ let () =
        ; handler_tests
        ; time_tests
        ; fake_time_tests
+       ; fake_posix_tests
        ; flow_time_tests ] )

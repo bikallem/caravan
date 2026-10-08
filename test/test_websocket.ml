@@ -2428,7 +2428,7 @@ let fake_time_tests =
           let f = Fake.make () in
           with_fake_socket f
           @@ fun c peer ->
-          let t0 = Fake.now f and m = Fake.mark f in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           let first = Affect.Fun.Async.call (fun () -> Ws.recv c) in
           Stdlib.Fun.protect ~finally:(fun () -> Affect.Fun.Async.cancel first)
           @@ fun () ->
@@ -2449,7 +2449,7 @@ let fake_time_tests =
           with_fake_socket f
           @@ fun c peer ->
           let frame = client Text "hello" in
-          let t0 = Fake.now f and m = Fake.mark f in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           with_call (fun () -> ignore (Ws.recv c))
           @@ fun reader ->
           (* The first read gets 2 bytes. The next read in the frame waits
@@ -2474,7 +2474,7 @@ let fake_time_tests =
           let f = Fake.make () in
           with_fake_socket f
           @@ fun c _peer ->
-          let t0 = Fake.now f and m = Fake.mark f in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           (* The peer never reads: only an advance can wake the send. *)
           with_call (fun () -> Ws.send c (Binary (String.make 10_000_000 'x')))
           @@ fun sender ->
@@ -2490,7 +2490,7 @@ let fake_time_tests =
           @@ fun c _peer ->
           Ws.send c (Text "one") ;
           Fake.advance f Mtime.Span.(ws_write - ns) ;
-          let t1 = Fake.now f and m = Fake.mark f in
+          let t1 = Fake.mono_now f and m = Fake.mark f in
           (* The peer never reads: the second frame waits from t1. *)
           with_call (fun () -> Ws.send c (Binary (String.make 10_000_000 'x')))
           @@ fun sender ->
@@ -2501,7 +2501,7 @@ let fake_time_tests =
           let f = Fake.make () in
           with_fake_socket ~idle:false f
           @@ fun c peer ->
-          let t0 = Fake.now f and m = Fake.mark f in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           with_call (fun () -> Ws.close c)
           @@ fun closer ->
           equal string "close 1000" (peer_frame peer) ;
@@ -2581,7 +2581,7 @@ let fake_time_tests =
                 Affect.Cell.Once.try_set first (Ws.recv c) ;
                 ignore (Ws.recv c) )
           in
-          let t0 = Fake.now f and m = Fake.mark f in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           Server_support.with_server ~config ~handler
           @@ fun server ->
           let flow = Caravan.Tcp.connect (Caravan.Server.local_addr server) in

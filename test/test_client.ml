@@ -3106,7 +3106,7 @@ let with_fake_exchange ?(broken = false) ?on_write_deadline f ~exchange test =
     (Unix.Unix_error (Unix.EIO, "write", ""))
   @@ fun ~server ~run ~break ~failed:_ ->
   if broken then break () ;
-  let t0 = Fake.now f and m = Fake.mark f in
+  let t0 = Fake.mono_now f and m = Fake.mark f in
   let c =
     Fun.Async.call (fun () ->
         match exchange (fun r -> run fake_spans r) with
@@ -3177,7 +3177,7 @@ let fake_time_tests =
           in
           Stdlib.Fun.protect ~finally:(fun () -> Atomic.set go true)
           @@ fun () ->
-          let t0 = Fake.now f
+          let t0 = Fake.mono_now f
           and m = Fake.mark f
           and ended = Cell.Once.make () in
           let c =
@@ -3217,7 +3217,7 @@ let fake_time_tests =
           main
           @@ fun () ->
           let f = Fake.make () in
-          let t0 = Fake.now f and m = Fake.mark f in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           C.run ~config:(fake_client_config f) (fun _ ->
               (* Each half of [idle_timeout]. *)
               Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.(6500 * ms)) ) )
@@ -3361,7 +3361,7 @@ let fake_time_tests =
           with_script_server answer_at_once
           @@ fun port ->
           let f = Fake.make () in
-          let t0 = Fake.now f and m = Fake.mark f in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           let release = Cell.Once.make ()
           and cancelled = Cell.Once.make ()
           and returned = Cell.Once.make () in
