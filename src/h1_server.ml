@@ -54,18 +54,6 @@ let linger (config : Config.t) flow =
     (Mtime.add_span (Mtime.now ()) config.linger_timeout) ;
   Flow.linger flow ~max:config.max_drain
 
-(* An action enabled with [tag] at [deadline], at once if it has passed; never
-   for [None]. *)
-let at deadline tag =
-  match deadline with
-  | None ->
-      Action.never
-  | Some d ->
-      let now = Mtime.now () in
-      if Mtime.is_earlier now ~than:d then
-        Mtime.wait_for' (Mtime.span now d) tag
-      else Action.always tag
-
 (* Why [response], an upgrade, cannot answer the request [head], if it cannot:
    RFC 9110 §7.8, §9.3.6 and §15.2.2. *)
 let upgrade_error (head : H1_parse.head) response =
@@ -132,7 +120,10 @@ let serve : Engine.t =
   and wait_for_input deadline =
     let input = Flow.readable' flow `Input
     and stop = Action.map (fun () -> `Stop) ctx.stopping in
-    match Action.invoke (Action.choose [stop; input; at deadline `Idle]) with
+    match
+      Action.invoke
+        (Action.choose [stop; input; Time.at Time.mono deadline `Idle])
+    with
     | `Stop | `Idle ->
         `Close
     | `Input -> (

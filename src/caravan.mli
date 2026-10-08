@@ -7,6 +7,7 @@ module Method = Method
 module Version = Version
 module Status = Status
 module Headers = Headers
+module Time = Time
 module Flow = Flow
 module Body = Body
 module Conn_info = Conn_info

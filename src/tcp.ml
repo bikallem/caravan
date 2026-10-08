@@ -60,10 +60,11 @@ let rec wait s ready d =
     match at with
     | None ->
         Action.never
-    | Some at ->
-        let now = Mtime.now () in
-        if not (Mtime.is_earlier now ~than:at) then raise Flow.Timeout ;
-        Mtime.wait_for' (Mtime.span now at) `Timeout
+    | Some d ->
+        (* A passed deadline wins over the other events. *)
+        if not (Mtime.is_earlier (Time.now Time.mono) ~than:d) then
+          raise Flow.Timeout ;
+        Time.at Time.mono at `Timeout
   in
   let events =
     [ Action.map (fun () -> `Ready) ready

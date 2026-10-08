@@ -59,15 +59,6 @@ let closing body f =
       (try Body.close body with _ -> ()) ;
       Printexc.raise_with_backtrace e bt
 
-let at = function
-  | None ->
-      Action.never
-  | Some d ->
-      let now = Mtime.now () in
-      if Mtime.is_earlier now ~than:d then
-        Mtime.wait_for' (Mtime.span now d) `Timeout
-      else Action.always `Timeout
-
 let closes (h : H1_parse.response_head) =
   h.version = Version.Http_1_0
   || Headers.has_token "connection" "close" h.headers
@@ -162,7 +153,9 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
             | `Body ->
                 Mtime.add_span start config.read_timeout
           in
-          let events = [Flow.readable' flow `Readable; at deadline] in
+          let events =
+            [Flow.readable' flow `Readable; Time.at Time.mono deadline `Timeout]
+          in
           let events =
             if !sent_at = None then
               Action.map (fun t -> `Sent t) (Cell.Once.get' sent) :: events

@@ -3,15 +3,6 @@ open Affect
 open Caravan
 module Mtime = Affect_unix.Mtime
 
-let at = function
-  | None ->
-      Action.never
-  | Some d ->
-      let now = Mtime.now () in
-      if Mtime.is_earlier now ~than:d then
-        Mtime.wait_for' (Mtime.span now d) `Timeout
-      else Action.always `Timeout
-
 (* [f] in a child call that stops at [deadline]. At the deadline, or at a cancel
    of the caller, the child stops, and [cleanup] gets a value that the child
    made in the race. *)
@@ -25,7 +16,8 @@ let bounded deadline f ~cleanup =
   match
     Action.invoke
       (Action.choose
-         [Action.map (fun v -> `Done v) (Fun.Async.get' c); at deadline] )
+         [ Action.map (fun v -> `Done v) (Fun.Async.get' c)
+         ; Time.at Time.mono deadline `Timeout ] )
   with
   | `Done v ->
       v
