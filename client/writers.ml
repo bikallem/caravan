@@ -90,8 +90,8 @@ let stop t =
   Cell.Once.try_set t.stopping () ;
   Fun.Async.cancel t.supervisor
 
-(* Takes no more jobs, and waits at most [grace] for the jobs that run: the
-   supervisor call ends after its children. *)
+(* Takes no more jobs, and waits at most [grace] on the time line [time] for the
+   jobs that run: the supervisor call ends after its children. *)
 let finish t ~time ~grace =
   Cell.Once.try_set t.stopping () ;
   let ended = Action.map (fun () -> `Ended) (Fun.Async.get' t.supervisor) in

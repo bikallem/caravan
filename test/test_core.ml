@@ -1101,7 +1101,9 @@ let time_tests =
           in
           (* The server and the client use the time line of their config or of
              their flows. *)
-          let injected = ["Time.mono"; "Time.("] in
+          let injected =
+            ["Time.mono"; "Time.("; "open Time"; "open Caravan.Time"]
+          in
           let files dir ~except =
             Sys.readdir (Filename.concat root dir)
             |> Array.to_list

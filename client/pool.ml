@@ -83,8 +83,9 @@ let rec checkout ?(reuse = true) t ~host ~port =
   | None ->
       let flow = t.connect ~host ~port in
       let c =
-        Conn.make ~released_at:(Time.now t.config.mono_time) ~host:(fst key)
-          ~port flow
+        Conn.make
+          ~released_at:(Time.now t.config.mono_time)
+          ~host:(fst key) ~port flow
       in
       let added =
         Mutex.protect t.lock (fun () ->

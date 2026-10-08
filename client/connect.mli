@@ -9,5 +9,6 @@ val connect :
   -> Caravan.Flow.t
 (* [connect config ~host ~port] resolves [host] and connects to each of its
    addresses in turn, with one deadline ([config.connect_timeout]) for the
-   lookup and all the connects. @raise Error.Error with Timeout `Connect at the
-   deadline, or Connect with the error of the last address. *)
+   lookup and all the connects. The deadline and the flow are on
+   [config.mono_time]. @raise Error.Error with Timeout `Connect at the deadline,
+   or Connect with the error of the last address. *)

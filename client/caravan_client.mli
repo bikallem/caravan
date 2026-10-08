@@ -62,8 +62,8 @@ module Config : sig
 
   val default : t
   (** [default] has the limits 10 s (connect), 30 s (response, read, write), 5 s
-      (idle), 8 idle connections, 8 KiB, 64 KiB, 200 fields, 5 s (close
-      grace) and {!Caravan.Time.mono}. *)
+      (idle), 8 idle connections, 8 KiB, 64 KiB, 200 fields, 5 s (close grace)
+      and {!Caravan.Time.mono}. *)
 end
 
 (** The type for errors. *)
