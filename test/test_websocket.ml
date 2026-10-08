@@ -810,7 +810,7 @@ let connection_tests =
           in
           let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
           let flow =
-            Caravan.Flow.make ~read
+            Caravan.Flow.make ~time:Caravan.Time.mono ~read
               ~read_now:(fun b o l -> Some (read b o l))
               ~write:(fun _ _ _ -> ())
               ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
@@ -837,7 +837,7 @@ let connection_tests =
           in
           let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
           let flow =
-            Caravan.Flow.make ~read
+            Caravan.Flow.make ~time:Caravan.Time.mono ~read
               ~read_now:(fun b o l -> Some (read b o l))
               ~write:(fun _ _ _ -> ())
               ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
@@ -1064,7 +1064,7 @@ let close_tests =
           in
           let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
           let flow =
-            Caravan.Flow.make ~read
+            Caravan.Flow.make ~time:Caravan.Time.mono ~read
               ~read_now:(fun b o l -> Some (read b o l))
               ~write:(fun _ _ _ -> ())
               ~readable:(Affect.Action.always ()) ~shutdown_send:ignore

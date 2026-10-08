@@ -455,7 +455,7 @@ let flow_tests =
             [Some 2; Some 1; Some 0]
             (List.init 3 (fun _ -> Flow.read_now f buf 0 4)) ;
           let nothing =
-            Flow.make
+            Flow.make ~time:Time.mono
               ~read:(fun _ _ _ -> failwith "blocking read")
               ~read_now:(fun _ _ _ -> None)
               ~write:(fun _ _ _ -> ())
@@ -478,7 +478,7 @@ let flow_tests =
         (fun () ->
           let log = ref [] in
           let flow ?reset () =
-            Flow.make
+            Flow.make ~time:Time.mono
               ~read:(fun _ _ _ -> 0)
               ~read_now:(fun _ _ _ -> Some 0)
               ~write:(fun _ _ _ -> ())
@@ -499,7 +499,7 @@ let flow_tests =
         (fun () ->
           let log = ref [] and input = ref "abcdef" in
           let flow ?read_error () =
-            Flow.make
+            Flow.make ~time:Time.mono
               ~read:(fun buf off len ->
                 Option.iter raise read_error ;
                 let n = Int.min (Int.min len 2) (String.length !input) in
@@ -537,7 +537,7 @@ let flow_tests =
     ; test "close is idempotent and later use raises Closed" (fun () ->
           let closes = ref 0 in
           let flow =
-            Flow.make
+            Flow.make ~time:Time.mono
               ~read:(fun _ _ _ -> 0)
               ~read_now:(fun _ _ _ -> Some 0)
               ~write:(fun _ _ _ -> ())
@@ -554,7 +554,7 @@ let flow_tests =
           let log = ref [] in
           let note s = log := s :: !log in
           let flow =
-            Flow.make
+            Flow.make ~time:Time.mono
               ~read:(fun buf off _ -> note "read" ; Bytes.set buf off 'a' ; 1)
               ~read_now:(fun _ _ _ -> note "read_now" ; None)
               ~write:(fun _ _ len -> note (Printf.sprintf "write %d" len))
@@ -598,7 +598,7 @@ let flow_tests =
     ; test "prepend passes shutdown and close to the flow" (fun () ->
           let log = ref [] in
           let flow =
-            Flow.make
+            Flow.make ~time:Time.mono
               ~read:(fun _ _ _ -> 0)
               ~read_now:(fun _ _ _ -> Some 0)
               ~write:(fun _ _ _ -> ())
@@ -618,7 +618,7 @@ let flow_tests =
           equal int 0 (Flow.read f (Bytes.create 1) 0 1) )
     ; test "prepend is readable while its bytes remain" (fun () ->
           let never =
-            Flow.make
+            Flow.make ~time:Time.mono
               ~read:(fun _ _ _ -> 0)
               ~read_now:(fun _ _ _ -> Some 0)
               ~write:(fun _ _ _ -> ())
@@ -1098,7 +1098,7 @@ let fake_main ?(domain_count = 1) f =
   calls := [] ;
   Affect_unix.Unix.main ~domain_count
   @@ fun () ->
-  Fun.protect ~finally:(fun () -> List.iter Affect.Fun.Async.cancel !calls) f
+  Fun.protect ~finally:(fun () -> List.iter (fun cancel -> cancel ()) !calls) f
 
 (* A call that waits for the fake timer at [d]. *)
 let timer_call f d =
@@ -1106,7 +1106,7 @@ let timer_call f d =
     Affect.Fun.Async.call (fun () ->
         Affect.Action.invoke (Time.at (Fake.mono f) (Some d) ()) )
   in
-  calls := c :: !calls ;
+  calls := (fun () -> Affect.Fun.Async.cancel c) :: !calls ;
   c
 
 (* A call that waits for the fake timer at [d], made after a mark, and the proof
@@ -1194,6 +1194,99 @@ let fake_time_tests =
             (Affect_unix.Mtime.equal (Time.now (Fake.mono f)) (t0 +: sec 3)) ;
           is_true ~msg:"the same value" (Fake.mono f == Fake.mono f) ) ]
 
+(* The time line of flows *)
+
+(* A connected pair of non-blocking sockets. *)
+let socket_pair () =
+  let a, b = Unix.socketpair ~cloexec:true Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  Unix.set_nonblock a ; Unix.set_nonblock b ; (a, b)
+
+(* A call that reads one byte of [flow]. *)
+let read_call flow =
+  let c =
+    Affect.Fun.Async.call (fun () -> Flow.read flow (Bytes.create 1) 0 1)
+  in
+  calls := (fun () -> Affect.Fun.Async.cancel c) :: !calls ;
+  c
+
+(* The result of [c] within 2 s of real time. *)
+let result_within_2s c =
+  match
+    Affect.Action.invoke
+      (Affect.Action.choose
+         [ Affect.Action.map (fun _ -> `Ended) (Affect.Fun.Async.get' c)
+         ; Affect_unix.Mtime.wait_for' (sec 2) `Late ] )
+  with
+  | `Ended -> (
+    match Affect.Fun.Async.get c with n -> `Read n | exception e -> `Raised e )
+  | `Late ->
+      `Late
+  | exception e ->
+      `Raised e
+
+(* The steps of F2 on [flow], which reads from the peer [peer]: a read with the
+   deadline L = 11 s gets a byte 1 ns before L, and a second read with the same
+   deadline times out at L. *)
+let read_until_deadline f ~deadline flow peer =
+  Flow.set_read_deadline flow (Some deadline) ;
+  let m = Fake.mark f in
+  let r = read_call flow in
+  Fake.wait_mono_timer f ~since:m deadline ;
+  Fake.advance f Affect_unix.Mtime.Span.(sec 11 - ns) ;
+  ignore (Unix.write_substring peer "x" 0 1) ;
+  is_true ~msg:"a byte 1 ns before the deadline" (result_within_2s r = `Read 1) ;
+  let m = Fake.mark f in
+  let r = read_call flow in
+  Fake.wait_mono_timer f ~since:m deadline ;
+  Fake.advance f Affect_unix.Mtime.Span.ns ;
+  is_true ~msg:"a timeout at the deadline"
+    (result_within_2s r = `Raised Flow.Timeout)
+
+let flow_time_tests =
+  group "Flow time"
+    [ test "a flow keeps its time line" (fun () ->
+          let f = Fake.make () and a, b = socket_pair () in
+          let flow = Tcp.flow ~time:(Fake.mono f) a in
+          is_true ~msg:"Tcp.flow ~time" (Flow.time flow == Fake.mono f) ;
+          is_true ~msg:"prepend"
+            (Flow.time (Flow.prepend "x" flow) == Fake.mono f) ;
+          is_true ~msg:"the default of Tcp.flow"
+            (Flow.time (Tcp.flow b) == Time.mono) ;
+          is_true ~msg:"the default of of_string"
+            (Flow.time (Flow.of_string "" (Buffer.create 0)) == Time.mono) ;
+          Unix.close a ;
+          Unix.close b )
+    ; test "a tcp flow waits for its deadlines on its time line" (fun () ->
+          let a, b = socket_pair () in
+          Fun.protect ~finally:(fun () -> Unix.close a ; Unix.close b)
+          @@ fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let flow = Tcp.flow ~time:(Fake.mono f) a in
+          let deadline = Option.get (Time.after (Flow.time flow) (sec 11)) in
+          read_until_deadline f ~deadline flow b )
+    ; test "a wrapper flow with the time line of its inner flow" (fun () ->
+          let a, b = socket_pair () in
+          Fun.protect ~finally:(fun () -> Unix.close a ; Unix.close b)
+          @@ fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let inner = Tcp.flow ~time:(Fake.mono f) a in
+          let wrapper =
+            Flow.make ~time:(Flow.time inner) ~read:(Flow.read inner)
+              ~read_now:(Flow.read_now inner) ~write:(Flow.write inner)
+              ~readable:(Flow.readable' inner ())
+              ~shutdown_send:(fun () -> Flow.shutdown_send inner)
+              ~close:(fun () -> Flow.close inner)
+              ~set_read_deadline:(Flow.set_read_deadline inner)
+              ~set_write_deadline:(Flow.set_write_deadline inner)
+              ()
+          in
+          let deadline = Option.get (Time.after (Flow.time wrapper) (sec 11)) in
+          read_until_deadline f ~deadline wrapper b ) ]
+
 let () =
   exit
     (run "core"
@@ -1211,4 +1304,5 @@ let () =
        ; response_tests
        ; handler_tests
        ; time_tests
-       ; fake_time_tests ] )
+       ; fake_time_tests
+       ; flow_time_tests ] )

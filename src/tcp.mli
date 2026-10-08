@@ -3,8 +3,9 @@
     All waiting is cooperative, through affect: a blocked read, write, connect
     or accept suspends only the asynchronous function that makes it. *)
 
-val flow : Unix.file_descr -> Flow.t
-(** [flow fd] is the flow of the connected, non-blocking socket [fd]:
+val flow : ?time:Time.mono -> Unix.file_descr -> Flow.t
+(** [flow ~time fd] is the flow of the connected, non-blocking socket [fd]:
+    - Its deadlines are on the time line [time] (default: {!Time.mono}).
     - Reads and writes wait cooperatively when the socket is not ready, and
       raise {!Flow.Timeout} if the flow's deadline passes first.
     - A reset or broken connection raises {!Flow.Closed}.

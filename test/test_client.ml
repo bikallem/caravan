@@ -122,7 +122,8 @@ let with_breakable error f =
   let real = Tcp.flow a and server = Tcp.flow b in
   let broken = Atomic.make false and failed = Cell.Once.make () in
   let client =
-    Flow.make ~read:(Flow.read real) ~read_now:(Flow.read_now real)
+    Flow.make ~time:(Flow.time real) ~read:(Flow.read real)
+      ~read_now:(Flow.read_now real)
       ~write:(fun buf off len ->
         if Atomic.get broken then (
           Cell.Once.try_set failed () ;
@@ -752,7 +753,8 @@ let exchange_tests =
           Unix.set_nonblock b ;
           let real = Tcp.flow a and server = Tcp.flow b in
           let client =
-            Flow.make ~read:(Flow.read real) ~read_now:(Flow.read_now real)
+            Flow.make ~time:(Flow.time real) ~read:(Flow.read real)
+              ~read_now:(Flow.read_now real)
               ~write:(fun buf off len ->
                 Flow.write real buf off len ;
                 Mtime.wait_for (ms 1000) )
@@ -1100,7 +1102,8 @@ let exchange_tests =
           Unix.set_nonblock b ;
           let real = Tcp.flow a and server = Tcp.flow b in
           let client =
-            Flow.make ~read:(Flow.read real) ~read_now:(Flow.read_now real)
+            Flow.make ~time:(Flow.time real) ~read:(Flow.read real)
+              ~read_now:(Flow.read_now real)
               ~write:(fun buf off len ->
                 Flow.write real buf off len ;
                 Mtime.wait_for (ms 1000) )
@@ -1300,7 +1303,8 @@ let exchange_tests =
               Unix.set_nonblock b ;
               let real = Tcp.flow a and server = Tcp.flow b in
               let client =
-                Flow.make ~read:(Flow.read real) ~read_now:(Flow.read_now real)
+                Flow.make ~time:(Flow.time real) ~read:(Flow.read real)
+                  ~read_now:(Flow.read_now real)
                   ~write:(fun buf off len ->
                     Flow.write real buf off len ;
                     Mtime.wait_for (ms 100) )
@@ -1850,7 +1854,7 @@ type fake = {closed: bool ref; server_closed: bool ref; flow: Flow.t}
 let fake () =
   let closed = ref false and server_closed = ref false in
   let flow =
-    Flow.make
+    Flow.make ~time:Time.mono
       ~read:(fun _ _ _ -> 0)
       ~read_now:(fun _ _ _ -> if !server_closed then Some 0 else None)
       ~write:(fun _ _ _ -> ())

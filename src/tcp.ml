@@ -54,7 +54,7 @@ let close ~reset s =
 (* Waits for [ready]. Raises Flow.Timeout when the deadline in [d] passes, and
    Flow.Closed when [s] closes. A new deadline applies also to a wait that
    started before it. *)
-let rec wait s ready d =
+let rec wait time s ready d =
   let {at; changed} = Atomic.get d in
   let timeout =
     match at with
@@ -62,9 +62,9 @@ let rec wait s ready d =
         Action.never
     | Some deadline ->
         (* A passed deadline wins over the other events. *)
-        if not (Mtime.is_earlier (Time.now Time.mono) ~than:deadline) then
+        if not (Mtime.is_earlier (Time.now time) ~than:deadline) then
           raise Flow.Timeout ;
-        Time.at Time.mono at `Timeout
+        Time.at time at `Timeout
   in
   let events =
     [ Action.map (fun () -> `Ready) ready
@@ -76,7 +76,7 @@ let rec wait s ready d =
   | `Ready ->
       ()
   | `Changed ->
-      wait s ready d
+      wait time s ready d
   | `Closed ->
       raise Flow.Closed
   | `Timeout ->
@@ -88,7 +88,7 @@ let is_closed = function
   | _ ->
       false
 
-let flow fd =
+let flow ?(time = Time.mono) fd =
   let s =
     { fd
     ; users= Atomic.make 0
@@ -114,7 +114,7 @@ let flow fd =
     | Some n ->
         n
     | None ->
-        wait s (Aunix.wait_readable fd ()) read_deadline ;
+        wait time s (Aunix.wait_readable fd ()) read_deadline ;
         read buf off len
   in
   let rec write buf off len =
@@ -124,7 +124,7 @@ let flow fd =
       | n ->
           write buf (off + n) (len - n)
       | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK), _, _) ->
-          wait s (Aunix.wait_writable fd ()) write_deadline ;
+          wait time s (Aunix.wait_writable fd ()) write_deadline ;
           write buf off len
       | exception Unix.Unix_error (EINTR, _, _) ->
           write buf off len
@@ -141,7 +141,7 @@ let flow fd =
   let readable =
     Action.choose [Aunix.wait_readable fd (); Cell.Once.get' s.closing]
   in
-  Flow.make
+  Flow.make ~time
     ~read:(fun buf off len -> use s (fun () -> read buf off len))
     ~read_now:(fun buf off len -> use s (fun () -> try_read buf off len))
     ~write:(fun buf off len -> use s (fun () -> write buf off len))

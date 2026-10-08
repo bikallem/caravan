@@ -21,7 +21,8 @@ exception Timeout
 exception Closed
 
 val make :
-     read:(bytes -> int -> int -> int)
+     time:Time.mono
+  -> read:(bytes -> int -> int -> int)
   -> read_now:(bytes -> int -> int -> int option)
   -> write:(bytes -> int -> int -> unit)
   -> readable:unit Action.t
@@ -32,9 +33,11 @@ val make :
   -> set_write_deadline:(Affect_unix.Mtime.t option -> unit)
   -> unit
   -> t
-(** [make ~read ~read_now ~write ~readable ~shutdown_send ~close ~reset
+(** [make ~time ~read ~read_now ~write ~readable ~shutdown_send ~close ~reset
      ~set_read_deadline ~set_write_deadline ()] is a flow implemented by the
     given functions:
+    - [time] is the time line of the deadlines. A flow that forwards its
+      deadlines to an inner flow gives [~time:(Flow.time inner)].
     - [read buf off len] reads at most [len > 0] bytes into [buf] from [off] and
       returns how many it read, [0] at the end of the stream. It may block
       cooperatively.
@@ -53,6 +56,12 @@ val make :
     - [set_read_deadline d] and [set_write_deadline d] set or clear the time
       after which a blocked read or write raises {!Timeout}. They must not
       suspend the fiber or block: callers can call them while they hold a lock.
+*)
+
+val time : t -> Time.mono
+(** [time flow] is the monotonic time line of [flow]: the time line of its
+    deadlines, and of the waits of the engine that serves it. Compute the
+    deadlines of [flow] with it, for example [Time.after (Flow.time flow) span].
 *)
 
 (** {1:reading Reading} *)
@@ -132,15 +141,16 @@ val linger : t -> max:int -> unit
 val prepend : string -> t -> t
 (** [prepend s flow] is [flow] with the bytes of [s] read first. Its
     {!readable'} action is enabled at once while bytes of [s] remain. Writes,
-    deadlines and closing go to [flow].
+    deadlines and closing go to [flow], and its time line is the one of [flow].
 
     An HTTP/1.1 connection uses it to hand the bytes it has already buffered to
     an upgrade callback. *)
 
-val of_string : ?chunk:int -> string -> Buffer.t -> t
+val of_string : ?time:Time.mono -> ?chunk:int -> string -> Buffer.t -> t
 (** [of_string ~chunk input output] is an in-memory flow for tests. Reads return
     the bytes of [input], at most [chunk] bytes per read (default: no limit) to
     imitate a network that splits data, and then [0]. Writes append to [output].
-    It is always readable and ignores deadlines.
+    It is always readable and ignores deadlines. Its time line is [time]
+    (default: {!Time.mono}).
 
     @raise Invalid_argument if [chunk <= 0]. *)
