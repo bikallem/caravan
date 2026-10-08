@@ -1047,19 +1047,23 @@ let grace_g = Mtime.Span.(7 * s)
 
 let linger_l = Mtime.Span.(11 * s)
 
+let read_r = Mtime.Span.(13 * s)
+
+let write_w = Mtime.Span.(17 * s)
+
 let fake_config f =
   { quiet with
     mono_time= Fake.mono f
   ; header_timeout= header_h
   ; idle_timeout= idle_i
-  ; read_timeout= Mtime.Span.(13 * s)
-  ; write_timeout= Mtime.Span.(17 * s)
+  ; read_timeout= read_r
+  ; write_timeout= write_w
   ; shutdown_grace= grace_g
   ; linger_timeout= linger_l }
 
 let within_2s = Server_support.within_2s
 
-(* [with_fake_listener] with the fake time [f]. When [f] ends, also by a
+(* [with_fake_listener] with the fake time [f]. When [test] ends, also by a
    failure, the fake time advances one day: then each wait on it ends, for
    example an accept pause, and the server can stop. *)
 let with_fake_server f ?handler ?engine ~clients steps test =
@@ -1104,6 +1108,7 @@ let fake_time_tests =
           let fd, c = socket_pair () in
           with_fake_server f ~clients:[c] [Conn fd; Gate Action.never]
           @@ fun _ _ _ ->
+          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
           half_head f c ~t0 ~since:m ;
           Fake.advance f Mtime.Span.(header_h - ns) ;
           Flow.write_string c "Host: x\r\n\r\n" ;
@@ -1125,6 +1130,7 @@ let fake_time_tests =
           let fd, c = socket_pair () in
           with_fake_server f ~clients:[c] [Conn fd; Gate Action.never]
           @@ fun _ _ _ ->
+          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
           Fake.wait_mono_timer f ~since:m (t0 +: header_h) ;
           let r = Private.Buf_reader.of_flow c in
           let m = Fake.mark f in
@@ -1141,6 +1147,52 @@ let fake_time_tests =
           Flow.set_read_deadline c (Some (deadline_in 2000)) ;
           equal int ~msg:"the end of the stream" 0
             (Private.Buf_reader.read_into r (Bytes.create 1) 0 1) )
+    ; test "a body read that waits until the read timeout gets 408" (fun () ->
+          let f = Fake.make () in
+          let t0 = Fake.now f and m = Fake.mark f in
+          let handler req =
+            Response.string (Body.to_string (Request.body req))
+          in
+          let fd, c = socket_pair () in
+          with_fake_server f ~handler ~clients:[c] [Conn fd; Gate Action.never]
+          @@ fun _ _ _ ->
+          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+          Flow.write_string c
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n" ;
+          (* The handler reads the body: each read waits [read_timeout]. *)
+          Fake.wait_mono_timer f ~since:m (t0 +: read_r) ;
+          Fake.advance f Mtime.Span.(read_r - ns) ;
+          let m = Fake.mark f in
+          Flow.write_string c "a" ;
+          let t1 = t0 +: Mtime.Span.(read_r - ns) in
+          Fake.wait_mono_timer f ~since:m (t1 +: read_r) ;
+          Fake.advance f read_r ;
+          let r = response c in
+          is_true ~msg:r (String.starts_with ~prefix:"HTTP/1.1 408" r) )
+    ; test
+        "a response write that waits until the write timeout ends the \
+         connection" (fun () ->
+          let f = Fake.make () in
+          let t0 = Fake.now f and m = Fake.mark f in
+          (* More than the buffers of the socket pair hold. *)
+          let size = 8 * 1024 * 1024 in
+          let handler _ = Response.string (String.make size 'x') in
+          let fd, c = socket_pair () in
+          with_fake_server f ~handler ~clients:[c] [Conn fd; Gate Action.never]
+          @@ fun _ _ _ ->
+          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+          Flow.write_string c (get "/") ;
+          (* The client does not read: a write waits [write_timeout]. *)
+          Fake.wait_mono_timer f ~since:m (t0 +: write_w) ;
+          Fake.advance f Mtime.Span.(write_w - ns) ;
+          let m = Fake.mark f in
+          let first = read_exactly c (1024 * 1024) in
+          let t1 = t0 +: Mtime.Span.(write_w - ns) in
+          Fake.wait_mono_timer f ~since:m (t1 +: write_w) ;
+          Fake.advance f write_w ;
+          let rest = read_all c in
+          is_true ~msg:"the connection ends before the whole body"
+            (String.length first + String.length rest < size) )
     ; test "a stop gives the requests in progress the shutdown grace" (fun () ->
           let f = Fake.make () in
           let t0 = Fake.now f in

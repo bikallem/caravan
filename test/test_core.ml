@@ -1088,18 +1088,40 @@ let time_tests =
             at 0
           in
           let direct =
-            ["Mtime.now"; "Mtime.wait_for"; "Unix.time"; "Unix.gettimeofday"]
+            [ "Mtime.now"
+            ; "Mtime.wait_for"
+            ; "Mtime.observe_wait_for"
+            ; "Mtime.count"
+            ; "Mtime.elapsed"
+            ; "Mtime.("
+            ; "Unix.time"
+            ; "Unix.gettimeofday"
+            ; "Unix.sleep"
+            ; "Unix.select" ]
           in
-          Sys.readdir dir |> Array.to_list
-          |> List.filter (fun file ->
-              Filename.check_suffix file ".ml"
-              && not (List.mem file ["time.ml"; "date.ml"]) )
-          |> List.iter (fun file ->
+          (* The server uses the time line of its config or of its flows. *)
+          let in_server = ["Time.mono"] in
+          let files =
+            Sys.readdir dir |> Array.to_list
+            |> List.filter (fun file ->
+                Filename.check_suffix file ".ml"
+                && not (List.mem file ["time.ml"; "date.ml"]) )
+          in
+          is_true ~msg:"the files of the server are found"
+            (List.mem "server.ml" files && List.mem "h1_server.ml" files) ;
+          List.iter
+            (fun file ->
               let text = read file in
+              let calls =
+                if List.mem file ["server.ml"; "h1_server.ml"] then
+                  direct @ in_server
+                else direct
+              in
               List.iter
                 (fun call ->
                   is_false ~msg:(file ^ " calls " ^ call) (contains text call) )
-                direct ) )
+                calls )
+            files )
     ; test "a sleep waits for its span" (fun () ->
           in_main
           @@ fun () ->
