@@ -30,7 +30,8 @@
   unix)
  (deps
   serve_until_signal.exe
-  (glob_files ../src/*.ml)))
+  (glob_files ../src/*.ml)
+  (glob_files ../client/*.ml)))
 
 (executable
  (name serve_until_signal)

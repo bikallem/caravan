@@ -78,6 +78,7 @@ let body_error e bt =
 
 let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
   let flow = conn.flow in
+  let time = Flow.time flow in
   let framing = H1_write.request_framing req in
   let inner = Request.body req in
   (* A bad request raises in the caller, and the connection did not change. For
@@ -109,7 +110,7 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
         let w =
           Buf_writer.make (fun buf off len ->
               Flow.set_write_deadline flow
-                (Mtime.add_span (Mtime.now ()) config.Cfg.write_timeout) ;
+                (Time.after time config.Cfg.write_timeout) ;
               try Flow.write flow buf off len
               with (Flow.Closed | Flow.Timeout | Unix.Unix_error _) as e ->
                 raise (Net e) )
@@ -132,13 +133,13 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
               end
             in
             H1_write.body w framing body ) ;
-        Cell.Once.try_set sent (Mtime.now ()) )
+        Cell.Once.try_set sent (Time.now time) )
   in
   (* One read function for the exchange: only the reader waits for input, and it
      also sees the end of the request and the end of the writer. *)
   let phase = ref `Head and sent_at = ref None and writer_seen = ref false in
   let read buf off len =
-    let start = Mtime.now () in
+    let start = Time.now time in
     let rec loop () =
       Fun.Async.check_cancellation () ;
       match Flow.read_now flow buf off len with
@@ -154,7 +155,7 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
                 Mtime.add_span start config.read_timeout
           in
           let events =
-            [Flow.readable' flow `Readable; Time.at Time.mono deadline `Timeout]
+            [Flow.readable' flow `Readable; Time.at time deadline `Timeout]
           in
           let events =
             if !sent_at = None then
@@ -179,7 +180,7 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
               writer_seen := true ;
               (* A writer that ends before [sent], for example with a write
                  error, starts the response deadline too. *)
-              if !sent_at = None then sent_at := Some (Mtime.now ()) ;
+              if !sent_at = None then sent_at := Some (Time.now time) ;
               match r with
               | Error (e, bt) when stops !phase e ->
                   raise (Writer_failed (e, bt))

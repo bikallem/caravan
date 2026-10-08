@@ -1070,14 +1070,14 @@ let time_tests =
     ; test "the last time is never enabled" (fun () ->
           let d = Some Affect_unix.Mtime.max_stamp in
           is_false (enabled_within_50ms (Time.at Time.mono d ())) )
-    ; test "src/ reads the time and waits only through Time" (fun () ->
+    ; test "src/ and client/ read the time and wait only through Time"
+        (fun () ->
           (* dune runs the test in _build/default/test; dune exec in the
              root. *)
-          let dir =
-            if Sys.file_exists "../src/time.ml" then "../src" else "src"
-          in
-          let read file =
-            In_channel.with_open_bin (Filename.concat dir file)
+          let root = if Sys.file_exists "../src/time.ml" then ".." else "." in
+          let read dir file =
+            In_channel.with_open_bin
+              (Filename.concat (Filename.concat root dir) file)
               In_channel.input_all
           in
           let contains s sub =
@@ -1099,29 +1099,43 @@ let time_tests =
             ; "Unix.sleep"
             ; "Unix.select" ]
           in
-          (* The server uses the time line of its config or of its flows. *)
-          let in_server = ["Time.mono"] in
-          let files =
-            Sys.readdir dir |> Array.to_list
+          (* The server and the client use the time line of their config or of
+             their flows. *)
+          let injected = ["Time.mono"; "Time.("] in
+          let files dir ~except =
+            Sys.readdir (Filename.concat root dir)
+            |> Array.to_list
             |> List.filter (fun file ->
-                Filename.check_suffix file ".ml"
-                && not (List.mem file ["time.ml"; "date.ml"]) )
+                Filename.check_suffix file ".ml" && not (List.mem file except) )
           in
+          let src = files "src" ~except:["time.ml"; "date.ml"]
+          and client = files "client" ~except:[] in
           is_true ~msg:"the files of the server are found"
-            (List.mem "server.ml" files && List.mem "h1_server.ml" files) ;
+            (List.mem "server.ml" src && List.mem "h1_server.ml" src) ;
+          is_true ~msg:"the files of the client are found"
+            (List.mem "pool.ml" client && List.mem "config.ml" client) ;
+          let check dir file calls =
+            let text = read dir file in
+            List.iter
+              (fun call ->
+                is_false
+                  ~msg:(dir ^ "/" ^ file ^ " calls " ^ call)
+                  (contains text call) )
+              calls
+          in
           List.iter
             (fun file ->
-              let text = read file in
-              let calls =
-                if List.mem file ["server.ml"; "h1_server.ml"] then
-                  direct @ in_server
-                else direct
-              in
-              List.iter
-                (fun call ->
-                  is_false ~msg:(file ^ " calls " ^ call) (contains text call) )
-                calls )
-            files )
+              check "src" file
+                ( if List.mem file ["server.ml"; "h1_server.ml"] then
+                    direct @ injected
+                  else direct ) )
+            src ;
+          (* client/config.ml has the default time line. *)
+          List.iter
+            (fun file ->
+              check "client" file
+                (if file = "config.ml" then direct else direct @ injected) )
+            client )
     ; test "a sleep waits for its span" (fun () ->
           in_main
           @@ fun () ->

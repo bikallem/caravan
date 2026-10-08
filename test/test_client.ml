@@ -3054,19 +3054,46 @@ let ( +: ) t span = Option.get (Mtime.add_span t span)
    proved with [Fake.wait_mono_timer]. *)
 let connect_c = Mtime.Span.(3 * s)
 
+let response_r = Mtime.Span.(5 * s)
+
+let read_d = Mtime.Span.(7 * s)
+
+let write_w = Mtime.Span.(11 * s)
+
 let idle_i = Mtime.Span.(13 * s)
 
 let grace_g = Mtime.Span.(17 * s)
 
-let fake_client_config f =
+(* The spans on the real time line. The exchange tests put only the flow on the
+   fake time line: thus an exchange that uses [mono_time] fails. *)
+let fake_spans =
   { Client_config.default with
-    mono_time= Fake.mono f
-  ; connect_timeout= connect_c
-  ; response_timeout= Mtime.Span.(5 * s)
-  ; read_timeout= Mtime.Span.(7 * s)
-  ; write_timeout= Mtime.Span.(11 * s)
+    connect_timeout= connect_c
+  ; response_timeout= response_r
+  ; read_timeout= read_d
+  ; write_timeout= write_w
   ; idle_timeout= idle_i
   ; close_grace= grace_g }
+
+let fake_client_config f = {fake_spans with mono_time= Fake.mono f}
+
+(* [test] with an exchange in a child call: [exchange run] runs [run] on the
+   client flow of [with_breakable], on the fake time line [f]. The call gives
+   the result of [exchange], or the text of its error. *)
+let with_fake_exchange f ~exchange test =
+  with_breakable ~time:(Fake.mono f) Exit
+  @@ fun ~server ~run ~break:_ ~failed:_ ->
+  let t0 = Fake.now f and m = Fake.mark f in
+  let c =
+    Fun.Async.call (fun () ->
+        match exchange (fun r -> run fake_spans r) with
+        | v ->
+            v
+        | exception Caravan_client.Error e ->
+            Printexc.to_string (Caravan_client.Error e) )
+  in
+  Stdlib.Fun.protect ~finally:(fun () -> Fun.Async.cancel c)
+  @@ fun () -> test ~server ~t0 ~since:m c
 
 (* Whether [cell] is set within 50 ms of real time. *)
 let set_within_50ms cell =
@@ -3199,6 +3226,104 @@ let fake_time_tests =
           within_2s (fun () -> Cell.Once.get returned) ;
           is_false ~msg:"no cancel within 50 ms" (set_within_50ms cancelled) ;
           Cell.Once.try_set release () ;
+          within_2s (fun () -> Fun.Async.get r) )
+    ; test "a response 1 ns before the response timeout is taken" (fun () ->
+          let f = Fake.make () in
+          with_fake_exchange f
+            ~exchange:(fun run -> Printf.sprintf "status %d" (status (run (req "/"))))
+          @@ fun ~server ~t0 ~since c ->
+          ignore (within_2s (fun () -> read_head (Buf_reader.of_flow server))) ;
+          (* The deadline starts at the end of the request. *)
+          Fake.wait_mono_timer f ~since (t0 +: response_r) ;
+          Fake.advance f Mtime.Span.(response_r - ns) ;
+          Flow.write_string server "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" ;
+          equal string "status 200" (within_2s (fun () -> Fun.Async.get c)) )
+    ; test "no response at the response timeout gives Timeout `Response"
+        (fun () ->
+          let f = Fake.make () in
+          with_fake_exchange f
+            ~exchange:(fun run -> Printf.sprintf "status %d" (status (run (req "/"))))
+          @@ fun ~server ~t0 ~since c ->
+          ignore (within_2s (fun () -> read_head (Buf_reader.of_flow server))) ;
+          Fake.wait_mono_timer f ~since (t0 +: response_r) ;
+          Fake.advance f response_r ;
+          equal string "Caravan_client.Error: response timeout"
+            (within_2s (fun () -> Fun.Async.get c)) )
+    ; test "a body read that waits until the read timeout gives Timeout `Read"
+        (fun () ->
+          let f = Fake.make () in
+          with_fake_exchange f
+            ~exchange:(fun run -> Body.to_string (body (run (req "/"))))
+          @@ fun ~server ~t0 ~since c ->
+          ignore (within_2s (fun () -> read_head (Buf_reader.of_flow server))) ;
+          (* The head and the first byte in one write: the client reads the
+             byte, and its next read waits from t0. *)
+          Flow.write_string server
+            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\na" ;
+          Fake.wait_mono_timer f ~since (t0 +: read_d) ;
+          Fake.advance f Mtime.Span.(read_d - ns) ;
+          let m = Fake.mark f in
+          Flow.write_string server "b" ;
+          let t1 = t0 +: Mtime.Span.(read_d - ns) in
+          Fake.wait_mono_timer f ~since:m (t1 +: read_d) ;
+          Fake.advance f read_d ;
+          equal string "Caravan_client.Error: read timeout"
+            (within_2s (fun () -> Fun.Async.get c)) )
+    ; test "a write that waits until the write timeout gives Timeout `Write"
+        (fun () ->
+          let f = Fake.make () and raised = Cell.Once.make () in
+          with_fake_exchange f
+            ~exchange:(fun run ->
+              Printf.sprintf "status %d"
+                (status (run (req ~meth:Method.POST ~body:(endless raised) "/"))) )
+          @@ fun ~server:_ ~t0 ~since c ->
+          (* The server never reads: only an advance can wake the write that
+             waits. A drain of the server wakes the write more than once, and
+             then the test cannot prove which wait is the last. *)
+          Fake.wait_mono_timer f ~since (t0 +: write_w) ;
+          Fake.advance f Mtime.Span.(write_w - ns) ;
+          is_false ~msg:"no write error 1 ns before the write timeout"
+            (set_within_50ms raised) ;
+          Fake.advance f Mtime.Span.ns ;
+          equal string "Caravan_client.Error: write timeout"
+            (within_2s (fun () -> Fun.Async.get c)) ;
+          within_2s (fun () -> Cell.Once.get raised) )
+    ; test "run cancels the bodies at the close grace of the config's time line"
+        (fun () ->
+          main
+          @@ fun () ->
+          with_script_server answer_at_once
+          @@ fun port ->
+          let f = Fake.make () in
+          let t0 = Fake.now f and m = Fake.mark f in
+          let release = Cell.Once.make ()
+          and cancelled = Cell.Once.make ()
+          and returned = Cell.Once.make () in
+          let r =
+            Fun.Async.call (fun () ->
+                C.run ~config:(fake_client_config f) (fun client ->
+                    ignore
+                      (C.request client
+                         (at_port port ~meth:Method.POST
+                            ~body:(held_body ~release ~cancelled)
+                            "/" ) ) ;
+                    Cell.Once.try_set returned () ) )
+          in
+          Stdlib.Fun.protect ~finally:(fun () ->
+              Cell.Once.try_set release () ;
+              Fun.Async.cancel r ;
+              Fake.advance f Mtime.Span.day )
+          @@ fun () ->
+          within_2s (fun () -> Cell.Once.get returned) ;
+          (* The timer of the reaper is at t0 + 6.5 s, and then at
+             t0 + 23.5 s - 1 ns: not at the grace. *)
+          Fake.wait_mono_timer f ~since:m (t0 +: grace_g) ;
+          Fake.advance f Mtime.Span.(grace_g - ns) ;
+          (* Only an advance can end the grace. *)
+          is_false ~msg:"no cancel 1 ns before the grace"
+            (set_within_50ms cancelled) ;
+          Fake.advance f Mtime.Span.ns ;
+          within_2s (fun () -> Cell.Once.get cancelled) ;
           within_2s (fun () -> Fun.Async.get r) ) ]
 
 let () =
