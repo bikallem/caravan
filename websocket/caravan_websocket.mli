@@ -69,6 +69,9 @@ val accept :
       Use {!ping} to keep a connection open through proxies that close idle
       connections.
 
+    The time limits are on the time line of the connection
+    ({!Caravan.Flow.time}), which is [Config.mono_time] of the server.
+
     When [f] ends, [accept] closes the connection with 1000. If [f] raises
     {!Closed} for its connection, the connection is closed already. If [f]
     raises a different exception, [accept] closes the connection with 1011 and

@@ -1070,8 +1070,7 @@ let time_tests =
     ; test "the last time is never enabled" (fun () ->
           let d = Some Affect_unix.Mtime.max_stamp in
           is_false (enabled_within_50ms (Time.at Time.mono d ())) )
-    ; test "src/ and client/ read the time and wait only through Time"
-        (fun () ->
+    ; test "the library reads the time and waits only through Time" (fun () ->
           (* dune runs the test in _build/default/test; dune exec in the
              root. *)
           let root = if Sys.file_exists "../src/time.ml" then ".." else "." in
@@ -1099,8 +1098,8 @@ let time_tests =
             ; "Unix.sleep"
             ; "Unix.select" ]
           in
-          (* The server and the client use the time line of their config or of
-             their flows. *)
+          (* The server, the client and the WebSocket use the time line of their
+             config or of their flows. *)
           let injected =
             ["Time.mono"; "Time.("; "open Time"; "open Caravan.Time"]
           in
@@ -1111,11 +1110,14 @@ let time_tests =
                 Filename.check_suffix file ".ml" && not (List.mem file except) )
           in
           let src = files "src" ~except:["time.ml"; "date.ml"]
-          and client = files "client" ~except:[] in
+          and client = files "client" ~except:[]
+          and websocket = files "websocket" ~except:[] in
           is_true ~msg:"the files of the server are found"
             (List.mem "server.ml" src && List.mem "h1_server.ml" src) ;
           is_true ~msg:"the files of the client are found"
             (List.mem "pool.ml" client && List.mem "config.ml" client) ;
+          is_true ~msg:"the files of the WebSocket are found"
+            (List.mem "connection.ml" websocket) ;
           let check dir file calls =
             let text = read dir file in
             List.iter
@@ -1137,7 +1139,10 @@ let time_tests =
             (fun file ->
               check "client" file
                 (if file = "config.ml" then direct else direct @ injected) )
-            client )
+            client ;
+          List.iter
+            (fun file -> check "websocket" file (direct @ injected))
+            websocket )
     ; test "a sleep waits for its span" (fun () ->
           in_main
           @@ fun () ->

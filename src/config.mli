@@ -52,8 +52,7 @@ type t =
             connections, their deadlines and timeouts, its pause after an accept
             error and its shutdown grace. Its clock must be monotonic. Tests
             give a fake time line. An engine computes the deadlines of a
-            connection with {!Flow.time} of its flow. WebSocket connections
-            compute their deadlines with the system clock at this time. *)
+            connection with {!Flow.time} of its flow. *)
   ; date_header: bool  (** Whether responses get a [Date] field. *)
   ; cancel_on_disconnect: bool
         (** Whether a handler is cancelled when its client closes the connection

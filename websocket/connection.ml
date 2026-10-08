@@ -35,6 +35,9 @@ let is_permitted code =
 
 let protocol t = t.protocol
 
+(* The time line of the deadlines: the time line of the flow. *)
+let time t = Flow.time t.flow
+
 let earlier a b =
   match (a, b) with
   | Some x, Some y ->
@@ -51,16 +54,13 @@ let earlier a b =
    applies. *)
 let set_read_deadline t span =
   Mutex.protect t.deadlines (fun () ->
-      let d =
-        Option.bind span (fun span -> Mtime.add_span (Mtime.now ()) span)
-      in
+      let d = Option.bind span (fun span -> Time.after (time t) span) in
       t.read_at <- earlier d (Atomic.get t.close_at) ;
       Flow.set_read_deadline t.flow t.read_at )
 
 let set_write_deadline t span =
   Mutex.protect t.deadlines (fun () ->
-      t.write_at <-
-        earlier (Mtime.add_span (Mtime.now ()) span) (Atomic.get t.close_at) ;
+      t.write_at <- earlier (Time.after (time t) span) (Atomic.get t.close_at) ;
       Flow.set_write_deadline t.flow t.write_at )
 
 (* The deadline of [close] stops also the reads and writes that wait at this
@@ -242,7 +242,7 @@ let peer_closed t payload =
 let after_close_deadline t =
   match Atomic.get t.close_at with
   | Some c ->
-      not (Mtime.is_earlier (Mtime.now ()) ~than:c)
+      not (Mtime.is_earlier (Time.now (time t)) ~than:c)
   | None ->
       false
 
@@ -385,7 +385,7 @@ let close ?(code = 1000) ?(reason = "") t =
   if not (Cell.Once.is_set t.closed) then begin
     (* Also if a different fiber started the close, for example to reply to the
        peer: we wait at most the close timeout. *)
-    set_close_deadline t (Mtime.add_span (Mtime.now ()) t.close_timeout) ;
+    set_close_deadline t (Time.after (time t) t.close_timeout) ;
     if claim_close t (Closed {code; reason}) then
       write_close t (code_payload code ^ reason)
   end ;
