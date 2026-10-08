@@ -161,11 +161,11 @@ let set_nodelay fd = function
   | Unix.ADDR_UNIX _ ->
       ()
 
-let connect addr =
+let connect ?time addr =
   let fd = Aunix.socket (Unix.domain_of_sockaddr addr) Unix.SOCK_STREAM 0 in
   match Aunix.connect fd addr ; set_nodelay fd addr with
   | () ->
-      flow fd
+      flow ?time fd
   | exception e ->
       Aunix.close_noerr fd ; raise e
 

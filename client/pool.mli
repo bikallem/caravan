@@ -2,13 +2,10 @@
 
 type t
 
-val make :
-     ?now:(unit -> Affect_unix.Mtime.t)
-  -> ?connect:(host:string -> port:int -> Caravan.Flow.t)
-  -> Config.t
-  -> t
-(* [now] and [connect] are for tests. By default, [connect] is
-   Connect.connect. *)
+val make : ?connect:(host:string -> port:int -> Caravan.Flow.t) -> Config.t -> t
+(* [connect] is for tests. By default, [connect] is Connect.connect. Its flows
+   must be on [config.mono_time]: only tests give a different time line. The age
+   of the idle connections is on [config.mono_time]. *)
 
 val checkout :
   ?reuse:bool -> t -> host:string -> port:int -> Conn.t * [`New | `Reused]

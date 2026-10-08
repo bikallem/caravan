@@ -1,12 +1,11 @@
 module Cfg = Config
 open Affect
 open Caravan
-module Mtime = Affect_unix.Mtime
 
 (* [f] in a child call that stops at [deadline]. At the deadline, or at a cancel
    of the caller, the child stops, and [cleanup] gets a value that the child
    made in the race. *)
-let bounded deadline f ~cleanup =
+let bounded time deadline f ~cleanup =
   let c = Fun.Async.call f in
   let stop () =
     Fun.Async.cancel c ;
@@ -17,7 +16,7 @@ let bounded deadline f ~cleanup =
     Action.invoke
       (Action.choose
          [ Action.map (fun v -> `Done v) (Fun.Async.get' c)
-         ; Time.at Time.mono deadline `Timeout ] )
+         ; Time.at time deadline `Timeout ] )
   with
   | `Done v ->
       v
@@ -33,16 +32,21 @@ let bounded deadline f ~cleanup =
    of the lookup: localhost can give ::1 first while a server listens only on
    127.0.0.1. *)
 let connect ?getaddrinfo (config : Cfg.t) ~host ~port =
-  let deadline = Mtime.add_span (Mtime.now ()) config.connect_timeout in
+  let time = config.mono_time in
+  let deadline = Time.after time config.connect_timeout in
   let addrs =
-    bounded deadline (Resolver.resolve ?getaddrinfo ~host ~port) ~cleanup:ignore
+    bounded time deadline
+      (Resolver.resolve ?getaddrinfo ~host ~port)
+      ~cleanup:ignore
   in
   let rec try_each last = function
     | [] ->
         Error.fail (Connect last)
     | addr :: rest -> (
       match
-        bounded deadline (fun () -> Tcp.connect addr) ~cleanup:Flow.close
+        bounded time deadline
+          (fun () -> Tcp.connect ~time addr)
+          ~cleanup:Flow.close
       with
       | flow ->
           flow

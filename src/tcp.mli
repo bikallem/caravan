@@ -17,8 +17,9 @@ val flow : ?time:Time.mono -> Unix.file_descr -> Flow.t
       {!Flow.Closed}. The socket closes when no read or write uses it, thus a
       fiber cannot use the socket of a different connection. *)
 
-val connect : Unix.sockaddr -> Flow.t
-(** [connect addr] connects to [addr] and is the connection's flow.
+val connect : ?time:Time.mono -> Unix.sockaddr -> Flow.t
+(** [connect ~time addr] connects to [addr] and is the connection's flow. Its
+    deadlines are on the time line [time] (default: {!Time.mono}).
 
     @raise Unix.Unix_error
       if the connection fails, for example with [ECONNREFUSED]. *)

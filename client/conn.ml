@@ -9,9 +9,9 @@ type t =
 
 let next_id = Atomic.make 0
 
-let make ~host ~port flow =
+let make ~released_at ~host ~port flow =
   { flow
   ; host
   ; port
   ; id= Atomic.fetch_and_add next_id 1
-  ; released_at= Mtime.now () }
+  ; released_at }

@@ -10,7 +10,8 @@ type t =
   ; max_status_line: int
   ; max_header_bytes: int
   ; max_header_count: int
-  ; close_grace: Mtime.Span.t }
+  ; close_grace: Mtime.Span.t
+  ; mono_time: Caravan.Time.mono }
 
 let default =
   { connect_timeout= Mtime.Span.(10 * s)
@@ -22,7 +23,8 @@ let default =
   ; max_status_line= 8192
   ; max_header_bytes= 65536
   ; max_header_count= 200
-  ; close_grace= Mtime.Span.(5 * s) }
+  ; close_grace= Mtime.Span.(5 * s)
+  ; mono_time= Caravan.Time.mono }
 
 let limits c =
   { Caravan.Private.H1_parse.max_request_line= c.max_status_line

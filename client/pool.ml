@@ -8,14 +8,13 @@ open Caravan
    the lock. *)
 type t =
   { config: Cfg.t
-  ; now: unit -> Mtime.t
   ; connect: host:string -> port:int -> Flow.t
   ; lock: Mutex.t
   ; idle: (string * int, Conn.t list) Hashtbl.t
   ; in_use: (int, Conn.t) Hashtbl.t
   ; mutable closed: bool }
 
-let make ?(now = Mtime.now) ?connect config =
+let make ?connect config =
   let connect =
     match connect with
     | Some c ->
@@ -24,7 +23,6 @@ let make ?(now = Mtime.now) ?connect config =
         fun ~host ~port -> Connect.connect config ~host ~port
   in
   { config
-  ; now
   ; connect
   ; lock= Mutex.create ()
   ; idle= Hashtbl.create 8
@@ -51,7 +49,7 @@ let take t key =
 let too_old t (c : Conn.t) =
   match Mtime.add_span c.released_at t.config.idle_timeout with
   | Some d ->
-      not (Mtime.is_earlier (t.now ()) ~than:d)
+      not (Mtime.is_earlier (Time.now t.config.mono_time) ~than:d)
   | None ->
       false
 
@@ -83,7 +81,11 @@ let rec checkout ?(reuse = true) t ~host ~port =
   | Some c ->
       (c, `Reused)
   | None ->
-      let c = Conn.make ~host:(fst key) ~port (t.connect ~host ~port) in
+      let flow = t.connect ~host ~port in
+      let c =
+        Conn.make ~released_at:(Time.now t.config.mono_time) ~host:(fst key)
+          ~port flow
+      in
       let added =
         Mutex.protect t.lock (fun () ->
             if t.closed then false
@@ -103,7 +105,7 @@ let release t (c : Conn.t) ~reusable =
           reusable && (not t.closed)
           && List.length idle < t.config.max_idle_per_host
         then begin
-          c.released_at <- t.now () ;
+          c.released_at <- Time.now t.config.mono_time ;
           Hashtbl.replace t.idle key (c :: idle) ;
           true
         end

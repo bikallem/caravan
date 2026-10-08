@@ -92,12 +92,13 @@ let stop t =
 
 (* Takes no more jobs, and waits at most [grace] for the jobs that run: the
    supervisor call ends after its children. *)
-let finish t ~grace =
+let finish t ~time ~grace =
   Cell.Once.try_set t.stopping () ;
   let ended = Action.map (fun () -> `Ended) (Fun.Async.get' t.supervisor) in
   match
     Action.invoke
-      (Action.choose [ended; Caravan.Time.(at mono (after mono grace)) `Late])
+      (Action.choose
+         [ended; Caravan.Time.at time (Caravan.Time.after time grace) `Late] )
   with
   | `Ended | `Late ->
       ()
