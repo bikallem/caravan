@@ -50,7 +50,8 @@ module Config : sig
     ; max_header_count: int  (** The limit of the number of response fields. *)
     ; close_grace: Affect_unix.Mtime.Span.t
           (** The time that {!run} gives to the request bodies that still go at
-              its end, before it cancels them. *) }
+              its end, before it cancels them. A grace of about 292 years or
+              more never ends. *) }
 
   val default : t
   (** [default] has the limits 10 s (connect), 30 s (response, read, write), 5 s

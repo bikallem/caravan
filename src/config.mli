@@ -45,7 +45,8 @@ type t =
   ; shutdown_grace: Affect_unix.Mtime.Span.t
         (** Time in-flight requests get to finish when the server stops. Then
             the server cancels them. A handler can see the stop with
-            {!Conn_info.stopping}. *)
+            {!Conn_info.stopping}. A grace of about 292 years or more never
+            ends. *)
   ; date_header: bool  (** Whether responses get a [Date] field. *)
   ; cancel_on_disconnect: bool
         (** Whether a handler is cancelled when its client closes the connection

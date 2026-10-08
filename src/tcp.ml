@@ -60,9 +60,9 @@ let rec wait s ready d =
     match at with
     | None ->
         Action.never
-    | Some d ->
+    | Some deadline ->
         (* A passed deadline wins over the other events. *)
-        if not (Mtime.is_earlier (Time.now Time.mono) ~than:d) then
+        if not (Mtime.is_earlier (Time.now Time.mono) ~than:deadline) then
           raise Flow.Timeout ;
         Time.at Time.mono at `Timeout
   in

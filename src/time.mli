@@ -53,8 +53,9 @@ val after : ('time, 'span) t -> 'span -> 'time option
     representable. *)
 
 val sleep : (_, 'span) t -> 'span -> unit
-(** [sleep t span] waits until the deadline [after t span]. A span with no
-    representable end waits forever. *)
+(** [sleep t span] waits until the deadline [after t span]. It waits forever if
+    the deadline is not representable, or if the timer of [t] never enables it
+    (see {!mono}). *)
 
 (** {1:system System time lines} *)
 

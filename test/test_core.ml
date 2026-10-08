@@ -1044,8 +1044,20 @@ let enabled_within_50ms action =
 let time_tests =
   group "Time"
     [ test "a deadline that has passed is enabled at once" (fun () ->
-          let d = Some (Affect_unix.Mtime.now ()) in
+          (* 1 s ago: a timer that waits for the time that has passed waits 1
+             s. *)
+          let d = Affect_unix.Mtime.(sub_span (now ()) Span.s) in
+          is_true ~msg:"representable" (Option.is_some d) ;
           is_true (enabled_within_50ms (Time.at Time.mono d ())) )
+    ; test "a timer reads the time when it is invoked" (fun () ->
+          let timer =
+            Time.at Time.mono
+              (Time.after Time.mono Affect_unix.Mtime.Span.(100 * ms))
+              ()
+          in
+          in_main (fun () ->
+              Affect_unix.Mtime.wait_for Affect_unix.Mtime.Span.(100 * ms) ) ;
+          is_true (enabled_within_50ms timer) )
     ; test "a deadline 10 ms ahead is enabled" (fun () ->
           let d = Time.after Time.mono Affect_unix.Mtime.Span.(10 * ms) in
           is_true (enabled_within_50ms (Time.at Time.mono d ())) )
