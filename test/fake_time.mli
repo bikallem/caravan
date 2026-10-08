@@ -22,9 +22,10 @@ val now : t -> Mtime.t
 
 val advance : t -> Mtime.Span.t -> unit
 (** [advance t span] moves the time forward by [span]. Then each timer whose
-    deadline is at or before the new time is enabled, in the order of the
-    deadlines. Raises [Invalid_argument] if the time leaves the range of
-    [Mtime.t]. *)
+    deadline is at or before the new time is enabled. [advance] enables them in
+    the order of the deadlines, but the calls that wait for them run in the
+    order of the scheduler. Raises [Invalid_argument] if the time leaves the
+    range of [Mtime.t]. *)
 
 (** The type for a point in the log of the timers. *)
 type mark

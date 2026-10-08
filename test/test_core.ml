@@ -1093,8 +1093,13 @@ let ( +: ) t span = Option.get (Affect_unix.Mtime.add_span t span)
    ever: [Unix.main] would wait for it. *)
 let calls = ref []
 
+(* One domain unless TEST_DOMAINS says otherwise. *)
+let domain_count =
+  Option.value ~default:1
+    (Option.bind (Sys.getenv_opt "TEST_DOMAINS") int_of_string_opt)
+
 (* [f] in [Unix.main]. At its end, the calls of the test are cancelled. *)
-let fake_main ?(domain_count = 1) f =
+let fake_main ?(domain_count = domain_count) f =
   calls := [] ;
   Affect_unix.Unix.main ~domain_count
   @@ fun () ->
@@ -1159,7 +1164,11 @@ let fake_time_tests =
           let f = Fake.make () in
           let d = Fake.now f +: ms 500 in
           Fake.advance f (sec 1) ;
-          is_true (ends_within_2s (timer_call f d)) )
+          (* A timer that is due at once is in the log too. *)
+          let m = Fake.mark f in
+          let c = timer_call f d in
+          Fake.wait_mono_timer f ~since:m d ;
+          is_true (ends_within_2s c) )
     ; test "a wait for a timer sees only the timers after its mark" (fun () ->
           fake_main
           @@ fun () ->
@@ -1173,6 +1182,14 @@ let fake_time_tests =
           | exception Fake.No_timer _ ->
               () ) ;
           let c2 = waiting_call f d in
+          ( match
+              Fake.wait_mono_timer ~guard:(ms 50) f ~since:m
+                (d +: Affect_unix.Mtime.Span.ns)
+            with
+          | () ->
+              fail "a timer at a different deadline"
+          | exception Fake.No_timer _ ->
+              () ) ;
           Fake.advance f (sec 10) ;
           is_true (ends_within_2s c1) ;
           is_true (ends_within_2s c2) )
@@ -1181,9 +1198,9 @@ let fake_time_tests =
           @@ fun () ->
           let f = Fake.make () in
           let d = Fake.now f +: sec 10 in
-          let calls = List.init 8 (fun _ -> waiting_call f d) in
+          let waiting = List.init 8 (fun _ -> waiting_call f d) in
           Fake.advance f (sec 10) ;
-          List.iter (fun c -> is_true (ends_within_2s c)) calls )
+          List.iter (fun c -> is_true (ends_within_2s c)) waiting )
     ; test "the fake time works outside Unix.main" (fun () ->
           let f = Fake.make () in
           let t0 = Time.now (Fake.mono f) in
@@ -1246,6 +1263,8 @@ let flow_time_tests =
   group "Flow time"
     [ test "a flow keeps its time line" (fun () ->
           let f = Fake.make () and a, b = socket_pair () in
+          Fun.protect ~finally:(fun () -> Unix.close a ; Unix.close b)
+          @@ fun () ->
           let flow = Tcp.flow ~time:(Fake.mono f) a in
           is_true ~msg:"Tcp.flow ~time" (Flow.time flow == Fake.mono f) ;
           is_true ~msg:"prepend"
@@ -1254,8 +1273,9 @@ let flow_time_tests =
             (Flow.time (Tcp.flow b) == Time.mono) ;
           is_true ~msg:"the default of of_string"
             (Flow.time (Flow.of_string "" (Buffer.create 0)) == Time.mono) ;
-          Unix.close a ;
-          Unix.close b )
+          is_true ~msg:"of_string ~time"
+            ( Flow.time (Flow.of_string ~time:(Fake.mono f) "" (Buffer.create 0))
+            == Fake.mono f ) )
     ; test "a tcp flow waits for its deadlines on its time line" (fun () ->
           let a, b = socket_pair () in
           Fun.protect ~finally:(fun () -> Unix.close a ; Unix.close b)

@@ -107,6 +107,22 @@ let advance t span =
 
 let mark t = locked t.state (fun () -> t.state.count)
 
+(* The deadline [d] as a span after the fake time, for messages. *)
+let pp_deadline st ppf d =
+  if Mtime.is_earlier d ~than:st.now then
+    Format.fprintf ppf "now - %a" Mtime.Span.pp (Mtime.span d st.now)
+  else Format.fprintf ppf "now + %a" Mtime.Span.pp (Mtime.span st.now d)
+
+let no_timer st ~since d =
+  locked st (fun () ->
+      let after = List.filter (fun (n, _) -> n > since) st.log in
+      Format.asprintf "no timer at %a; the timers after the mark: [%a]"
+        (pp_deadline st) d
+        (Format.pp_print_list
+           ~pp_sep:(fun ppf () -> Format.pp_print_string ppf "; ")
+           (fun ppf (_, d) -> pp_deadline st ppf d) )
+        (List.rev after) )
+
 let wait_mono_timer ?(guard = Mtime.Span.(2 * s)) t ~since d =
   let st = t.state in
   let late = Time.after Time.mono guard in
@@ -117,15 +133,16 @@ let wait_mono_timer ?(guard = Mtime.Span.(2 * s)) t ~since d =
           , st.changed ) )
     in
     if not found then
+      (* [`Late] is first: the guard holds also if timers come all the time. *)
       match
         Action.invoke
           (Action.choose
-             [ Action.map (fun () -> `Changed) (Cell.Once.get' changed)
-             ; Time.at Time.mono late `Late ] )
+             [ Time.at Time.mono late `Late
+             ; Action.map (fun () -> `Changed) (Cell.Once.get' changed) ] )
       with
       | `Changed ->
           loop ()
       | `Late ->
-          raise (No_timer (Format.asprintf "no timer at %a" Mtime.pp d))
+          raise (No_timer (no_timer st ~since d))
   in
   loop ()
