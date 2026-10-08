@@ -2484,6 +2484,19 @@ let fake_time_tests =
             (ends_within_50ms sender) ;
           Fake.advance f Mtime.Span.ns ;
           equal string "closed 1006 \"\"" (result sender) )
+    ; test "each frame gets a new write deadline" (fun () ->
+          let f = Fake.make () in
+          with_fake_socket f
+          @@ fun c _peer ->
+          Ws.send c (Text "one") ;
+          Fake.advance f Mtime.Span.(ws_write - ns) ;
+          let t1 = Fake.now f and m = Fake.mark f in
+          (* The peer never reads: the second frame waits from t1. *)
+          with_call (fun () -> Ws.send c (Binary (String.make 10_000_000 'x')))
+          @@ fun sender ->
+          Fake.wait_mono_timer f ~since:m (t1 +: ws_write) ;
+          Fake.advance f ws_write ;
+          equal string "closed 1006 \"\"" (result sender) )
     ; test "close ends at the close timeout and not 1 ns before" (fun () ->
           let f = Fake.make () in
           with_fake_socket ~idle:false f
@@ -2561,10 +2574,11 @@ let fake_time_tests =
           in
           (* The handler reads the first frame. Then it waits for a frame until
              the idle timeout. *)
+          let first = Affect.Cell.Once.make () in
           let handler req =
             Ws.accept ~close_timeout:ws_close ~write_timeout:ws_write
               ~read_timeout:ws_read ~idle_timeout:ws_idle req (fun c ->
-                ignore (Ws.recv c) ;
+                Affect.Cell.Once.try_set first (Ws.recv c) ;
                 ignore (Ws.recv c) )
           in
           let t0 = Fake.now f and m = Fake.mark f in
@@ -2587,7 +2601,10 @@ let fake_time_tests =
           Fake.wait_mono_timer f ~since:m (t0 +: ws_idle) ;
           Fake.advance f ws_idle ;
           equal string "close 1001"
-            (show_frame (Frame.read r ~masked:false ~max:125)) ) ]
+            (show_frame (Frame.read r ~masked:false ~max:125)) ;
+          is_true ~msg:"the first frame"
+            (within_2s (fun () -> Affect.Cell.Once.get first) = Text "early") )
+    ]
 
 let () =
   exit
