@@ -1082,9 +1082,6 @@ let with_socket ?time ?close_timeout ?write_timeout ?read_timeout ?idle_timeout
 
 let ms n = Affect_unix.Mtime.Span.(n * ms)
 
-let elapsed_ms c =
-  Affect_unix.Mtime.Span.to_float_ns (Affect_unix.Mtime.count c) /. 1e6
-
 (* [f ()], in a call that must end in 2 s. If not, the test cancels the call and
    fails, so that a regression does not stop the suite. *)
 let within_2s f = Server_support.within_2s f
@@ -1188,51 +1185,6 @@ let socket_tests =
           within_2s (fun () -> Ws.close c) ;
           equal int 1000 (closed_code (fun () -> Ws.recv c)) ;
           ignore (Fun.Async.get sender) )
-    ; test
-        "the end of the handler does not stop the closing handshake of a stop"
-        (fun () ->
-          let open Affect in
-          with_flows
-          @@ fun server peer ->
-          let stop = Cell.Once.make () and raised = Cell.Once.make () in
-          let handler =
-            Fun.Async.call (fun () ->
-                run_handler ~stopping:(Cell.Once.get' stop)
-                  ~close_timeout:(ms 1000)
-                  (fun c ->
-                    (* The peer does not read yet: the send holds the writer,
-                       and the Close frame of the stop waits for it. *)
-                    ignore
-                      (Fun.Async.call (fun () ->
-                           try Ws.send c (Binary (String.make 4_000_000 'x'))
-                           with Ws.Closed _ -> () ) ) ;
-                    Cell.Once.get stop ;
-                    wait_closing c ;
-                    Cell.Once.try_set raised () ;
-                    raise (Ws.Closed {code= 1001; reason= "server shutdown"}) )
-                  server )
-          in
-          let r = Buf_reader.of_flow peer in
-          is_false (Buf_reader.peek_eof r) ;
-          Cell.Once.try_set stop () ;
-          (* The peer reads after the end of the handler. The wait of 50 ms only
-             gives the end of the handler time to act: the result of correct
-             code does not depend on it. *)
-          within_2s (fun () -> Cell.Once.get raised) ;
-          Affect_unix.Mtime.wait_for (ms 50) ;
-          let first = Frame.read r ~masked:false ~max:max_int in
-          let second =
-            match Frame.read r ~masked:false ~max:125 with
-            | f ->
-                Caravan.Flow.write_string peer (client Close f.payload) ;
-                show_frame f
-            | exception End_of_file ->
-                "end of the stream"
-          in
-          within_2s (fun () -> Fun.Async.get handler) ;
-          equal (list string)
-            ["binary"; "close 1001 \"server shutdown\""]
-            [opcode_name first.opcode; second] )
     ; (* A cancel in the middle of a frame closes the connection, because the
          stream is out of step. The fake time tests have the cancels of a
          recv. *)
@@ -1748,108 +1700,6 @@ let server_tests =
             (Some
                "Caravan_websocket__Connection.Closed(1001, \"server shutdown\")"
             ) (Atomic.get recorded) )
-    ; test
-        "a handler that does not use the connection gets Close 1001, then the \
-         cancel" (fun () ->
-          let errors = ref [] in
-          let config =
-            { Server_support.config with
-              shutdown_grace= ms 300
-            ; on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
-            }
-          in
-          let t = ref (Affect_unix.Mtime.counter ()) in
-          let s =
-            Server_support.with_server ~config ~handler:server_handler
-              (fun server ->
-                within_2s (fun () ->
-                    session server "/wait" ~during:(fun () ->
-                        t := Affect_unix.Mtime.counter () ;
-                        Caravan.Server.shutdown server ) ) )
-          in
-          let took = elapsed_ms !t in
-          equal string "close 1001 \"server shutdown\""
-            (List.nth (String.split_on_char '\n' s) 5) ;
-          is_true
-            ~msg:(Printf.sprintf "stopped after %.0fms" took)
-            (took >= 290.) ;
-          equal (list string) [] !errors )
-    ; test
-        "a cancel at the grace while the stop waits for the reply is not an \
-         error" (fun () ->
-          let errors = ref [] in
-          let config =
-            { Server_support.config with
-              shutdown_grace= ms 300
-            ; on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
-            }
-          in
-          let s =
-            Server_support.with_server ~config ~handler:server_handler
-              (fun server ->
-                within_2s (fun () ->
-                    session server "/wait-slow-close" ~reply:false
-                      ~during:(fun () -> Caravan.Server.shutdown server ) ) )
-          in
-          equal string "close 1001 \"server shutdown\""
-            (List.nth (String.split_on_char '\n' s) 5) ;
-          equal (list string) [] !errors )
-    ; test
-        "a peer that does not reply to Close 1001 gets the end of the stream \
-         at the close timeout" (fun () ->
-          let t = ref (Affect_unix.Mtime.counter ()) and took = ref 0. in
-          let s =
-            Server_support.with_server ~handler:server_handler (fun server ->
-                let s =
-                  within_2s (fun () ->
-                      session server "/echo-fast" ~reply:false
-                        ~during:(fun () ->
-                          t := Affect_unix.Mtime.counter () ;
-                          Caravan.Server.shutdown server ) )
-                in
-                took := elapsed_ms !t ;
-                s )
-          in
-          equal string "close 1001 \"server shutdown\""
-            (List.nth (String.split_on_char '\n' s) 5) ;
-          is_true ~msg:(Printf.sprintf "ended after %.0fms" !took) (!took >= 90.) )
-    ; test "a handler that only sends gets the full closing handshake"
-        (fun () ->
-          let errors = ref [] in
-          let config =
-            { Server_support.config with
-              shutdown_grace= ms 30_000
-            ; on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
-            }
-          in
-          started := Affect.Cell.Once.make () ;
-          let t = ref (Affect_unix.Mtime.counter ()) and took = ref 0. in
-          let s =
-            Server_support.with_server ~config ~handler:server_handler
-              (fun server ->
-                let s =
-                  within_2s (fun () ->
-                      session server "/ticker" ~reply:false ~during:(fun () ->
-                          within_2s (fun () -> Affect.Cell.Once.get !started) ;
-                          t := Affect_unix.Mtime.counter () ;
-                          Caravan.Server.shutdown server ) )
-                in
-                took := elapsed_ms !t ;
-                s )
-          in
-          let frames =
-            List.filteri (fun i _ -> i > 4) (String.split_on_char '\n' s)
-          in
-          is_true ~msg:"one or more ticks" (List.hd frames = "text \"tick\"") ;
-          equal (list string)
-            ["close 1001 \"server shutdown\""]
-            (List.filter (fun f -> f <> "text \"tick\"") frames) ;
-          equal string "close 1001 \"server shutdown\""
-            (List.nth frames (List.length frames - 1)) ;
-          is_true
-            ~msg:(Printf.sprintf "ended after %.0fms" !took)
-            (!took >= 290.) ;
-          equal (list string) [] !errors )
     ; test "a stop before the handler starts sends the 101, then Close 1001"
         (fun () ->
           let open Affect in
@@ -2512,6 +2362,60 @@ let fake_time_tests =
           Caravan.Flow.write_string peer (client Continuation "lo") ;
           equal int 1006
             (within_2s (fun () -> closed_code (fun () -> Ws.recv c))) )
+    ; test
+        "the end of the handler does not stop the closing handshake of a stop"
+        (fun () ->
+          let open Affect in
+          let f = Fake.make () in
+          with_flows ~time:(Fake.mono f)
+          @@ fun server peer ->
+          Stdlib.Fun.protect ~finally:(fun () -> Fake.advance f Mtime.Span.day)
+          @@ fun () ->
+          let stop = Cell.Once.make () and raised = Cell.Once.make () in
+          let close = Mtime.Span.(37 * s) in
+          let handler =
+            Fun.Async.call (fun () ->
+                run_handler ~stopping:(Cell.Once.get' stop) ~close_timeout:close
+                  (fun c ->
+                    (* The peer does not read yet: the send holds the writer,
+                       and the Close frame of the stop waits for it. *)
+                    ignore
+                      (Fun.Async.call (fun () ->
+                           try Ws.send c (Binary (String.make 10_000_000 'x'))
+                           with Ws.Closed _ -> () ) ) ;
+                    Cell.Once.get stop ;
+                    wait_closing c ;
+                    Cell.Once.try_set raised () ;
+                    raise (Ws.Closed {code= 1001; reason= "server shutdown"}) )
+                  server )
+          in
+          Stdlib.Fun.protect ~finally:(fun () -> Fun.Async.cancel handler)
+          @@ fun () ->
+          let r = Buf_reader.of_flow peer in
+          is_false (within_2s (fun () -> Buf_reader.peek_eof r)) ;
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          Cell.Once.try_set stop () ;
+          within_2s (fun () -> Cell.Once.get raised) ;
+          (* The read of the close is the only read: its timer proves that after
+             the end of the handler, the connection waits for the end of the
+             closing handshake. Then the peer reads. *)
+          Fake.wait_mono_timer f ~since:m (t0 +: close) ;
+          let first =
+            within_2s (fun () -> Frame.read r ~masked:false ~max:max_int)
+          in
+          let second =
+            within_2s (fun () ->
+                match Frame.read r ~masked:false ~max:125 with
+                | f ->
+                    Caravan.Flow.write_string peer (client Close f.payload) ;
+                    show_frame f
+                | exception End_of_file ->
+                    "end of the stream" )
+          in
+          within_2s (fun () -> Fun.Async.get handler) ;
+          equal (list string)
+            ["binary"; "close 1001 \"server shutdown\""]
+            [opcode_name first.opcode; second] )
     ; test "an upgraded connection keeps the time line of the server" (fun () ->
           let f = Fake.make () in
           let config =
@@ -2558,6 +2462,133 @@ let fake_time_tests =
             (within_2s (fun () -> Affect.Cell.Once.get first) = Text "early") )
     ]
 
+(* The server on a fake time line *)
+
+(* [Server_support.fake_config] with an idle timeout of 41 s: the default close
+   timeout of a WebSocket connection is 5 s, the idle timeout of [fake_config].
+   The errors go to [errors]. *)
+let fake_server_config f errors =
+  { (Server_support.fake_config f) with
+    idle_timeout= Mtime.Span.(41 * s)
+  ; on_error= (fun e _ -> errors := Printexc.to_string e :: !errors) }
+
+(* [session server path] in a child call. [test] gets the call when the response
+   head came. The call is cancelled at the end. *)
+let with_session ?reply server path test =
+  let head = Affect.Cell.Once.make () in
+  let call =
+    Affect.Fun.Async.call (fun () ->
+        session ?reply server path ~during:(fun () ->
+            Affect.Cell.Once.try_set head () ) )
+  in
+  Stdlib.Fun.protect ~finally:(fun () -> Affect.Fun.Async.cancel call)
+  @@ fun () ->
+  within_2s (fun () -> Affect.Cell.Once.get head) ;
+  test call
+
+(* The Close frame of the server in the result of [session]. *)
+let server_close s = List.nth (String.split_on_char '\n' s) 5
+
+let fake_server_tests =
+  group "Server on a fake time line"
+    [ test
+        "a handler that does not use the connection gets Close 1001, then the \
+         cancel" (fun () ->
+          let f = Fake.make () and errors = ref [] in
+          Server_support.with_fake_time_server f
+            ~config:(fake_server_config f errors) ~handler:server_handler
+            (fun server ->
+              with_session server "/wait"
+              @@ fun exchange ->
+              let t0 = Fake.mono_now f and m = Fake.mark f in
+              Caravan.Server.shutdown server ;
+              (* The peer replies to the Close frame, and the session ends. The
+                 handler waits until the grace. *)
+              let s = within_2s (fun () -> Affect.Fun.Async.get exchange) in
+              equal string "close 1001 \"server shutdown\"" (server_close s) ;
+              let grace = Server_support.grace_g in
+              with_call (fun () -> Caravan.Server.wait server)
+              @@ fun wait ->
+              Fake.wait_mono_timer f ~since:m (t0 +: grace) ;
+              Fake.advance f Mtime.Span.(grace - ns) ;
+              is_false ~msg:"no end 1 ns before the grace"
+                (ends_within_50ms wait) ;
+              Fake.advance f Mtime.Span.ns ;
+              equal string "ended" (result wait) ) ;
+          equal (list string) [] !errors )
+    ; test
+        "a cancel at the grace while the stop waits for the reply is not an \
+         error" (fun () ->
+          let f = Fake.make () and errors = ref [] in
+          (* The grace of 1 s ends before the close timeout of 2 s of the
+             handler. *)
+          let config =
+            {(fake_server_config f errors) with shutdown_grace= Mtime.Span.s}
+          in
+          Server_support.with_fake_time_server f ~config ~handler:server_handler
+            (fun server ->
+              with_session ~reply:false server "/wait-slow-close"
+              @@ fun exchange ->
+              let t0 = Fake.mono_now f and m = Fake.mark f in
+              Caravan.Server.shutdown server ;
+              (* The close timer proves that the stop waits for the reply. *)
+              Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.(2 * s)) ;
+              Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.s) ;
+              Fake.advance f Mtime.Span.s ;
+              let s = within_2s (fun () -> Affect.Fun.Async.get exchange) in
+              equal string "close 1001 \"server shutdown\"" (server_close s) ) ;
+          equal (list string) [] !errors )
+    ; test
+        "a peer that does not reply to Close 1001 gets the end of the stream \
+         at the close timeout" (fun () ->
+          let f = Fake.make () and errors = ref [] in
+          Server_support.with_fake_time_server f
+            ~config:(fake_server_config f errors) ~handler:server_handler
+            (fun server ->
+              with_session ~reply:false server "/echo-fast"
+              @@ fun exchange ->
+              let t0 = Fake.mono_now f and m = Fake.mark f in
+              Caravan.Server.shutdown server ;
+              let close = Mtime.Span.(100 * ms) in
+              Fake.wait_mono_timer f ~since:m (t0 +: close) ;
+              Fake.advance f Mtime.Span.(close - ns) ;
+              is_false ~msg:"no end 1 ns before the close timeout"
+                (ends_within_50ms exchange) ;
+              Fake.advance f Mtime.Span.ns ;
+              let s = within_2s (fun () -> Affect.Fun.Async.get exchange) in
+              equal string "close 1001 \"server shutdown\"" (server_close s) ) ;
+          equal (list string) [] !errors )
+    ; test "a handler that only sends gets the full closing handshake"
+        (fun () ->
+          let f = Fake.make () and errors = ref [] in
+          started := Affect.Cell.Once.make () ;
+          Server_support.with_fake_time_server f
+            ~config:(fake_server_config f errors) ~handler:server_handler
+            (fun server ->
+              with_session ~reply:false server "/ticker"
+              @@ fun exchange ->
+              within_2s (fun () -> Affect.Cell.Once.get !started) ;
+              let t0 = Fake.mono_now f and m = Fake.mark f in
+              Caravan.Server.shutdown server ;
+              (* The close waits for the reply until the close timeout. *)
+              let close = Mtime.Span.(300 * ms) in
+              Fake.wait_mono_timer f ~since:m (t0 +: close) ;
+              Fake.advance f Mtime.Span.(close - ns) ;
+              is_false ~msg:"no end 1 ns before the close timeout"
+                (ends_within_50ms exchange) ;
+              Fake.advance f Mtime.Span.ns ;
+              let s = within_2s (fun () -> Affect.Fun.Async.get exchange) in
+              let frames =
+                List.filteri (fun i _ -> i > 4) (String.split_on_char '\n' s)
+              in
+              is_true ~msg:"one or more ticks" (List.hd frames = "text \"tick\"") ;
+              equal (list string)
+                ["close 1001 \"server shutdown\""]
+                (List.filter (fun f -> f <> "text \"tick\"") frames) ;
+              equal string "close 1001 \"server shutdown\""
+                (List.nth frames (List.length frames - 1)) ) ;
+          equal (list string) [] !errors ) ]
+
 let () =
   exit
     (run "websocket"
@@ -2570,4 +2601,5 @@ let () =
        ; socket_tests
        ; handshake_tests
        ; server_tests
-       ; fake_time_tests ] )
+       ; fake_time_tests
+       ; fake_server_tests ] )
