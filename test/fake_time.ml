@@ -170,6 +170,8 @@ let within_50ms a =
     (Action.choose
        [Action.map (fun _ -> true) a; Mtime.wait_for' Mtime.Span.(50 * ms) false] )
 
+let ends_within_50ms c = within_50ms (Fun.Async.get' c)
+
 let with_call_at_timer t d f test =
   let m = mark t in
   let c = Fun.Async.call f in

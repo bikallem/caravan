@@ -169,7 +169,7 @@ let integration_tests =
           @@ fun () ->
           Flow.set_read_deadline flow
             (Mtime.add_span (Mtime.now ()) Mtime.Span.(2 * s)) ;
-          Flow.write_string flow (get "/drip") ;
+          Flow.write_string flow (get "/") ;
           let rec header () =
             if Buf_reader.read_line r ~max:1000 <> "" then header ()
           in
@@ -352,12 +352,6 @@ let upgrade_tests =
 (* Clients that leave while their handler runs *)
 
 let disconnect_tests =
-  let within limit cell =
-    Action.invoke
-      (Action.choose
-         [ Action.map (fun () -> true) (Cell.Once.get' cell)
-         ; Mtime.wait_for' Mtime.Span.(limit * ms) false ] )
-  in
   let reset () =
     waiting := Cell.Once.make () ;
     cancelled := Cell.Once.make ()
@@ -367,12 +361,15 @@ let disconnect_tests =
           reset () ;
           with_server
           @@ fun server ->
+          (* The handler waits 10 s if no cancel comes. On a failure, the abort
+             cancels it: the test does not wait for the 10 s. *)
+          Fun.protect ~finally:(fun () -> Server.abort server)
+          @@ fun () ->
           let flow, _ = connect server in
           Flow.write_string flow (get "/wait") ;
           within_2s (fun () -> Cell.Once.get !waiting) ;
           Flow.close flow ;
-          (* The handler waits 10 s if no cancel comes. *)
-          is_true ~msg:"cancelled" (within 2000 !cancelled) )
+          within_2s (fun () -> Cell.Once.get !cancelled) )
     ; test "the cancellation reaches the handler's upstream connection"
         (fun () ->
           reset () ;

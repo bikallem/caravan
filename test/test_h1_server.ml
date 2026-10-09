@@ -286,18 +286,9 @@ let idle_i = Server_support.idle_i
 (* The spans of [Server_support], on the fake time line [f]. *)
 let fake_config = Server_support.fake_config
 
-(* The result of the call [c] within 2 s of real time. *)
-let ended c = Server_support.within_2s (fun () -> Fun.Async.get c)
+let get_2s = Server_support.get_2s
 
-(* For a call [c] that only an advance can end: after the mark [since], the call
-   made a timer for [span] after [t0]. It does not end 1 ns before that
-   deadline, and it ends at it. The fake time must be at [t0]. *)
-let ends_at f ~since ~t0 span c =
-  Fake.wait_mono_timer f ~since (t0 +: span) ;
-  Fake.advance f Affect_unix.Mtime.Span.(span - ns) ;
-  is_false ~msg:"ended 1 ns before" (Fake.within_50ms (Fun.Async.get' c)) ;
-  Fake.advance f Affect_unix.Mtime.Span.ns ;
-  ended c
+let ends_at = Server_support.ends_at
 
 let connection_tests =
   group "H1_server connections"
@@ -1114,10 +1105,9 @@ let timeout_tests =
               Fake.wait_mono_timer f ~since:m2 (t0 +: header_h) ;
               equal int ~msg:"wakeups" 1 (Atomic.get woken) ;
               Fake.advance f Affect_unix.Mtime.Span.(header_h - s - ns) ;
-              is_false ~msg:"ended 1 ns before"
-                (Fake.within_50ms (Fun.Async.get' c)) ;
+              is_false ~msg:"ended 1 ns before" (Fake.ends_within_50ms c) ;
               Fake.advance f Affect_unix.Mtime.Span.ns ;
-              ended c ) )
+              get_2s c ) )
     ; test "a wakeup without input does not hold up a stopping server"
         (fun () ->
           (* The server stops when the flow finds nothing to read. *)

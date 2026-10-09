@@ -58,6 +58,11 @@ val within_50ms : _ Affect.Action.t -> bool
 (** [within_50ms a] is [true] if [a] is enabled within 50 ms of real time. Call
     it in [Unix.main]. *)
 
+val ends_within_50ms : _ Affect.Fun.Async.t -> bool
+(** [ends_within_50ms c] is [true] if the call [c] ends within 50 ms of real
+    time. If [c] ends with an exception, it raises the exception. Call it in
+    [Unix.main]. *)
+
 val with_call_at_timer :
   t -> Mtime.t -> (unit -> 'a) -> ('a Affect.Fun.Async.t -> 'b) -> 'b
 (** [with_call_at_timer t d f test] takes a mark, starts [f] in a call, waits
