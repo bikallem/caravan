@@ -1046,45 +1046,6 @@ let close_tests =
             --
             close 1000
             |} )
-    ; test "close stops at the time limit if the peer sends without a stop"
-        (fun () ->
-          (* A flow that always has bytes: a read never waits for its deadline.
-             The peer sends 100 000 000 frames, then ends. A read of all of them
-             takes many seconds. *)
-          let frame = client Binary "" and count = 100_000_000 in
-          let size = String.length frame in
-          let total = count * size and pos = ref 0 in
-          let read buf off len =
-            let n = Int.min len (total - !pos) in
-            for i = 0 to n - 1 do
-              Bytes.set buf (off + i) frame.[(!pos + i) mod size]
-            done ;
-            pos := !pos + n ;
-            n
-          in
-          let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
-          let flow =
-            Caravan.Flow.make ~time:Caravan.Time.mono ~read
-              ~read_now:(fun b o l -> Some (read b o l))
-              ~write:(fun _ _ _ -> ())
-              ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
-              ~close:ignore ~set_read_deadline:ignore_deadline
-              ~set_write_deadline:ignore_deadline ()
-          in
-          let t = Affect_unix.Mtime.counter () in
-          Affect_unix.Unix.main ~domain_count:1 (fun () ->
-              Ws.close
-                (Ws.Private.of_flow
-                   ~close_timeout:Affect_unix.Mtime.Span.(50 * ms)
-                   flow ) ) ;
-          let took =
-            Affect_unix.Mtime.Span.to_float_ns (Affect_unix.Mtime.count t)
-            /. 1e6
-          in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 2000.) ;
-          is_true
-            ~msg:(Printf.sprintf "read %d of %d bytes" !pos total)
-            (!pos < total) )
     ; test "close examines its code and its reason" (fun () ->
           (* The largest reason: 123 bytes of UTF-8. *)
           let reason = String.make 120 'x' ^ "\xe2\x82\xac" in
@@ -1183,19 +1144,6 @@ let socket_tests =
           done ;
           Fun.Async.get a ;
           Fun.Async.get b )
-    ; test "close stops at the time limit if the peer does not reply" (fun () ->
-          with_socket ~close_timeout:(ms 50)
-          @@ fun c peer ->
-          let t = Affect_unix.Mtime.counter () in
-          within_2s (fun () -> Ws.close c) ;
-          let took = elapsed_ms t in
-          is_true
-            ~msg:(Printf.sprintf "took %.0fms" took)
-            (took >= 40. && took < 2000.) ;
-          equal string "close 1000"
-            (show_frame
-               (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125) ) ;
-          equal int 1006 (closed_code (fun () -> Ws.recv c)) )
     ; test "a fiber in recv reads the reply to close" (fun () ->
           let open Affect in
           with_socket
@@ -1211,41 +1159,6 @@ let socket_tests =
           Caravan.Flow.write_string peer (client Close (code_reason 1001 "")) ;
           Fun.Async.get closer ;
           equal int 1001 (Fun.Async.get reader) )
-    ; test "a fiber in recv stops at the time limit of close" (fun () ->
-          let open Affect in
-          with_socket ~close_timeout:(ms 50)
-          @@ fun c _peer ->
-          let reader =
-            Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c))
-          in
-          Affect_unix.Mtime.wait_for (ms 20) ;
-          let t = Affect_unix.Mtime.counter () in
-          within_2s (fun () -> Ws.close c) ;
-          let took = elapsed_ms t in
-          is_true
-            ~msg:(Printf.sprintf "took %.0fms" took)
-            (took >= 40. && took < 2000.) ;
-          equal int 1006 (Fun.Async.get reader) )
-    ; test "a fiber blocked in send stops at the time limit of close" (fun () ->
-          let open Affect in
-          with_socket ~close_timeout:(ms 50)
-          @@ fun c _peer ->
-          (* The peer reads nothing: the sends fill the socket buffers. *)
-          let sender =
-            Fun.Async.call (fun () ->
-                closed_code (fun () ->
-                    while true do
-                      Ws.send c (Binary (String.make 1_000_000 'x'))
-                    done ) )
-          in
-          Affect_unix.Mtime.wait_for (ms 50) ;
-          let t = Affect_unix.Mtime.counter () in
-          within_2s (fun () -> Ws.close c) ;
-          let took = elapsed_ms t in
-          is_true
-            ~msg:(Printf.sprintf "took %.0fms" took)
-            (took >= 40. && took < 2000.) ;
-          equal int 1006 (Fun.Async.get sender) )
     ; test "a send that waits for a different send raises Closed after close"
         (fun () ->
           let open Affect in
@@ -1272,178 +1185,6 @@ let socket_tests =
           Fun.Async.get big ;
           equal int 1000 (Fun.Async.get late) ;
           Fun.Async.get closer )
-    ; test "a send to a peer that reads nothing stops at the write timeout"
-        (fun () ->
-          let open Affect in
-          with_socket ~write_timeout:(ms 50)
-          @@ fun c _peer ->
-          let t = Affect_unix.Mtime.counter () in
-          let send () = Ws.send c (Binary (String.make 10_000_000 'x')) in
-          let sender = Fun.Async.call (fun () -> closed_code send) in
-          let ended = Action.map (fun _ -> `Ended) (Fun.Async.get' sender) in
-          ( match
-              Action.invoke
-                (Action.choose
-                   [ended; Affect_unix.Mtime.wait_for' (ms 2000) `Late] )
-            with
-          | `Ended ->
-              equal int 1006 (Fun.Async.get sender)
-          | `Late ->
-              Fun.Async.cancel sender ;
-              fail "the send did not stop" ) ;
-          let took = elapsed_ms t in
-          is_true
-            ~msg:(Printf.sprintf "took %.0fms" took)
-            (took >= 40. && took < 2000.) )
-    ; test "a peer that sends no frame in the idle timeout gets Close 1001"
-        (fun () ->
-          with_socket ~idle_timeout:(ms 50)
-          @@ fun c peer ->
-          (* The connection does not wait for the reply of the peer. *)
-          let t = Affect_unix.Mtime.counter () in
-          ( match Ws.recv c with
-          | _ ->
-              fail "a message"
-          | exception Ws.Closed {code; reason} ->
-              equal int 1001 code ;
-              equal string "idle timeout" reason ) ;
-          let took = elapsed_ms t in
-          is_true
-            ~msg:(Printf.sprintf "took %.0fms" took)
-            (took >= 40. && took < 1000.) ;
-          equal string "close 1001"
-            (show_frame
-               (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125) ) )
-    ; test
-        "a frame that stops in the middle gets Close 1001 at the read timeout"
-        (fun () ->
-          let open Affect in
-          with_socket ~read_timeout:(ms 50) ~close_timeout:(ms 50)
-          @@ fun c peer ->
-          Caravan.Flow.write_string peer (String.sub (client Text "hello") 0 3) ;
-          let reader = Fun.Async.call (fun () -> Ws.recv c) in
-          let ended = Action.map (fun _ -> `Ended) (Fun.Async.get' reader) in
-          ( match
-              Action.invoke
-                (Action.choose
-                   [ended; Affect_unix.Mtime.wait_for' (ms 2000) `Late] )
-            with
-          | `Late ->
-              Fun.Async.cancel reader ;
-              fail "no timeout after 2 s"
-          | `Ended ->
-              fail "a message"
-          | exception Ws.Closed {code; reason} ->
-              equal int 1001 code ;
-              equal string "read timeout" reason ) ;
-          equal string "close 1001"
-            (show_frame
-               (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125) ) )
-    ; test "a slow frame with no long pause gets no timeout" (fun () ->
-          let open Affect in
-          with_socket ~read_timeout:(ms 200) ~idle_timeout:(ms 200)
-          @@ fun c peer ->
-          (* 2 006 bytes, 100 bytes each 20 ms: about 420 ms in all. *)
-          let frame = client Binary (String.make 2000 'x') in
-          let writer =
-            Fun.Async.call (fun () ->
-                let rec loop off =
-                  if off < String.length frame then begin
-                    let n = Int.min 100 (String.length frame - off) in
-                    Caravan.Flow.write_string peer (String.sub frame off n) ;
-                    Affect_unix.Mtime.wait_for (ms 20) ;
-                    loop (off + n)
-                  end
-                in
-                loop 0 )
-          in
-          is_true (Ws.recv c = Binary (String.make 2000 'x')) ;
-          Fun.Async.get writer )
-    ; test "a frame that is in part in the buffer gets the read timeout"
-        (fun () ->
-          with_socket ~read_timeout:(ms 50) ~close_timeout:(ms 50)
-          @@ fun c peer ->
-          (* One read gets the first frame and 1 byte of the next frame. Without
-             an idle timeout, only the read timeout stops the wait. *)
-          Caravan.Flow.write_string peer
-            (client Text "one" ^ String.sub (client Text "two") 0 1) ;
-          Affect_unix.Mtime.wait_for (ms 20) ;
-          is_true (Ws.recv c = Text "one") ;
-          match within_2s (fun () -> Ws.recv c) with
-          | _ ->
-              fail "a message"
-          | exception Ws.Closed {code; reason} ->
-              equal int 1001 code ;
-              equal string "read timeout" reason )
-    ; test "the read timeout does not apply between frames" (fun () ->
-          with_socket ~read_timeout:(ms 50)
-          @@ fun c peer ->
-          (* A read inside the first frame sets the read timeout. *)
-          let frame = client Text "one" in
-          Caravan.Flow.write_string peer (String.sub frame 0 2) ;
-          let first = Affect.Fun.Async.call (fun () -> Ws.recv c) in
-          Affect_unix.Mtime.wait_for (ms 20) ;
-          Caravan.Flow.write_string peer
-            (String.sub frame 2 (String.length frame - 2)) ;
-          is_true (Affect.Fun.Async.get first = Text "one") ;
-          (* recv waits for 150 ms, more than the read timeout. *)
-          let second = Affect.Fun.Async.call (fun () -> Ws.recv c) in
-          Affect_unix.Mtime.wait_for (ms 150) ;
-          Caravan.Flow.write_string peer (client Text "two") ;
-          is_true (Affect.Fun.Async.get second = Text "two") )
-    ; test "each frame gets a new idle timeout" (fun () ->
-          let open Affect in
-          with_socket ~idle_timeout:(ms 100)
-          @@ fun c peer ->
-          let writer =
-            Fun.Async.call (fun () ->
-                for _ = 1 to 5 do
-                  Affect_unix.Mtime.wait_for (ms 40) ;
-                  Caravan.Flow.write_string peer (client Ping "")
-                done ;
-                Caravan.Flow.write_string peer (client Text "end") )
-          in
-          is_true (Ws.recv c = Text "end") ;
-          Fun.Async.get writer )
-    ; test "close stops at a shorter idle timeout" (fun () ->
-          with_socket ~close_timeout:(ms 1000) ~idle_timeout:(ms 50)
-          @@ fun c _peer ->
-          let t = Affect_unix.Mtime.counter () in
-          within_2s (fun () -> Ws.close c) ;
-          let took = elapsed_ms t in
-          is_true
-            ~msg:(Printf.sprintf "took %.0fms" took)
-            (took >= 40. && took < 500.) )
-    ; test "close keeps the shorter write timeout of a send that waits"
-        (fun () ->
-          let open Affect in
-          with_socket ~close_timeout:(ms 1000) ~write_timeout:(ms 100)
-          @@ fun c peer ->
-          (* The peer reads only the first bytes: the send waits until its write
-             timeout. When the first bytes come, the send is in its frame. *)
-          let t = Affect_unix.Mtime.counter () in
-          let sender =
-            Fun.Async.call (fun () ->
-                closed_code (fun () ->
-                    Ws.send c (Binary (String.make 10_000_000 'x')) ) )
-          in
-          is_false (Buf_reader.peek_eof (Buf_reader.of_flow peer)) ;
-          let closer = Fun.Async.call (fun () -> Ws.close c) in
-          equal int 1006 (Fun.Async.get sender) ;
-          let took = elapsed_ms t in
-          is_true
-            ~msg:(Printf.sprintf "took %.0fms" took)
-            (took >= 90. && took < 500.) ;
-          Fun.Async.get closer )
-    ; test "close keeps its time limit with a long idle timeout" (fun () ->
-          with_socket ~close_timeout:(ms 50) ~idle_timeout:(ms 1000)
-          @@ fun c _peer ->
-          let t = Affect_unix.Mtime.counter () in
-          within_2s (fun () -> Ws.close c) ;
-          let took = elapsed_ms t in
-          is_true
-            ~msg:(Printf.sprintf "took %.0fms" took)
-            (took >= 40. && took < 500.) )
     ; test
         "after a protocol error, the peer gets the Close frame and the end of \
          the stream" (fun () ->
@@ -1509,58 +1250,6 @@ let socket_tests =
           within_2s (fun () -> Ws.close c) ;
           equal int 1000 (closed_code (fun () -> Ws.recv c)) ;
           ignore (Fun.Async.get sender) )
-    ; test
-        "close keeps its time limit when the reply to the peer waits for a send"
-        (fun () ->
-          let open Affect in
-          with_socket ~close_timeout:(ms 100) ~write_timeout:(ms 1500)
-          @@ fun c peer ->
-          (* The peer reads only the first bytes: the send holds the writer
-             until its write timeout. *)
-          let sender =
-            Fun.Async.call (fun () ->
-                closed_code (fun () ->
-                    Ws.send c (Binary (String.make 10_000_000 'x')) ) )
-          in
-          is_false (Buf_reader.peek_eof (Buf_reader.of_flow peer)) ;
-          let reader =
-            Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c))
-          in
-          Caravan.Flow.write_string peer (client Close (code_reason 1000 "")) ;
-          wait_closing c ;
-          let t = Affect_unix.Mtime.counter () in
-          within_2s (fun () -> Ws.close c) ;
-          let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 500.) ;
-          ignore (Fun.Async.get reader) ;
-          ignore (Fun.Async.get sender) )
-    ; test "a second close does not make the close deadline later" (fun () ->
-          let open Affect in
-          with_socket ~close_timeout:(ms 300)
-          @@ fun c peer ->
-          (* The peer sends a message each 10 ms and does not reply: each read
-             gets the deadline again. The second close starts 200 ms after the
-             first: with a new deadline, the first close takes 500 ms. *)
-          let stop = Atomic.make false in
-          let sender =
-            Fun.Async.call (fun () ->
-                try
-                  while not (Atomic.get stop) do
-                    Caravan.Flow.write_string peer (client Text "x") ;
-                    Affect_unix.Mtime.wait_for (ms 10)
-                  done
-                with Caravan.Flow.Closed -> () )
-          in
-          let t = Affect_unix.Mtime.counter () in
-          let first = Fun.Async.call (fun () -> Ws.close c ; elapsed_ms t) in
-          Affect_unix.Mtime.wait_for (ms 200) ;
-          within_2s (fun () -> Ws.close c) ;
-          let took = within_2s (fun () -> Fun.Async.get first) in
-          Atomic.set stop true ;
-          Fun.Async.get sender ;
-          is_true
-            ~msg:(Printf.sprintf "took %.0fms" took)
-            (took >= 290. && took < 450.) )
     ; test
         "the end of the handler does not stop the closing handshake of a stop"
         (fun () ->
@@ -2378,18 +2067,38 @@ let ws_write = Mtime.Span.(29 * s)
 
 let ws_read = Mtime.Span.(31 * s)
 
-(* [with_socket] with the server flow on the fake time line [f] and all the
-   spans. With [~idle:false], no idle timeout: then [close] waits for its own
-   deadline. When [test] ends, also by a failure, the fake time advances one
-   day: then each wait on it ends. *)
-let with_fake_socket ?(idle = true) f test =
-  with_socket ~time:(Fake.mono f) ~close_timeout:ws_close
-    ~write_timeout:ws_write ~read_timeout:ws_read
-    ?idle_timeout:(if idle then Some ws_idle else None)
-  @@ fun c peer ->
+(* A connection with the server flow on the fake time line [f], and its peer.
+   The spans are [idle], [close], [write] and [ws_read]. With [~idle:None], no
+   idle timeout: then [close] waits for its own deadline. The connection reads
+   and writes through [Server_support.counted]: [test] gets the counts too. When
+   [test] ends, also by a failure, the fake time advances one day: then each
+   wait on it ends. *)
+let with_counted_socket ?(idle = Some ws_idle) ?(close = ws_close)
+    ?(write = ws_write) f test =
+  with_flows ~time:(Fake.mono f)
+  @@ fun server peer ->
+  let counted = Server_support.counted server in
+  let c =
+    Ws.Private.of_flow ~close_timeout:close ~write_timeout:write
+      ~read_timeout:ws_read ?idle_timeout:idle counted.flow
+  in
   Stdlib.Fun.protect
     ~finally:(fun () -> Fake.advance f Mtime.Span.day)
-    (fun () -> test c peer)
+    (fun () -> test c peer counted)
+
+(* [with_counted_socket] without the counts. *)
+let with_fake_socket ?idle ?close ?write f test =
+  with_counted_socket ?idle ?close ?write f (fun c peer _ -> test c peer)
+
+(* Waits at most 2 s until [cond ()]. *)
+let wait_until ~msg cond =
+  let rec wait n =
+    if (not (cond ())) && n > 0 then (
+      Affect_unix.Mtime.wait_for Mtime.Span.ms ;
+      wait (n - 1) )
+  in
+  wait 2000 ;
+  is_true ~msg (cond ())
 
 (* [f ()], with its [Closed] exception as text. *)
 let outcome f =
@@ -2442,10 +2151,11 @@ let fake_time_tests =
           let f = Fake.make () in
           with_fake_socket f
           @@ fun c peer ->
-          let frame = client Text "hello" in
+          let frame = client Text "hello" and next = client Text "two" in
           let t0 = Fake.mono_now f and m = Fake.mark f in
-          with_call (fun () -> ignore (Ws.recv c))
-          @@ fun reader ->
+          let first = Affect.Fun.Async.call (fun () -> Ws.recv c) in
+          Stdlib.Fun.protect ~finally:(fun () -> Affect.Fun.Async.cancel first)
+          @@ fun () ->
           (* The first read gets 2 bytes. The next read in the frame waits
              [read_timeout]. *)
           Caravan.Flow.write_string peer (String.sub frame 0 2) ;
@@ -2456,11 +2166,24 @@ let fake_time_tests =
           (* The new timer proves that the code took the byte. *)
           let t1 = t0 +: Mtime.Span.(ws_read - ns) in
           Fake.wait_mono_timer f ~since:m (t1 +: ws_read) ;
+          (* A slow frame with no long pause gets no timeout: the frame passed
+             the idle deadline and the first read deadline. *)
+          Fake.advance f Mtime.Span.(ws_read - ns) ;
+          Caravan.Flow.write_string peer
+            (String.sub frame 3 (String.length frame - 3)) ;
+          is_true ~msg:"the slow frame"
+            (within_2s (fun () -> Affect.Fun.Async.get first) = Text "hello") ;
+          (* The next frame stops in the middle. *)
+          let t2 = t1 +: Mtime.Span.(ws_read - ns) and m = Fake.mark f in
+          with_call (fun () -> ignore (Ws.recv c))
+          @@ fun reader ->
+          Caravan.Flow.write_string peer (String.sub next 0 2) ;
+          Fake.wait_mono_timer f ~since:m (t2 +: ws_read) ;
           Fake.advance f ws_read ;
           equal string "close 1001" (peer_frame peer) ;
           (* Then the connection lingers for [close_timeout]. *)
-          let t2 = t1 +: ws_read in
-          Fake.wait_mono_timer f ~since:m (t2 +: ws_close) ;
+          let t3 = t2 +: ws_read in
+          Fake.wait_mono_timer f ~since:m (t3 +: ws_close) ;
           Fake.advance f ws_close ;
           equal string "closed 1001 \"read timeout\"" (result reader) )
     ; test "a send that waits ends at the write timeout and not 1 ns before"
@@ -2493,7 +2216,7 @@ let fake_time_tests =
           equal string "closed 1006 \"\"" (result sender) )
     ; test "close ends at the close timeout and not 1 ns before" (fun () ->
           let f = Fake.make () in
-          with_fake_socket ~idle:false f
+          with_fake_socket ~idle:None f
           @@ fun c peer ->
           let t0 = Fake.mono_now f and m = Fake.mark f in
           with_call (fun () -> Ws.close c)
@@ -2554,6 +2277,215 @@ let fake_time_tests =
             (Atomic.get reads >= 20) ;
           equal int ~msg:"bytes after the close deadline"
             (Atomic.get at_deadline) (Atomic.get served) )
+    ; test "a fiber in recv stops at the time limit of close" (fun () ->
+          let f = Fake.make () in
+          with_fake_socket ~idle:None f
+          @@ fun c peer ->
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          with_call (fun () -> ignore (Ws.recv c))
+          @@ fun reader ->
+          (* The reader waits inside a frame until its read deadline. *)
+          Caravan.Flow.write_string peer (String.sub (client Text "hello") 0 2) ;
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_read) ;
+          let m = Fake.mark f in
+          with_call (fun () -> Ws.close c)
+          @@ fun closer ->
+          (* The close deadline is earlier: the read waits for it. *)
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_close) ;
+          Fake.advance f Mtime.Span.(ws_close - ns) ;
+          is_false ~msg:"no end 1 ns before the close timeout"
+            (ends_within_50ms closer) ;
+          Fake.advance f Mtime.Span.ns ;
+          equal string "closed 1006 \"\"" (result reader) ;
+          equal string "ended" (result closer) )
+    ; test "a fiber blocked in send stops at the time limit of close" (fun () ->
+          let f = Fake.make () in
+          with_fake_socket ~idle:None f
+          @@ fun c _peer ->
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          (* The peer reads nothing: the send waits until its write deadline. *)
+          with_call (fun () -> Ws.send c (Binary (String.make 10_000_000 'x')))
+          @@ fun sender ->
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_write) ;
+          let m = Fake.mark f in
+          with_call (fun () -> Ws.close c)
+          @@ fun closer ->
+          (* The close deadline is earlier: the write waits for it. *)
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_close) ;
+          Fake.advance f Mtime.Span.(ws_close - ns) ;
+          is_false ~msg:"no end 1 ns before the close timeout"
+            (ends_within_50ms closer) ;
+          Fake.advance f Mtime.Span.ns ;
+          equal string "closed 1006 \"\"" (result sender) ;
+          equal string "ended" (result closer) )
+    ; test "a frame that is in part in the buffer gets the read timeout"
+        (fun () ->
+          let f = Fake.make () in
+          with_counted_socket ~idle:None f
+          @@ fun c peer counted ->
+          (* One read gets the first frame and 1 byte of the next frame. Without
+             an idle timeout, only the read timeout stops the wait. *)
+          let input = client Text "one" ^ String.sub (client Text "two") 0 1 in
+          Caravan.Flow.write_string peer input ;
+          is_true (within_2s (fun () -> Ws.recv c) = Text "one") ;
+          equal int ~msg:"the bytes in the buffer" (String.length input)
+            (Atomic.get counted.read_bytes) ;
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          with_call (fun () -> ignore (Ws.recv c))
+          @@ fun second ->
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_read) ;
+          Fake.advance f ws_read ;
+          equal string "close 1001" (peer_frame peer) ;
+          (* Then the connection lingers for [close_timeout]. *)
+          let t1 = t0 +: ws_read in
+          Fake.wait_mono_timer f ~since:m (t1 +: ws_close) ;
+          Fake.advance f ws_close ;
+          equal string "closed 1001 \"read timeout\"" (result second) )
+    ; test "the read timeout does not apply between frames" (fun () ->
+          let f = Fake.make () in
+          with_fake_socket ~idle:None f
+          @@ fun c peer ->
+          (* A read inside the first frame sets the read deadline. *)
+          let frame = client Text "one" in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          let first = Affect.Fun.Async.call (fun () -> Ws.recv c) in
+          Stdlib.Fun.protect ~finally:(fun () -> Affect.Fun.Async.cancel first)
+          @@ fun () ->
+          Caravan.Flow.write_string peer (String.sub frame 0 2) ;
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_read) ;
+          Caravan.Flow.write_string peer
+            (String.sub frame 2 (String.length frame - 2)) ;
+          is_true (within_2s (fun () -> Affect.Fun.Async.get first) = Text "one") ;
+          (* The second recv waits past the read deadline of the first frame. *)
+          with_call (fun () -> ignore (Ws.recv c))
+          @@ fun second ->
+          Fake.advance f ws_read ;
+          is_false ~msg:"no end after the read deadline"
+            (ends_within_50ms second) ;
+          Caravan.Flow.write_string peer (client Text "two") ;
+          equal string "ended" (result second) )
+    ; test "each frame gets a new idle timeout" (fun () ->
+          let f = Fake.make () in
+          with_fake_socket f
+          @@ fun c peer ->
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          let reader = Affect.Fun.Async.call (fun () -> Ws.recv c) in
+          Stdlib.Fun.protect ~finally:(fun () -> Affect.Fun.Async.cancel reader)
+          @@ fun () ->
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_idle) ;
+          (* A Ping 1 ns before the idle deadline. The new timer proves that the
+             code took it. *)
+          Fake.advance f Mtime.Span.(ws_idle - ns) ;
+          let t1 = Fake.mono_now f and m = Fake.mark f in
+          Caravan.Flow.write_string peer (client Ping "") ;
+          Fake.wait_mono_timer f ~since:m (t1 +: ws_idle) ;
+          equal string "pong \"\"" (peer_frame peer) ;
+          Fake.advance f Mtime.Span.(ws_idle - ns) ;
+          Caravan.Flow.write_string peer (client Text "end") ;
+          is_true
+            (within_2s (fun () -> Affect.Fun.Async.get reader) = Text "end") )
+    ; test "close stops at a shorter idle timeout" (fun () ->
+          let f = Fake.make () in
+          (* The idle timeout is shorter than the close timeout. *)
+          with_fake_socket f
+          @@ fun c _peer ->
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          with_call (fun () -> Ws.close c)
+          @@ fun closer ->
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_idle) ;
+          Fake.advance f Mtime.Span.(ws_idle - ns) ;
+          is_false ~msg:"no end 1 ns before the idle timeout"
+            (ends_within_50ms closer) ;
+          Fake.advance f Mtime.Span.ns ;
+          equal string "ended" (result closer) )
+    ; test "close keeps the shorter write timeout of a send that waits"
+        (fun () ->
+          let f = Fake.make () in
+          (* The write timeout is shorter than the close timeout. *)
+          with_fake_socket ~close:Mtime.Span.(37 * s) f
+          @@ fun c _peer ->
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          (* The peer reads nothing: the send waits until its write deadline. *)
+          with_call (fun () -> Ws.send c (Binary (String.make 10_000_000 'x')))
+          @@ fun sender ->
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_write) ;
+          with_call (fun () -> Ws.close c)
+          @@ fun closer ->
+          (* The close sets its deadline before the close starts. *)
+          wait_closing c ;
+          Fake.advance f Mtime.Span.(ws_write - ns) ;
+          is_false ~msg:"no end 1 ns before the write timeout"
+            (ends_within_50ms sender) ;
+          Fake.advance f Mtime.Span.ns ;
+          equal string "closed 1006 \"\"" (result sender) ;
+          equal string "ended" (result closer) )
+    ; test "close keeps its time limit with a long idle timeout" (fun () ->
+          let f = Fake.make () in
+          (* The idle timeout is longer than the close timeout. *)
+          with_fake_socket ~idle:(Some Mtime.Span.(37 * s)) f
+          @@ fun c _peer ->
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          with_call (fun () -> Ws.close c)
+          @@ fun closer ->
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_close) ;
+          Fake.advance f Mtime.Span.(ws_close - ns) ;
+          is_false ~msg:"no end 1 ns before the close timeout"
+            (ends_within_50ms closer) ;
+          Fake.advance f Mtime.Span.ns ;
+          equal string "ended" (result closer) )
+    ; test
+        "close keeps its time limit when the reply to the peer waits for a send"
+        (fun () ->
+          let f = Fake.make () in
+          with_fake_socket f
+          @@ fun c peer ->
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          (* The peer reads nothing: the send holds the writer until its write
+             deadline. *)
+          with_call (fun () -> Ws.send c (Binary (String.make 10_000_000 'x')))
+          @@ fun sender ->
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_write) ;
+          (* The reply to the Close frame of the peer waits for the writer. *)
+          with_call (fun () -> ignore (Ws.recv c))
+          @@ fun reader ->
+          Caravan.Flow.write_string peer (client Close (code_reason 1000 "")) ;
+          wait_closing c ;
+          let m = Fake.mark f in
+          with_call (fun () -> Ws.close c)
+          @@ fun closer ->
+          (* The close deadline is earlier: the write waits for it. *)
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_close) ;
+          Fake.advance f Mtime.Span.(ws_close - ns) ;
+          is_false ~msg:"no end 1 ns before the close timeout"
+            (ends_within_50ms closer) ;
+          Fake.advance f Mtime.Span.ns ;
+          equal string "ended" (result closer) ;
+          equal string "closed 1006 \"\"" (result sender) ;
+          equal string "closed 1006 \"\"" (result reader) )
+    ; test "a second close does not make the close deadline later" (fun () ->
+          let f = Fake.make () in
+          with_counted_socket ~idle:None f
+          @@ fun c peer counted ->
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          with_call (fun () -> Ws.close c)
+          @@ fun first ->
+          equal string "close 1000" (peer_frame peer) ;
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_close) ;
+          (* The second close comes 1 s after the first. A close sets the write
+             deadline: the count proves that the second close set its
+             deadline. *)
+          Fake.advance f Mtime.Span.s ;
+          let m = Fake.mark f and w = Atomic.get counted.write_deadlines in
+          with_call (fun () -> Ws.close c)
+          @@ fun second ->
+          wait_until ~msg:"the second close set its deadline" (fun () ->
+              Atomic.get counted.write_deadlines > w ) ;
+          (* After a frame, the read waits again, until the first deadline. *)
+          Caravan.Flow.write_string peer (client Text "x") ;
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_close) ;
+          Fake.advance f Mtime.Span.(ws_close - s) ;
+          equal string "ended" (result first) ;
+          equal string "ended" (result second) )
     ; test "an upgraded connection keeps the time line of the server" (fun () ->
           let f = Fake.make () in
           let config =
