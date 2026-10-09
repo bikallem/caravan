@@ -7,12 +7,16 @@ let of_unix_time t =
     , (tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday)
     , (tm.tm_hour, tm.tm_min, tm.tm_sec) )
 
-(* (second, encoded date) of the last call; one string per second for all
+(* (second, encoded date) of the last call: one string per second for all
    domains. A race only recomputes the same string. *)
-let cache = Atomic.make (-1, "")
+let cache = Atomic.make (min_int, "")
 
-let now_at t =
-  let second = int_of_float t in
+let of_posix p =
+  (* The exact floor of the second. A float can round a fraction near 1 s up to
+     the next second. *)
+  let span = Affect_unix.Ptime.to_span p in
+  let second = Option.get (Affect_unix.Ptime.Span.to_int_s span) in
+  let t = Float.of_int second in
   let cached_second, cached = Atomic.get cache in
   if second = cached_second then cached
   else begin
@@ -22,5 +26,3 @@ let now_at t =
     Atomic.set cache (second, date) ;
     date
   end
-
-let now () = now_at (Unix.time ())

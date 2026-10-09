@@ -5,7 +5,8 @@ exception Timeout
 exception Closed
 
 type t =
-  { read: bytes -> int -> int -> int
+  { time: Time.mono
+  ; read: bytes -> int -> int -> int
   ; read_now: bytes -> int -> int -> int option
   ; write: bytes -> int -> int -> unit
   ; readable: unit Action.t
@@ -16,9 +17,10 @@ type t =
   ; set_write_deadline: Affect_unix.Mtime.t option -> unit
   ; closed: bool Atomic.t }
 
-let make ~read ~read_now ~write ~readable ~shutdown_send ~close ?(reset = close)
-    ~set_read_deadline ~set_write_deadline () =
-  { read
+let make ~time ~read ~read_now ~write ~readable ~shutdown_send ~close
+    ?(reset = close) ~set_read_deadline ~set_write_deadline () =
+  { time
+  ; read
   ; read_now
   ; write
   ; readable
@@ -28,6 +30,8 @@ let make ~read ~read_now ~write ~readable ~shutdown_send ~close ?(reset = close)
   ; set_read_deadline
   ; set_write_deadline
   ; closed= Atomic.make false }
+
+let time flow = flow.time
 
 let check_range fn buf off len =
   if off < 0 || len < 0 || off > Bytes.length buf - len then
@@ -102,7 +106,7 @@ let prepend s flow =
       Action.guard (fun () ->
           if remaining () > 0 then Action.always () else flow.readable )
     in
-    make ~read ~read_now ~write:(write flow) ~readable
+    make ~time:flow.time ~read ~read_now ~write:(write flow) ~readable
       ~shutdown_send:(fun () -> shutdown_send flow)
       ~close:(fun () -> close flow)
       ~reset:(fun () -> reset flow)
@@ -121,7 +125,7 @@ let of_string ?(chunk = max_int) input output =
   in
   let write buf off len = Buffer.add_subbytes output buf off len in
   let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
-  make ~read
+  make ~time:Time.mono ~read
     ~read_now:(fun buf off len -> Some (read buf off len))
     ~write ~readable:(Action.always ()) ~shutdown_send:ignore ~close:ignore
     ~set_read_deadline:ignore_deadline ~set_write_deadline:ignore_deadline ()

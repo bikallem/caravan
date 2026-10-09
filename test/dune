@@ -17,7 +17,8 @@
   test_server_stateful
   test_websocket
   test_client
-  server_support)
+  server_support
+  fake_time)
  (libraries
   caravan
   caravan.websocket
@@ -27,7 +28,11 @@
   windtrap
   http-date
   unix)
- (deps serve_until_signal.exe))
+ (deps
+  serve_until_signal.exe
+  (glob_files ../src/*.ml)
+  (glob_files ../client/*.ml)
+  (glob_files ../websocket/*.ml)))
 
 (executable
  (name serve_until_signal)

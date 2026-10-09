@@ -111,18 +111,20 @@ let endless raised =
         Cell.Once.try_set raised () ;
         raise e )
 
-(* [f] with a client flow, over a socket pair, whose writes raise [error] after
-   [break ()]. [failed] is set at the first such write. *)
-let with_breakable error f =
+(* [f] with a client flow on the time line [time], over a socket pair, whose
+   writes raise [error] after [break ()]. [failed] is set at the first such
+   write. [on_write_deadline] gets each write deadline that the client sets. *)
+let with_breakable ?time ?(on_write_deadline = ignore) error f =
   Affect_unix.Unix.main ~domain_count:Server_support.domain_count
   @@ fun () ->
   let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
   Unix.set_nonblock a ;
   Unix.set_nonblock b ;
-  let real = Tcp.flow a and server = Tcp.flow b in
+  let real = Tcp.flow ?time a and server = Tcp.flow b in
   let broken = Atomic.make false and failed = Cell.Once.make () in
   let client =
-    Flow.make ~read:(Flow.read real) ~read_now:(Flow.read_now real)
+    Flow.make ~time:(Flow.time real) ~read:(Flow.read real)
+      ~read_now:(Flow.read_now real)
       ~write:(fun buf off len ->
         if Atomic.get broken then (
           Cell.Once.try_set failed () ;
@@ -132,7 +134,9 @@ let with_breakable error f =
       ~shutdown_send:(fun () -> Flow.shutdown_send real)
       ~close:(fun () -> Flow.close real)
       ~set_read_deadline:(Flow.set_read_deadline real)
-      ~set_write_deadline:(Flow.set_write_deadline real)
+      ~set_write_deadline:(fun d ->
+        on_write_deadline d ;
+        Flow.set_write_deadline real d )
       ()
   in
   let writers = Writers.make () in
@@ -752,7 +756,8 @@ let exchange_tests =
           Unix.set_nonblock b ;
           let real = Tcp.flow a and server = Tcp.flow b in
           let client =
-            Flow.make ~read:(Flow.read real) ~read_now:(Flow.read_now real)
+            Flow.make ~time:(Flow.time real) ~read:(Flow.read real)
+              ~read_now:(Flow.read_now real)
               ~write:(fun buf off len ->
                 Flow.write real buf off len ;
                 Mtime.wait_for (ms 1000) )
@@ -1100,7 +1105,8 @@ let exchange_tests =
           Unix.set_nonblock b ;
           let real = Tcp.flow a and server = Tcp.flow b in
           let client =
-            Flow.make ~read:(Flow.read real) ~read_now:(Flow.read_now real)
+            Flow.make ~time:(Flow.time real) ~read:(Flow.read real)
+              ~read_now:(Flow.read_now real)
               ~write:(fun buf off len ->
                 Flow.write real buf off len ;
                 Mtime.wait_for (ms 1000) )
@@ -1300,7 +1306,8 @@ let exchange_tests =
               Unix.set_nonblock b ;
               let real = Tcp.flow a and server = Tcp.flow b in
               let client =
-                Flow.make ~read:(Flow.read real) ~read_now:(Flow.read_now real)
+                Flow.make ~time:(Flow.time real) ~read:(Flow.read real)
+                  ~read_now:(Flow.read_now real)
                   ~write:(fun buf off len ->
                     Flow.write real buf off len ;
                     Mtime.wait_for (ms 100) )
@@ -1850,7 +1857,7 @@ type fake = {closed: bool ref; server_closed: bool ref; flow: Flow.t}
 let fake () =
   let closed = ref false and server_closed = ref false in
   let flow =
-    Flow.make
+    Flow.make ~time:Time.mono
       ~read:(fun _ _ _ -> 0)
       ~read_now:(fun _ _ _ -> if !server_closed then Some 0 else None)
       ~write:(fun _ _ _ -> ())
@@ -1860,18 +1867,16 @@ let fake () =
   in
   {closed; server_closed; flow}
 
-(* A pool with a fake clock and fake connects. *)
+(* A pool on a fake time line, with fake connects. *)
 let fake_pool ?(config = Client_config.default) () =
-  let clock = ref Mtime.(now ()) and made = ref [] in
-  let now () = !clock in
+  let f = Fake_time.make () and made = ref [] in
   let connect ~host:_ ~port:_ =
     let f = fake () in
     made := f :: !made ;
     f.flow
   in
-  let pool = Pool.make ~now ~connect config in
-  let advance span = clock := Option.get (Mtime.add_span !clock span) in
-  (pool, advance, fun () -> List.rev !made)
+  let pool = Pool.make ~connect {config with mono_time= Fake_time.mono f} in
+  (pool, Fake_time.advance f, fun () -> List.rev !made)
 
 let pool_tests =
   group "Pool"
@@ -2083,14 +2088,14 @@ end
 module Pool_system = struct
   type pool =
     { pool: Pool.t
-    ; clock: Mtime.t ref
+    ; time: Fake_time.t
     ; fakes: (int, fake) Hashtbl.t
     ; connects: int ref }
 
   let owners : (int, pool) Hashtbl.t = Hashtbl.create 64
 
   let make () =
-    let clock = ref Mtime.(now ())
+    let time = Fake_time.make ()
     and fakes = Hashtbl.create 8
     and connects = ref 0 in
     let connect ~host:_ ~port:_ =
@@ -2103,12 +2108,10 @@ module Pool_system = struct
     let config =
       { Client_config.default with
         max_idle_per_host= 2
-      ; idle_timeout= Mtime.Span.(5 * s) }
+      ; idle_timeout= Mtime.Span.(5 * s)
+      ; mono_time= Fake_time.mono time }
     in
-    { pool= Pool.make ~now:(fun () -> !clock) ~connect config
-    ; clock
-    ; fakes
-    ; connects }
+    {pool= Pool.make ~connect config; time; fakes; connects}
 
   let checkout p =
     let c, _ = Pool.checkout p.pool ~host:"a" ~port:80 in
@@ -2118,8 +2121,7 @@ module Pool_system = struct
   let release (c : Conn.t) reusable =
     Pool.release (Hashtbl.find owners c.id).pool c ~reusable
 
-  let advance p n =
-    p.clock := Option.get (Mtime.add_span !(p.clock) Mtime.Span.(n * ms))
+  let advance p n = Fake_time.advance p.time Mtime.Span.(n * ms)
 
   let fake_of (c : Conn.t) = Hashtbl.find (Hashtbl.find owners c.id).fakes c.id
 
@@ -3038,7 +3040,335 @@ let api_tests =
           let id2 = get_text client (url ^ "/id") in
           is_true ~msg:(id1 ^ " then " ^ id2) (id1 <> id2) ) ]
 
+(* The client on a fake time line *)
+
+module Fake = Fake_time
+
+let ( +: ) = Fake.( +: )
+
+(* The spans of the fake time tests. A test advances only to deadlines that it
+   proved with [Fake.wait_mono_timer]. *)
+let connect_c = Mtime.Span.(3 * s)
+
+let response_r = Mtime.Span.(5 * s)
+
+let read_d = Mtime.Span.(7 * s)
+
+let write_w = Mtime.Span.(11 * s)
+
+let idle_i = Mtime.Span.(13 * s)
+
+let grace_g = Mtime.Span.(17 * s)
+
+(* The spans on the real time line. The exchange tests put only the flow on the
+   fake time line: thus an exchange that uses [mono_time] fails. *)
+let fake_spans =
+  { Client_config.default with
+    connect_timeout= connect_c
+  ; response_timeout= response_r
+  ; read_timeout= read_d
+  ; write_timeout= write_w
+  ; idle_timeout= idle_i
+  ; close_grace= grace_g }
+
+let fake_client_config f = {fake_spans with mono_time= Fake.mono f}
+
+(* [test] with an exchange in a child call: [exchange run] runs [run] on the
+   client flow of [with_breakable], on the fake time line [f]. The call gives
+   the result of [exchange], or the text of its error. With [~broken:true], each
+   write of the client raises EIO. *)
+let with_fake_exchange ?(broken = false) ?on_write_deadline f ~exchange test =
+  with_breakable ~time:(Fake.mono f) ?on_write_deadline
+    (Unix.Unix_error (Unix.EIO, "write", ""))
+  @@ fun ~server ~run ~break ~failed:_ ->
+  if broken then break () ;
+  let t0 = Fake.mono_now f and m = Fake.mark f in
+  let c =
+    Fun.Async.call (fun () ->
+        match exchange (fun r -> run fake_spans r) with
+        | v ->
+            v
+        | exception Caravan_client.Error e ->
+            Printexc.to_string (Caravan_client.Error e) )
+  in
+  Stdlib.Fun.protect ~finally:(fun () -> Fun.Async.cancel c)
+  @@ fun () -> test ~server ~t0 ~since:m c
+
+let set_within_50ms cell = Fake.within_50ms (Cell.Once.get' cell)
+
+(* [f port] with a server on [port] that runs [script] on one connection. *)
+let with_script_server script f =
+  let l = Tcp.Listener.listen Server_support.loopback in
+  let port =
+    match Tcp.Listener.addr l with Unix.ADDR_INET (_, p) -> p | _ -> 0
+  in
+  let server =
+    Fun.Async.call (fun () ->
+        let fd, _ = Tcp.Listener.accept l in
+        let flow = Tcp.flow fd in
+        Stdlib.Fun.protect
+          ~finally:(fun () -> Flow.close flow)
+          (fun () -> try script flow (Buf_reader.of_flow flow) with _ -> ()) )
+  in
+  Stdlib.Fun.protect
+    ~finally:(fun () -> Fun.Async.cancel server ; Tcp.Listener.close l)
+    (fun () -> f port)
+
+(* A server that answers at once, does not read the body, and waits for the end
+   of the connection. *)
+let answer_at_once flow r =
+  ignore (read_head r) ;
+  Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n" ;
+  ignore (Buf_reader.peek_eof r)
+
+(* A request body that writes 3 bytes, then waits until [release] is set. A
+   cancel sets [cancelled]. *)
+let held_body ~release ~cancelled =
+  Body.of_writer (fun w ->
+      Body.Writer.write_string w "abc" ;
+      Body.Writer.flush w ;
+      try Cell.Once.get release
+      with e ->
+        Cell.Once.try_set cancelled () ;
+        raise e )
+
+let fake_time_tests =
+  group "Client on a fake time line"
+    [ test "a lookup that does not end gives a connect timeout at the deadline"
+        (fun () ->
+          main
+          @@ fun () ->
+          let f = Fake.make () and go = Atomic.make false in
+          (* The thread of the lookup ends only when [go] is set. *)
+          let held _ _ _ =
+            while not (Atomic.get go) do
+              Unix.sleepf 0.005
+            done ;
+            []
+          in
+          Stdlib.Fun.protect ~finally:(fun () -> Atomic.set go true)
+          @@ fun () ->
+          let t0 = Fake.mono_now f
+          and m = Fake.mark f
+          and ended = Cell.Once.make () in
+          let c =
+            Fun.Async.call (fun () ->
+                Stdlib.Fun.protect
+                  ~finally:(fun () -> Cell.Once.try_set ended ())
+                  (fun () ->
+                    error_text (fun () ->
+                        Connect.connect ~getaddrinfo:held (fake_client_config f)
+                          ~host:"a.example" ~port:80 ) ) )
+          in
+          Stdlib.Fun.protect ~finally:(fun () -> Fun.Async.cancel c)
+          @@ fun () ->
+          Fake.wait_mono_timer f ~since:m (t0 +: connect_c) ;
+          (* Only an advance can end the connect. *)
+          Fake.advance f Mtime.Span.(connect_c - ns) ;
+          is_false ~msg:"no end 1 ns before the deadline"
+            (set_within_50ms ended) ;
+          Fake.advance f Mtime.Span.ns ;
+          equal string "Caravan_client.Error: connect timeout"
+            (within_2s (fun () -> Fun.Async.get c)) )
+    ; test "a connect gives a flow on the time line of the config" (fun () ->
+          main
+          @@ fun () ->
+          with_listener
+          @@ fun port ->
+          let f = Fake.make () in
+          let flow =
+            Connect.connect (fake_client_config f) ~host:"127.0.0.1" ~port
+          in
+          Stdlib.Fun.protect ~finally:(fun () -> Flow.close flow)
+          @@ fun () ->
+          is_true ~msg:"the time line of the flow"
+            (Flow.time flow == Fake.mono f) )
+    ; test "the timer that closes idle connections is on the config's time line"
+        (fun () ->
+          main
+          @@ fun () ->
+          let f = Fake.make () in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          C.run ~config:(fake_client_config f) (fun _ ->
+              (* Each half of [idle_timeout]. *)
+              Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.(6500 * ms)) ) )
+    ; test "a close grace of 2^63 ns or more does not cancel the bodies"
+        (fun () ->
+          (* 2^63 ns + 1 s: affect ends a wait of 2^63 ns or more at once. *)
+          let grace = Mtime.Span.(add (of_uint64_ns Int64.min_int) s) in
+          main
+          @@ fun () ->
+          with_script_server answer_at_once
+          @@ fun port ->
+          let release = Cell.Once.make ()
+          and cancelled = Cell.Once.make ()
+          and returned = Cell.Once.make () in
+          let config = {Client_config.default with close_grace= grace} in
+          let r =
+            Fun.Async.call (fun () ->
+                C.run ~config (fun client ->
+                    ignore
+                      (C.request client
+                         (at_port port ~meth:Method.POST
+                            ~body:(held_body ~release ~cancelled)
+                            "/" ) ) ;
+                    Cell.Once.try_set returned () ) )
+          in
+          Stdlib.Fun.protect ~finally:(fun () ->
+              Cell.Once.try_set release () ;
+              Fun.Async.cancel r )
+          @@ fun () ->
+          within_2s (fun () -> Cell.Once.get returned) ;
+          is_false ~msg:"no cancel within 50 ms" (set_within_50ms cancelled) ;
+          Cell.Once.try_set release () ;
+          within_2s (fun () -> Fun.Async.get r) )
+    ; test "a response 1 ns before the response timeout is taken" (fun () ->
+          let f = Fake.make () in
+          with_fake_exchange f ~exchange:(fun run ->
+              Printf.sprintf "status %d" (status (run (req "/"))) )
+          @@ fun ~server ~t0 ~since c ->
+          ignore (within_2s (fun () -> read_head (Buf_reader.of_flow server))) ;
+          (* The deadline starts at the end of the request. *)
+          Fake.wait_mono_timer f ~since (t0 +: response_r) ;
+          Fake.advance f Mtime.Span.(response_r - ns) ;
+          Flow.write_string server
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" ;
+          equal string "status 200" (within_2s (fun () -> Fun.Async.get c)) )
+    ; test "no response at the response timeout gives Timeout `Response"
+        (fun () ->
+          let f = Fake.make () in
+          with_fake_exchange f ~exchange:(fun run ->
+              Printf.sprintf "status %d" (status (run (req "/"))) )
+          @@ fun ~server ~t0 ~since c ->
+          ignore (within_2s (fun () -> read_head (Buf_reader.of_flow server))) ;
+          Fake.wait_mono_timer f ~since (t0 +: response_r) ;
+          Fake.advance f response_r ;
+          equal string "Caravan_client.Error: response timeout"
+            (within_2s (fun () -> Fun.Async.get c)) )
+    ; test "a body read that waits until the read timeout gives Timeout `Read"
+        (fun () ->
+          let f = Fake.make () in
+          with_fake_exchange f ~exchange:(fun run ->
+              Body.to_string (body (run (req "/"))) )
+          @@ fun ~server ~t0 ~since c ->
+          ignore (within_2s (fun () -> read_head (Buf_reader.of_flow server))) ;
+          (* The head and the first byte in one write: the client reads the
+             byte, and its next read waits from t0. *)
+          Flow.write_string server
+            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\na" ;
+          Fake.wait_mono_timer f ~since (t0 +: read_d) ;
+          Fake.advance f Mtime.Span.(read_d - ns) ;
+          let m = Fake.mark f in
+          Flow.write_string server "b" ;
+          let t1 = t0 +: Mtime.Span.(read_d - ns) in
+          Fake.wait_mono_timer f ~since:m (t1 +: read_d) ;
+          Fake.advance f read_d ;
+          equal string "Caravan_client.Error: read timeout"
+            (within_2s (fun () -> Fun.Async.get c)) )
+    ; test "a write that waits until the write timeout gives Timeout `Write"
+        (fun () ->
+          let f = Fake.make () and raised = Cell.Once.make () in
+          with_fake_exchange f ~exchange:(fun run ->
+              Printf.sprintf "status %d"
+                (status
+                   (run (req ~meth:Method.POST ~body:(endless raised) "/")) ) )
+          @@ fun ~server:_ ~t0 ~since c ->
+          (* The server never reads: only an advance can wake the write that
+             waits. A drain of the server wakes the write more than once, and
+             then the test cannot prove which wait is the last. *)
+          Fake.wait_mono_timer f ~since (t0 +: write_w) ;
+          Fake.advance f Mtime.Span.(write_w - ns) ;
+          is_false ~msg:"no write error 1 ns before the write timeout"
+            (set_within_50ms raised) ;
+          Fake.advance f Mtime.Span.ns ;
+          equal string "Caravan_client.Error: write timeout"
+            (within_2s (fun () -> Fun.Async.get c)) ;
+          within_2s (fun () -> Cell.Once.get raised) )
+    ; test
+        "a write error before the end of the request starts the response \
+         deadline" (fun () ->
+          let f = Fake.make () in
+          with_fake_exchange ~broken:true f ~exchange:(fun run ->
+              Printf.sprintf "status %d" (status (run (req "/"))) )
+          @@ fun ~server:_ ~t0 ~since c ->
+          (* The writer ends with the error before [sent]: the reader stamps the
+             end of the request. *)
+          Fake.wait_mono_timer f ~since (t0 +: response_r) ;
+          Fake.advance f response_r ;
+          equal string "Caravan_client.Error: response timeout"
+            (within_2s (fun () -> Fun.Async.get c)) )
+    ; test "each write gets a new write deadline" (fun () ->
+          let f = Fake.make () and gate = Cell.Once.make () in
+          let lock = Mutex.create () and deadlines = ref [] in
+          let on_write_deadline d =
+            Mutex.protect lock (fun () -> deadlines := d :: !deadlines)
+          in
+          let has d =
+            eventually (fun () ->
+                Mutex.protect lock (fun () -> List.mem (Some d) !deadlines) )
+          in
+          (* The head goes before the producer runs. The producer writes after
+             [gate]. *)
+          let late =
+            Body.of_writer (fun w ->
+                Cell.Once.get gate ;
+                Body.Writer.write_string w "b" ;
+                Body.Writer.flush w )
+          in
+          with_fake_exchange ~on_write_deadline f ~exchange:(fun run ->
+              Printf.sprintf "status %d"
+                (status (run (req ~meth:Method.POST ~body:late "/"))) )
+          @@ fun ~server:_ ~t0 ~since:_ _ ->
+          (* No write waits: the deadlines make no timer. *)
+          is_true ~msg:"the deadline of the head" (has (t0 +: write_w)) ;
+          Fake.advance f Mtime.Span.(5 * s) ;
+          Cell.Once.try_set gate () ;
+          is_true ~msg:"the deadline of the body"
+            (has (t0 +: Mtime.Span.(5 * s) +: write_w)) )
+    ; test "run cancels the bodies at the close grace of the config's time line"
+        (fun () ->
+          main
+          @@ fun () ->
+          with_script_server answer_at_once
+          @@ fun port ->
+          let f = Fake.make () in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          let release = Cell.Once.make ()
+          and cancelled = Cell.Once.make ()
+          and returned = Cell.Once.make () in
+          let r =
+            Fun.Async.call (fun () ->
+                C.run ~config:(fake_client_config f) (fun client ->
+                    ignore
+                      (C.request client
+                         (at_port port ~meth:Method.POST
+                            ~body:(held_body ~release ~cancelled)
+                            "/" ) ) ;
+                    Cell.Once.try_set returned () ) )
+          in
+          Stdlib.Fun.protect ~finally:(fun () ->
+              Cell.Once.try_set release () ;
+              Fun.Async.cancel r ;
+              Fake.advance f Mtime.Span.day )
+          @@ fun () ->
+          within_2s (fun () -> Cell.Once.get returned) ;
+          (* The timer of the reaper is at t0 + 6.5 s, and then at t0 + 23.5 s -
+             1 ns: not at the grace. *)
+          Fake.wait_mono_timer f ~since:m (t0 +: grace_g) ;
+          Fake.advance f Mtime.Span.(grace_g - ns) ;
+          (* Only an advance can end the grace. *)
+          is_false ~msg:"no cancel 1 ns before the grace"
+            (set_within_50ms cancelled) ;
+          Fake.advance f Mtime.Span.ns ;
+          within_2s (fun () -> Cell.Once.get cancelled) ;
+          within_2s (fun () -> Fun.Async.get r) ) ]
+
 let () =
   exit
     (run "client"
-       [exchange_tests; resolver_tests; pool_tests; pool_stateful; api_tests] )
+       [ exchange_tests
+       ; resolver_tests
+       ; pool_tests
+       ; pool_stateful
+       ; api_tests
+       ; fake_time_tests ] )

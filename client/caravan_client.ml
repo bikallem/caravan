@@ -34,7 +34,7 @@ let reaper (config : Config.t) pool =
   Affect.Fun.Async.call (fun () ->
       try
         while true do
-          Affect_unix.Mtime.wait_for half ;
+          Caravan.Time.sleep config.mono_time half ;
           Pool.reap pool
         done
       with Affect.Fun.Async.Cancelled -> () )
@@ -55,7 +55,8 @@ let run ?config f =
   (* The request bodies that still go get [close_grace]. A cancel of the caller
      ends the grace at once. *)
   let finish () =
-    Writers.finish t.writers ~grace:t.config.close_grace ;
+    Writers.finish t.writers ~time:t.config.mono_time
+      ~grace:t.config.close_grace ;
     close t ;
     Writers.wait t.writers ;
     Affect.Fun.Async.mask_cancellation (fun () -> Affect.Fun.Async.get t.reaper)

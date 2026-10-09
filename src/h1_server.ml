@@ -1,5 +1,4 @@
 open Affect
-module Mtime = Affect_unix.Mtime
 
 let limits (c : Config.t) : H1_parse.limits =
   { max_request_line= c.max_request_line
@@ -51,20 +50,8 @@ let expects_continue h = expectation h = `Continue
    most [linger_timeout] and [max_drain] bytes. *)
 let linger (config : Config.t) flow =
   Flow.set_read_deadline flow
-    (Mtime.add_span (Mtime.now ()) config.linger_timeout) ;
+    (Time.after (Flow.time flow) config.linger_timeout) ;
   Flow.linger flow ~max:config.max_drain
-
-(* An action enabled with [tag] at [deadline], at once if it has passed; never
-   for [None]. *)
-let at deadline tag =
-  match deadline with
-  | None ->
-      Action.never
-  | Some d ->
-      let now = Mtime.now () in
-      if Mtime.is_earlier now ~than:d then
-        Mtime.wait_for' (Mtime.span now d) tag
-      else Action.always tag
 
 (* Why [response], an upgrade, cannot answer the request [head], if it cannot:
    RFC 9110 §7.8, §9.3.6 and §15.2.2. *)
@@ -90,7 +77,8 @@ let serve : Engine.t =
  fun ctx flow handler ->
   let config = ctx.config in
   let limits = limits config in
-  let after span () = Mtime.add_span (Mtime.now ()) span in
+  let time = Flow.time flow in
+  let after span () = Time.after time span in
   (* Reads get a deadline fixed for a whole request head, and renewed before
      each read of a body. Each write gets its own. *)
   let read_deadline = ref (fun () -> None) in
@@ -117,7 +105,10 @@ let serve : Engine.t =
     match Conn_info.scheme ctx.conn with `Http -> "http" | `Https -> "https"
   in
   let report e = config.on_error e (Printexc.get_raw_backtrace ()) in
-  let date () = if config.date_header then Some (Date.now ()) else None in
+  let date () =
+    if config.date_header then Some (Date.of_posix (Time.now config.posix_time))
+    else None
+  in
   let error ?meth e = error_response ?date:(date ()) ?meth w e in
   (* Waits at most [idle] for the next request. A stopping server takes no new
      request, even one already received. *)
@@ -132,7 +123,9 @@ let serve : Engine.t =
   and wait_for_input deadline =
     let input = Flow.readable' flow `Input
     and stop = Action.map (fun () -> `Stop) ctx.stopping in
-    match Action.invoke (Action.choose [stop; input; at deadline `Idle]) with
+    match
+      Action.invoke (Action.choose [stop; input; Time.at time deadline `Idle])
+    with
     | `Stop | `Idle ->
         `Close
     | `Input -> (

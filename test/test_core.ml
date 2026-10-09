@@ -373,26 +373,30 @@ let date_tests =
         (fun t ->
           let d = Date.of_unix_time (Float.of_int t) in
           equal http_date d (Http_date.decode (Http_date.encode d)) )
-    ; test "now_at caches one string per second" (fun () ->
+    ; test "of_posix caches one string per second" (fun () ->
           let enc t = Http_date.encode (Date.of_unix_time t) in
-          let a = Date.now_at 1000. in
-          let b = Date.now_at 1000.5 in
+          let posix t = Option.get (Affect_unix.Ptime.of_float_s t) in
+          let a = Date.of_posix (posix 1000.) in
+          let b = Date.of_posix (posix 1000.5) in
           equal string (enc 1000.) a ;
           is_true ~msg:"same second reuses the string" (a == b) ;
-          equal string (enc 1001.) (Date.now_at 1001.) ;
-          equal string (enc 1000.) (Date.now_at 1000.) )
-    ; test "now is the current IMF date" (fun () ->
-          let before = Unix.time () in
-          let s = Date.now () in
-          let after = Unix.time () in
-          let candidates =
-            List.map
-              (fun t -> Http_date.encode (Date.of_unix_time t))
-              [before; after]
+          equal string (enc 1001.) (Date.of_posix (posix 1001.)) ;
+          equal string (enc 1000.) (Date.of_posix (posix 1000.)) )
+    ; test "of_posix drops the fraction of a time before 1970" (fun () ->
+          let posix t = Option.get (Affect_unix.Ptime.of_float_s t) in
+          equal string "Thu, 01 Jan 1970 00:00:00 GMT"
+            (Date.of_posix (posix 0.5)) ;
+          equal string "Wed, 31 Dec 1969 23:59:59 GMT"
+            (Date.of_posix (posix (-0.5))) ;
+          equal string "Wed, 31 Dec 1969 23:59:59 GMT"
+            (Date.of_posix (posix (-1.))) )
+    ; test "of_posix drops a fraction near 1 s" (fun () ->
+          (* 100 ns before midnight: a float rounds it up to the next second. *)
+          let p =
+            Affect_unix.Ptime.(
+              Option.get (of_span (Span.v (20500, 86_399_999_999_900_000L))) )
           in
-          is_true ~msg:"matches the clock" (List.mem s candidates) ;
-          is_true ~msg:"decodes as IMF"
-            (match Http_date.decode s with `IMF _ -> true | _ -> false) ) ]
+          equal string "Mon, 16 Feb 2026 23:59:59 GMT" (Date.of_posix p) ) ]
 
 (* Flow *)
 
@@ -455,7 +459,7 @@ let flow_tests =
             [Some 2; Some 1; Some 0]
             (List.init 3 (fun _ -> Flow.read_now f buf 0 4)) ;
           let nothing =
-            Flow.make
+            Flow.make ~time:Time.mono
               ~read:(fun _ _ _ -> failwith "blocking read")
               ~read_now:(fun _ _ _ -> None)
               ~write:(fun _ _ _ -> ())
@@ -478,7 +482,7 @@ let flow_tests =
         (fun () ->
           let log = ref [] in
           let flow ?reset () =
-            Flow.make
+            Flow.make ~time:Time.mono
               ~read:(fun _ _ _ -> 0)
               ~read_now:(fun _ _ _ -> Some 0)
               ~write:(fun _ _ _ -> ())
@@ -499,7 +503,7 @@ let flow_tests =
         (fun () ->
           let log = ref [] and input = ref "abcdef" in
           let flow ?read_error () =
-            Flow.make
+            Flow.make ~time:Time.mono
               ~read:(fun buf off len ->
                 Option.iter raise read_error ;
                 let n = Int.min (Int.min len 2) (String.length !input) in
@@ -537,7 +541,7 @@ let flow_tests =
     ; test "close is idempotent and later use raises Closed" (fun () ->
           let closes = ref 0 in
           let flow =
-            Flow.make
+            Flow.make ~time:Time.mono
               ~read:(fun _ _ _ -> 0)
               ~read_now:(fun _ _ _ -> Some 0)
               ~write:(fun _ _ _ -> ())
@@ -554,7 +558,7 @@ let flow_tests =
           let log = ref [] in
           let note s = log := s :: !log in
           let flow =
-            Flow.make
+            Flow.make ~time:Time.mono
               ~read:(fun buf off _ -> note "read" ; Bytes.set buf off 'a' ; 1)
               ~read_now:(fun _ _ _ -> note "read_now" ; None)
               ~write:(fun _ _ len -> note (Printf.sprintf "write %d" len))
@@ -598,7 +602,7 @@ let flow_tests =
     ; test "prepend passes shutdown and close to the flow" (fun () ->
           let log = ref [] in
           let flow =
-            Flow.make
+            Flow.make ~time:Time.mono
               ~read:(fun _ _ _ -> 0)
               ~read_now:(fun _ _ _ -> Some 0)
               ~write:(fun _ _ _ -> ())
@@ -618,7 +622,7 @@ let flow_tests =
           equal int 0 (Flow.read f (Bytes.create 1) 0 1) )
     ; test "prepend is readable while its bytes remain" (fun () ->
           let never =
-            Flow.make
+            Flow.make ~time:Time.mono
               ~read:(fun _ _ _ -> 0)
               ~read_now:(fun _ _ _ -> Some 0)
               ~write:(fun _ _ _ -> ())
@@ -1025,6 +1029,432 @@ let handler_tests =
           in
           equal status Status.not_found (Response.status r) ) ]
 
+(* Time *)
+
+(* 2^63 ns + 1 s. [Time.after] can represent the deadline, and the span from the
+   invoke to the deadline stays 2^63 ns or more. affect ends a wait of 2^63 ns
+   or more at once: it compares with a signed comparison. *)
+let beyond_2_63_ns = Affect_unix.Mtime.Span.(add (of_uint64_ns Int64.min_int) s)
+
+(* Whether [action] is enabled within 50 ms. *)
+let enabled_within_50ms action =
+  in_main (fun () -> Fake_time.within_50ms action)
+
+let time_tests =
+  group "Time"
+    [ test "a deadline that has passed is enabled at once" (fun () ->
+          (* 1 s ago: a timer that waits for the time that has passed waits 1
+             s. *)
+          let d = Affect_unix.Mtime.(sub_span (now ()) Span.s) in
+          is_true ~msg:"representable" (Option.is_some d) ;
+          is_true (enabled_within_50ms (Time.at Time.mono d ())) )
+    ; test "a timer reads the time when it is invoked" (fun () ->
+          let timer =
+            Time.at Time.mono
+              (Time.after Time.mono Affect_unix.Mtime.Span.(100 * ms))
+              ()
+          in
+          in_main (fun () ->
+              Affect_unix.Mtime.wait_for Affect_unix.Mtime.Span.(100 * ms) ) ;
+          is_true (enabled_within_50ms timer) )
+    ; test "a deadline 10 ms ahead is enabled" (fun () ->
+          let d = Time.after Time.mono Affect_unix.Mtime.Span.(10 * ms) in
+          is_true (enabled_within_50ms (Time.at Time.mono d ())) )
+    ; test "no deadline is never enabled" (fun () ->
+          is_false (enabled_within_50ms (Time.at Time.mono None ())) )
+    ; test "a deadline 2^63 ns or more ahead is never enabled" (fun () ->
+          let d = Time.after Time.mono beyond_2_63_ns in
+          is_true ~msg:"representable" (Option.is_some d) ;
+          is_false (enabled_within_50ms (Time.at Time.mono d ())) )
+    ; test "the last time is never enabled" (fun () ->
+          let d = Some Affect_unix.Mtime.max_stamp in
+          is_false (enabled_within_50ms (Time.at Time.mono d ())) )
+    ; test "the library reads the time and waits only through Time" (fun () ->
+          (* dune runs the test in _build/default/test; dune exec in the
+             root. *)
+          let root = if Sys.file_exists "../src/time.ml" then ".." else "." in
+          let read dir file =
+            In_channel.with_open_bin
+              (Filename.concat (Filename.concat root dir) file)
+              In_channel.input_all
+          in
+          let contains s sub =
+            let n = String.length sub in
+            let rec at i =
+              i + n <= String.length s && (String.sub s i n = sub || at (i + 1))
+            in
+            at 0
+          in
+          let direct =
+            [ "Mtime.now"
+            ; "Mtime.wait_for"
+            ; "Mtime.observe_wait_for"
+            ; "Mtime.count"
+            ; "Mtime.elapsed"
+            ; "Mtime.("
+            ; "Unix.time"
+            ; "Unix.gettimeofday"
+            ; "Unix.sleep"
+            ; "Unix.select"
+            ; "Ptime.now"
+            ; "Ptime.wait_until"
+            ; "Ptime.observe_wait_until"
+            ; "Ptime.(" ]
+          in
+          (* The server, the client and the WebSocket use the time line of their
+             config or of their flows, also to add spans. *)
+          let injected =
+            [ "Time.mono"
+            ; "Time.posix"
+            ; "Mtime.add_span"
+            ; "Ptime.add_span"
+            ; "Time.("
+            ; "open Time"
+            ; "open Caravan.Time" ]
+          in
+          let files dir ~except =
+            Sys.readdir (Filename.concat root dir)
+            |> Array.to_list
+            |> List.filter (fun file ->
+                Filename.check_suffix file ".ml" && not (List.mem file except) )
+          in
+          let src = files "src" ~except:["time.ml"]
+          and client = files "client" ~except:[]
+          and websocket = files "websocket" ~except:[] in
+          is_true ~msg:"the files of the server are found"
+            (List.mem "server.ml" src && List.mem "h1_server.ml" src) ;
+          is_true ~msg:"the files of the client are found"
+            (List.mem "pool.ml" client && List.mem "config.ml" client) ;
+          is_true ~msg:"the files of the WebSocket are found"
+            (List.mem "connection.ml" websocket) ;
+          let check dir file calls =
+            let text = read dir file in
+            List.iter
+              (fun call ->
+                is_false
+                  ~msg:(dir ^ "/" ^ file ^ " calls " ^ call)
+                  (contains text call) )
+              calls
+          in
+          List.iter
+            (fun file ->
+              check "src" file
+                ( if List.mem file ["server.ml"; "h1_server.ml"] then
+                    direct @ injected
+                  else direct ) )
+            src ;
+          (* client/config.ml has the default time line. *)
+          List.iter
+            (fun file ->
+              check "client" file
+                (if file = "config.ml" then direct else direct @ injected) )
+            client ;
+          List.iter
+            (fun file -> check "websocket" file (direct @ injected))
+            websocket )
+    ; test "the POSIX time line reads the system clock" (fun () ->
+          let module Ptime = Affect_unix.Ptime in
+          let d = Ptime.diff (Time.now Time.posix) (Ptime.now ()) in
+          is_true ~msg:"within 2 s"
+            Ptime.Span.(is_shorter (abs d) ~than:(of_int_s 2)) ;
+          let t = Time.now Time.posix in
+          let d = Option.get (Time.after Time.posix (Ptime.Span.of_int_s 1)) in
+          is_false ~msg:"after adds the span"
+            Ptime.(
+              is_earlier d ~than:(Option.get (add_span t (Span.of_int_s 1))) ) ;
+          is_true ~msg:"within 2 s of the span"
+            Ptime.(
+              is_earlier d ~than:(Option.get (add_span t (Span.of_int_s 3))) ) ;
+          is_true ~msg:"the default of the config"
+            (Config.default.posix_time == Time.posix) )
+    ; test "a POSIX deadline that has passed is enabled at once" (fun () ->
+          let now = Affect_unix.Ptime.now () in
+          is_true (enabled_within_50ms (Time.at Time.posix (Some now) ())) )
+    ; test "a POSIX timer is enabled at its deadline" (fun () ->
+          let module Ptime = Affect_unix.Ptime in
+          let module Mtime = Affect_unix.Mtime in
+          in_main
+          @@ fun () ->
+          let t0 = Mtime.now () in
+          let span = Ptime.Span.of_mtime_span Mtime.Span.(20 * ms) in
+          let p = Option.get (Ptime.add_span (Ptime.now ()) span) in
+          ( match
+              Affect.Action.invoke
+                (Affect.Action.choose
+                   [ Time.at Time.posix (Some p) `Enabled
+                   ; Mtime.wait_for' Mtime.Span.(2 * s) `Late ] )
+            with
+          | `Enabled ->
+              ()
+          | `Late ->
+              fail "not enabled after 2 s" ) ;
+          is_false ~msg:"the POSIX clock before the deadline"
+            (Ptime.is_earlier (Ptime.now ()) ~than:p) ;
+          is_false ~msg:"less than 20 ms"
+            Mtime.Span.(
+              is_shorter (Mtime.span t0 (Mtime.now ())) ~than:(20 * ms) ) )
+    ; test "a sleep waits for its span" (fun () ->
+          in_main
+          @@ fun () ->
+          let t0 = Affect_unix.Mtime.now () in
+          Time.sleep Time.mono Affect_unix.Mtime.Span.(20 * ms) ;
+          let slept = Affect_unix.Mtime.(span t0 (now ())) in
+          is_false ~msg:"at least 20 ms"
+            Affect_unix.Mtime.Span.(is_shorter slept ~than:(20 * ms)) ) ]
+
+(* Fake time *)
+
+module Fake = Fake_time
+
+let ms n = Affect_unix.Mtime.Span.(n * ms)
+
+let sec n = Affect_unix.Mtime.Span.(n * s)
+
+let ( +: ) = Fake.( +: )
+
+(* The calls of a test. A test that fails must not leave a call that waits for
+   ever: [Unix.main] would wait for it. *)
+let calls = ref []
+
+(* One domain unless TEST_DOMAINS says otherwise. *)
+let domain_count =
+  Option.value ~default:1
+    (Option.bind (Sys.getenv_opt "TEST_DOMAINS") int_of_string_opt)
+
+(* [f] in [Unix.main]. At its end, the calls of the test are cancelled. *)
+let fake_main ?(domain_count = domain_count) f =
+  calls := [] ;
+  Affect_unix.Unix.main ~domain_count
+  @@ fun () ->
+  Fun.protect ~finally:(fun () -> List.iter (fun cancel -> cancel ()) !calls) f
+
+(* A call that waits for the fake timer at [d]. *)
+let timer_call f d =
+  let c =
+    Affect.Fun.Async.call (fun () ->
+        Affect.Action.invoke (Time.at (Fake.mono f) (Some d) ()) )
+  in
+  calls := (fun () -> Affect.Fun.Async.cancel c) :: !calls ;
+  c
+
+(* A call that waits for the fake timer at [d], made after a mark, and the proof
+   that the call made its timer. *)
+let waiting_call f d =
+  let m = Fake.mark f in
+  let c = timer_call f d in
+  Fake.wait_mono_timer f ~since:m d ;
+  c
+
+(* Whether [c] ends within 50 ms of real time. *)
+let ends_within_50ms c = Fake.within_50ms (Affect.Fun.Async.get' c)
+
+(* Whether [c] ends within 2 s of real time. *)
+let ends_within_2s c =
+  Affect.Action.invoke
+    (Affect.Action.choose
+       [ Affect.Action.map (fun () -> true) (Affect.Fun.Async.get' c)
+       ; Affect_unix.Mtime.wait_for' (sec 2) false ] )
+
+let fake_time_tests =
+  group "Fake time"
+    [ test "a timer is enabled when the time reaches its deadline" (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let d = Fake.mono_now f +: sec 10 in
+          let c = waiting_call f d in
+          Fake.advance f Affect_unix.Mtime.Span.(sec 10 - ns) ;
+          is_false ~msg:"at the deadline - 1 ns" (ends_within_50ms c) ;
+          Fake.advance f Affect_unix.Mtime.Span.ns ;
+          is_true ~msg:"at the deadline" (ends_within_2s c) ;
+          (* The timer is first: it is enabled, so it wins. *)
+          let d = Fake.mono_now f +: sec 1 in
+          Fake.advance f (sec 1) ;
+          let first =
+            Affect.Action.invoke
+              (Affect.Action.choose
+                 [ Time.at (Fake.mono f) (Some d) `Timer
+                 ; Affect.Action.always `Always ] )
+          in
+          is_true ~msg:"the timer wins" (first = `Timer) )
+    ; test "a timer made after its deadline is enabled at once" (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let d = Fake.mono_now f +: ms 500 in
+          Fake.advance f (sec 1) ;
+          (* A timer that is due at once is in the log too. *)
+          let m = Fake.mark f in
+          let c = timer_call f d in
+          Fake.wait_mono_timer f ~since:m d ;
+          is_true (ends_within_2s c) )
+    ; test "a wait for a timer sees only the timers after its mark" (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let d = Fake.mono_now f +: sec 10 in
+          let c1 = waiting_call f d in
+          let m = Fake.mark f in
+          ( match Fake.wait_mono_timer ~guard:(ms 50) f ~since:m d with
+          | () ->
+              fail "a timer before the mark"
+          | exception Fake.No_timer _ ->
+              () ) ;
+          let c2 = waiting_call f d in
+          ( match
+              Fake.wait_mono_timer ~guard:(ms 50) f ~since:m
+                (d +: Affect_unix.Mtime.Span.ns)
+            with
+          | () ->
+              fail "a timer at a different deadline"
+          | exception Fake.No_timer _ ->
+              () ) ;
+          Fake.advance f (sec 10) ;
+          is_true (ends_within_2s c1) ;
+          is_true (ends_within_2s c2) )
+    ; test "one advance wakes the calls on all domains" (fun () ->
+          fake_main ~domain_count:4
+          @@ fun () ->
+          let f = Fake.make () in
+          let d = Fake.mono_now f +: sec 10 in
+          let waiting = List.init 8 (fun _ -> waiting_call f d) in
+          Fake.advance f (sec 10) ;
+          List.iter (fun c -> is_true (ends_within_2s c)) waiting )
+    ; test "the fake time works outside Unix.main" (fun () ->
+          let f = Fake.make () in
+          let t0 = Time.now (Fake.mono f) in
+          is_true ~msg:"one day after the real time"
+            Affect_unix.Mtime.(is_later t0 ~than:(now () +: Span.hour)) ;
+          Fake.advance f (sec 3) ;
+          is_true ~msg:"3 s later"
+            (Affect_unix.Mtime.equal (Time.now (Fake.mono f)) (t0 +: sec 3)) ;
+          is_true ~msg:"the same value" (Fake.mono f == Fake.mono f) ) ]
+
+(* The fake POSIX clock *)
+
+module Ptime = Affect_unix.Ptime
+
+let fake_posix_tests =
+  group "Fake POSIX clock"
+    [ test "advance moves the two time lines" (fun () ->
+          let f = Fake.make () in
+          let m0 = Fake.mono_now f and p0 = Time.now (Fake.posix f) in
+          equal float_exact ~msg:"the POSIX start" 784111777.
+            (Ptime.to_float_s p0) ;
+          Fake.advance f (sec 3) ;
+          is_true ~msg:"mono"
+            (Affect_unix.Mtime.equal (Fake.mono_now f) (m0 +: sec 3)) ;
+          is_true ~msg:"POSIX"
+            (Ptime.equal
+               (Time.now (Fake.posix f))
+               (Option.get (Ptime.add_span p0 (Ptime.Span.of_int_s 3))) ) ;
+          is_true ~msg:"the same value" (Fake.posix f == Fake.posix f) )
+    ; test "an advance out of range changes nothing" (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let m0 = Fake.mono_now f and p0 = Time.now (Fake.posix f) in
+          let c = waiting_call f (m0 +: sec 1) in
+          raises_match
+            (function Invalid_argument _ -> true | _ -> false)
+            (fun () -> Fake.advance f Affect_unix.Mtime.Span.max_span) ;
+          is_true ~msg:"mono" (Affect_unix.Mtime.equal (Fake.mono_now f) m0) ;
+          is_true ~msg:"POSIX" (Ptime.equal (Time.now (Fake.posix f)) p0) ;
+          is_false ~msg:"no timer enabled" (ends_within_50ms c) ) ]
+
+(* The time line of flows *)
+
+(* A connected pair of non-blocking sockets. *)
+let socket_pair () =
+  let a, b = Unix.socketpair ~cloexec:true Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  Unix.set_nonblock a ; Unix.set_nonblock b ; (a, b)
+
+(* A call that reads one byte of [flow]. *)
+let read_call flow =
+  let c =
+    Affect.Fun.Async.call (fun () -> Flow.read flow (Bytes.create 1) 0 1)
+  in
+  calls := (fun () -> Affect.Fun.Async.cancel c) :: !calls ;
+  c
+
+(* The result of [c] within 2 s of real time. *)
+let result_within_2s c =
+  match
+    Affect.Action.invoke
+      (Affect.Action.choose
+         [ Affect.Action.map (fun _ -> `Ended) (Affect.Fun.Async.get' c)
+         ; Affect_unix.Mtime.wait_for' (sec 2) `Late ] )
+  with
+  | `Ended -> (
+    match Affect.Fun.Async.get c with n -> `Read n | exception e -> `Raised e )
+  | `Late ->
+      `Late
+  | exception e ->
+      `Raised e
+
+(* The steps of F2 on [flow], which reads from the peer [peer]: a read with the
+   deadline L = 11 s gets a byte 1 ns before L, and a second read with the same
+   deadline times out at L. *)
+let read_until_deadline f ~deadline flow peer =
+  Flow.set_read_deadline flow (Some deadline) ;
+  let m = Fake.mark f in
+  let r = read_call flow in
+  Fake.wait_mono_timer f ~since:m deadline ;
+  Fake.advance f Affect_unix.Mtime.Span.(sec 11 - ns) ;
+  ignore (Unix.write_substring peer "x" 0 1) ;
+  is_true ~msg:"a byte 1 ns before the deadline" (result_within_2s r = `Read 1) ;
+  let m = Fake.mark f in
+  let r = read_call flow in
+  Fake.wait_mono_timer f ~since:m deadline ;
+  Fake.advance f Affect_unix.Mtime.Span.ns ;
+  is_true ~msg:"a timeout at the deadline"
+    (result_within_2s r = `Raised Flow.Timeout)
+
+let flow_time_tests =
+  group "Flow time"
+    [ test "a flow keeps its time line" (fun () ->
+          let f = Fake.make () and a, b = socket_pair () in
+          Fun.protect ~finally:(fun () -> Unix.close a ; Unix.close b)
+          @@ fun () ->
+          let flow = Tcp.flow ~time:(Fake.mono f) a in
+          is_true ~msg:"Tcp.flow ~time" (Flow.time flow == Fake.mono f) ;
+          is_true ~msg:"prepend"
+            (Flow.time (Flow.prepend "x" flow) == Fake.mono f) ;
+          is_true ~msg:"the default of Tcp.flow"
+            (Flow.time (Tcp.flow b) == Time.mono) ;
+          is_true ~msg:"of_string"
+            (Flow.time (Flow.of_string "" (Buffer.create 0)) == Time.mono) )
+    ; test "a tcp flow waits for its deadlines on its time line" (fun () ->
+          let a, b = socket_pair () in
+          Fun.protect ~finally:(fun () -> Unix.close a ; Unix.close b)
+          @@ fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let flow = Tcp.flow ~time:(Fake.mono f) a in
+          let deadline = Option.get (Time.after (Flow.time flow) (sec 11)) in
+          read_until_deadline f ~deadline flow b )
+    ; test "a wrapper flow with the time line of its inner flow" (fun () ->
+          let a, b = socket_pair () in
+          Fun.protect ~finally:(fun () -> Unix.close a ; Unix.close b)
+          @@ fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let inner = Tcp.flow ~time:(Fake.mono f) a in
+          let wrapper =
+            Flow.make ~time:(Flow.time inner) ~read:(Flow.read inner)
+              ~read_now:(Flow.read_now inner) ~write:(Flow.write inner)
+              ~readable:(Flow.readable' inner ())
+              ~shutdown_send:(fun () -> Flow.shutdown_send inner)
+              ~close:(fun () -> Flow.close inner)
+              ~set_read_deadline:(Flow.set_read_deadline inner)
+              ~set_write_deadline:(Flow.set_write_deadline inner)
+              ()
+          in
+          let deadline = Option.get (Time.after (Flow.time wrapper) (sec 11)) in
+          read_until_deadline f ~deadline wrapper b ) ]
+
 let () =
   exit
     (run "core"
@@ -1040,4 +1470,8 @@ let () =
        ; conn_info_tests
        ; request_tests
        ; response_tests
-       ; handler_tests ] )
+       ; handler_tests
+       ; time_tests
+       ; fake_time_tests
+       ; fake_posix_tests
+       ; flow_time_tests ] )

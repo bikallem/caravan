@@ -45,7 +45,17 @@ type t =
   ; shutdown_grace: Affect_unix.Mtime.Span.t
         (** Time in-flight requests get to finish when the server stops. Then
             the server cancels them. A handler can see the stop with
-            {!Conn_info.stopping}. *)
+            {!Conn_info.stopping}. A grace of about 292 years or more never
+            ends. *)
+  ; mono_time: Time.mono
+        (** The monotonic time line of the server: the time line of its
+            connections, their deadlines and timeouts, its pause after an accept
+            error and its shutdown grace. Its clock must be monotonic. Tests
+            give a fake time line. An engine computes the deadlines of a
+            connection with {!Flow.time} of its flow. *)
+  ; posix_time: Time.posix
+        (** The POSIX time line of the server, for the [Date] field. Its clock
+            must be the POSIX clock. Tests give a fake time line. *)
   ; date_header: bool  (** Whether responses get a [Date] field. *)
   ; cancel_on_disconnect: bool
         (** Whether a handler is cancelled when its client closes the connection
@@ -62,5 +72,5 @@ val default : t
     1024 connections, 4 KiB buffers, default limits (8 KiB request line, 16 KiB
     and 100 header fields), 8 MiB bodies, 64 KiB drains, timeouts of 10s (head),
     30s (idle, read, write), 2s lingering, a 10s shutdown grace, a [Date] field,
-    handlers cancelled when their client leaves, and errors printed on [stderr].
-*)
+    handlers cancelled when their client leaves, errors printed on [stderr], and
+    the time lines {!Time.mono} and {!Time.posix}. *)

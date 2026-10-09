@@ -203,7 +203,7 @@ let serve ?(config = {Config.default with date_header= false}) ?chunk
     let write buf off len =
       if unwritable then raise Flow.Closed else Flow.write inner buf off len
     in
-    Flow.make ~read ~read_now ~write ~readable
+    Flow.make ~time:(Flow.time inner) ~read ~read_now ~write ~readable
       ~shutdown_send:(fun () -> Buffer.add_string out "[FIN]")
       ~close:ignore
       ~reset:(fun () -> Buffer.add_string out "[RST]")
@@ -751,7 +751,7 @@ let connection_tests =
     ; test "a stopping server ends an idle connection without reading"
         (fun () ->
           let flow =
-            Flow.make
+            Flow.make ~time:Time.mono
               ~read:(fun _ _ _ -> failwith "read while stopping")
               ~read_now:(fun _ _ _ -> failwith "read while stopping")
               ~write:(fun _ _ _ -> ())
@@ -771,7 +771,8 @@ let connection_tests =
             Flow.of_string "GET / HTTP/1.1\r\n\r\n" (Buffer.create 0)
           in
           let flow =
-            Flow.make ~read:(Flow.read input) ~read_now:(Flow.read_now input)
+            Flow.make ~time:(Flow.time input) ~read:(Flow.read input)
+              ~read_now:(Flow.read_now input)
               ~write:(fun _ _ _ -> raise Flow.Closed)
               ~readable:(Flow.readable' input ()) ~shutdown_send:ignore
               ~close:ignore ~set_read_deadline:ignore ~set_write_deadline:ignore
@@ -1012,7 +1013,7 @@ let timeout_tests =
         "a wakeup without input does not hold up a stopping server" (fun () ->
           let woken = ref false in
           let flow =
-            Flow.make
+            Flow.make ~time:Time.mono
               ~read:(fun _ _ _ -> failwith "blocking read")
               ~read_now:(fun _ _ _ ->
                 woken := true ;
@@ -1333,7 +1334,7 @@ let disconnect_tests =
             else Some (read buf off len)
           in
           let flow =
-            Flow.make ~read ~read_now
+            Flow.make ~time:Time.mono ~read ~read_now
               ~write:(fun b off len -> Buffer.add_subbytes out b off len)
               ~readable:
                 (Action.guard (fun () ->

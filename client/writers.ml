@@ -90,14 +90,15 @@ let stop t =
   Cell.Once.try_set t.stopping () ;
   Fun.Async.cancel t.supervisor
 
-(* Takes no more jobs, and waits at most [grace] for the jobs that run: the
-   supervisor call ends after its children. *)
-let finish t ~grace =
+(* Takes no more jobs, and waits at most [grace] on the time line [time] for the
+   jobs that run: the supervisor call ends after its children. *)
+let finish t ~time ~grace =
   Cell.Once.try_set t.stopping () ;
   let ended = Action.map (fun () -> `Ended) (Fun.Async.get' t.supervisor) in
   match
     Action.invoke
-      (Action.choose [ended; Affect_unix.Mtime.wait_for' grace `Late])
+      (Action.choose
+         [ended; Caravan.Time.at time (Caravan.Time.after time grace) `Late] )
   with
   | `Ended | `Late ->
       ()

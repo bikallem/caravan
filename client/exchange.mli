@@ -22,4 +22,5 @@ val run :
    runs one time: at the end of the body, at once for an empty body, at
    Body.close, or at an error. If the connection can stay and the response ends
    before the user code of the request body, it runs later instead, in the fiber
-   of the writer, at the end of the writer. *)
+   of the writer, at the end of the writer. The deadlines are on the time line
+   of [conn.flow] (Flow.time). *)
