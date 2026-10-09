@@ -408,8 +408,9 @@ let signal_tests =
       (Filename.dirname Sys.executable_name)
       "serve_until_signal.exe"
   in
-  (* Runs [f pid out] with the program started: its pid, and a reader on its
-     standard output. Kills the program if [f] leaves it running. *)
+  (* Runs [f pid line] with the program started: its pid, and [line ()], the
+     next line of its standard output. [line] waits at most 5 s. Kills the
+     program if [f] leaves it running. *)
   let with_program ?(args = []) f =
     let out_r, out_w = Unix.pipe ~cloexec:true () in
     let pid =
@@ -431,17 +432,24 @@ let signal_tests =
       | exception Unix.Unix_error (Unix.ECHILD, _, _) ->
           ()
     in
-    Fun.protect ~finally (fun () -> f pid (Buf_reader.of_flow out))
+    let r = Buf_reader.of_flow out in
+    let line () =
+      Flow.set_read_deadline out
+        (Mtime.add_span (Mtime.now ()) Mtime.Span.(5 * s)) ;
+      Buf_reader.read_line r ~max:100
+    in
+    Fun.protect ~finally (fun () -> f pid line)
   in
-  let connect out =
-    let port = int_of_string (Buf_reader.read_line out ~max:100) in
+  let connect port =
     let flow = Tcp.connect (Unix.ADDR_INET (Unix.inet_addr_loopback, port)) in
     Flow.set_read_deadline flow
       (Mtime.add_span (Mtime.now ()) Mtime.Span.(5 * s)) ;
     (flow, Buf_reader.of_flow flow)
   in
-  (* The exit status of [pid] and the milliseconds it took, killing it after
-     5s. *)
+  (* The first line of the program is its port. *)
+  let port line = int_of_string (line ()) in
+  (* The exit status of [pid] and the milliseconds it took, killing it after 5s.
+     The grace of the server is 10 s: thus a server that waits for it fails. *)
   let exited pid =
     let clock = Mtime.counter () in
     let rec poll () =
@@ -456,65 +464,68 @@ let signal_tests =
     in
     poll ()
   in
-  let exited_ok pid ~within =
-    let status, ms = exited pid in
-    equal bool ~msg:"exit 0" true (status = Unix.WEXITED 0) ;
-    is_true ~msg:(Printf.sprintf "exited after %.0fms" ms) (ms < within)
+  let exited_ok pid =
+    let status, _ = exited pid in
+    equal bool ~msg:"exit 0" true (status = Unix.WEXITED 0)
   in
+  (* Signals of a type merge while they are pending. Thus each test waits for
+     the line that shows the effect of a signal before it sends the next. *)
   group "Server.run and signals"
     [ test "SIGTERM: the request in progress finishes, then the process exits"
         (fun () ->
           in_main
           @@ fun () ->
           with_program
-          @@ fun pid out ->
-          let flow, r = connect out in
+          @@ fun pid line ->
+          let flow, r = connect (port line) in
           Flow.write_string flow (get "/slow") ;
-          equal string "started" (Buf_reader.read_line out ~max:100) ;
+          equal string "started" (line ()) ;
           Unix.kill pid Sys.sigterm ;
+          (* /slow gives "timeout" after 2 s without the stop. *)
           equal string {|200 "done" close|} (read_response ~head:false r) ;
           Flow.close flow ;
-          exited_ok pid ~within:3000. )
+          exited_ok pid )
     ; test "a second SIGINT aborts the request in progress" (fun () ->
           in_main
           @@ fun () ->
           with_program
-          @@ fun pid out ->
-          let flow, r = connect out in
+          @@ fun pid line ->
+          let flow, r = connect (port line) in
           Flow.write_string flow (get "/stuck") ;
-          equal string "started" (Buf_reader.read_line out ~max:100) ;
+          equal string "started" (line ()) ;
           Unix.kill pid Sys.sigint ;
-          Mtime.wait_for Mtime.Span.(50 * ms) ;
+          equal string "stopping" (line ()) ;
           Unix.kill pid Sys.sigint ;
-          exited_ok pid ~within:1000. ;
+          exited_ok pid ;
           is_true ~msg:"no response" (Buf_reader.peek_eof r) ;
           Flow.close flow )
     ; test "SIGTERM with nothing in progress exits at once" (fun () ->
           in_main
           @@ fun () ->
           with_program
-          @@ fun pid out ->
-          let flow, r = connect out in
+          @@ fun pid line ->
+          let flow, r = connect (port line) in
           Flow.write_string flow (get "/hello") ;
           equal string {|200 "hello"|} (read_response ~head:false r) ;
           Unix.kill pid Sys.sigterm ;
           is_true ~msg:"the idle connection is closed" (Buf_reader.peek_eof r) ;
           Flow.close flow ;
-          exited_ok pid ~within:1000. )
+          exited_ok pid )
     ; test
         "a third signal ends a server stuck in a handler deaf to cancellation"
         (fun () ->
           in_main
           @@ fun () ->
           with_program
-          @@ fun pid out ->
-          let flow, _ = connect out in
+          @@ fun pid line ->
+          let flow, _ = connect (port line) in
           Flow.write_string flow (get "/deaf") ;
-          equal string "started" (Buf_reader.read_line out ~max:100) ;
-          for _ = 1 to 3 do
-            Unix.kill pid Sys.sigint ;
-            Mtime.wait_for Mtime.Span.(50 * ms)
-          done ;
+          equal string "started" (line ()) ;
+          Unix.kill pid Sys.sigint ;
+          equal string "stopping" (line ()) ;
+          Unix.kill pid Sys.sigint ;
+          equal string "cancelled" (line ()) ;
+          Unix.kill pid Sys.sigint ;
           let status, ms = exited pid in
           equal bool ~msg:"killed by SIGINT" true
             (status = Unix.WSIGNALED Sys.sigint) ;
@@ -524,10 +535,10 @@ let signal_tests =
           in_main
           @@ fun () ->
           with_program ~args:["after-run"]
-          @@ fun pid out ->
-          ignore (Buf_reader.read_line out ~max:100) ;
+          @@ fun pid line ->
+          ignore (line ()) ;
           Unix.kill pid Sys.sigterm ;
-          equal string "stopped" (Buf_reader.read_line out ~max:100) ;
+          equal string "stopped" (line ()) ;
           Unix.kill pid Sys.sigterm ;
           let status, ms = exited pid in
           equal bool ~msg:"killed by SIGTERM" true
