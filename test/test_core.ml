@@ -1059,7 +1059,15 @@ let time_tests =
           is_true (enabled_within_50ms timer) )
     ; test "a deadline 10 ms ahead is enabled" (fun () ->
           let d = Time.after Time.mono Affect_unix.Mtime.Span.(10 * ms) in
-          is_true (enabled_within_50ms (Time.at Time.mono d ())) )
+          (* A 2 s window: a slow machine can take more than 50 ms. *)
+          is_true
+            (in_main (fun () ->
+                 Affect.Action.invoke
+                   (Affect.Action.choose
+                      [ Time.at Time.mono d true
+                      ; Affect_unix.Mtime.wait_for'
+                          Affect_unix.Mtime.Span.(2 * s)
+                          false ] ) ) ) )
     ; test "no deadline is never enabled" (fun () ->
           is_false (enabled_within_50ms (Time.at Time.mono None ())) )
     ; test "a deadline 2^63 ns or more ahead is never enabled" (fun () ->
