@@ -11,18 +11,17 @@ let in_main f = Affect_unix.Unix.main ~domain_count f
 
 let loopback = Server_support.loopback
 
-(* A connected (client, server) pair of flows. *)
-let with_pair f =
-  in_main
-  @@ fun () ->
-  let l = Tcp.Listener.listen loopback in
-  Fun.protect ~finally:(fun () -> Tcp.Listener.close l)
-  @@ fun () ->
-  let client = Fun.Async.call (fun () -> Tcp.connect (Tcp.Listener.addr l)) in
-  let fd, _ = Tcp.Listener.accept l in
-  let server = Tcp.flow fd and client = Fun.Async.get client in
-  Fun.protect ~finally:(fun () -> Flow.close client ; Flow.close server)
-  @@ fun () -> f client server
+module Fake = Fake_time
+
+let ( +: ) = Fake.( +: )
+
+let within_2s = Server_support.within_2s
+
+(* [f server client] with a connected pair of flows. The server end is on the
+   time line [time]. The client end stays on the real time line: a real deadline
+   on a fake time line is about one day in the past, and gives Timeout at
+   once. *)
+let with_flows = Server_support.with_flows
 
 let read_all flow =
   let buf = Bytes.create 65536 and out = Buffer.create 65536 in
@@ -46,7 +45,15 @@ let read_exactly flow n =
 let deadline_in n =
   Mtime.add_span (Mtime.now ()) Mtime.Span.(n * ms) |> Option.get
 
-let elapsed_ms c = Mtime.Span.to_float_ns (Mtime.count c) /. 1e6
+(* More than the socket buffers hold: the write blocks when the peer does not
+   read. *)
+let write_much flow =
+  let chunk = Bytes.make (1024 * 1024) 'x' in
+  for _ = 1 to 256 do
+    Flow.write flow chunk 0 (Bytes.length chunk)
+  done
+
+let get_2s = Server_support.get_2s
 
 (* [call] must end with Timeout in less than 2 s. If it does not, the test
    cancels it, so that a failure does not stop the suite. *)
@@ -78,15 +85,15 @@ let tcp_tests =
               fail "not an inet address" ) ;
           Tcp.Listener.close l )
     ; test "a request and its echo" (fun () ->
-          with_pair
-          @@ fun client server ->
+          with_flows
+          @@ fun server client ->
           Flow.write_string client "ping" ;
           equal string "ping" (read_exactly server 4) ;
           Flow.write_string server "pong" ;
           equal string "pong" (read_exactly client 4) )
     ; test "read_now does not wait for input" (fun () ->
-          with_pair
-          @@ fun client server ->
+          with_flows
+          @@ fun server client ->
           let buf = Bytes.create 8 in
           let now () = Flow.read_now server buf 0 8 in
           (* A wakeup may come without input. *)
@@ -103,8 +110,8 @@ let tcp_tests =
             [None; Some 2; Some 0]
             [before; data; next ()] )
     ; test "half-close: the peer reads the end and can still answer" (fun () ->
-          with_pair
-          @@ fun client server ->
+          with_flows
+          @@ fun server client ->
           Flow.write_string client "request" ;
           Flow.shutdown_send client ;
           equal string "request" (read_all server) ;
@@ -112,8 +119,8 @@ let tcp_tests =
           Flow.shutdown_send server ;
           equal string "response" (read_all client) )
     ; test "4 MiB each way at once" (fun () ->
-          with_pair
-          @@ fun client server ->
+          with_flows
+          @@ fun server client ->
           let data =
             String.init (4 * 1024 * 1024) (fun i -> Char.chr (i land 0xff))
           in
@@ -132,76 +139,121 @@ let tcp_tests =
           is_true ~msg:"client received it"
             (String.equal data (Fun.Async.get r2)) )
     ; test "a read deadline ends a wait with Timeout" (fun () ->
-          with_pair
-          @@ fun _client server ->
-          let c = Mtime.counter () in
-          Flow.set_read_deadline server (Some (deadline_in 50)) ;
-          raises Flow.Timeout (fun () -> Flow.read server (Bytes.create 1) 0 1) ;
-          let ms = elapsed_ms c in
-          is_true
-            ~msg:(Printf.sprintf "took %.0fms" ms)
-            (ms >= 40. && ms < 1000.) ;
-          Flow.set_read_deadline server (Some (Mtime.now ())) ;
+          let f = Fake.make () in
+          with_flows ~time:(Fake.mono f)
+          @@ fun server _client ->
+          let span = Mtime.Span.(5 * s) in
+          let d = Fake.mono_now f +: span in
+          Flow.set_read_deadline server (Some d) ;
+          Fake.with_call_at_timer f d (fun () ->
+              ignore (Flow.read server (Bytes.create 1) 0 1) )
+          @@ fun reader ->
+          (* No data comes: only an advance can end the read. *)
+          Fake.advance f Mtime.Span.(span - ns) ;
+          is_false ~msg:"no end 1 ns before the deadline"
+            (Fake.ends_within_50ms reader) ;
+          Fake.advance f Mtime.Span.ns ;
+          times_out reader ;
+          (* A deadline at the time of the time line has passed. *)
+          Flow.set_read_deadline server (Some (Fake.mono_now f)) ;
           raises Flow.Timeout (fun () -> Flow.read server (Bytes.create 1) 0 1) )
     ; test "without a deadline a read waits for data" (fun () ->
-          with_pair
-          @@ fun client server ->
-          Flow.set_read_deadline server (Some (deadline_in 10)) ;
+          let f = Fake.make () in
+          with_flows ~time:(Fake.mono f)
+          @@ fun server client ->
+          let span = Mtime.Span.(5 * s) in
+          Flow.set_read_deadline server (Some (Fake.mono_now f +: span)) ;
           Flow.set_read_deadline server None ;
-          let _writer =
-            Fun.Async.call (fun () ->
-                Mtime.wait_for Mtime.Span.(100 * ms) ;
-                Flow.write_string client "late" )
-          in
-          equal string "late" (read_exactly server 4) )
+          let reader = Fun.Async.call (fun () -> read_exactly server 4) in
+          Fun.protect ~finally:(fun () -> Fun.Async.cancel reader)
+          @@ fun () ->
+          (* Past the deadline that the read does not have. *)
+          Fake.advance f Mtime.Span.(2 * span) ;
+          is_false ~msg:"no end" (Fake.ends_within_50ms reader) ;
+          Flow.write_string client "late" ;
+          equal string "late" (get_2s reader) )
     ; test "a write deadline ends a blocked write with Timeout" (fun () ->
-          with_pair
-          @@ fun client _server ->
-          let chunk = Bytes.make (1024 * 1024) 'x' in
-          Flow.set_write_deadline client (Some (deadline_in 200)) ;
-          raises Flow.Timeout (fun () ->
-              for _ = 1 to 256 do
-                Flow.write client chunk 0 (Bytes.length chunk)
-              done ) )
+          let f = Fake.make () in
+          with_flows ~time:(Fake.mono f)
+          @@ fun server _client ->
+          let span = Mtime.Span.(5 * s) in
+          let d = Fake.mono_now f +: span in
+          Flow.set_write_deadline server (Some d) ;
+          (* The client does not read: the write blocks with the deadline. *)
+          Fake.with_call_at_timer f d (fun () -> write_much server)
+          @@ fun writer -> Fake.advance f span ; times_out writer )
     ; (* A deadline set from a different fiber reaches a read or a write that
-         waits already. *)
+         waits already. The wait starts with a deadline D1, whose timer proves
+         the wait. Then the next two tests show a change from D1 to an earlier
+         D2, and a change from no deadline to a deadline D3. *)
       test "a new deadline ends a read that waits" (fun () ->
-          with_pair
-          @@ fun _client server ->
-          let reader =
-            Fun.Async.call (fun () ->
-                ignore (Flow.read server (Bytes.create 1) 0 1) )
-          in
-          Mtime.wait_for Mtime.Span.(20 * ms) ;
-          Flow.set_read_deadline server (Some (deadline_in 20)) ;
+          let f = Fake.make () in
+          with_flows ~time:(Fake.mono f)
+          @@ fun server _client ->
+          let t0 = Fake.mono_now f in
+          let d1 = t0 +: Mtime.Span.(10 * s)
+          and d2 = t0 +: Mtime.Span.(5 * s)
+          and d3 = t0 +: Mtime.Span.(7 * s) in
+          Flow.set_read_deadline server (Some d1) ;
+          Fake.with_call_at_timer f d1 (fun () ->
+              ignore (Flow.read server (Bytes.create 1) 0 1) )
+          @@ fun reader ->
+          let m = Fake.mark f in
+          Flow.set_read_deadline server (Some d2) ;
+          Fake.wait_mono_timer f ~since:m d2 ;
+          (* The read waits again, with no deadline. No timer can prove this
+             wait: the check of 50 ms gives it the time, and it cannot fail on
+             correct code. *)
+          Flow.set_read_deadline server None ;
+          is_false ~msg:"no end without a deadline"
+            (Fake.ends_within_50ms reader) ;
+          let m = Fake.mark f in
+          Flow.set_read_deadline server (Some d3) ;
+          Fake.wait_mono_timer f ~since:m d3 ;
+          Fake.advance f Mtime.Span.(7 * s) ;
           times_out reader )
     ; test "a new deadline ends a write that waits" (fun () ->
-          with_pair
-          @@ fun client _server ->
-          let chunk = Bytes.make (1024 * 1024) 'x' in
-          let writer =
-            Fun.Async.call (fun () ->
-                for _ = 1 to 256 do
-                  Flow.write client chunk 0 (Bytes.length chunk)
-                done )
-          in
-          Mtime.wait_for Mtime.Span.(50 * ms) ;
-          Flow.set_write_deadline client (Some (deadline_in 20)) ;
+          let f = Fake.make () in
+          with_flows ~time:(Fake.mono f)
+          @@ fun server _client ->
+          let t0 = Fake.mono_now f in
+          let d1 = t0 +: Mtime.Span.(10 * s)
+          and d2 = t0 +: Mtime.Span.(5 * s)
+          and d3 = t0 +: Mtime.Span.(7 * s) in
+          Flow.set_write_deadline server (Some d1) ;
+          Fake.with_call_at_timer f d1 (fun () -> write_much server)
+          @@ fun writer ->
+          let m = Fake.mark f in
+          Flow.set_write_deadline server (Some d2) ;
+          Fake.wait_mono_timer f ~since:m d2 ;
+          (* The write waits again, with no deadline. No timer can prove this
+             wait: the check of 50 ms gives it the time, and it cannot fail on
+             correct code. *)
+          Flow.set_write_deadline server None ;
+          is_false ~msg:"no end without a deadline"
+            (Fake.ends_within_50ms writer) ;
+          let m = Fake.mark f in
+          Flow.set_write_deadline server (Some d3) ;
+          Fake.wait_mono_timer f ~since:m d3 ;
+          Fake.advance f Mtime.Span.(7 * s) ;
           times_out writer )
     ; test "a deadline removed from a read that waits stops it no more"
         (fun () ->
-          with_pair
-          @@ fun client server ->
-          Flow.set_read_deadline server (Some (deadline_in 100)) ;
-          let reader = Fun.Async.call (fun () -> read_exactly server 4) in
-          Mtime.wait_for Mtime.Span.(20 * ms) ;
+          let f = Fake.make () in
+          with_flows ~time:(Fake.mono f)
+          @@ fun server client ->
+          let d = Fake.mono_now f +: Mtime.Span.(5 * s) in
+          Flow.set_read_deadline server (Some d) ;
+          Fake.with_call_at_timer f d (fun () -> read_exactly server 4)
+          @@ fun reader ->
           Flow.set_read_deadline server None ;
-          Mtime.wait_for Mtime.Span.(150 * ms) ;
+          Fake.advance f Mtime.Span.(10 * s) ;
+          is_false ~msg:"no end" (Fake.ends_within_50ms reader) ;
           Flow.write_string client "late" ;
-          equal string "late" (Fun.Async.get reader) )
+          equal string "late" (get_2s reader) )
     ; test "writing to a closed peer raises Closed" (fun () ->
-          with_pair
-          @@ fun client server ->
+          with_flows
+          @@ fun server client ->
           Flow.close server ;
           Mtime.wait_for Mtime.Span.(20 * ms) ;
           raises Flow.Closed (fun () ->
@@ -221,65 +273,72 @@ let tcp_tests =
           let server = Tcp.flow fd in
           Unix.setsockopt_optint peer Unix.SO_LINGER (Some 0) ;
           Unix.close peer ;
-          Mtime.wait_for Mtime.Span.(20 * ms) ;
+          (* The RST makes the socket readable. *)
+          within_2s (fun () -> Action.invoke (Flow.readable' server ())) ;
           raises Flow.Closed (fun () -> Flow.read server (Bytes.create 1) 0 1) ;
           Flow.shutdown_send server ;
           Flow.close server ;
           Tcp.Listener.close l )
     ; test "reset makes the peer see a reset, not the end of the stream"
         (fun () ->
-          with_pair
-          @@ fun client server ->
+          with_flows
+          @@ fun server client ->
           Flow.write_string server "cut" ;
           Flow.reset server ;
           equal string "cut" (read_exactly client 3) ;
           raises Flow.Closed (fun () -> Flow.read client (Bytes.create 1) 0 1) ;
           Flow.close client )
-    ; test "cancelling a blocked read" (fun () ->
-          with_pair
-          @@ fun _client server ->
-          let reader =
-            Fun.Async.call (fun () -> Flow.read server (Bytes.create 1) 0 1)
-          in
-          Mtime.wait_for Mtime.Span.(50 * ms) ;
+    ; (* In the next tests, the timer of a read or a write deadline proves that
+         the call waits. No advance comes: the deadline does not end the
+         call. *)
+      test "cancelling a blocked read" (fun () ->
+          let f = Fake.make () in
+          with_flows ~time:(Fake.mono f)
+          @@ fun server _client ->
+          let d = Fake.mono_now f +: Mtime.Span.(100 * s) in
+          Flow.set_read_deadline server (Some d) ;
+          Fake.with_call_at_timer f d (fun () ->
+              Flow.read server (Bytes.create 1) 0 1 )
+          @@ fun reader ->
           Fun.Async.cancel reader ;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader) ;
+          raises Fun.Async.Cancelled (fun () -> get_2s reader) ;
           Flow.close server ;
           raises Flow.Closed (fun () -> Flow.read server (Bytes.create 1) 0 1) )
     ; (* A different fiber closes the flow. The waits end with Closed, and the
          fd keeps its number until they end. *)
       test "a close ends a read that waits with Closed" (fun () ->
-          with_pair
-          @@ fun _client server ->
-          let reader =
-            Fun.Async.call (fun () -> Flow.read server (Bytes.create 1) 0 1)
-          in
-          Mtime.wait_for Mtime.Span.(20 * ms) ;
+          let f = Fake.make () in
+          with_flows ~time:(Fake.mono f)
+          @@ fun server _client ->
+          let d = Fake.mono_now f +: Mtime.Span.(100 * s) in
+          Flow.set_read_deadline server (Some d) ;
+          Fake.with_call_at_timer f d (fun () ->
+              Flow.read server (Bytes.create 1) 0 1 )
+          @@ fun reader ->
           Flow.close server ;
-          raises Flow.Closed (fun () -> Fun.Async.get reader) )
+          raises Flow.Closed (fun () -> get_2s reader) )
     ; test "a close ends a write that waits with Closed" (fun () ->
-          with_pair
-          @@ fun client _server ->
-          let chunk = Bytes.make (1024 * 1024) 'x' in
-          let writer =
-            Fun.Async.call (fun () ->
-                for _ = 1 to 256 do
-                  Flow.write client chunk 0 (Bytes.length chunk)
-                done )
-          in
-          Mtime.wait_for Mtime.Span.(50 * ms) ;
-          Flow.close client ;
-          raises Flow.Closed (fun () -> Fun.Async.get writer) )
-    ; test "the fd closes when the last read that waits ends" (fun () ->
-          with_pair
-          @@ fun client server ->
-          let reader =
-            Fun.Async.call (fun () -> Flow.read server (Bytes.create 1) 0 1)
-          in
-          Mtime.wait_for Mtime.Span.(20 * ms) ;
+          let f = Fake.make () in
+          with_flows ~time:(Fake.mono f)
+          @@ fun server _client ->
+          let d = Fake.mono_now f +: Mtime.Span.(100 * s) in
+          Flow.set_write_deadline server (Some d) ;
+          Fake.with_call_at_timer f d (fun () -> write_much server)
+          @@ fun writer ->
           Flow.close server ;
-          raises Flow.Closed (fun () -> Fun.Async.get reader) ;
-          Flow.set_read_deadline client (Some (deadline_in 1000)) ;
+          raises Flow.Closed (fun () -> get_2s writer) )
+    ; test "the fd closes when the last read that waits ends" (fun () ->
+          let f = Fake.make () in
+          with_flows ~time:(Fake.mono f)
+          @@ fun server client ->
+          let d = Fake.mono_now f +: Mtime.Span.(100 * s) in
+          Flow.set_read_deadline server (Some d) ;
+          Fake.with_call_at_timer f d (fun () ->
+              Flow.read server (Bytes.create 1) 0 1 )
+          @@ fun reader ->
+          Flow.close server ;
+          raises Flow.Closed (fun () -> get_2s reader) ;
+          Flow.set_read_deadline client (Some (deadline_in 2000)) ;
           equal int ~msg:"the end of the stream" 0
             (Flow.read client (Bytes.create 1) 0 1) )
     ; test
@@ -287,24 +346,28 @@ let tcp_tests =
         (fun () ->
           in_main
           @@ fun () ->
+          let f = Fake.make () in
           let l = Tcp.Listener.listen loopback in
           Fun.protect ~finally:(fun () -> Tcp.Listener.close l)
           @@ fun () ->
           let connect () =
             Fun.Async.call (fun () -> Tcp.connect (Tcp.Listener.addr l))
           in
-          let accept () = Tcp.flow (fst (Tcp.Listener.accept l)) in
+          let accept ?time () = Tcp.flow ?time (fst (Tcp.Listener.accept l)) in
           let first = connect () in
-          let old = accept () in
+          let old = accept ~time:(Fake.mono f) () in
+          let d = Fake.mono_now f +: Mtime.Span.(100 * s) in
+          Flow.set_read_deadline old (Some d) ;
           let buf = Bytes.create 64 in
-          let reader = Fun.Async.call (fun () -> Flow.read old buf 0 64) in
-          Mtime.wait_for Mtime.Span.(20 * ms) ;
+          Fake.with_call_at_timer f d (fun () -> Flow.read old buf 0 64)
+          @@ fun reader ->
           Flow.close old ;
           let second = connect () in
           let fresh = accept () in
           let client = Fun.Async.get second in
           Flow.write_string client "0123456789" ;
-          raises Flow.Closed (fun () -> Fun.Async.get reader) ;
+          raises Flow.Closed (fun () -> get_2s reader) ;
+          Flow.set_read_deadline fresh (Some (deadline_in 2000)) ;
           equal string "0123456789" (read_exactly fresh 10) ;
           List.iter Flow.close [fresh; client; Fun.Async.get first] )
     ; test "connecting to a closed port fails" (fun () ->
@@ -321,52 +384,52 @@ let tcp_tests =
           in_main
           @@ fun () ->
           let l = Tcp.Listener.listen loopback in
-          let ready () =
+          let ready within =
             Action.invoke
               (Action.choose
                  [ Tcp.Listener.wait_acceptable l true
-                 ; Mtime.wait_for' Mtime.Span.(30 * ms) false ] )
+                 ; Mtime.wait_for' within false ] )
           in
-          is_true ~msg:"nothing pending" (not (ready ())) ;
+          is_true ~msg:"nothing pending" (not (ready Mtime.Span.(30 * ms))) ;
           let client = Tcp.connect (Tcp.Listener.addr l) in
-          is_true ~msg:"a connection is pending" (ready ()) ;
+          (* A slow machine can take more than 30 ms. *)
+          is_true ~msg:"a connection is pending" (ready Mtime.Span.(2 * s)) ;
           let fd, _ = Tcp.Listener.accept l in
           Unix.close fd ; Flow.close client ; Tcp.Listener.close l )
     ; test "try_accept does not wait" (fun () ->
           in_main
           @@ fun () ->
           let l = Tcp.Listener.listen loopback in
-          is_true ~msg:"nothing pending" (Tcp.Listener.try_accept l = None) ;
+          Fun.protect ~finally:(fun () -> Tcp.Listener.close l)
+          @@ fun () ->
+          let none () =
+            within_2s (fun () -> Tcp.Listener.try_accept l) = None
+          in
+          is_true ~msg:"nothing pending" (none ()) ;
           let client = Tcp.connect (Tcp.Listener.addr l) in
-          let rec accepted tries =
+          (* The readiness can be spurious: after a None, it waits again. *)
+          let rec accept () =
+            Action.invoke (Tcp.Listener.wait_acceptable l ()) ;
             match Tcp.Listener.try_accept l with
             | Some (fd, _) ->
-                Unix.close fd ; true
+                Unix.close fd
             | None ->
-                tries > 0
-                &&
-                ( Mtime.wait_for Mtime.Span.(5 * ms) ;
-                  accepted (tries - 1) )
+                accept ()
           in
-          is_true ~msg:"a pending connection" (accepted 20) ;
-          is_true ~msg:"nothing pending again" (Tcp.Listener.try_accept l = None) ;
-          Flow.close client ;
-          Tcp.Listener.close l ) ]
+          within_2s accept ;
+          is_true ~msg:"nothing pending again" (none ()) ;
+          Flow.close client ) ]
 
 (* Server *)
 
 let quiet = Server_support.config
 
-(* Set when /sleep or /pause starts, so that a test can stop the server while it
-   is in progress. *)
+(* Set when /pause starts, so that a test can stop the server while it is in
+   progress. *)
 let started = ref (Cell.Once.make ())
 
 let handler req =
   match Request.path_only req with
-  | "/sleep" ->
-      Cell.Once.try_set !started () ;
-      Mtime.wait_for Mtime.Span.(10 * s) ;
-      Response.string "late"
   | "/pause" ->
       Cell.Once.try_set !started () ;
       Mtime.wait_for Mtime.Span.(300 * ms) ;
@@ -486,78 +549,6 @@ let server_tests =
           Flow.close first ;
           let _, body = read_response second in
           equal string "hello" body ; Flow.close second )
-    ; test "requests that outlast shutdown_grace are cancelled" (fun () ->
-          in_main
-          @@ fun () ->
-          started := Cell.Once.make () ;
-          let config = {quiet with shutdown_grace= Mtime.Span.(100 * ms)} in
-          let server = Server.start ~config handler in
-          let c = Tcp.connect (Server.local_addr server) in
-          Flow.write_string c (get "/sleep") ;
-          Cell.Once.get !started ;
-          let clock = Mtime.counter () in
-          Server.shutdown server ;
-          Server.wait server ;
-          let waited = elapsed_ms clock in
-          is_true
-            ~msg:(Printf.sprintf "waited %.0fms" waited)
-            (waited > 90. && waited < 1000.) ;
-          equal string "" (read_all c) ;
-          Flow.close c )
-    ; test "abort cancels requests in progress without a grace" (fun () ->
-          in_main
-          @@ fun () ->
-          started := Cell.Once.make () ;
-          let server = Server.start ~config:quiet handler in
-          let c = Tcp.connect (Server.local_addr server) in
-          Flow.write_string c (get "/sleep") ;
-          Cell.Once.get !started ;
-          let clock = Mtime.counter () in
-          Server.abort server ;
-          Server.wait server ;
-          is_true ~msg:"well before the 10s grace" (elapsed_ms clock < 1000.) ;
-          equal string "" (read_all c) ;
-          Flow.close c )
-    ; test "a request in progress at shutdown finishes, closing its connection"
-        (fun () ->
-          in_main
-          @@ fun () ->
-          started := Cell.Once.make () ;
-          let server = Server.start ~config:quiet handler in
-          let c = Tcp.connect (Server.local_addr server) in
-          Flow.write_string c (get "/pause") ;
-          Cell.Once.get !started ;
-          let clock = Mtime.counter () in
-          Server.shutdown server ;
-          equal string
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: text/plain; charset=utf-8\r\n\
-             Content-Length: 4\r\n\
-             Connection: close\r\n\
-             \r\n\
-             done"
-            (read_all c) ;
-          Flow.close c ;
-          Server.wait server ;
-          let waited = elapsed_ms clock in
-          is_true
-            ~msg:(Printf.sprintf "waited %.0fms, not the 10s grace" waited)
-            (waited < 2000.) )
-    ; test "idle connections close at once on shutdown" (fun () ->
-          in_main
-          @@ fun () ->
-          let server = Server.start ~config:quiet handler in
-          let c = Tcp.connect (Server.local_addr server) in
-          let r = Private.Buf_reader.of_flow c in
-          Flow.write_string c (get "/") ;
-          ignore (read_response_from r) ;
-          let clock = Mtime.counter () in
-          Server.shutdown server ;
-          equal int ~msg:"end of stream" 0
-            (Private.Buf_reader.read_into r (Bytes.create 1) 0 1) ;
-          Server.wait server ;
-          is_true ~msg:"well before the 10s grace" (elapsed_ms clock < 2000.) ;
-          Flow.close c )
     ; test "an engine sees the server stopping" (fun () ->
           let engine (ctx : Engine.ctx) flow _handler =
             let before = ctx.is_stopping () in
@@ -577,24 +568,34 @@ let server_tests =
           Flow.close c )
     ; test "with every slot busy, shutdown still refuses new clients at once"
         (fun () ->
+          let started = Cell.Once.make () and release = Cell.Once.make () in
+          let handler _ =
+            Cell.Once.try_set started () ;
+            Cell.Once.get release ;
+            Response.string "done"
+          in
           in_main
           @@ fun () ->
-          started := Cell.Once.make () ;
           let server =
             Server.start ~config:{quiet with max_connections= 1} handler
           in
+          (* A failure must not hang: the request ends with the test. *)
+          Fun.protect ~finally:(fun () -> Cell.Once.try_set release ())
+          @@ fun () ->
           let addr = Server.local_addr server in
           let c = Tcp.connect addr in
-          Flow.write_string c (get "/pause") ;
-          Cell.Once.get !started ;
+          Flow.write_string c (get "/") ;
+          within_2s (fun () -> Cell.Once.get started) ;
           Server.shutdown server ;
-          (* The listener closes while the only slot is still taken. *)
-          let rec refused tries =
+          (* The listener closes while the only slot is still taken. The test
+             tries again for 2 s at most. *)
+          let deadline = deadline_in 2000 in
+          let rec refused () =
             let retry () =
-              tries > 0
+              Mtime.is_earlier (Mtime.now ()) ~than:deadline
               &&
               ( Mtime.wait_for Mtime.Span.(5 * ms) ;
-                refused (tries - 1) )
+                refused () )
             in
             match Tcp.connect addr with
             | exception Unix.Unix_error (Unix.ECONNREFUSED, _, _) ->
@@ -605,9 +606,13 @@ let server_tests =
             | c ->
                 Flow.close c ; retry ()
           in
-          is_true ~msg:"refused" (refused 20) ;
+          is_true ~msg:"refused" (refused ()) ;
+          Cell.Once.try_set release () ;
+          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
           let _, body = read_response c in
-          equal string "done" body ; Flow.close c ; Server.wait server )
+          equal string "done" body ;
+          Flow.close c ;
+          within_2s (fun () -> Server.wait server) )
     ; test "200 starts and shutdowns in a row all finish" (fun () ->
           (* Readiness of the listener can be spurious: the acceptor must not
              then block in accept, deaf to the stop. *)
@@ -912,30 +917,7 @@ let contains s sub =
 
 let accept_loop_tests =
   group "Accept loop"
-    [ test "EMFILE is reported, then the server waits 100 ms and accepts again"
-        (fun () ->
-          let fd, c = socket_pair () in
-          with_fake_listener ~clients:[c] [Error EMFILE; Conn fd]
-          @@ fun l server errors ->
-          Flow.write_string c (get ~close:true "/") ;
-          ends_with "hello" (response c) ;
-          is_true ~msg:"one EMFILE reported"
-            ( match Atomic.get errors with
-            | [Unix.Unix_error (EMFILE, "accept", _)] ->
-                true
-            | _ ->
-                false ) ;
-          ( match Atomic.get l.calls with
-          | [conn; emfile] ->
-              let pause = Mtime.span emfile conn in
-              is_false
-                ~msg:(Format.asprintf "a pause of %a" Mtime.Span.pp pause)
-                (Mtime.Span.is_shorter pause ~than:Mtime.Span.(100 * ms))
-          | calls ->
-              fail (Printf.sprintf "%d calls of try_accept" (List.length calls))
-          ) ;
-          equal bool true (Server.local_addr server = Unix.ADDR_UNIX "fake") )
-    ; (* A test does not prove that the retry has no pause: a limit on the time
+    [ (* A test does not prove that the retry has no pause: a limit on the time
          makes a test fail on a slow machine. *)
       test "ECONNABORTED is not reported, and the server accepts again"
         (fun () ->
@@ -1036,36 +1018,20 @@ let date_tests =
 
 (* The server on a fake time line *)
 
-module Fake = Fake_time
+(* The spans and the config of the server on a fake time line. *)
+let header_h = Server_support.header_h
 
-let ( +: ) = Fake.( +: )
+let idle_i = Server_support.idle_i
 
-(* The spans of the fake time tests. A test advances only to deadlines that it
-   proved with [Fake.wait_mono_timer]. *)
-let header_h = Mtime.Span.(3 * s)
+let grace_g = Server_support.grace_g
 
-let idle_i = Mtime.Span.(5 * s)
+let linger_l = Server_support.linger_l
 
-let grace_g = Mtime.Span.(7 * s)
+let read_r = Server_support.read_r
 
-let linger_l = Mtime.Span.(11 * s)
+let write_w = Server_support.write_w
 
-let read_r = Mtime.Span.(13 * s)
-
-let write_w = Mtime.Span.(17 * s)
-
-let fake_config f =
-  { quiet with
-    mono_time= Fake.mono f
-  ; posix_time= Fake.posix f
-  ; header_timeout= header_h
-  ; idle_timeout= idle_i
-  ; read_timeout= read_r
-  ; write_timeout= write_w
-  ; shutdown_grace= grace_g
-  ; linger_timeout= linger_l }
-
-let within_2s = Server_support.within_2s
+let fake_config = Server_support.fake_config
 
 (* [with_fake_listener] with the fake time [f] and the config [config] (default
    [fake_config f]). When [test] ends, also by a failure, the fake time advances
@@ -1079,34 +1045,51 @@ let with_fake_server f ?(config = fake_config f) ?handler ?engine ~clients steps
     ~finally:(fun () -> Fake.advance f Mtime.Span.day)
     (fun () -> test l server errors)
 
-(* The steps before a header timeout: the connection opened at t0 and waits for
-   its first request until t0 + H. At t0 + 1 s, half a head comes, and the
-   engine reads it: it waits for the rest until t0 + 1 s + H. *)
-let half_head f c ~t0 ~since =
-  Fake.wait_mono_timer f ~since (t0 +: header_h) ;
-  Fake.advance f Mtime.Span.s ;
-  let m = Fake.mark f in
-  Flow.write_string c "GET / HTTP/1.1\r\n" ;
-  Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.s +: header_h)
+let half_head = Server_support.half_head
 
 let status_is code (status, _) =
   is_true ~msg:status (String.starts_with ~prefix:("HTTP/1.1 " ^ code) status)
 
 let fake_time_tests =
   group "Server on a fake time line"
-    [ test "EMFILE pauses the accepts for 100 ms" (fun () ->
+    [ test "with_fake_time_server ends when a request is in progress" (fun () ->
+          (* Only a cancel ends the handler. A shutdown in place of the abort
+             can compute the grace deadline after the advance, and then wait for
+             ever. *)
+          let f = Fake.make () and started = Cell.Once.make () in
+          let handler _ =
+            Cell.Once.try_set started () ;
+            Cell.Once.get (Cell.Once.make ())
+          in
+          Server_support.with_fake_time_server f ~handler
+          @@ fun server ->
+          (* The client stays open: the server must end it. *)
+          let c = Tcp.connect (Server.local_addr server) in
+          Flow.write_string c (get "/") ;
+          within_2s (fun () -> Cell.Once.get started) )
+    ; test "EMFILE pauses the accepts for 100 ms" (fun () ->
           let f = Fake.make () in
           let t0 = Fake.mono_now f and m = Fake.mark f in
           let fd, c = socket_pair () in
           with_fake_server f ~clients:[c]
             [Error EMFILE; Conn fd; Gate Action.never]
-          @@ fun l _ _ ->
+          @@ fun l server errors ->
           Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.(100 * ms)) ;
           equal int ~msg:"calls of try_accept in the pause" 1
             (List.length (Atomic.get l.calls)) ;
+          is_true ~msg:"one EMFILE reported"
+            ( match Atomic.get errors with
+            | [Unix.Unix_error (EMFILE, "accept", _)] ->
+                true
+            | _ ->
+                false ) ;
           Fake.advance f Mtime.Span.(100 * ms) ;
           Flow.write_string c (get ~close:true "/") ;
-          ends_with "hello" (response c) )
+          ends_with "hello" (response c) ;
+          (* The gate is never enabled: no more calls come. *)
+          equal int ~msg:"calls of try_accept: the EMFILE and the connection" 2
+            (List.length (Atomic.get l.calls)) ;
+          equal bool true (Server.local_addr server = Unix.ADDR_UNIX "fake") )
     ; test "a head that completes 1 ns before the header timeout gets 200"
         (fun () ->
           let f = Fake.make () in
@@ -1206,21 +1189,38 @@ let fake_time_tests =
           let t0 = Fake.mono_now f and m = Fake.mark f in
           (* More than the buffers of the socket pair hold. *)
           let size = 8 * 1024 * 1024 in
-          let handler _ = Response.string (String.make size 'x') in
-          let fd, c = socket_pair () in
-          with_fake_server f ~handler ~clients:[c] [Conn fd; Gate Action.never]
+          let handler req =
+            match Request.path_only req with
+            | "/big" ->
+                Response.string (String.make size 'x')
+            | _ ->
+                Response.string "hello"
+          in
+          let fd, c = socket_pair () and fd2, c2 = socket_pair () in
+          let config = {(fake_config f) with max_connections= 1} in
+          with_fake_server f ~config ~handler ~clients:[c; c2]
+            [Conn fd; Conn fd2; Gate Action.never]
           @@ fun _ _ _ ->
           Flow.set_read_deadline c (Some (deadline_in 2000)) ;
-          Flow.write_string c (get "/") ;
+          Flow.write_string c (get "/big") ;
           (* The client does not read until the timeout: only an advance can
              wake the write that waits. A read before the timeout wakes the
              write more than once, and then the test cannot prove which wait is
              the last. *)
           Fake.wait_mono_timer f ~since:m (t0 +: write_w) ;
-          Fake.advance f write_w ;
+          (* [c2] waits for the only slot, which [c] holds until the write
+             timeout. *)
+          Flow.write_string c2 (get ~close:true "/") ;
+          Fake.advance f Mtime.Span.(write_w - ns) ;
+          let r2 = Fun.Async.call (fun () -> response c2) in
+          is_false ~msg:"no slot 1 ns before the write timeout"
+            (Fake.ends_within_50ms r2) ;
+          Fake.advance f Mtime.Span.ns ;
           let rest = read_all c in
           is_true ~msg:"the connection ends before the whole body"
-            (String.length rest < size) )
+            (String.length rest < size) ;
+          (* The end of the connection frees its slot. *)
+          ends_with "hello" (get_2s r2) )
     ; test "a stop gives the requests in progress the shutdown grace" (fun () ->
           let f = Fake.make () in
           let t0 = Fake.mono_now f in
@@ -1267,6 +1267,40 @@ let fake_time_tests =
           within_2s (fun () -> Server.wait server) ;
           is_true ~msg:"the request in progress is cancelled"
             (Cell.Once.is_set cancelled_a) )
+    ; test "abort cancels requests in progress without a grace" (fun () ->
+          (* No advance: the fake grace never ends. Thus only the abort can end
+             the request. *)
+          let f = Fake.make () and started = Cell.Once.make () in
+          let handler _ =
+            Cell.Once.try_set started () ;
+            Cell.Once.get (Cell.Once.make () : unit Cell.Once.t) ;
+            Response.string "late"
+          in
+          let fd, c = socket_pair () in
+          with_fake_server f ~handler ~clients:[c] [Conn fd; Gate Action.never]
+          @@ fun _ server _ ->
+          Flow.write_string c (get "/") ;
+          within_2s (fun () -> Cell.Once.get started) ;
+          Server.abort server ;
+          within_2s (fun () -> Server.wait server) ;
+          (* The cancelled request ends its connection with no bytes. *)
+          equal string "" (response c) )
+    ; test "idle connections close at once on shutdown" (fun () ->
+          (* No advance: the fake idle timeout and the fake grace never end.
+             Thus this test shows that [Server.wait] ends when the last
+             connection ends. *)
+          let f = Fake.make () in
+          let fd, c = socket_pair () in
+          with_fake_server f ~clients:[c] [Conn fd; Gate Action.never]
+          @@ fun _ server _ ->
+          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+          let r = Private.Buf_reader.of_flow c in
+          Flow.write_string c (get "/") ;
+          ignore (read_response_from r) ;
+          Server.shutdown server ;
+          equal int ~msg:"the end of the stream" 0
+            (Private.Buf_reader.read_into r (Bytes.create 1) 0 1) ;
+          within_2s (fun () -> Server.wait server) )
     ; test "a connection that the server ends lingers for the linger timeout"
         (fun () ->
           let f = Fake.make () in
@@ -1277,14 +1311,19 @@ let fake_time_tests =
               ~finally:(fun () -> Cell.Once.try_set served ())
               (fun () -> Private.H1_server.serve ctx flow handler)
           in
-          let fd, c = socket_pair () in
-          with_fake_server f ~engine ~clients:[c] [Conn fd; Gate Action.never]
+          let fd, c = socket_pair () and fd2, c2 = socket_pair () in
+          let config = {(fake_config f) with max_connections= 1} in
+          with_fake_server f ~config ~engine ~clients:[c; c2]
+            [Conn fd; Conn fd2; Gate Action.never]
           @@ fun _ _ _ ->
           Flow.write_string c (get ~close:true "/") ;
           (* The server half-closes at once: the client gets the response and
              the end of the stream, and keeps its socket open. *)
           Flow.set_read_deadline c (Some (deadline_in 2000)) ;
           ends_with "hello" (read_all c) ;
+          (* [c2] waits for the only slot, which [c] holds while the server
+             lingers on it. *)
+          Flow.write_string c2 (get ~close:true "/") ;
           Fake.wait_mono_timer f ~since:m (t0 +: linger_l) ;
           Fake.advance f Mtime.Span.(linger_l - ns) ;
           let m = Fake.mark f in
@@ -1293,7 +1332,9 @@ let fake_time_tests =
           Fake.wait_mono_timer f ~since:m (t0 +: linger_l) ;
           is_false ~msg:"the engine ended" (Cell.Once.is_set served) ;
           Fake.advance f Mtime.Span.ns ;
-          within_2s (fun () -> Cell.Once.get served) )
+          within_2s (fun () -> Cell.Once.get served) ;
+          (* The end of the linger frees the slot. *)
+          ends_with "hello" (response c2) )
     ; test "the engine uses the time line of its flow" (fun () ->
           in_main
           @@ fun () ->

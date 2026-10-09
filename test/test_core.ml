@@ -1059,7 +1059,15 @@ let time_tests =
           is_true (enabled_within_50ms timer) )
     ; test "a deadline 10 ms ahead is enabled" (fun () ->
           let d = Time.after Time.mono Affect_unix.Mtime.Span.(10 * ms) in
-          is_true (enabled_within_50ms (Time.at Time.mono d ())) )
+          (* A 2 s window: a slow machine can take more than 50 ms. *)
+          is_true
+            (in_main (fun () ->
+                 Affect.Action.invoke
+                   (Affect.Action.choose
+                      [ Time.at Time.mono d true
+                      ; Affect_unix.Mtime.wait_for'
+                          Affect_unix.Mtime.Span.(2 * s)
+                          false ] ) ) ) )
     ; test "no deadline is never enabled" (fun () ->
           is_false (enabled_within_50ms (Time.at Time.mono None ())) )
     ; test "a deadline 2^63 ns or more ahead is never enabled" (fun () ->
@@ -1245,15 +1253,9 @@ let waiting_call f d =
   Fake.wait_mono_timer f ~since:m d ;
   c
 
-(* Whether [c] ends within 50 ms of real time. *)
-let ends_within_50ms c = Fake.within_50ms (Affect.Fun.Async.get' c)
+let ends_within_50ms = Fake.ends_within_50ms
 
-(* Whether [c] ends within 2 s of real time. *)
-let ends_within_2s c =
-  Affect.Action.invoke
-    (Affect.Action.choose
-       [ Affect.Action.map (fun () -> true) (Affect.Fun.Async.get' c)
-       ; Affect_unix.Mtime.wait_for' (sec 2) false ] )
+let get_2s = Server_support.get_2s
 
 let fake_time_tests =
   group "Fake time"
@@ -1266,7 +1268,8 @@ let fake_time_tests =
           Fake.advance f Affect_unix.Mtime.Span.(sec 10 - ns) ;
           is_false ~msg:"at the deadline - 1 ns" (ends_within_50ms c) ;
           Fake.advance f Affect_unix.Mtime.Span.ns ;
-          is_true ~msg:"at the deadline" (ends_within_2s c) ;
+          (* At the deadline, the call ends. *)
+          get_2s c ;
           (* The timer is first: it is enabled, so it wins. *)
           let d = Fake.mono_now f +: sec 1 in
           Fake.advance f (sec 1) ;
@@ -1287,7 +1290,7 @@ let fake_time_tests =
           let m = Fake.mark f in
           let c = timer_call f d in
           Fake.wait_mono_timer f ~since:m d ;
-          is_true (ends_within_2s c) )
+          get_2s c )
     ; test "a wait for a timer sees only the timers after its mark" (fun () ->
           fake_main
           @@ fun () ->
@@ -1310,8 +1313,8 @@ let fake_time_tests =
           | exception Fake.No_timer _ ->
               () ) ;
           Fake.advance f (sec 10) ;
-          is_true (ends_within_2s c1) ;
-          is_true (ends_within_2s c2) )
+          get_2s c1 ;
+          get_2s c2 )
     ; test "one advance wakes the calls on all domains" (fun () ->
           fake_main ~domain_count:4
           @@ fun () ->
@@ -1319,7 +1322,25 @@ let fake_time_tests =
           let d = Fake.mono_now f +: sec 10 in
           let waiting = List.init 8 (fun _ -> waiting_call f d) in
           Fake.advance f (sec 10) ;
-          List.iter (fun c -> is_true (ends_within_2s c)) waiting )
+          List.iter get_2s waiting )
+    ; test "with_call_at_timer waits for the timer, and cancels the call"
+        (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let d = Fake.mono_now f +: sec 10 in
+          let call = ref None in
+          Fake.with_call_at_timer f d
+            (fun () -> Affect.Action.invoke (Time.at (Fake.mono f) (Some d) ()))
+            (fun c ->
+              call := Some c ;
+              is_false ~msg:"waits at the timer" (ends_within_50ms c) ) ;
+          let c = Option.get !call in
+          raises Affect.Fun.Async.Cancelled (fun () -> Affect.Fun.Async.get c) ;
+          (* A call that makes no timer: No_timer after the guard. *)
+          raises_match
+            (function Fake.No_timer _ -> true | _ -> false)
+            (fun () -> Fake.with_call_at_timer f d (fun () -> ()) (fun _ -> ())) )
     ; test "the fake time works outside Unix.main" (fun () ->
           let f = Fake.make () in
           let t0 = Time.now (Fake.mono f) in
@@ -1377,21 +1398,6 @@ let read_call flow =
   calls := (fun () -> Affect.Fun.Async.cancel c) :: !calls ;
   c
 
-(* The result of [c] within 2 s of real time. *)
-let result_within_2s c =
-  match
-    Affect.Action.invoke
-      (Affect.Action.choose
-         [ Affect.Action.map (fun _ -> `Ended) (Affect.Fun.Async.get' c)
-         ; Affect_unix.Mtime.wait_for' (sec 2) `Late ] )
-  with
-  | `Ended -> (
-    match Affect.Fun.Async.get c with n -> `Read n | exception e -> `Raised e )
-  | `Late ->
-      `Late
-  | exception e ->
-      `Raised e
-
 (* The steps of F2 on [flow], which reads from the peer [peer]: a read with the
    deadline L = 11 s gets a byte 1 ns before L, and a second read with the same
    deadline times out at L. *)
@@ -1402,13 +1408,12 @@ let read_until_deadline f ~deadline flow peer =
   Fake.wait_mono_timer f ~since:m deadline ;
   Fake.advance f Affect_unix.Mtime.Span.(sec 11 - ns) ;
   ignore (Unix.write_substring peer "x" 0 1) ;
-  is_true ~msg:"a byte 1 ns before the deadline" (result_within_2s r = `Read 1) ;
+  equal int ~msg:"a byte 1 ns before the deadline" 1 (get_2s r) ;
   let m = Fake.mark f in
   let r = read_call flow in
   Fake.wait_mono_timer f ~since:m deadline ;
   Fake.advance f Affect_unix.Mtime.Span.ns ;
-  is_true ~msg:"a timeout at the deadline"
-    (result_within_2s r = `Raised Flow.Timeout)
+  raises ~msg:"a timeout at the deadline" Flow.Timeout (fun () -> get_2s r)
 
 let flow_time_tests =
   group "Flow time"

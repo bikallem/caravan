@@ -1,28 +1,53 @@
-(* Server.run for the signal tests: prints its port, then "started" when a
-   request to /slow (100ms), /stuck (10s) or /deaf (10s, deaf to cancellation)
-   starts, in CRLF lines. With the argument "after-run", it prints "stopped"
-   once run returned and lives on for 10s. *)
+(* Server.run for the signal tests. It prints its port, then lines that show
+   what the handlers see, in CRLF lines.
 
+   /slow prints "started". It gives "done" when the server starts to stop, or
+   "timeout" after 2 s.
+
+   /stuck prints "started", then "stopping" when the server starts to stop. Then
+   it waits 10 s.
+
+   /deaf does as /stuck, but when the server cancels it, it prints "cancelled"
+   and blocks its domain for 10 s, deaf to the cancel. A handler cannot print
+   while a different handler blocks its domain: then affect does no I/O.
+
+   With the argument "after-run", the program prints "stopped" once run
+   returned, and lives on for 10 s. *)
+
+open Affect
 open Caravan
 module Mtime = Affect_unix.Mtime
 
+let print line =
+  print_string (line ^ "\r\n") ;
+  flush stdout
+
+(* Prints "started", then "stopping" when the server starts to stop, then waits
+   10 s. *)
+let wait_for_stop req =
+  print "started" ;
+  Action.invoke (Conn_info.stopping (Option.get (Request.conn req))) ;
+  print "stopping" ;
+  Mtime.wait_for Mtime.Span.(10 * s)
+
 let handler req =
-  let pause span =
-    print_string "started\r\n" ;
-    flush stdout ;
-    Mtime.wait_for span ;
-    Response.string "done"
-  in
   match Request.path_only req with
   | "/slow" ->
-      pause Mtime.Span.(100 * ms)
+      print "started" ;
+      let stopping = Conn_info.stopping (Option.get (Request.conn req)) in
+      Response.string
+        (Action.invoke
+           (Action.choose
+              [ Action.map (fun () -> "done") stopping
+              ; Mtime.wait_for' Mtime.Span.(2 * s) "timeout" ] ) )
   | "/stuck" ->
-      pause Mtime.Span.(10 * s)
-  | "/deaf" ->
-      print_string "started\r\n" ;
-      flush stdout ;
-      Unix.sleepf 10. ;
-      Response.string "done"
+      wait_for_stop req ; Response.string "done"
+  | "/deaf" -> (
+    match wait_for_stop req with
+    | () ->
+        Response.string "done"
+    | exception Fun.Async.Cancelled ->
+        print "cancelled" ; Unix.sleepf 10. ; Response.string "done" )
   | _ ->
       Response.string "hello"
 
@@ -41,5 +66,5 @@ let () =
 
 let () =
   if Array.length Sys.argv > 1 && Sys.argv.(1) = "after-run" then begin
-    print_string "stopped\r\n" ; flush stdout ; Unix.sleepf 10.
+    print "stopped" ; Unix.sleepf 10.
   end

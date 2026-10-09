@@ -40,11 +40,12 @@ let upgrade_echo = Headers.of_list [("Upgrade", "echo")]
 (* How the last slow handler ended: finished or cancelled. *)
 let slow_outcome = ref ""
 
-(* Answers "late" after 50ms, having read the request body or not. *)
-let slowly ~read req =
+(* Answers "late" after [span] of real time, having read the request body or
+   not. *)
+let slowly ~read ~span req =
   match
     if read then ignore (Body.to_string (Request.body req)) ;
-    Affect_unix.Mtime.wait_for Affect_unix.Mtime.Span.(50 * ms)
+    Affect_unix.Mtime.wait_for span
   with
   | () ->
       slow_outcome := "[handler finished]" ;
@@ -52,6 +53,17 @@ let slowly ~read req =
   | exception Fun.Async.Cancelled ->
       slow_outcome := "[handler cancelled]" ;
       raise Fun.Async.Cancelled
+
+(* /slow waits 50 ms: a test that needs the handler to finish uses it. *)
+let slow = Affect_unix.Mtime.Span.(50 * ms)
+
+(* /hold waits 2 s: a test that needs a cancel uses it. The cancel comes at
+   once, and a missing cancel gives "[handler finished]" after 2 s, not a
+   hang. *)
+let hold = Affect_unix.Mtime.Span.(2 * s)
+
+(* Set by /endless after it flushed its first bytes. *)
+let flushed = ref (Cell.Once.make ())
 
 (* Set by /stop, as a server stopping while its response is written. *)
 let stopping = ref false
@@ -95,6 +107,7 @@ let handler req =
         Response.stream (fun w ->
             Body.Writer.write_string w "first" ;
             Body.Writer.flush w ;
+            ignore (Cell.Once.try_set !flushed ()) ;
             Affect_unix.Mtime.wait_for Affect_unix.Mtime.Span.(10 * s) )
     | "/partial" ->
         Response.stream (fun w ->
@@ -102,11 +115,13 @@ let handler req =
             Body.Writer.flush w ;
             failwith "cut short" )
     | "/slow" ->
-        slowly ~read:false req
-    | "/read-slow" ->
-        slowly ~read:true req
-    | "/slow-cleanup-fails" -> (
-      try slowly ~read:false req
+        slowly ~read:false ~span:slow req
+    | "/hold" ->
+        slowly ~read:false ~span:hold req
+    | "/read-hold" ->
+        slowly ~read:true ~span:hold req
+    | "/hold-cleanup-fails" -> (
+      try slowly ~read:false ~span:hold req
       with Fun.Async.Cancelled -> failwith "cleanup failed" )
     | "/ws" ->
         Response.upgrade ~headers:upgrade_echo echo_upgraded
@@ -162,13 +177,17 @@ let handler req =
    reported. At the end of [input] the client closes; with [~stall:true] it goes
    quiet instead (the flow is no longer readable and reads time out), and with
    [~reset:true] it resets the connection. With [~unwritable:true] every write
-   fails as on a reset connection. With [~cancel_after] the connection is
-   cancelled after that time, as by a server shutdown. With [~false_wakes:n] the
-   flow is first readable [n] times with nothing to read yet, and a read that
-   would block then fails. *)
-let serve ?(config = {Config.default with date_header= false}) ?chunk
-    ?(stall = false) ?(reset = false) ?(unwritable = false) ?(watch = false)
-    ?cancel_after ?(false_wakes = 0) input =
+   fails as on a reset connection. With [~false_wakes:n] the flow is first
+   readable [n] times with nothing to read yet, and a read that would block then
+   fails. The flow is on the time line [time] (default: the real one).
+
+   With [~drive] or [~cancel_on], the engine runs in a call. [drive] gets the
+   call, for example to advance a fake time. Then, when [cancel_on] is enabled,
+   the call is cancelled, as by a server shutdown. At the end, also on a
+   failure, [serve] cancels the call, so that a failure does not hang. *)
+let serve ?(config = {Config.default with date_header= false}) ?chunk ?time
+    ?drive ?cancel_on ?(stall = false) ?(reset = false) ?(unwritable = false)
+    ?(watch = false) ?(false_wakes = 0) input =
   let errors = ref [] in
   (* The input's end looks like a client leaving: only watched for if asked. *)
   let config =
@@ -203,7 +222,9 @@ let serve ?(config = {Config.default with date_header= false}) ?chunk
     let write buf off len =
       if unwritable then raise Flow.Closed else Flow.write inner buf off len
     in
-    Flow.make ~time:(Flow.time inner) ~read ~read_now ~write ~readable
+    Flow.make
+      ~time:(Option.value time ~default:(Flow.time inner))
+      ~read ~read_now ~write ~readable
       ~shutdown_send:(fun () -> Buffer.add_string out "[FIN]")
       ~close:ignore
       ~reset:(fun () -> Buffer.add_string out "[RST]")
@@ -217,25 +238,25 @@ let serve ?(config = {Config.default with date_header= false}) ?chunk
         ; stopping= Action.never
         ; is_stopping= (fun () -> !stopping) }
       in
-      match cancel_after with
-      | None ->
-          Private.H1_server.serve ctx flow handler
-      | Some span -> (
-          let c =
-            Fun.Async.call (fun () -> Private.H1_server.serve ctx flow handler)
-          in
-          Affect_unix.Mtime.wait_for span ;
-          Fun.Async.cancel c ;
-          try Fun.Async.get c with Fun.Async.Cancelled -> () ) ) ;
+      let serve () = Private.H1_server.serve ctx flow handler in
+      if drive = None && cancel_on = None then serve ()
+      else
+        let c = Fun.Async.call serve in
+        Stdlib.Fun.protect
+          ~finally:(fun () -> Fun.Async.cancel c)
+          (fun () ->
+            Option.iter (fun drive -> drive c) drive ;
+            Option.iter Action.invoke cancel_on ) ;
+        try Fun.Async.get c with Fun.Async.Cancelled -> () ) ;
   let unread = String.length input - !consumed in
   if unread > 0 then Printf.bprintf out "[unread %d]" unread ;
   (Buffer.contents out, List.rev !errors)
 
-let show ?config ?chunk ?stall ?reset ?unwritable ?watch ?cancel_after
+let show ?config ?chunk ?time ?drive ?cancel_on ?stall ?reset ?unwritable ?watch
     ?false_wakes input =
   let out, errors =
-    serve ?config ?chunk ?stall ?reset ?unwritable ?watch ?cancel_after
-      ?false_wakes input
+    serve ?config ?chunk ?time ?drive ?cancel_on ?stall ?reset ?unwritable
+      ?watch ?false_wakes input
   in
   show_crlf out
   ^ String.concat "" (List.map (fun e -> "\n! " ^ e) errors)
@@ -251,6 +272,23 @@ let post ?(headers = []) path body =
     (String.length body)
     (String.concat "" (List.map (fun (n, v) -> n ^ ": " ^ v ^ "\r\n") headers))
     body
+
+(* The engine on a fake time line *)
+
+module Fake = Fake_time
+
+let ( +: ) = Fake.( +: )
+
+let header_h = Server_support.header_h
+
+let idle_i = Server_support.idle_i
+
+(* The spans of [Server_support], on the fake time line [f]. *)
+let fake_config = Server_support.fake_config
+
+let get_2s = Server_support.get_2s
+
+let ends_at = Server_support.ends_at
 
 let connection_tests =
   group "H1_server connections"
@@ -637,9 +675,9 @@ let connection_tests =
     ; test
         "a close-delimited body cut short by cancellation resets the connection"
         (fun () ->
+          flushed := Cell.Once.make () ;
           expect
-            (show
-               ~cancel_after:Affect_unix.Mtime.Span.(20 * ms)
+            (show ~cancel_on:(Cell.Once.get' !flushed)
                (get ~v:"HTTP/1.0" "/endless") )
           @@ __POS_OF__
                {|
@@ -926,12 +964,6 @@ let connection_tests =
           @@ __POS_OF__ {| | |} ) ]
 
 let timeout_tests =
-  let quick =
-    { Config.default with
-      date_header= false
-    ; header_timeout= Affect_unix.Mtime.Span.(10 * ms)
-    ; idle_timeout= Affect_unix.Mtime.Span.(10 * ms) }
-  in
   let body_10 path =
     Printf.sprintf
       "POST %s HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nhel" path
@@ -983,9 +1015,22 @@ let timeout_tests =
             ignored[FIN]
             |} )
     ; test "a new connection that sends nothing is closed" (fun () ->
-          expect (show ~config:quick ~stall:true "") @@ __POS_OF__ {||} )
+          (* The first wait for a request has the header timeout. *)
+          let f = Fake.make () in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          expect
+            (show ~config:(fake_config f) ~time:(Fake.mono f) ~stall:true
+               ~drive:(ends_at f ~since:m ~t0 header_h)
+               "" )
+          @@ __POS_OF__ {||} )
     ; test "an idle connection is closed" (fun () ->
-          expect (show ~config:quick ~stall:true (get "/"))
+          (* The close is not a linger: no [FIN]. *)
+          let f = Fake.make () in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          expect
+            (show ~config:(fake_config f) ~time:(Fake.mono f) ~stall:true
+               ~drive:(ends_at f ~since:m ~t0 idle_i)
+               (get "/") )
           @@ __POS_OF__
                {|
             HTTP/1.1 200 OK\r\n
@@ -1007,16 +1052,72 @@ let timeout_tests =
             hello
             |} )
     ; test "a wakeup without input leaves the timeout running" (fun () ->
-          expect (show ~config:quick ~stall:true ~false_wakes:2 "")
-          @@ __POS_OF__ {||} )
-    ; test ~timeout:5.
-        "a wakeup without input does not hold up a stopping server" (fun () ->
-          let woken = ref false in
+          (* The flow is readable only when the test sets [wake], and then it
+             has nothing to read. A wakeup 1 s after the start must keep the
+             deadline of the first wait. *)
+          let f = Fake.make () in
+          let woken = Atomic.make 0 and pending = Atomic.make false in
+          let wake = ref (Cell.Once.make ()) in
+          let readable =
+            Action.guard (fun () ->
+                if Atomic.get pending then Action.always ()
+                else Cell.Once.get' !wake )
+          in
+          let read_now _ _ _ =
+            if Atomic.get pending then begin
+              Atomic.incr woken ;
+              wake := Cell.Once.make () ;
+              Atomic.set pending false
+            end ;
+            None
+          in
+          let flow =
+            Flow.make ~time:(Fake.mono f)
+              ~read:(fun _ _ _ -> failwith "blocking read")
+              ~read_now
+              ~write:(fun _ _ _ -> ())
+              ~readable
+              ~shutdown_send:(fun () -> failwith "shutdown_send")
+              ~close:ignore ~set_read_deadline:ignore ~set_write_deadline:ignore
+              ()
+          in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          Affect_unix.Unix.main ~domain_count:1 (fun () ->
+              let ctx =
+                { Engine.config= fake_config f
+                ; conn
+                ; stopping= Action.never
+                ; is_stopping= (fun () -> false) }
+              in
+              let c =
+                Fun.Async.call (fun () ->
+                    Private.H1_server.serve ctx flow handler )
+              in
+              Stdlib.Fun.protect ~finally:(fun () -> Fun.Async.cancel c)
+              @@ fun () ->
+              Fake.wait_mono_timer f ~since:m (t0 +: header_h) ;
+              Fake.advance f Affect_unix.Mtime.Span.s ;
+              let m2 = Fake.mark f in
+              Atomic.set pending true ;
+              ignore (Cell.Once.try_set !wake ()) ;
+              (* The engine woke, found nothing, and waits again: for the old
+                 deadline, not for a new one 1 s later. *)
+              Fake.wait_mono_timer f ~since:m2 (t0 +: header_h) ;
+              equal int ~msg:"wakeups" 1 (Atomic.get woken) ;
+              Fake.advance f Affect_unix.Mtime.Span.(header_h - s - ns) ;
+              is_false ~msg:"ended 1 ns before" (Fake.ends_within_50ms c) ;
+              Fake.advance f Affect_unix.Mtime.Span.ns ;
+              get_2s c ) )
+    ; test "a wakeup without input does not hold up a stopping server"
+        (fun () ->
+          (* The server stops when the flow finds nothing to read. *)
+          let woken = ref false and stop = Cell.Once.make () in
           let flow =
             Flow.make ~time:Time.mono
               ~read:(fun _ _ _ -> failwith "blocking read")
               ~read_now:(fun _ _ _ ->
                 woken := true ;
+                ignore (Cell.Once.try_set stop ()) ;
                 None )
               ~write:(fun _ _ _ -> ())
               ~readable:
@@ -1031,13 +1132,11 @@ let timeout_tests =
                     { Config.default with
                       header_timeout= Affect_unix.Mtime.Span.(60 * s) }
                 ; conn
-                ; stopping=
-                    Affect_unix.Mtime.wait_for'
-                      Affect_unix.Mtime.Span.(20 * ms)
-                      ()
+                ; stopping= Cell.Once.get' stop
                 ; is_stopping= (fun () -> false) }
               in
-              Private.H1_server.serve ctx flow handler ) ;
+              Server_support.within_2s (fun () ->
+                  Private.H1_server.serve ctx flow handler ) ) ;
           is_true ~msg:"woken" !woken ) ]
 
 let upgrade_tests =
@@ -1228,14 +1327,9 @@ let upgrade_tests =
     ]
 
 let disconnect_tests =
-  let quick =
-    { Config.default with
-      date_header= false
-    ; idle_timeout= Affect_unix.Mtime.Span.(10 * ms) }
-  in
   group "H1_server client disconnects"
     [ test "a client that leaves cancels its handler" (fun () ->
-          expect (show ~watch:true (get "/slow"))
+          expect (show ~watch:true (get "/hold"))
           @@ __POS_OF__ {| [handler cancelled] |} )
     ; test "without cancel_on_disconnect the handler finishes" (fun () ->
           expect (show (get "/slow"))
@@ -1269,10 +1363,14 @@ let disconnect_tests =
             |} )
     ; test "a request arriving during the handler is not a disconnect"
         (fun () ->
+          (* After the two responses, the connection is idle. *)
+          let f = Fake.make () in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           let first = get "/slow" in
           expect
-            (show ~watch:true ~stall:true ~config:quick
-               ~chunk:(String.length first)
+            (show ~watch:true ~stall:true ~config:(fake_config f)
+               ~time:(Fake.mono f) ~chunk:(String.length first)
+               ~drive:(ends_at f ~since:m ~t0 idle_i)
                (first ^ get "/") )
           @@ __POS_OF__
                {|
@@ -1288,7 +1386,7 @@ let disconnect_tests =
             [handler finished]
             |} )
     ; test "a request with an empty body is watched at once" (fun () ->
-          expect (show ~watch:true (post "/slow" ""))
+          expect (show ~watch:true (post "/hold" ""))
           @@ __POS_OF__ {| [handler cancelled] |} )
     ; test "nothing is watched while the request body is unread" (fun () ->
           expect (show ~watch:true (post "/slow" "hello"))
@@ -1302,7 +1400,7 @@ let disconnect_tests =
             [handler finished]
             |} )
     ; test "a handler that fails while cancelled is reported" (fun () ->
-          expect (show ~watch:true (get "/slow-cleanup-fails"))
+          expect (show ~watch:true (get "/hold-cleanup-fails"))
           @@ __POS_OF__
                {|
             ! Failure("cleanup failed")
@@ -1310,13 +1408,14 @@ let disconnect_tests =
             |} )
     ; test "a client that leaves after its body was read cancels its handler"
         (fun () ->
-          expect (show ~watch:true (post "/read-slow" "hello"))
+          expect (show ~watch:true (post "/read-hold" "hello"))
           @@ __POS_OF__ {| [handler cancelled] |} )
     ; test "a wakeup without input while the handler runs is not a disconnect"
         (fun () ->
           (* Once the request is read the client is quiet: the flow is readable
              once more with nothing to read, and a read would block, which
              fails. *)
+          let f = Fake.make () in
           let input = get "/slow" and out = Buffer.create 64 in
           let pos = ref 0 and woken = ref false in
           let quiet () = !pos = String.length input in
@@ -1334,7 +1433,7 @@ let disconnect_tests =
             else Some (read buf off len)
           in
           let flow =
-            Flow.make ~time:Time.mono ~read ~read_now
+            Flow.make ~time:(Fake.mono f) ~read ~read_now
               ~write:(fun b off len -> Buffer.add_subbytes out b off len)
               ~readable:
                 (Action.guard (fun () ->
@@ -1344,14 +1443,23 @@ let disconnect_tests =
               ~set_write_deadline:ignore ()
           in
           slow_outcome := "" ;
+          let t0 = Fake.mono_now f and m = Fake.mark f in
           Affect_unix.Unix.main ~domain_count:1 (fun () ->
               let ctx =
-                { Engine.config= {quick with cancel_on_disconnect= true}
+                { Engine.config=
+                    {(fake_config f) with cancel_on_disconnect= true}
                 ; conn
                 ; stopping= Action.never
                 ; is_stopping= (fun () -> false) }
               in
-              Private.H1_server.serve ctx flow handler ) ;
+              let c =
+                Fun.Async.call (fun () ->
+                    Private.H1_server.serve ctx flow handler )
+              in
+              (* After the response, the connection is idle. *)
+              Stdlib.Fun.protect
+                ~finally:(fun () -> Fun.Async.cancel c)
+                (fun () -> ends_at f ~since:m ~t0 idle_i c) ) ;
           is_true ~msg:"woken" !woken ;
           expect (show_crlf (Buffer.contents out) ^ "\n" ^ !slow_outcome)
           @@ __POS_OF__

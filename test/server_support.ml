@@ -63,8 +63,7 @@ let fetch () =
   Response.string "answer"
 
 (* Handlers read request bodies, except /ignore, which leaves its body to be
-   drained or lingered over. /ws-echo upgrades to echoing what it gets, and
-   CONNECT opens a tunnel. *)
+   drained or lingered over. CONNECT opens a tunnel. *)
 let handler req =
   let body = Request.body req in
   let read () = ignore (Body.to_string body) in
@@ -99,10 +98,6 @@ let handler req =
             Body.Writer.write_string w "partial" ;
             Body.Writer.flush w ;
             failwith "cut short" )
-    | "/ws-echo" ->
-        Response.upgrade
-          ~headers:(Headers.of_list [("Upgrade", "echo")])
-          (fun flow -> copy flow flow)
     | "/hello" ->
         read () ; Response.string "hello"
     | "/echo" ->
@@ -123,20 +118,6 @@ let handler req =
             Body.Writer.write_string w "cd" )
     | "/ignore" ->
         Response.string "ignored"
-    | "/big" ->
-        (* 64 MiB, more than socket buffers hold. *)
-        let chunk = String.make 65536 'x' in
-        Response.stream (fun w ->
-            for _ = 1 to 1024 do
-              Body.Writer.write_string w chunk
-            done )
-    | "/drip" ->
-        Response.stream (fun w ->
-            for i = 1 to 3 do
-              Body.Writer.write_string w (string_of_int i) ;
-              Body.Writer.flush w ;
-              Mtime.wait_for Mtime.Span.(40 * ms)
-            done )
     | _ ->
         read () ;
         Response.string ~status:Status.not_found "not found"
@@ -266,17 +247,134 @@ let with_flows ?time f =
   Stdlib.Fun.protect ~finally:(fun () -> Flow.close peer ; Flow.close server)
   @@ fun () -> f server peer
 
-(* The result of [f], or a failure of the test if [f] takes more than 2 s: a bug
-   gives a failure, not a hang. *)
-let within_2s f =
+(* The result of [f], or a failure of the test if [f] takes more than [span] of
+   real time: a bug gives a failure, not a hang. *)
+let within span f =
   let call = Fun.Async.call f in
   let ended = Action.map (fun v -> `Ended v) (Fun.Async.get' call) in
-  match
-    Action.invoke
-      (Action.choose [ended; Mtime.wait_for' Mtime.Span.(2 * s) `Late])
-  with
+  match Action.invoke (Action.choose [ended; Mtime.wait_for' span `Late]) with
   | `Ended v ->
       v
   | `Late ->
       Fun.Async.cancel call ;
-      Windtrap.fail "no end after 2 s"
+      Windtrap.fail
+        (Printf.sprintf "no end after %g s"
+           (Mtime.Span.to_float_ns span /. 1e9) )
+
+let within_2s f = within Mtime.Span.(2 * s) f
+
+(* The result of the call [c], or its exception, within 2 s of real time. *)
+let get_2s c = within_2s (fun () -> Fun.Async.get c)
+
+(* Polls [p] each 1 ms until it is true, for at most 2 s of real time. If [p] is
+   still false, the test fails with [msg]. *)
+let eventually ~msg p =
+  let late = Option.get (Mtime.add_span (Mtime.now ()) Mtime.Span.(2 * s)) in
+  while (not (p ())) && Mtime.is_earlier (Mtime.now ()) ~than:late do
+    Mtime.wait_for Mtime.Span.ms
+  done ;
+  Windtrap.is_true ~msg (p ())
+
+(* [inner] with counts, as proof that the code took data or set a deadline: the
+   bytes that reads gave, and the calls of [set_write_deadline]. [write]
+   replaces the write of [inner], and [on_write_deadline] gets each write
+   deadline. *)
+type counted =
+  {flow: Flow.t; read_bytes: int Atomic.t; write_deadlines: int Atomic.t}
+
+let counted ?write ?(on_write_deadline = ignore) inner =
+  let read_bytes = Atomic.make 0 and write_deadlines = Atomic.make 0 in
+  let took n = ignore (Atomic.fetch_and_add read_bytes n) in
+  let read buf off len =
+    let n = Flow.read inner buf off len in
+    took n ; n
+  in
+  let read_now buf off len =
+    let r = Flow.read_now inner buf off len in
+    Option.iter took r ; r
+  in
+  let set_write_deadline d =
+    Atomic.incr write_deadlines ;
+    on_write_deadline d ;
+    Flow.set_write_deadline inner d
+  in
+  let write = Option.value write ~default:(Flow.write inner) in
+  let flow =
+    Flow.make ~time:(Flow.time inner) ~read ~read_now ~write
+      ~readable:(Flow.readable' inner ())
+      ~shutdown_send:(fun () -> Flow.shutdown_send inner)
+      ~close:(fun () -> Flow.close inner)
+      ~reset:(fun () -> Flow.reset inner)
+      ~set_read_deadline:(Flow.set_read_deadline inner)
+      ~set_write_deadline ()
+  in
+  {flow; read_bytes; write_deadlines}
+
+(* The server on a fake time line *)
+
+module Fake = Fake_time
+
+let ( +: ) = Fake.( +: )
+
+(* For a call [c] that only an advance can end: after the mark [since], the call
+   made a timer for [span] after [t0]. It does not end 1 ns before that
+   deadline, and it ends at it. The fake time must be at [t0]. *)
+let ends_at f ~since ~t0 span c =
+  Fake.wait_mono_timer f ~since (t0 +: span) ;
+  Fake.advance f Mtime.Span.(span - ns) ;
+  Windtrap.is_false ~msg:"ended 1 ns before" (Fake.ends_within_50ms c) ;
+  Fake.advance f Mtime.Span.ns ;
+  get_2s c
+
+(* The spans of the server on a fake time line. A test advances only to
+   deadlines that it proved with [Fake.wait_mono_timer]. *)
+let header_h = Mtime.Span.(3 * s)
+
+let idle_i = Mtime.Span.(5 * s)
+
+let grace_g = Mtime.Span.(7 * s)
+
+let linger_l = Mtime.Span.(11 * s)
+
+let read_r = Mtime.Span.(13 * s)
+
+let write_w = Mtime.Span.(17 * s)
+
+let fake_config f =
+  { config with
+    mono_time= Fake.mono f
+  ; posix_time= Fake.posix f
+  ; header_timeout= header_h
+  ; idle_timeout= idle_i
+  ; read_timeout= read_r
+  ; write_timeout= write_w
+  ; shutdown_grace= grace_g
+  ; linger_timeout= linger_l }
+
+(* [f server] with a server on the fake time line [fake]. A failure must not
+   hang: at the end, the server aborts, and then the fake time advances one day,
+   so that each wait on it ends. The abort also ends the connections of clients
+   that [f] left open. A shutdown in place of the abort can hang: the grace
+   computes its deadline when it sees the stop, which can come after the
+   advance. *)
+let with_fake_time_server fake ?(config = fake_config fake) ?engine
+    ?(handler = handler) f =
+  Affect_unix.Unix.main ~domain_count
+  @@ fun () ->
+  let server = Server.start ~config ?engine handler in
+  Fun.protect
+    ~finally:(fun () ->
+      Server.abort server ;
+      Fake.advance fake Mtime.Span.day ;
+      Server.wait server )
+    (fun () -> f server)
+
+(* The steps before a header timeout: the connection opened at t0 and waits for
+   its first request until t0 + H. At t0 + 1 s, half a head comes, and the
+   engine reads it: it waits for the rest until t0 + 1 s + H. *)
+let half_head f c ~t0 ~since =
+  Fake.wait_mono_timer f ~since (t0 +: header_h) ;
+  Fake.advance f Mtime.Span.s ;
+  let m = Fake.mark f in
+  Flow.write_string c "GET / HTTP/1.1\r\n" ;
+  Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.s +: header_h)
