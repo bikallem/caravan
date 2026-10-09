@@ -169,3 +169,12 @@ let within_50ms a =
   Action.invoke
     (Action.choose
        [Action.map (fun _ -> true) a; Mtime.wait_for' Mtime.Span.(50 * ms) false] )
+
+let with_call_at_timer t d f test =
+  let m = mark t in
+  let c = Fun.Async.call f in
+  Stdlib.Fun.protect
+    ~finally:(fun () -> Fun.Async.cancel c)
+    (fun () ->
+      wait_mono_timer t ~since:m d ;
+      test c )

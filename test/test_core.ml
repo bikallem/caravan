@@ -1320,6 +1320,24 @@ let fake_time_tests =
           let waiting = List.init 8 (fun _ -> waiting_call f d) in
           Fake.advance f (sec 10) ;
           List.iter (fun c -> is_true (ends_within_2s c)) waiting )
+    ; test "with_call_at_timer waits for the timer, and cancels the call"
+        (fun () ->
+          fake_main
+          @@ fun () ->
+          let f = Fake.make () in
+          let d = Fake.mono_now f +: sec 10 in
+          let call = ref None in
+          Fake.with_call_at_timer f d
+            (fun () -> Affect.Action.invoke (Time.at (Fake.mono f) (Some d) ()))
+            (fun c ->
+              call := Some c ;
+              is_false ~msg:"waits at the timer" (ends_within_50ms c) ) ;
+          let c = Option.get !call in
+          raises Affect.Fun.Async.Cancelled (fun () -> Affect.Fun.Async.get c) ;
+          (* A call that makes no timer: No_timer after the guard. *)
+          raises_match
+            (function Fake.No_timer _ -> true | _ -> false)
+            (fun () -> Fake.with_call_at_timer f d (fun () -> ()) (fun _ -> ())) )
     ; test "the fake time works outside Unix.main" (fun () ->
           let f = Fake.make () in
           let t0 = Time.now (Fake.mono f) in

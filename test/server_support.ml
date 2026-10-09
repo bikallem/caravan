@@ -280,3 +280,93 @@ let within_2s f =
   | `Late ->
       Fun.Async.cancel call ;
       Windtrap.fail "no end after 2 s"
+
+(* [inner] with counts, as proof that the code took data or set a deadline: the
+   bytes that reads gave, and the calls of [set_write_deadline]. *)
+type counted =
+  {flow: Flow.t; read_bytes: int Atomic.t; write_deadlines: int Atomic.t}
+
+let counted inner =
+  let read_bytes = Atomic.make 0 and write_deadlines = Atomic.make 0 in
+  let took n = ignore (Atomic.fetch_and_add read_bytes n) in
+  let read buf off len =
+    let n = Flow.read inner buf off len in
+    took n ; n
+  in
+  let read_now buf off len =
+    let r = Flow.read_now inner buf off len in
+    Option.iter took r ; r
+  in
+  let set_write_deadline d =
+    Atomic.incr write_deadlines ;
+    Flow.set_write_deadline inner d
+  in
+  let flow =
+    Flow.make ~time:(Flow.time inner) ~read ~read_now ~write:(Flow.write inner)
+      ~readable:(Flow.readable' inner ())
+      ~shutdown_send:(fun () -> Flow.shutdown_send inner)
+      ~close:(fun () -> Flow.close inner)
+      ~reset:(fun () -> Flow.reset inner)
+      ~set_read_deadline:(Flow.set_read_deadline inner)
+      ~set_write_deadline ()
+  in
+  {flow; read_bytes; write_deadlines}
+
+(* The server on a fake time line *)
+
+module Fake = Fake_time
+
+let ( +: ) = Fake.( +: )
+
+(* The spans of the server on a fake time line. A test advances only to
+   deadlines that it proved with [Fake.wait_mono_timer]. *)
+let header_h = Mtime.Span.(3 * s)
+
+let idle_i = Mtime.Span.(5 * s)
+
+let grace_g = Mtime.Span.(7 * s)
+
+let linger_l = Mtime.Span.(11 * s)
+
+let read_r = Mtime.Span.(13 * s)
+
+let write_w = Mtime.Span.(17 * s)
+
+let fake_config f =
+  { config with
+    mono_time= Fake.mono f
+  ; posix_time= Fake.posix f
+  ; header_timeout= header_h
+  ; idle_timeout= idle_i
+  ; read_timeout= read_r
+  ; write_timeout= write_w
+  ; shutdown_grace= grace_g
+  ; linger_timeout= linger_l }
+
+(* [f server] with a server on the fake time line [fake]. A failure must not
+   hang: at the end, the server aborts, and then the fake time advances one day,
+   so that each wait on it ends. The abort also ends the connections of clients
+   that [f] left open. A shutdown in place of the abort can hang: the grace
+   computes its deadline when it sees the stop, which can come after the
+   advance. *)
+let with_fake_time_server fake ?(config = fake_config fake) ?engine
+    ?(handler = handler) f =
+  Affect_unix.Unix.main ~domain_count
+  @@ fun () ->
+  let server = Server.start ~config ?engine handler in
+  Fun.protect
+    ~finally:(fun () ->
+      Server.abort server ;
+      Fake.advance fake Mtime.Span.day ;
+      Server.wait server )
+    (fun () -> f server)
+
+(* The steps before a header timeout: the connection opened at t0 and waits for
+   its first request until t0 + H. At t0 + 1 s, half a head comes, and the
+   engine reads it: it waits for the rest until t0 + 1 s + H. *)
+let half_head f c ~t0 ~since =
+  Fake.wait_mono_timer f ~since (t0 +: header_h) ;
+  Fake.advance f Mtime.Span.s ;
+  let m = Fake.mark f in
+  Flow.write_string c "GET / HTTP/1.1\r\n" ;
+  Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.s +: header_h)

@@ -1040,30 +1040,20 @@ module Fake = Fake_time
 
 let ( +: ) = Fake.( +: )
 
-(* The spans of the fake time tests. A test advances only to deadlines that it
-   proved with [Fake.wait_mono_timer]. *)
-let header_h = Mtime.Span.(3 * s)
+(* The spans and the config of the server on a fake time line. *)
+let header_h = Server_support.header_h
 
-let idle_i = Mtime.Span.(5 * s)
+let idle_i = Server_support.idle_i
 
-let grace_g = Mtime.Span.(7 * s)
+let grace_g = Server_support.grace_g
 
-let linger_l = Mtime.Span.(11 * s)
+let linger_l = Server_support.linger_l
 
-let read_r = Mtime.Span.(13 * s)
+let read_r = Server_support.read_r
 
-let write_w = Mtime.Span.(17 * s)
+let write_w = Server_support.write_w
 
-let fake_config f =
-  { quiet with
-    mono_time= Fake.mono f
-  ; posix_time= Fake.posix f
-  ; header_timeout= header_h
-  ; idle_timeout= idle_i
-  ; read_timeout= read_r
-  ; write_timeout= write_w
-  ; shutdown_grace= grace_g
-  ; linger_timeout= linger_l }
+let fake_config = Server_support.fake_config
 
 let within_2s = Server_support.within_2s
 
@@ -1079,22 +1069,29 @@ let with_fake_server f ?(config = fake_config f) ?handler ?engine ~clients steps
     ~finally:(fun () -> Fake.advance f Mtime.Span.day)
     (fun () -> test l server errors)
 
-(* The steps before a header timeout: the connection opened at t0 and waits for
-   its first request until t0 + H. At t0 + 1 s, half a head comes, and the
-   engine reads it: it waits for the rest until t0 + 1 s + H. *)
-let half_head f c ~t0 ~since =
-  Fake.wait_mono_timer f ~since (t0 +: header_h) ;
-  Fake.advance f Mtime.Span.s ;
-  let m = Fake.mark f in
-  Flow.write_string c "GET / HTTP/1.1\r\n" ;
-  Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.s +: header_h)
+let half_head = Server_support.half_head
 
 let status_is code (status, _) =
   is_true ~msg:status (String.starts_with ~prefix:("HTTP/1.1 " ^ code) status)
 
 let fake_time_tests =
   group "Server on a fake time line"
-    [ test "EMFILE pauses the accepts for 100 ms" (fun () ->
+    [ test "with_fake_time_server ends when a request is in progress" (fun () ->
+          (* Only a cancel ends the handler. A shutdown in place of the abort
+             can compute the grace deadline after the advance, and then wait for
+             ever. *)
+          let f = Fake.make () and started = Cell.Once.make () in
+          let handler _ =
+            Cell.Once.try_set started () ;
+            Cell.Once.get (Cell.Once.make ())
+          in
+          Server_support.with_fake_time_server f ~handler
+          @@ fun server ->
+          (* The client stays open: the server must end it. *)
+          let c = Tcp.connect (Server.local_addr server) in
+          Flow.write_string c (get "/") ;
+          within_2s (fun () -> Cell.Once.get started) )
+    ; test "EMFILE pauses the accepts for 100 ms" (fun () ->
           let f = Fake.make () in
           let t0 = Fake.mono_now f and m = Fake.mark f in
           let fd, c = socket_pair () in
