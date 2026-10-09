@@ -94,7 +94,10 @@ let integration_tests =
               (List.init 20 (fun _ -> {|200 "hello" close|}))
               responses
           done )
-    ; test "a chunked upload in small delayed pieces is echoed" (fun () ->
+    ; test "a chunked upload in many small writes is echoed" (fun () ->
+          (* The writes can arrive together. The h1_server tests split the input
+             at known points (test_h1_server.ml, "the bytes after the head are
+             the same however the input is split"). *)
           with_server
           @@ fun server ->
           let flow, r = connect server in
@@ -113,7 +116,6 @@ let integration_tests =
               (* Split each chunk across writes too. *)
               let half = String.length chunk / 2 in
               Flow.write_string flow (String.sub chunk 0 half) ;
-              Mtime.wait_for Mtime.Span.(1 * ms) ;
               Flow.write_string flow
                 (String.sub chunk half (String.length chunk - half)) ;
               send (i + n)
@@ -147,29 +149,39 @@ let integration_tests =
             (String.equal response (summary 200 data false)) ;
           Flow.close flow )
     ; test "a streamed response arrives as it is produced" (fun () ->
-          with_server
+          (* The handler writes chunk i + 1 only after the client got chunk i
+             and set [got.(i - 1)]. *)
+          let got = Array.init 2 (fun _ -> Cell.Once.make ()) in
+          let handler _ =
+            Response.stream (fun w ->
+                for i = 1 to 3 do
+                  Body.Writer.write_string w (string_of_int i) ;
+                  Body.Writer.flush w ;
+                  if i < 3 then Cell.Once.get got.(i - 1)
+                done )
+          in
+          with_server ~handler
           @@ fun server ->
           let flow, r = connect server in
+          Fun.protect ~finally:(fun () ->
+              Array.iter (fun c -> Cell.Once.try_set c ()) got ;
+              Flow.close flow )
+          @@ fun () ->
+          Flow.set_read_deadline flow
+            (Mtime.add_span (Mtime.now ()) Mtime.Span.(2 * s)) ;
           Flow.write_string flow (get "/drip") ;
-          let clock = Mtime.counter () in
           let rec header () =
             if Buf_reader.read_line r ~max:1000 <> "" then header ()
           in
           header () ;
-          (* Chunks: size line, data line. Note when each data byte arrives. *)
-          let arrivals =
-            List.init 3 (fun _ ->
-                ignore (Buf_reader.read_line r ~max:100) ;
-                let data = Buf_reader.read_line r ~max:100 in
-                (data, Mtime.Span.to_float_ns (Mtime.count clock) /. 1e6) )
+          (* Chunks: size line, data line. *)
+          let chunk i =
+            ignore (Buf_reader.read_line r ~max:100) ;
+            let data = Buf_reader.read_line r ~max:100 in
+            if i < 2 then Cell.Once.try_set got.(i) () ;
+            data
           in
-          equal (list string) ["1"; "2"; "3"] (List.map fst arrivals) ;
-          let times = List.map snd arrivals in
-          is_true
-            ~msg:(String.concat ", " (List.map (Printf.sprintf "%.0fms") times))
-            ( List.nth times 1 -. List.nth times 0 > 25.
-            && List.nth times 2 -. List.nth times 1 > 25. ) ;
-          Flow.close flow )
+          equal (list string) ["1"; "2"; "3"] (List.init 3 chunk) )
     ; test "clients that leave mid-request do not disturb others" (fun () ->
           with_server
           @@ fun server ->
@@ -199,135 +211,48 @@ let integration_tests =
           equal string {|200 "ignored" close|} (read_response ~head:false r) ;
           equal int ~msg:"end of stream" 0
             (Buf_reader.read_into r (Bytes.create 1) 0 1) ;
-          Flow.close flow )
-    ; test "a client that never closes is let go after linger_timeout"
-        (fun () ->
-          let config =
-            { config with
-              max_connections= 1
-            ; linger_timeout= Mtime.Span.(80 * ms) }
-          in
-          with_server ~config
-          @@ fun server ->
-          let a, ra = connect server in
-          Flow.write_string a (get ~conn:(Some "close") "/hello") ;
-          equal string {|200 "hello" close|} (read_response ~head:false ra) ;
-          (* [a] stays open and holds the only connection slot while the server
-             lingers on it. *)
-          let clock = Mtime.counter () in
-          let b, rb = connect server in
-          Flow.set_read_deadline b
-            (Mtime.add_span (Mtime.now ()) Mtime.Span.(5 * s)) ;
-          Flow.write_string b (get "/hello") ;
-          equal string {|200 "hello"|} (read_response ~head:false rb) ;
-          let waited = Mtime.Span.to_float_ns (Mtime.count clock) /. 1e6 in
-          is_true ~msg:(Printf.sprintf "waited %.0fms" waited) (waited > 60.) ;
-          Flow.close a ;
-          Flow.close b ) ]
+          Flow.close flow ) ]
 
-(* Timeouts of 50ms. The clients wait at most 5s for anything. *)
+(* Timeouts on a fake time line. The test_net and test_h1_server suites have the
+   other timeouts. *)
 let timeout_tests =
-  let config =
-    { config with
-      header_timeout= Mtime.Span.(50 * ms)
-    ; idle_timeout= Mtime.Span.(50 * ms)
-    ; read_timeout= Mtime.Span.(50 * ms)
-    ; write_timeout= Mtime.Span.(50 * ms) }
-  in
-  let connect server =
-    let flow, r = connect server in
-    Flow.set_read_deadline flow
-      (Mtime.add_span (Mtime.now ()) Mtime.Span.(5 * s)) ;
-    (flow, r)
-  in
-  let eof r =
-    equal int ~msg:"end of stream" 0
-      (Buf_reader.read_into r (Bytes.create 1) 0 1)
-  in
   group "Server timeouts"
-    [ test "a request head sent too slowly gets 408" (fun () ->
-          with_server ~config
+    [ test "a body trickled after the response is not drained forever" (fun () ->
+          let f = Fake.make () in
+          let t0 = Fake.mono_now f in
+          with_fake_time_server f
           @@ fun server ->
           let flow, r = connect server in
-          Flow.write_string flow "GET /hello HTTP/1.1\r\nHo" ;
-          equal string {|408 "Request Timeout\n" close|}
-            (read_response ~head:false r) ;
-          eof r ;
-          Flow.close flow )
-    ; test "an idle connection is closed" (fun () ->
-          with_server ~config
-          @@ fun server ->
-          let flow, r = connect server in
-          Flow.write_string flow (get "/hello") ;
-          equal string {|200 "hello"|} (read_response ~head:false r) ;
-          eof r ;
-          Flow.close flow )
-    ; test "a body trickled after the response is not drained forever"
-        (fun () ->
-          with_server ~config
-          @@ fun server ->
-          let flow, r = connect server in
+          Flow.set_read_deadline flow
+            (Mtime.add_span (Mtime.now ()) Mtime.Span.(2 * s)) ;
+          let m = Fake.mark f in
           Flow.write_string flow
             ( "POST /ignore HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n"
             ^ String.make 10 'x' ) ;
           equal string {|200 "ignored"|} (read_response ~head:false r) ;
-          (* A byte every 20ms, within the 50ms read timeout, for 2s. *)
-          let trickle =
-            Fun.Async.call (fun () ->
-                try
-                  for _ = 1 to 100 do
-                    Mtime.wait_for Mtime.Span.(20 * ms) ;
-                    Flow.write_string flow "x"
-                  done
-                with Flow.Closed -> () )
-          in
-          let clock = Mtime.counter () in
+          (* The drain waits for the rest of the body until t0 + R. *)
+          Fake.wait_mono_timer f ~since:m (t0 +: read_r) ;
+          (* A byte each second. After each byte, the next read waits for the
+             same deadline. This proves that the drain took the byte, and that
+             the byte did not renew the deadline. *)
+          for _ = 1 to 12 do
+            Fake.advance f Mtime.Span.s ;
+            let m = Fake.mark f in
+            Flow.write_string flow "x" ;
+            Fake.wait_mono_timer f ~since:m (t0 +: read_r)
+          done ;
+          Fake.advance f Mtime.Span.(read_r - (12 * s) - ns) ;
+          let m = Fake.mark f in
+          Flow.write_string flow "x" ;
+          Fake.wait_mono_timer f ~since:m (t0 +: read_r) ;
+          (* At t0 + R, the server ends the connection. *)
+          Fake.advance f Mtime.Span.ns ;
           ( match Buf_reader.read_into r (Bytes.create 1) 0 1 with
           | 0 | (exception Flow.Closed) ->
               ()
           | _ ->
               fail "unexpected bytes" ) ;
-          let waited = Mtime.Span.to_float_ns (Mtime.count clock) /. 1e6 in
-          is_true
-            ~msg:(Printf.sprintf "ended after %.0fms" waited)
-            (waited < 1000.) ;
-          Fun.Async.cancel trickle ;
-          Flow.close flow )
-    ; test "a stalled upload gets 408" (fun () ->
-          with_server ~config
-          @@ fun server ->
-          let flow, r = connect server in
-          Flow.write_string flow
-            "POST /hello HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc" ;
-          equal string {|408 "Request Timeout\n" close|}
-            (read_response ~head:false r) ;
-          eof r ;
-          Flow.close flow )
-    ; test "a slow upload that keeps sending is not cut off" (fun () ->
-          with_server ~config
-          @@ fun server ->
-          let flow, r = connect server in
-          Flow.write_string flow
-            "POST /hello HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\n\r\n" ;
-          (* 120ms in all, but never 50ms without a byte. *)
-          for _ = 1 to 6 do
-            Mtime.wait_for Mtime.Span.(20 * ms) ;
-            Flow.write_string flow "x"
-          done ;
-          equal string {|200 "hello"|} (read_response ~head:false r) ;
-          Flow.close flow )
-    ; test "a client that does not read its response is let go" (fun () ->
-          with_server ~config:{config with max_connections= 1}
-          @@ fun server ->
-          let a, _ = connect server in
-          Flow.write_string a (get "/big") ;
-          (* [a] never reads: once the socket buffers are full, the server's
-             writes block, and it lets [a] go after write_timeout. *)
-          let b, rb = connect server in
-          Flow.write_string b (get "/hello") ;
-          equal string {|200 "hello"|} (read_response ~head:false rb) ;
-          Flow.close a ;
-          Flow.close b ) ]
+          Flow.close flow ) ]
 
 (* Upgrades over sockets *)
 
@@ -365,29 +290,31 @@ let upgrade_tests =
     [ test
         "after a 101, bytes are echoed as they arrive, without HTTP's timeouts"
         (fun () ->
-          let short = Mtime.Span.(50 * ms) in
-          let config =
-            { config with
-              header_timeout= short
-            ; read_timeout= short
-            ; write_timeout= short }
+          let f = Fake.make () in
+          let t0 = Fake.mono_now f in
+          let m = Fake.mark f in
+          (* [half_head] asks for "/". *)
+          let handler _ =
+            Response.upgrade
+              ~headers:(Headers.of_list [("Upgrade", "echo")])
+              (fun flow -> copy flow flow)
           in
-          with_server ~config
+          with_fake_time_server f ~handler
           @@ fun server ->
           let flow, r = connect server in
           (* In two parts, so that the server reads the second under its head
              deadline. *)
-          Flow.write_string flow "GET /ws-echo HTTP/1.1\r\nHost: x\r\n" ;
-          Mtime.wait_for Mtime.Span.(10 * ms) ;
-          Flow.write_string flow "Upgrade: echo\r\nConnection: Upgrade\r\n\r\n" ;
+          half_head f flow ~t0 ~since:m ;
+          Flow.write_string flow
+            "Host: x\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n" ;
           equal string "HTTP/1.1 101 Switching Protocols" (read_head r) ;
           List.iter
             (fun msg ->
               Flow.write_string flow msg ;
               equal string msg (read_n r (String.length msg)) )
             ["ping"; "pong"; String.make 10_000 'x'] ;
-          (* Quiet for longer than the server's HTTP timeouts. *)
-          Mtime.wait_for Mtime.Span.(120 * ms) ;
+          (* Past all the HTTP deadlines of the connection. *)
+          Fake.advance f Mtime.Span.(60 * s) ;
           Flow.write_string flow "still there" ;
           equal string "still there" (read_n r 11) ;
           Flow.shutdown_send flow ;
@@ -442,12 +369,10 @@ let disconnect_tests =
           @@ fun server ->
           let flow, _ = connect server in
           Flow.write_string flow (get "/wait") ;
-          Cell.Once.get !waiting ;
-          let clock = Mtime.counter () in
+          within_2s (fun () -> Cell.Once.get !waiting) ;
           Flow.close flow ;
-          is_true ~msg:"cancelled" (within 1000 !cancelled) ;
-          let ms = Mtime.Span.to_float_ns (Mtime.count clock) /. 1e6 in
-          is_true ~msg:(Printf.sprintf "after %.0fms" ms) (ms < 500.) )
+          (* The handler waits 10 s if no cancel comes. *)
+          is_true ~msg:"cancelled" (within 2000 !cancelled) )
     ; test "the cancellation reaches the handler's upstream connection"
         (fun () ->
           reset () ;
