@@ -145,11 +145,10 @@ val prepend : string -> t -> t
     An HTTP/1.1 connection uses it to hand the bytes it has already buffered to
     an upgrade callback. *)
 
-val of_string : ?time:Time.mono -> ?chunk:int -> string -> Buffer.t -> t
+val of_string : ?chunk:int -> string -> Buffer.t -> t
 (** [of_string ~chunk input output] is an in-memory flow for tests. Reads return
     the bytes of [input], at most [chunk] bytes per read (default: no limit) to
     imitate a network that splits data, and then [0]. Writes append to [output].
-    It is always readable and ignores deadlines. Its time line is [time]
-    (default: {!Time.mono}).
+    It is always readable and ignores deadlines. Its time line is {!Time.mono}.
 
     @raise Invalid_argument if [chunk <= 0]. *)

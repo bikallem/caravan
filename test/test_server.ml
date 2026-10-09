@@ -653,13 +653,8 @@ let stop_tests =
           Flow.write_string flow (get "/hold") ;
           within_2s (fun () -> Cell.Once.get started) ;
           Server.shutdown server ;
-          let cancel =
-            Action.invoke
-              (Action.choose
-                 [ Action.map (fun () -> `Cancelled) (Cell.Once.get' cancelled)
-                 ; Mtime.wait_for' Mtime.Span.(50 * ms) `None ] )
-          in
-          is_true ~msg:"no cancel within 50 ms" (cancel = `None) ;
+          is_false ~msg:"no cancel within 50 ms"
+            (Fake_time.within_50ms (Cell.Once.get' cancelled)) ;
           Cell.Once.try_set release () ;
           equal string {|200 "done" close|} (read_response ~head:false r) ;
           Flow.close flow ) ]

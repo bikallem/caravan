@@ -114,7 +114,7 @@ let prepend s flow =
       ~set_write_deadline:(set_write_deadline flow) ()
   end
 
-let of_string ?(time = Time.mono) ?(chunk = max_int) input output =
+let of_string ?(chunk = max_int) input output =
   if chunk <= 0 then invalid_arg "Flow.of_string: chunk must be positive" ;
   let pos = ref 0 in
   let read buf off len =
@@ -125,7 +125,7 @@ let of_string ?(time = Time.mono) ?(chunk = max_int) input output =
   in
   let write buf off len = Buffer.add_subbytes output buf off len in
   let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
-  make ~time ~read
+  make ~time:Time.mono ~read
     ~read_now:(fun buf off len -> Some (read buf off len))
     ~write ~readable:(Action.always ()) ~shutdown_send:ignore ~close:ignore
     ~set_read_deadline:ignore_deadline ~set_write_deadline:ignore_deadline ()

@@ -150,9 +150,9 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
             match !phase with
             | `Head ->
                 Option.bind !sent_at (fun t ->
-                    Mtime.add_span t config.response_timeout )
+                    Time.add time t config.response_timeout )
             | `Body ->
-                Mtime.add_span start config.read_timeout
+                Time.add time start config.read_timeout
           in
           let events =
             [Flow.readable' flow `Readable; Time.at time deadline `Timeout]

@@ -47,7 +47,7 @@ let take t key =
 (* An idle connection is stale when it is too old, or when its server closed it,
    reset it, or sent bytes that no request asked for. *)
 let too_old t (c : Conn.t) =
-  match Mtime.add_span c.released_at t.config.idle_timeout with
+  match Time.add t.config.mono_time c.released_at t.config.idle_timeout with
   | Some d ->
       not (Mtime.is_earlier (Time.now t.config.mono_time) ~than:d)
   | None ->
@@ -81,12 +81,7 @@ let rec checkout ?(reuse = true) t ~host ~port =
   | Some c ->
       (c, `Reused)
   | None ->
-      let flow = t.connect ~host ~port in
-      let c =
-        Conn.make
-          ~released_at:(Time.now t.config.mono_time)
-          ~host:(fst key) ~port flow
-      in
+      let c = Conn.make ~host:(fst key) ~port (t.connect ~host ~port) in
       let added =
         Mutex.protect t.lock (fun () ->
             if t.closed then false

@@ -65,11 +65,7 @@ let with_conn f =
   Stdlib.Fun.protect ~finally:(fun () ->
       Writers.stop writers ; Writers.wait writers )
   @@ fun () ->
-  let conn =
-    Conn.make
-      ~released_at:(Time.now (Flow.time client))
-      ~host:"a.example" ~port:80 client
-  in
+  let conn = Conn.make ~host:"a.example" ~port:80 client in
   let releases = ref [] in
   let on_release (c : Conn.t) ~reusable =
     releases := reusable :: !releases ;
@@ -150,11 +146,7 @@ let with_breakable ?time ?(on_write_deadline = ignore) error f =
       Flow.close server ;
       Flow.close client )
   @@ fun () ->
-  let conn =
-    Conn.make
-      ~released_at:(Time.now (Flow.time client))
-      ~host:"a" ~port:80 client
-  in
+  let conn = Conn.make ~host:"a" ~port:80 client in
   let run config r =
     Exchange.run config writers conn ~on_release:(fun _ ~reusable:_ -> ()) r
   in
@@ -783,10 +775,7 @@ let exchange_tests =
               Flow.close server ;
               Flow.close client )
           @@ fun () ->
-          let conn =
-            Conn.make
-              ~released_at:(Time.now (Flow.time client))
-              ~host:"a" ~port:80 client
+          let conn = Conn.make ~host:"a" ~port:80 client
           and releases = ref [] in
           let r = Buf_reader.of_flow server in
           let s =
@@ -921,10 +910,7 @@ let exchange_tests =
           let writers = Writers.make () in
           Writers.stop writers ;
           Writers.wait writers ;
-          let conn =
-            Conn.make
-              ~released_at:(Time.now (Flow.time client))
-              ~host:"a" ~port:80 client
+          let conn = Conn.make ~host:"a" ~port:80 client
           and releases = ref [] in
           let closes = Atomic.make 0 in
           let source =
@@ -1138,10 +1124,7 @@ let exchange_tests =
               Flow.close server ;
               Flow.close client )
           @@ fun () ->
-          let conn =
-            Conn.make
-              ~released_at:(Time.now (Flow.time client))
-              ~host:"a" ~port:80 client
+          let conn = Conn.make ~host:"a" ~port:80 client
           and releases = ref [] in
           let r = Buf_reader.of_flow server in
           let responded = Cell.Once.make () in
@@ -1342,10 +1325,7 @@ let exchange_tests =
                   Flow.close server ;
                   Flow.close client )
               @@ fun () ->
-              let conn =
-                Conn.make
-                  ~released_at:(Time.now (Flow.time client))
-                  ~host:"a" ~port:80 client
+              let conn = Conn.make ~host:"a" ~port:80 client
               and releases = ref [] in
               let r = Buf_reader.of_flow server in
               let s =
@@ -1580,11 +1560,7 @@ let exchange_tests =
             ; stopping= Cell.Once.make ()
             ; supervisor= Fun.Async.call ignore }
           in
-          let conn =
-            Conn.make
-              ~released_at:(Time.now (Flow.time client))
-              ~host:"a.example" ~port:80 client
-          in
+          let conn = Conn.make ~host:"a.example" ~port:80 client in
           let releases = ref [] in
           let on_release _ ~reusable = releases := reusable :: !releases in
           let f =
@@ -3068,7 +3044,7 @@ let api_tests =
 
 module Fake = Fake_time
 
-let ( +: ) t span = Option.get (Mtime.add_span t span)
+let ( +: ) = Fake.( +: )
 
 (* The spans of the fake time tests. A test advances only to deadlines that it
    proved with [Fake.wait_mono_timer]. *)
@@ -3118,12 +3094,7 @@ let with_fake_exchange ?(broken = false) ?on_write_deadline f ~exchange test =
   Stdlib.Fun.protect ~finally:(fun () -> Fun.Async.cancel c)
   @@ fun () -> test ~server ~t0 ~since:m c
 
-(* Whether [cell] is set within 50 ms of real time. *)
-let set_within_50ms cell =
-  Action.invoke
-    (Action.choose
-       [ Action.map (fun () -> true) (Cell.Once.get' cell)
-       ; Mtime.wait_for' (ms 50) false ] )
+let set_within_50ms cell = Fake.within_50ms (Cell.Once.get' cell)
 
 (* [f port] with a server on [port] that runs [script] on one connection. *)
 let with_script_server script f =

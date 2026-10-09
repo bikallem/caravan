@@ -56,6 +56,10 @@ val at : ('time, _) t -> 'time option -> 'tag -> 'tag Affect.Action.t
 (** [at t d tag] is the timer of [t] at the deadline [d], enabled with [tag].
     [None] is no deadline: the action is never enabled. *)
 
+val add : ('time, 'span) t -> 'time -> 'span -> 'time option
+(** [add t time span] is [time] plus [span] on the time line [t], [None] if the
+    result is not representable. *)
+
 val after : ('time, 'span) t -> 'span -> 'time option
 (** [after t span] is [now t] plus [span], [None] if the result is not
     representable. *)

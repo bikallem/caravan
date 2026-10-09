@@ -2365,7 +2365,7 @@ let server_tests =
 module Fake = Fake_time
 module Mtime = Affect_unix.Mtime
 
-let ( +: ) t span = Option.get (Mtime.add_span t span)
+let ( +: ) = Fake.( +: )
 
 (* The spans of the fake time tests: different from each other and from the
    spans of the server. A test advances only to deadlines that it proved with
@@ -2409,13 +2409,7 @@ let with_call f test =
 
 let result call = within_2s (fun () -> Affect.Fun.Async.get call)
 
-(* Whether [call] ends within 50 ms of real time. *)
-let ends_within_50ms call =
-  let open Affect in
-  Action.invoke
-    (Action.choose
-       [ Action.map (fun _ -> true) (Fun.Async.get' call)
-       ; Mtime.wait_for' (ms 50) false ] )
+let ends_within_50ms call = Fake.within_50ms (Affect.Fun.Async.get' call)
 
 let peer_frame peer =
   within_2s (fun () ->

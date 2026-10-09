@@ -1038,7 +1038,7 @@ let date_tests =
 
 module Fake = Fake_time
 
-let ( +: ) t span = Option.get (Mtime.add_span t span)
+let ( +: ) = Fake.( +: )
 
 (* The spans of the fake time tests. A test advances only to deadlines that it
    proved with [Fake.wait_mono_timer]. *)

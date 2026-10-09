@@ -8,6 +8,7 @@ val of_unix_time : float -> Http_date.t
 val of_posix : Affect_unix.Ptime.t -> string
 (** [of_posix p] is the POSIX time [p] encoded as an IMF-fixdate, for example
     ["Sun, 06 Nov 1994 08:49:37 GMT"], for the [Date] field. Fractions of a
-    second are dropped: a time before 1970 goes to the second before it. The
-    string is computed at most once per second and shared by all domains: in the
-    second of the previous call, [of_posix] gives the cached string. *)
+    second are dropped: a time before 1970 goes to the second before it. All
+    domains share one cached string: in the second of the previous call,
+    [of_posix] gives it. Two domains can compute the string of a new second at
+    the same time, and then the result is the same. *)

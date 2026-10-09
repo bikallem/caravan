@@ -41,9 +41,11 @@ let at (type time span) (t : (time, span) t) d tag =
       let module T = (val t.timer) in
       T.at d tag
 
-let after (type time span) (t : (time, span) t) span =
+let add (type time span) (t : (time, span) t) time span =
   let module S = (val t.span) in
-  S.add (now t) span
+  S.add time span
+
+let after t span = add t (now t) span
 
 let sleep t span = Action.invoke (at t (after t span) ())
 
