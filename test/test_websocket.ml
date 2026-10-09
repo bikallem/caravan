@@ -1144,47 +1144,6 @@ let socket_tests =
           done ;
           Fun.Async.get a ;
           Fun.Async.get b )
-    ; test "a fiber in recv reads the reply to close" (fun () ->
-          let open Affect in
-          with_socket
-          @@ fun c peer ->
-          let reader =
-            Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c))
-          in
-          Affect_unix.Mtime.wait_for (ms 20) ;
-          let closer = Fun.Async.call (fun () -> Ws.close ~code:1001 c) in
-          equal string "close 1001"
-            (show_frame
-               (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125) ) ;
-          Caravan.Flow.write_string peer (client Close (code_reason 1001 "")) ;
-          Fun.Async.get closer ;
-          equal int 1001 (Fun.Async.get reader) )
-    ; test "a send that waits for a different send raises Closed after close"
-        (fun () ->
-          let open Affect in
-          with_socket ~close_timeout:(ms 2000)
-          @@ fun c peer ->
-          (* The peer reads nothing: [big] fills the socket buffers. *)
-          let big =
-            Fun.Async.call (fun () ->
-                Ws.send c (Binary (String.make 4_000_000 'x')) )
-          in
-          Affect_unix.Mtime.wait_for (ms 50) ;
-          let late =
-            Fun.Async.call (fun () ->
-                closed_code (fun () -> Ws.send c (Text "late")) )
-          in
-          Affect_unix.Mtime.wait_for (ms 20) ;
-          let closer = Fun.Async.call (fun () -> Ws.close c) in
-          Affect_unix.Mtime.wait_for (ms 20) ;
-          let r = Buf_reader.of_flow peer in
-          let next () = Frame.read r ~masked:false ~max:max_int in
-          equal int 4_000_000 (String.length (next ()).payload) ;
-          equal string "close 1000" (show_frame (next ())) ;
-          Caravan.Flow.write_string peer (client Close (code_reason 1000 "")) ;
-          Fun.Async.get big ;
-          equal int 1000 (Fun.Async.get late) ;
-          Fun.Async.get closer )
     ; test
         "after a protocol error, the peer gets the Close frame and the end of \
          the stream" (fun () ->
@@ -1207,27 +1166,6 @@ let socket_tests =
           raises End_of_file (fun () -> Frame.read r ~masked:false ~max:125) ;
           Caravan.Flow.close peer ;
           equal int 1009 (Fun.Async.get reader) )
-    ; test "a second close waits for the end of the first closing handshake"
-        (fun () ->
-          let open Affect in
-          with_socket ~close_timeout:(ms 2000)
-          @@ fun c peer ->
-          let first = Fun.Async.call (fun () -> Ws.close ~code:1001 c) in
-          let r = Buf_reader.of_flow peer in
-          equal string "close 1001"
-            (show_frame (Frame.read r ~masked:false ~max:125)) ;
-          let second =
-            Fun.Async.call (fun () ->
-                let t = Affect_unix.Mtime.counter () in
-                Ws.close c ; elapsed_ms t )
-          in
-          (* The peer replies after 100 ms. *)
-          Affect_unix.Mtime.wait_for (ms 100) ;
-          Caravan.Flow.write_string peer (client Close (code_reason 1001 "")) ;
-          within_2s (fun () -> Fun.Async.get first) ;
-          let took = within_2s (fun () -> Fun.Async.get second) in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took >= 50.) ;
-          raises End_of_file (fun () -> Frame.read r ~masked:false ~max:125) )
     ; test "a cancel in the reply to a Close frame closes the connection"
         (fun () ->
           let open Affect in
@@ -1295,55 +1233,9 @@ let socket_tests =
           equal (list string)
             ["binary"; "close 1001 \"server shutdown\""]
             [opcode_name first.opcode; second] )
-    ; test "a cancel in the linger after a protocol error closes the connection"
-        (fun () ->
-          let open Affect in
-          with_socket ~close_timeout:(ms 1000)
-          @@ fun c peer ->
-          (* The peer does not close: the linger waits. *)
-          let reader = Fun.Async.call (fun () -> Ws.recv c) in
-          Caravan.Flow.write_string peer (client Continuation "x") ;
-          (* The end of the stream comes after the Close frame: the server is in
-             the linger. *)
-          let r = Buf_reader.of_flow peer in
-          equal string "close 1002"
-            (show_frame (Frame.read r ~masked:false ~max:125)) ;
-          is_true (Buf_reader.peek_eof r) ;
-          Fun.Async.cancel reader ;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader) ;
-          let t = Affect_unix.Mtime.counter () in
-          equal int 1002
-            (within_2s (fun () -> closed_code (fun () -> Ws.recv c))) ;
-          let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 500.) )
-    ; test "the linger after a protocol error discards at most 1 MiB" (fun () ->
-          let open Affect in
-          with_socket
-          @@ fun c peer ->
-          let t = Affect_unix.Mtime.counter () in
-          let reader =
-            Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c))
-          in
-          (* The peer sends 3 MiB after a frame that is too large, and does not
-             close. The server stops before its close timeout of 5 s. *)
-          let header =
-            of_hex "82ff" ^ "\x00\x00\x00\x00\x01\x40\x00\x00"
-            ^ "\x01\x02\x03\x04"
-          in
-          let writer =
-            Fun.Async.call (fun () ->
-                try
-                  Caravan.Flow.write_string peer
-                    (header ^ String.make (3 * 1024 * 1024) 'x')
-                with Caravan.Flow.Closed -> () )
-          in
-          equal int 1009 (Fun.Async.get reader) ;
-          let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 2000.) ;
-          Caravan.Flow.close peer ;
-          Fun.Async.get writer )
     ; (* A cancel in the middle of a frame closes the connection, because the
-         stream is out of step. A cancel between messages does not. *)
+         stream is out of step. The fake time tests have the cancels of a
+         recv. *)
       test "a cancel in the middle of a send closes with 1006" (fun () ->
           let open Affect in
           with_socket
@@ -1359,68 +1251,7 @@ let socket_tests =
           raises Fun.Async.Cancelled (fun () -> Fun.Async.get sender) ;
           equal int 1006 (closed_code (fun () -> Ws.send c (Text "hello"))) ;
           raises End_of_file (fun () -> Frame.read r ~masked:false ~max:max_int) )
-    ; test "a cancel between messages does not close" (fun () ->
-          let open Affect in
-          with_socket
-          @@ fun c peer ->
-          let reader = Fun.Async.call (fun () -> Ws.recv c) in
-          Affect_unix.Mtime.wait_for (ms 20) ;
-          Fun.Async.cancel reader ;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader) ;
-          Caravan.Flow.write_string peer (client Text "hello") ;
-          is_true (Ws.recv c = Text "hello") )
-    ; test "a cancel in the middle of a received frame closes with 1006"
-        (fun () ->
-          let open Affect in
-          with_socket
-          @@ fun c peer ->
-          let reader = Fun.Async.call (fun () -> Ws.recv c) in
-          let frame = client Text "hello" in
-          Caravan.Flow.write_string peer (String.sub frame 0 3) ;
-          Affect_unix.Mtime.wait_for (ms 20) ;
-          Fun.Async.cancel reader ;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader) ;
-          Caravan.Flow.write_string peer
-            (String.sub frame 3 (String.length frame - 3) ^ client Text "next") ;
-          equal int 1006 (closed_code (fun () -> Ws.recv c)) )
-    ; test
-        "a cancel in the wait to send a Pong inside a fragmented message \
-         closes with 1006" (fun () ->
-          let open Affect in
-          (* Without the fix, the next recv waits for the write timeout of
-             [big]: 1 s. *)
-          with_socket ~write_timeout:Affect_unix.Mtime.Span.(1 * s)
-          @@ fun c peer ->
-          (* The peer reads nothing: [big] keeps the writer semaphore. *)
-          let big =
-            Fun.Async.call (fun () ->
-                try Ws.send c (Binary (String.make 10_000_000 'x'))
-                with Ws.Closed _ -> () )
-          in
-          Affect_unix.Mtime.wait_for (ms 50) ;
-          let reader = Fun.Async.call (fun () -> Ws.recv c) in
-          Caravan.Flow.write_string peer
-            (client ~fin:false Text "Hel" ^ client Ping "p") ;
-          Affect_unix.Mtime.wait_for (ms 20) ;
-          Fun.Async.cancel reader ;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader) ;
-          Caravan.Flow.write_string peer (client Continuation "lo") ;
-          let t = Affect_unix.Mtime.counter () in
-          equal int 1006 (closed_code (fun () -> Ws.recv c)) ;
-          let took = elapsed_ms t in
-          is_true ~msg:(Printf.sprintf "took %.0fms" took) (took < 500.) ;
-          Fun.Async.get big )
-    ; test "a cancel inside a fragmented message closes with 1006" (fun () ->
-          let open Affect in
-          with_socket
-          @@ fun c peer ->
-          let reader = Fun.Async.call (fun () -> Ws.recv c) in
-          Caravan.Flow.write_string peer (client ~fin:false Text "Hel") ;
-          Affect_unix.Mtime.wait_for (ms 20) ;
-          Fun.Async.cancel reader ;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader) ;
-          Caravan.Flow.write_string peer (client Continuation "lo") ;
-          equal int 1006 (closed_code (fun () -> Ws.recv c)) ) ]
+    ]
 
 (* The fields of the RFC 6455 §1.3 example, without [Origin]. *)
 let request_fields =
@@ -2486,6 +2317,201 @@ let fake_time_tests =
           Fake.advance f Mtime.Span.(ws_close - s) ;
           equal string "ended" (result first) ;
           equal string "ended" (result second) )
+    ; test "a fiber in recv reads the reply to close" (fun () ->
+          let f = Fake.make () in
+          with_fake_socket f
+          @@ fun c peer ->
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          with_call (fun () -> ignore (Ws.recv c))
+          @@ fun reader ->
+          (* The idle timer proves that the reader waits. *)
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_idle) ;
+          with_call (fun () -> Ws.close ~code:1001 c)
+          @@ fun closer ->
+          equal string "close 1001" (peer_frame peer) ;
+          Caravan.Flow.write_string peer (client Close (code_reason 1001 "")) ;
+          equal string "ended" (result closer) ;
+          equal string "closed 1001 \"\"" (result reader) )
+    ; test "a send that waits for a different send raises Closed after close"
+        (fun () ->
+          let f = Fake.make () in
+          with_fake_socket f
+          @@ fun c peer ->
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          (* The peer reads nothing yet: [big] fills the socket buffers. Its
+             write timer proves that it waits. *)
+          let size = 10_000_000 in
+          with_call (fun () -> Ws.send c (Binary (String.make size 'x')))
+          @@ fun big ->
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_write) ;
+          (* No proof shows that [late] waits for the writer before the close
+             starts. If it starts after, it raises at once: the result is the
+             same. *)
+          with_call (fun () -> Ws.send c (Text "late"))
+          @@ fun late ->
+          with_call (fun () -> Ws.close c)
+          @@ fun closer ->
+          wait_closing c ;
+          let r = Buf_reader.of_flow peer in
+          let next () =
+            within_2s (fun () -> Frame.read r ~masked:false ~max:max_int)
+          in
+          equal int size (String.length (next ()).payload) ;
+          equal string "close 1000" (show_frame (next ())) ;
+          Caravan.Flow.write_string peer (client Close (code_reason 1000 "")) ;
+          equal string "ended" (result big) ;
+          equal string "closed 1000 \"\"" (result late) ;
+          equal string "ended" (result closer) )
+    ; test "a second close waits for the end of the first closing handshake"
+        (fun () ->
+          let f = Fake.make () in
+          with_counted_socket f
+          @@ fun c peer counted ->
+          with_call (fun () -> Ws.close ~code:1001 c)
+          @@ fun first ->
+          let r = Buf_reader.of_flow peer in
+          equal string "close 1001"
+            (within_2s (fun () ->
+                 show_frame (Frame.read r ~masked:false ~max:125) ) ) ;
+          (* The count proves that the second close set its deadline. No proof
+             shows that it then waits: the check of 50 ms can miss a bug, but it
+             cannot fail on correct code. *)
+          let w = Atomic.get counted.write_deadlines in
+          with_call (fun () -> Ws.close c)
+          @@ fun second ->
+          wait_until ~msg:"the second close set its deadline" (fun () ->
+              Atomic.get counted.write_deadlines > w ) ;
+          is_false ~msg:"the second close waits" (ends_within_50ms second) ;
+          Caravan.Flow.write_string peer (client Close (code_reason 1001 "")) ;
+          equal string "ended" (result first) ;
+          equal string "ended" (result second) ;
+          raises End_of_file (fun () -> Frame.read r ~masked:false ~max:125) )
+    ; test "a cancel in the linger after a protocol error closes the connection"
+        (fun () ->
+          let f = Fake.make () in
+          with_fake_socket f
+          @@ fun c peer ->
+          (* The peer does not close, and the time does not advance: only the
+             cancel ends the linger. *)
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          let reader = Affect.Fun.Async.call (fun () -> Ws.recv c) in
+          Caravan.Flow.write_string peer (client Continuation "x") ;
+          let r = Buf_reader.of_flow peer in
+          equal string "close 1002"
+            (within_2s (fun () ->
+                 show_frame (Frame.read r ~masked:false ~max:125) ) ) ;
+          (* The end of the stream and the timer of the linger prove that the
+             server is in the linger. *)
+          is_true (within_2s (fun () -> Buf_reader.peek_eof r)) ;
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_close) ;
+          Affect.Fun.Async.cancel reader ;
+          raises Affect.Fun.Async.Cancelled (fun () ->
+              Affect.Fun.Async.get reader ) ;
+          equal int 1002
+            (within_2s (fun () -> closed_code (fun () -> Ws.recv c))) )
+    ; test "the linger after a protocol error discards at most 1 MiB" (fun () ->
+          let f = Fake.make () in
+          with_fake_socket f
+          @@ fun c peer ->
+          (* The peer sends 3 MiB after a frame that is too large, and does not
+             close. The time does not advance: only the limit of 1 MiB stops the
+             linger. *)
+          with_call (fun () -> ignore (Ws.recv c))
+          @@ fun reader ->
+          let header =
+            of_hex "82ff" ^ "\x00\x00\x00\x00\x01\x40\x00\x00"
+            ^ "\x01\x02\x03\x04"
+          in
+          let writer =
+            Affect.Fun.Async.call (fun () ->
+                try
+                  Caravan.Flow.write_string peer
+                    (header ^ String.make (3 * 1024 * 1024) 'x')
+                with Caravan.Flow.Closed -> () )
+          in
+          equal string "closed 1009 \"message is too large\"" (result reader) ;
+          Caravan.Flow.close peer ;
+          within_2s (fun () -> Affect.Fun.Async.get writer) )
+    ; test "a cancel between messages does not close" (fun () ->
+          let f = Fake.make () in
+          with_fake_socket f
+          @@ fun c peer ->
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          let reader = Affect.Fun.Async.call (fun () -> Ws.recv c) in
+          (* The idle timer proves that the reader waits. *)
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_idle) ;
+          Affect.Fun.Async.cancel reader ;
+          raises Affect.Fun.Async.Cancelled (fun () ->
+              Affect.Fun.Async.get reader ) ;
+          Caravan.Flow.write_string peer (client Text "hello") ;
+          is_true (within_2s (fun () -> Ws.recv c) = Text "hello") )
+    ; test "a cancel in the middle of a received frame closes with 1006"
+        (fun () ->
+          let f = Fake.make () in
+          with_fake_socket f
+          @@ fun c peer ->
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          let reader = Affect.Fun.Async.call (fun () -> Ws.recv c) in
+          let frame = client Text "hello" in
+          Caravan.Flow.write_string peer (String.sub frame 0 3) ;
+          (* The read timer proves that the reader took the bytes and waits
+             inside the frame. *)
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_read) ;
+          Affect.Fun.Async.cancel reader ;
+          raises Affect.Fun.Async.Cancelled (fun () ->
+              Affect.Fun.Async.get reader ) ;
+          Caravan.Flow.write_string peer
+            (String.sub frame 3 (String.length frame - 3) ^ client Text "next") ;
+          equal int 1006
+            (within_2s (fun () -> closed_code (fun () -> Ws.recv c))) )
+    ; test
+        "a cancel in the wait to send a Pong inside a fragmented message \
+         closes with 1006" (fun () ->
+          let f = Fake.make () in
+          with_counted_socket f
+          @@ fun c peer counted ->
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          (* The peer reads nothing: [big] keeps the writer. Its write timer
+             proves that it waits. *)
+          with_call (fun () -> Ws.send c (Binary (String.make 10_000_000 'x')))
+          @@ fun big ->
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_write) ;
+          let reader = Affect.Fun.Async.call (fun () -> Ws.recv c) in
+          let input = client ~fin:false Text "Hel" ^ client Ping "p" in
+          Caravan.Flow.write_string peer input ;
+          (* The count proves that the reader took the fragment and the Ping.
+             Then it waits for the writer to send the Pong. *)
+          wait_until ~msg:"the reader took the input" (fun () ->
+              Atomic.get counted.read_bytes >= String.length input ) ;
+          Affect.Fun.Async.cancel reader ;
+          raises Affect.Fun.Async.Cancelled (fun () ->
+              Affect.Fun.Async.get reader ) ;
+          Caravan.Flow.write_string peer (client Continuation "lo") ;
+          (* Without the fix, the next recv waits for the write deadline of
+             [big]. The time does not advance. *)
+          equal int 1006
+            (within_2s (fun () -> closed_code (fun () -> Ws.recv c))) ;
+          equal string "closed 1006 \"\"" (result big) )
+    ; test "a cancel inside a fragmented message closes with 1006" (fun () ->
+          let f = Fake.make () in
+          with_fake_socket f
+          @@ fun c peer ->
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          let reader = Affect.Fun.Async.call (fun () -> Ws.recv c) in
+          Fake.wait_mono_timer f ~since:m (t0 +: ws_idle) ;
+          (* The fragment comes 1 s later: then the idle deadline of the next
+             frame is different. Its timer proves that the reader took the
+             fragment. *)
+          Fake.advance f Mtime.Span.s ;
+          let t1 = Fake.mono_now f and m = Fake.mark f in
+          Caravan.Flow.write_string peer (client ~fin:false Text "Hel") ;
+          Fake.wait_mono_timer f ~since:m (t1 +: ws_idle) ;
+          Affect.Fun.Async.cancel reader ;
+          raises Affect.Fun.Async.Cancelled (fun () ->
+              Affect.Fun.Async.get reader ) ;
+          Caravan.Flow.write_string peer (client Continuation "lo") ;
+          equal int 1006
+            (within_2s (fun () -> closed_code (fun () -> Ws.recv c))) )
     ; test "an upgraded connection keeps the time line of the server" (fun () ->
           let f = Fake.make () in
           let config =
