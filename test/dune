@@ -56,3 +56,8 @@
  (name conformance_app)
  (modules conformance_app)
  (libraries caravan))
+
+(executable
+ (name conformance_server)
+ (modules conformance_server)
+ (libraries caravan conformance_app unix))
