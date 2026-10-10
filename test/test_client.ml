@@ -1724,7 +1724,40 @@ let fake_pool ?(config = Client_config.default) () =
 
 let pool_tests =
   group "Pool"
-    [ test "two requests in sequence use one connection" (fun () ->
+    [ test
+        "a request body that ends after the response, then the next exchange \
+         on the connection" (fun () ->
+          with_pool ~handler:Server_support.handler
+          @@ fun pool writers port ->
+          let go_on = Cell.Once.make () in
+          let late_body =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w (String.make 3000 'a') ;
+                Body.Writer.flush w ;
+                Cell.Once.get go_on ;
+                Body.Writer.write_string w (String.make 3000 'b') )
+          in
+          (* /ignore answers before it reads the body. *)
+          equal string "ignored"
+            (Body.to_string
+               (body
+                  (pooled pool writers ~port
+                     (req ~meth:Method.POST ~body:late_body "/ignore") ) ) ) ;
+          equal int ~msg:"the writer keeps the connection" 0
+            (Pool.idle_hosts pool) ;
+          Cell.Once.try_set go_on () ;
+          eventually ~msg:"the connection is back in the pool" (fun () ->
+              Pool.idle_hosts pool = 1 ) ;
+          let sent = String.init 9000 (fun i -> Char.chr (97 + (i mod 26))) in
+          let c, tag = Pool.checkout pool ~host:"127.0.0.1" ~port in
+          is_true ~msg:"the same connection" (tag = `Reused) ;
+          let resp =
+            Exchange.run Client_config.default writers c
+              ~on_release:(fun c ~reusable -> Pool.release pool c ~reusable)
+              (req ~meth:Method.POST ~body:(Body.of_string sent) "/echo")
+          in
+          equal string sent (Body.to_string (body resp)) )
+    ; test "two requests in sequence use one connection" (fun () ->
           with_pool
           @@ fun pool writers port ->
           let a = get_id pool writers ~port () in
@@ -2018,10 +2051,27 @@ let name = function
 (* The handler of the tests: "/id" gives the id of the connection, "/conn" the
    Connection field and the id, and the others go to the handler of
    Server_support. *)
+(* The cell that lets the second half of /two-part go. *)
+let two_part_go = ref (Cell.Once.make ())
+
 let api_handler req =
   match Request.path_only req with
   | "/id" ->
       id_handler req
+  | "/two-part" ->
+      (* Half of the body, then the rest when the test lets it go. *)
+      let c = Option.value (Request.query req) ~default:"x" in
+      let go = !two_part_go in
+      Response.stream (fun w ->
+          Body.Writer.write_string w
+            (String.concat "" (List.init 50 (fun _ -> c))) ;
+          Body.Writer.flush w ;
+          Cell.Once.get go ;
+          Body.Writer.write_string w (String.make 50 'z') )
+  | "/long-head" ->
+      Response.string
+        ~headers:(Headers.of_list [("X-Long", String.make 6000 'h')])
+        "long"
   | "/conn" ->
       Response.string
         ( Option.value ~default:"-"
@@ -2053,6 +2103,9 @@ let with_client ?(config = big_config) ?client_config f =
   f client (Printf.sprintf "http://127.0.0.1:%d" (server_port server))
 
 let text resp = Body.to_string (C.body resp)
+
+(* The port of a url of [with_client]. *)
+let port_of url = int_of_string (List.nth (String.split_on_char ':' url) 2)
 
 let get_text client url = text (C.get client url)
 
@@ -2124,6 +2177,183 @@ let api_tests =
           case "no authority" (fun body -> Request.make ~body Method.POST "/") ;
           case "bad path" (fun body ->
               Request.make ~authority ~body Method.POST "/a#b" ) )
+    ; test
+        "a body writer that its producer keeps cannot reach the next exchange"
+        (fun () ->
+          with_client
+          @@ fun client url ->
+          let port = port_of url in
+          let post produce =
+            at_port port ~meth:Method.POST ~body:(Body.of_writer produce)
+              "/echo"
+          in
+          let id0 = get_text client (url ^ "/id") in
+          let kept = ref None in
+          equal string "one"
+            (text
+               (C.request client
+                  (post (fun w ->
+                       kept := Some w ;
+                       Body.Writer.write_string w "one" ) ) ) ) ;
+          let late = ref "" and nested = ref "" in
+          let second =
+            text
+              (C.request client
+                 (post (fun w ->
+                      Body.Writer.write_string w "hello" ;
+                      ( match
+                          Body.Writer.write_string (Option.get !kept) "XXXX"
+                        with
+                      | () ->
+                          late := "went through"
+                      | exception Invalid_argument _ ->
+                          late := "refused" ) ;
+                      (* The stopped writer given to a nested writer body. *)
+                      match
+                        Body.write_to
+                          (Body.of_writer (fun w2 ->
+                               Body.Writer.write_string w2 "YYYY" ) )
+                          (Option.get !kept)
+                      with
+                      | () ->
+                          nested := "went through"
+                      | exception Invalid_argument _ ->
+                          nested := "refused" ) ) )
+          in
+          equal string "hello" second ;
+          equal string "refused" !late ;
+          equal string "refused" !nested ;
+          equal string ~msg:"one connection" id0 (get_text client (url ^ "/id")) )
+    ; test "a response that arrives while request bytes wait in the buffer"
+        (fun () ->
+          with_client
+          @@ fun client url ->
+          let port = port_of url in
+          let go_on = Cell.Once.make () in
+          let x = String.make 100 'x'
+          and y = String.make 100 'y'
+          and z = String.make 100 'z' in
+          let produce w =
+            Body.Writer.write_string w x ;
+            Body.Writer.flush w ;
+            (* Not flushed: these bytes wait in the write buffer while the
+               response comes in. *)
+            Body.Writer.write_string w y ;
+            Cell.Once.get go_on ;
+            Body.Writer.write_string w z
+          in
+          (* /echo sends its head with the first bytes of the echo. *)
+          let resp =
+            C.request client
+              (at_port port ~meth:Method.POST ~body:(Body.of_writer produce)
+                 "/echo" )
+          in
+          Cell.Once.try_set go_on () ;
+          equal string (x ^ y ^ z) (text resp) )
+    ; test "two exchanges hold request bytes in their buffers at the same time"
+        (fun () ->
+          (* Each producer leaves bytes unsent in its write buffer and waits. A
+             buffer that two connections share mixes the two requests. *)
+          with_client
+          @@ fun client url ->
+          let port = port_of url in
+          let echo c ~waiting ~go_on =
+            Fun.Async.call (fun () ->
+                let first = String.make 50 c and second = String.make 50 'z' in
+                let produce w =
+                  Body.Writer.write_string w first ;
+                  Cell.Once.try_set waiting () ;
+                  Cell.Once.get go_on ;
+                  Body.Writer.write_string w second
+                in
+                text
+                  (C.request client
+                     (at_port port ~meth:Method.POST
+                        ~body:(Body.of_writer produce) "/echo" ) ) )
+          in
+          let wa = Cell.Once.make () and wb = Cell.Once.make () in
+          let go_on = Cell.Once.make () in
+          let a = echo 'a' ~waiting:wa ~go_on in
+          within_2s (fun () -> Cell.Once.get wa) ;
+          let b = echo 'b' ~waiting:wb ~go_on in
+          within_2s (fun () -> Cell.Once.get wb) ;
+          Cell.Once.try_set go_on () ;
+          equal string
+            (String.make 50 'a' ^ String.make 50 'z')
+            (Fun.Async.get a) ;
+          equal string
+            (String.make 50 'b' ^ String.make 50 'z')
+            (Fun.Async.get b) )
+    ; test "two responses wait half read in their buffers at the same time"
+        (fun () ->
+          (* Each response is half read when the other one comes in. A read
+             buffer that two connections share mixes the two responses. *)
+          with_client
+          @@ fun client url ->
+          two_part_go := Cell.Once.make () ;
+          let a = C.get client (url ^ "/two-part?a") in
+          let b = C.get client (url ^ "/two-part?b") in
+          Cell.Once.try_set !two_part_go () ;
+          equal string (String.make 50 'a' ^ String.make 50 'z') (text a) ;
+          equal string (String.make 50 'b' ^ String.make 50 'z') (text b) )
+    ; test "a response head larger than the read buffer" (fun () ->
+          with_client
+          @@ fun client url ->
+          let id0 = get_text client (url ^ "/id") in
+          List.iter
+            (fun _ ->
+              let resp = C.get client (url ^ "/long-head") in
+              equal int 6000
+                (String.length
+                   (Option.value ~default:""
+                      (Headers.find "X-Long" (Response.headers resp)) ) ) ;
+              equal string "long" (text resp) )
+            [1; 2] ;
+          equal string "hello" (get_text client (url ^ "/hello")) ;
+          equal string ~msg:"one connection" id0 (get_text client (url ^ "/id")) )
+    ; test "two exchanges at the same time on two connections" (fun () ->
+          with_client
+          @@ fun client url ->
+          let port = port_of url in
+          let echo c =
+            Fun.Async.call (fun () ->
+                let sent = String.make 6000 c in
+                let got =
+                  text
+                    (C.request client
+                       (at_port port ~meth:Method.POST
+                          ~body:
+                            (Body.of_writer (fun w ->
+                                 String.iter
+                                   (fun ch ->
+                                     Body.Writer.write_string w
+                                       (String.make 1 ch) ;
+                                     if Random.int 500 = 0 then (
+                                       Body.Writer.flush w ; Fun.Async.yield ()
+                                       ) )
+                                   sent ) )
+                          "/echo" ) )
+                in
+                equal string sent got )
+          in
+          let a = echo 'a' and b = echo 'b' in
+          Fun.Async.get a ; Fun.Async.get b )
+    ; test "sequential exchanges with large heads and bodies" (fun () ->
+          with_client
+          @@ fun client url ->
+          let port = port_of url in
+          List.iter
+            (fun n ->
+              let body =
+                String.init n (fun i -> Char.chr (65 + ((i + n) mod 26)))
+              in
+              let headers = [("X-Long", String.make 5000 'h')] in
+              equal string body
+                (text
+                   (C.request client
+                      (at_port port ~meth:Method.POST ~headers
+                         ~body:(Body.of_string body) "/echo" ) ) ) )
+            [4097; 1; 5000; 4096] )
     ; test "GET, HEAD, 204 and a stream, with reuse" (fun () ->
           with_client
           @@ fun client url ->

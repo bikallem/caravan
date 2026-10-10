@@ -108,7 +108,7 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
   let job =
     Writers.job (fun () ->
         let w =
-          Buf_writer.make (fun buf off len ->
+          Buf_writer.make ~buffer:conn.write_buf (fun buf off len ->
               Flow.set_write_deadline flow
                 (Time.after time config.Cfg.write_timeout) ;
               try Flow.write flow buf off len
@@ -189,7 +189,9 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
     in
     loop ()
   in
-  let r = Buf_reader.make ~read_now:(Flow.read_now flow) read in
+  let r =
+    Buf_reader.make ~buffer:conn.read_buf ~read_now:(Flow.read_now flow) read
+  in
   let response = ref None and response_framing = ref H1_parse.Until_close in
   let reusable () =
     match !response with

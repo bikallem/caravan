@@ -14,7 +14,20 @@ type t =
   ; mutable eof: bool (* [read] returned 0 *)
   ; mutable consumed: int }
 
-let make ?(size = 4096) ?read_now read =
+let make ?size ?buffer ?read_now read =
+  let size =
+    match (size, buffer) with
+    | Some _, Some _ ->
+        invalid_arg "Buf_reader.make: size and buffer are exclusive"
+    | _, Some b when Bytes.length b = 0 ->
+        invalid_arg "Buf_reader.make: buffer must not be empty"
+    | _, Some b ->
+        Bytes.length b
+    | Some s, None ->
+        s
+    | None, None ->
+        4096
+  in
   if size <= 0 then invalid_arg "Buf_reader.make: size must be positive" ;
   let read_now =
     match read_now with
@@ -26,7 +39,7 @@ let make ?(size = 4096) ?read_now read =
   { read
   ; read_now
   ; size
-  ; buf= Bytes.empty
+  ; buf= Option.value buffer ~default:Bytes.empty
   ; pos= 0
   ; len= 0
   ; eof= false

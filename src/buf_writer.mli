@@ -3,12 +3,18 @@
 (** The type for buffered writers. A writer has a single producer. *)
 type t
 
-val make : ?size:int -> (bytes -> int -> int -> unit) -> t
-(** [make ~size write] writes its output with [write buf off len], which writes
-    all [len] bytes or raises. [size] is the buffer size, 4 KiB by default. The
-    buffer is allocated by the first write that needs it.
+val make : ?size:int -> ?buffer:bytes -> (bytes -> int -> int -> unit) -> t
+(** [make ~size ~buffer write] writes its output with [write buf off len], which
+    writes all [len] bytes or raises. [size] is the buffer size, 4 KiB by
+    default. The buffer is allocated by the first write that needs it.
 
-    @raise Invalid_argument if [size <= 0]. *)
+    With [buffer], the writer uses these bytes as its buffer, and [size] is
+    their length. The caller must not use them, or give them to a different
+    writer, while this writer can use them.
+
+    @raise Invalid_argument
+      if [size <= 0], if [buffer] is empty, or if [size] and [buffer] are both
+      given. *)
 
 val write_string : t -> string -> unit
 (** [write_string w s] writes [s]. *)
@@ -38,4 +44,5 @@ val buffered : t -> int
 (** [buffered w] is the number of bytes written to [w] but not yet flushed. *)
 
 val capacity : t -> int
-(** [capacity w] is the size of [w]'s buffer, [0] until it is allocated. *)
+(** [capacity w] is the size of [w]'s buffer, [0] until it is allocated. With a
+    [buffer] given to {!make}, the buffer is there from the start. *)
