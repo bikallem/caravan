@@ -42,9 +42,9 @@ val make :
   -> t
 (** [make ~max_body ~expect_continue ~limits r framing] is the request body
     delimited by [framing]: {!Body.empty}, {!fixed} or {!chunked}. If the
-    request expects [100-continue], [expect_continue ()] runs once, just before
-    the handler's first read of the body; the engine sends [100 Continue] from
-    it.
+    request expects [100-continue], [expect_continue ()] runs once: just before
+    the handler's first read of the body, or at {!send_continue}. The engine
+    sends [100 Continue] from it.
 
     The handler's reads raise {!H1_error.E} for a malformed body or one that
     timed out ([408]), and {!Body.Truncated} when the client ended or reset the
@@ -73,6 +73,11 @@ val failed : t -> bool
 (** [failed t] is [true] once a read of the body raised: the framing was
     malformed or truncated, or the connection failed. Later reads raise the same
     error again, and the connection cannot be reused. *)
+
+val send_continue : t -> unit
+(** [send_continue t] runs [expect_continue ()] now if the request expects
+    [100-continue] and it did not run yet, also when the body is empty or
+    complete. Else it does nothing. It raises what [expect_continue] raises. *)
 
 val continue_owed : t -> bool
 (** [continue_owed t] is [true] iff the request expects [100-continue], the body

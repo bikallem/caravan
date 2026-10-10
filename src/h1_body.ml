@@ -276,6 +276,14 @@ let unread t = match t.src with None -> Some 0 | Some src -> src.unread ()
 
 let failed t = match t.src with None -> false | Some src -> src.failed ()
 
+let send_continue t =
+  match !(t.continue) with
+  | Expected f ->
+      t.continue := Sent ;
+      f ()
+  | No_expectation | Sent ->
+      ()
+
 let continue_owed t =
   match !(t.continue) with
   | Expected _ ->

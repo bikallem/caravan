@@ -130,6 +130,9 @@ let handler req =
         Response.upgrade ~headers:upgrade_echo echo_upgraded
     | "/ws-bare" ->
         Response.upgrade echo_upgraded
+    | "/ws-read" ->
+        ignore (Body.to_string (Request.body req)) ;
+        Response.upgrade ~headers:upgrade_echo echo_upgraded
     | "/ws-fail" ->
         Response.upgrade ~headers:upgrade_echo (fun _ -> failwith "ws")
     | "/tunnel" ->
@@ -1196,8 +1199,217 @@ let upgrade_tests =
       ?(headers = [("Upgrade", "echo"); ("Connection", "Upgrade")]) path =
     get ~v ~headers path
   in
+  let expect_100 = ("Expect", "100-continue") in
+  let small_drain = {Config.default with date_header= false; max_drain= 2} in
   group "H1_server upgrades"
-    [ test "101 hands over the connection, with the bytes already received"
+    [ test "Expect 100-continue and no body: 100, then 101 (RFC 9110 7.8)"
+        (fun () ->
+          expect
+            (show
+               ( ws
+                   ~headers:
+                     [("Upgrade", "echo"); ("Connection", "Upgrade"); expect_100]
+                   "/ws"
+               ^ "after" ) )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 100 Continue\r\n
+            \r\n
+            HTTP/1.1 101 Switching Protocols\r\n
+            Upgrade: echo\r\n
+            Connection: Upgrade\r\n
+            \r\n
+            got after
+            |} )
+    ; test "Expect 100-continue and Content-Length: 0: 100, then 101" (fun () ->
+          expect
+            (show
+               (ws
+                  ~headers:
+                    [ ("Upgrade", "echo")
+                    ; ("Connection", "Upgrade")
+                    ; expect_100
+                    ; ("Content-Length", "0") ]
+                  "/ws" ) )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 100 Continue\r\n
+            \r\n
+            HTTP/1.1 101 Switching Protocols\r\n
+            Upgrade: echo\r\n
+            Connection: Upgrade\r\n
+            \r\n
+            got
+            |} )
+    ; test "Expect 100-continue and a body not read: 100, drain, 101" (fun () ->
+          expect
+            (show
+               ( ws
+                   ~headers:
+                     [ ("Upgrade", "echo")
+                     ; ("Connection", "Upgrade")
+                     ; expect_100
+                     ; ("Content-Length", "5") ]
+                   "/ws"
+               ^ "helloafter" ) )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 100 Continue\r\n
+            \r\n
+            HTTP/1.1 101 Switching Protocols\r\n
+            Upgrade: echo\r\n
+            Connection: Upgrade\r\n
+            \r\n
+            got after
+            |} )
+    ; test
+        "Expect 100-continue and a Content-Length above max_drain: 500, no 100"
+        (fun () ->
+          expect
+            (show ~config:small_drain
+               ( ws
+                   ~headers:
+                     [ ("Upgrade", "echo")
+                     ; ("Connection", "Upgrade")
+                     ; expect_100
+                     ; ("Content-Length", "5") ]
+                   "/ws"
+               ^ "hello" ) )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            |} )
+    ; test "Expect 100-continue and a chunked body above max_drain: 100, 500"
+        (fun () ->
+          expect
+            (show ~config:small_drain
+               ( ws
+                   ~headers:
+                     [ ("Upgrade", "echo")
+                     ; ("Connection", "Upgrade")
+                     ; expect_100
+                     ; ("Transfer-Encoding", "chunked") ]
+                   "/ws"
+               ^ "5\r\nhello\r\n0\r\n\r\n" ) )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 100 Continue\r\n
+            \r\n
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            |} )
+    ; test "Expect 100-continue and a body that the handler read: one 100"
+        (fun () ->
+          expect
+            (show
+               ( ws
+                   ~headers:
+                     [ ("Upgrade", "echo")
+                     ; ("Connection", "Upgrade")
+                     ; expect_100
+                     ; ("Content-Length", "5") ]
+                   "/ws-read"
+               ^ "helloafter" ) )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 100 Continue\r\n
+            \r\n
+            HTTP/1.1 101 Switching Protocols\r\n
+            Upgrade: echo\r\n
+            Connection: Upgrade\r\n
+            \r\n
+            got after
+            |} )
+    ; test "Expect 100-continue, CONNECT with a body: 100, drain, 200"
+        (fun () ->
+          expect
+            (show
+               "CONNECT x.example:443 HTTP/1.1\r\n\
+                Host: x.example:443\r\n\
+                Expect: 100-continue\r\n\
+                Content-Length: 5\r\n\
+                \r\n\
+                helloafter" )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 100 Continue\r\n
+            \r\n
+            HTTP/1.1 200 OK\r\n
+            \r\n
+            got after
+            |} )
+    ; test "Expect 100-continue, CONNECT with no body: 200, no 100" (fun () ->
+          expect
+            (show
+               "CONNECT x.example:443 HTTP/1.1\r\n\
+                Host: x.example:443\r\n\
+                Expect: 100-continue\r\n\
+                \r\n\
+                after" )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 200 OK\r\n
+            \r\n
+            got after
+            |} )
+    ; test "Expect 100-continue and an upgrade that is refused: 500, no 100"
+        (fun () ->
+          expect
+            (show
+               (ws
+                  ~headers:
+                    [("Upgrade", "echo"); ("Connection", "Upgrade"); expect_100]
+                  "/ws-bare" ) )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Failure("Response.upgrade: 101 without an Upgrade field")
+            |} )
+    ; test "Expect 100-continue and a client that left: nothing, no error"
+        (fun () ->
+          expect
+            (show ~unwritable:true
+               (ws
+                  ~headers:
+                    [("Upgrade", "echo"); ("Connection", "Upgrade"); expect_100]
+                  "/ws" ) )
+          @@ __POS_OF__ {||} )
+    ; test "Expect 100-continue in HTTP/1.0 CONNECT with a body: no 100"
+        (fun () ->
+          (* RFC 9110 10.1.1: a server ignores the expectation of HTTP/1.0. *)
+          expect
+            (show
+               "CONNECT x.example:443 HTTP/1.0\r\n\
+                Host: x.example:443\r\n\
+                Expect: 100-continue\r\n\
+                Content-Length: 5\r\n\
+                \r\n\
+                helloafter" )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 200 OK\r\n
+            Connection: keep-alive\r\n
+            \r\n
+            got after
+            |} )
+    ; test "101 hands over the connection, with the bytes already received"
         (fun () ->
           expect (show (ws "/ws" ^ "early bytes, " ^ "then more"))
           @@ __POS_OF__

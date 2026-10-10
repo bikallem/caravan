@@ -538,25 +538,21 @@ let direct_tests =
           / HEAD => 200
           /q7w2e9r4t1y6u3i8o5p0a2s7d4f9g1h6 HEAD => 404
           |} )
-    ; xfail
-        ~reason:
-          "G3: caravan sends the 101 with no 100 when the request has no body"
-        (test
-           "continue_before_upgrade: 100 before 101 for Upgrade and Expect \
-            100-continue, no body (RFC 9110 7.8)" (fun () ->
-             (* Upstream sends this to its URLs. The fixture path makes the
-                application switch protocols. *)
-             let input =
-               direct ~connection:"Connection: upgrade\r\n"
-                 ~additional:"Upgrade: https\r\nExpect: 100-continue\r\n"
-                 "/fixture/upgrade"
-             in
-             equal string "100 101" (codes ~meth:"GET" (serve_one input)) ) )
     ; test
-        "continue_before_upgrade: with a body that the handler does not read, \
-         the result is 500 (not an upstream case)" (fun () ->
-          (* No 101 goes out, so RFC 9110 7.8 does not apply. This records the
-             behavior until issue #23 is fixed. *)
+        "continue_before_upgrade: 100 before 101 for Upgrade and Expect \
+         100-continue, no body (RFC 9110 7.8)" (fun () ->
+          (* Upstream sends this to its URLs. The fixture path makes the
+             application switch protocols. *)
+          let input =
+            direct ~connection:"Connection: upgrade\r\n"
+              ~additional:"Upgrade: https\r\nExpect: 100-continue\r\n"
+              "/fixture/upgrade"
+          in
+          equal string "100 101" (codes ~meth:"GET" (serve_one input)) )
+    ; test
+        "continue_before_upgrade: 100 before 101 also with a body that the \
+         handler does not read (not an upstream case)" (fun () ->
+          (* Before #23 was fixed, the result was 500. *)
           let input =
             direct ~connection:"Connection: upgrade\r\n"
               ~additional:
@@ -566,7 +562,7 @@ let direct_tests =
               "/fixture/upgrade"
             ^ "hello"
           in
-          equal string "500" (codes ~meth:"GET" (serve_one input)) )
+          equal string "100 101" (codes ~meth:"GET" (serve_one input)) )
     ; test
         "content_length_2XX_connect: no Content-Length in a 2xx to CONNECT \
          (RFC 9110 8.6)" (fun () ->
