@@ -1659,8 +1659,8 @@ let show_framing_of ~meth ~version r =
   match H1_write.framing ~meth ~version r with
   | H1_write.No_body ->
       "no body"
-  | Head_length n ->
-      Printf.sprintf "head, length %d" n
+  | Length_only n ->
+      Printf.sprintf "length only %d" n
   | Length n ->
       Printf.sprintf "length %d" n
   | Chunked ->
@@ -1697,6 +1697,10 @@ let response_framing_tests =
                     ; ("HEAD 200 sized", HEAD, Http_1_1, sized "hello")
                     ; ("HEAD 200 stream", HEAD, Http_1_1, stream_body)
                     ; ("HEAD 304", HEAD, Http_1_1, st 304 (sized "x"))
+                    ; ("GET 205 sized", GET, Http_1_1, st 205 (sized "x"))
+                    ; ("HEAD 205 sized", HEAD, Http_1_1, st 205 (sized "x"))
+                    ; ("GET 205 stream 1.1", GET, Http_1_1, st 205 stream_body)
+                    ; ("GET 205 stream 1.0", GET, Http_1_0, st 205 stream_body)
                     ; ("CONNECT 200", CONNECT, Http_1_1, sized "x")
                     ; ( "CONNECT 200 upgrade"
                       , CONNECT
@@ -1704,6 +1708,7 @@ let response_framing_tests =
                       , Response.upgrade ~status:Status.ok ignore )
                     ; ("CONNECT 404", CONNECT, Http_1_1, st 404 (sized "no"))
                     ; ("CONNECT 299", CONNECT, Http_1_1, st 299 stream_body)
+                    ; ("CONNECT 205", CONNECT, Http_1_1, st 205 (sized "x"))
                     ; ( "CONNECT 300 stream"
                       , CONNECT
                       , Http_1_1
@@ -1720,13 +1725,18 @@ let response_framing_tests =
             GET 204 with a body        => no body
             GET 304                    => no body
             GET 404 sized              => length 4
-            HEAD 200 sized             => head, length 5
+            HEAD 200 sized             => length only 5
             HEAD 200 stream            => no body
             HEAD 304                   => no body
+            GET 205 sized              => length only 0
+            HEAD 205 sized             => length only 0
+            GET 205 stream 1.1         => length only 0
+            GET 205 stream 1.0         => length only 0
             CONNECT 200                => no body
             CONNECT 200 upgrade        => no body
             CONNECT 404                => length 2
             CONNECT 299                => no body
+            CONNECT 205                => no body
             CONNECT 300 stream         => chunked
             |} )
     ; test "wants_close" (fun () ->
@@ -1829,6 +1839,50 @@ let response_head_tests =
             HTTP/1.1 101 Switching Protocols\r\n
             Upgrade: websocket\r\n
             Connection: Upgrade\r\n
+            \r\n
+            |} )
+    ; test "426 keeps Upgrade and adds the upgrade option (RFC 9110 7.8)"
+        (fun () ->
+          let r =
+            Response.string ~status:Status.upgrade_required
+              ~headers:(hs [("Upgrade", "example/1"); ("Connection", "x")])
+              "!"
+          in
+          expect
+            (String.concat "\n"
+               [ render r
+               ; render ~keep_alive:false r
+               ; render ~version:Version.Http_1_0 r ] )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 426 Upgrade Required\r\n
+            Upgrade: example/1\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 1\r\n
+            Connection: Upgrade\r\n
+            \r\n
+
+            HTTP/1.1 426 Upgrade Required\r\n
+            Upgrade: example/1\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 1\r\n
+            Connection: Upgrade, close\r\n
+            \r\n
+
+            HTTP/1.1 426 Upgrade Required\r\n
+            Upgrade: example/1\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 1\r\n
+            Connection: Upgrade, keep-alive\r\n
+            \r\n
+            |} )
+    ; test "426 without Upgrade gets no upgrade option" (fun () ->
+          expect (render (Response.string ~status:Status.upgrade_required "!"))
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 426 Upgrade Required\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 1\r\n
             \r\n
             |} )
     ; test "an unregistered status has an empty reason" (fun () ->
@@ -2013,7 +2067,7 @@ let response_body_tests =
             ; ("chunked empty", Chunked, Body.empty)
             ; ("close-delimited", Close_delimited, pieces_source ["ab"; "cd"])
             ; ("no body", No_body, Body.of_string "hidden")
-            ; ("head", Head_length 6, Body.of_string "hidden") ]
+            ; ("head", Length_only 6, Body.of_string "hidden") ]
           in
           expect
             (String.concat "\n"
@@ -2084,7 +2138,7 @@ let response_body_tests =
               equal string ""
                 (fst
                    (write_body framing (Body.of_writer (fun _ -> ran := true))) ) )
-            H1_write.[No_body; Head_length 1] ;
+            H1_write.[No_body; Length_only 1] ;
           equal int 2 !closes ;
           is_true (not !ran) )
     ; test "framings without a body still flush the head" (fun () ->
@@ -2094,7 +2148,7 @@ let response_body_tests =
               Buf_writer.write_string w "HTTP/1.1 204 No Content\r\n\r\n" ;
               H1_write.body w framing Body.empty ;
               equal (list string) ["HTTP/1.1 204 No Content\r\n\r\n"] (calls ()) )
-            H1_write.[No_body; Head_length 5] )
+            H1_write.[No_body; Length_only 5] )
     ; test "the body is closed once, also when writing fails" (fun () ->
           let closes = ref 0 in
           ignore

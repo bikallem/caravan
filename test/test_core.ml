@@ -1316,6 +1316,11 @@ let fake_time_tests =
           get_2s c1 ;
           get_2s c2 )
     ; test "one advance wakes the calls on all domains" (fun () ->
+          (* The test needs several domains. TEST_DOMAINS=1 asks for one, for
+             example in mutation testing, which cannot fork after a domain
+             starts. *)
+          if Sys.getenv_opt "TEST_DOMAINS" = Some "1" then
+            skip ~reason:"TEST_DOMAINS=1 asks for one domain" () ;
           fake_main ~domain_count:4
           @@ fun () ->
           let f = Fake.make () in

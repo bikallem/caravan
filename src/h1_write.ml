@@ -1,6 +1,6 @@
 type framing =
   | No_body
-  | Head_length of int
+  | Length_only of int
   | Length of int
   | Chunked
   | Close_delimited
@@ -12,9 +12,13 @@ let framing ~meth ~version r =
   | Response.Body body -> (
       let code = Status.code (Response.status r) in
       if code < 200 || code = 204 || code = 304 then No_body
-      else if Method.equal meth Method.CONNECT && code < 300 then No_body
+      else if Method.equal meth Method.CONNECT && code < 300 then
+        No_body
+        (* RFC 9110 §15.3.6: no content in a 205. RFC 9112 §6.3 would read a 205
+           without a framing field to the close. *)
+      else if code = 205 then Length_only 0
       else if Method.equal meth Method.HEAD then
-        match Body.length body with Some n -> Head_length n | None -> No_body
+        match Body.length body with Some n -> Length_only n | None -> No_body
       else
         match Body.length body with
         | Some n ->
@@ -43,6 +47,8 @@ let field w name value =
 let head w ?date ~version ~keep_alive framing r =
   let status = Response.status r and headers = Response.headers r in
   let upgrade = Status.code status = 101 in
+  (* RFC 9110 §15.5.22: a 426 names the protocols to upgrade to. *)
+  let advertises = Status.code status = 426 && Headers.mem "upgrade" headers in
   Buf_writer.write_string w "HTTP/1.1 " ;
   Buf_writer.write_string w (string_of_int (Status.code status)) ;
   Buf_writer.write_char w ' ' ;
@@ -55,20 +61,28 @@ let head w ?date ~version ~keep_alive framing r =
       () ) ;
   let owned name =
     let name = String.lowercase_ascii name in
-    List.mem name connection_fields && not (upgrade && name = "upgrade")
+    List.mem name connection_fields
+    && not ((upgrade || advertises) && name = "upgrade")
   in
   Headers.iter (fun n v -> if not (owned n) then field w n v) headers ;
   ( match framing with
-  | Length n | Head_length n ->
+  | Length n | Length_only n ->
       field w "Content-Length" (string_of_int n)
   | Chunked ->
       field w "Transfer-Encoding" "chunked"
   | No_body | Close_delimited ->
       () ) ;
-  if upgrade then field w "Connection" "Upgrade"
-  else if (not keep_alive) || framing = Close_delimited then
-    field w "Connection" "close"
-  else if version = Version.Http_1_0 then field w "Connection" "keep-alive" ;
+  (* RFC 9110 §7.8: a sender of Upgrade also sends the upgrade option. *)
+  let options =
+    if upgrade then ["Upgrade"]
+    else
+      (if advertises then ["Upgrade"] else [])
+      @
+      if (not keep_alive) || framing = Close_delimited then ["close"]
+      else if version = Version.Http_1_0 then ["keep-alive"]
+      else []
+  in
+  if options <> [] then field w "Connection" (String.concat ", " options) ;
   Buf_writer.write_string w "\r\n"
 
 (* Requests, for a client *)
@@ -142,7 +156,7 @@ let request_head w framing req =
       field w "Content-Length" (string_of_int n)
   | Chunked ->
       field w "Transfer-Encoding" "chunked"
-  | No_body | Head_length _ | Close_delimited ->
+  | No_body | Length_only _ | Close_delimited ->
       () ) ;
   if request_closes req then field w "Connection" "close" ;
   Buf_writer.write_string w "\r\n"
@@ -213,7 +227,7 @@ let body ?(before = ignore) w framing b =
     flush ()
   in
   match framing with
-  | No_body | Head_length _ ->
+  | No_body | Length_only _ ->
       flush ()
   | Close_delimited ->
       write_all (Buf_writer.write_bytes w)

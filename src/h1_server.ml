@@ -70,6 +70,13 @@ let upgrade_error (head : H1_parse.head) response =
     Some (Format.asprintf "2xx upgrade to a %a request" Method.pp head.meth)
   else None
 
+(* RFC 9110 §7.8: a 101 to a request that expects 100-continue comes after a
+   100, also when the request has no content. A CONNECT request has no content
+   (§9.3.6): a tunnel gets the 100 only for a body still owed. *)
+let continue_before_switch response body =
+  if Status.code (Response.status response) = 101 || H1_body.continue_owed body
+  then H1_body.send_continue body
+
 let internal_error () =
   Response.string ~status:Status.internal_server_error "Internal Server Error\n"
 
@@ -204,15 +211,26 @@ let serve : Engine.t =
         | Some e ->
             report (Failure ("Response.upgrade: " ^ e)) ;
             fail_500 head
-        (* What follows the request body is the new protocol's. *)
-        | None when not (drain body) ->
+        (* A body known to be too large to drain gets the 500 with no 100: after
+           a 100 the client sends it (RFC 9110 §10.1.1). *)
+        | None
+          when Option.fold ~none:false
+                 ~some:(fun n -> n > config.max_drain)
+                 (H1_body.unread body) ->
             fail_500 head
-        | None ->
-            ignore
-              (write ~committed ~body
-                 ~keep_alive:(fun () -> true)
-                 head response ) ;
-            switch f )
+        | None -> (
+          match continue_before_switch response body with
+          | exception Body.Truncated ->
+              `Close (* the client left *)
+          (* What follows the request body is the new protocol's. *)
+          | () when not (drain body) ->
+              fail_500 head
+          | () ->
+              ignore
+                (write ~committed ~body
+                   ~keep_alive:(fun () -> true)
+                   head response ) ;
+              switch f ) )
       (* RFC 9110 §9.3.6: a 2xx to CONNECT opens a tunnel. *)
       | Response.Body _
         when Method.equal head.meth Method.CONNECT

@@ -1310,6 +1310,7 @@ let handshake_tests =
           @@ __POS_OF__
                {|
             426 Upgrade Required
+            Upgrade: websocket
             Sec-WebSocket-Version: 13
             Content-Type: text/plain; charset=utf-8
             WebSocket handshake: the version must be 13
@@ -1318,6 +1319,7 @@ let handshake_tests =
           @@ __POS_OF__
                {|
             426 Upgrade Required
+            Upgrade: websocket
             Sec-WebSocket-Version: 13
             Content-Type: text/plain; charset=utf-8
             WebSocket handshake: the version must be 13

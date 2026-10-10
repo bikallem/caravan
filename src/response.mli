@@ -16,6 +16,14 @@ val make : ?status:Status.t -> ?headers:Headers.t -> Body.t -> t
     {!Status.ok}, [headers] to {!Headers.empty}. The protocol engine adds
     framing fields such as [Content-Length]; handlers do not set them.
 
+    [Upgrade] is a field of the connection. The engine sends it only on a [101]
+    and on a [426] (Upgrade Required), whose [Upgrade] field must name the
+    protocols to upgrade to (RFC 9110 15.5.22). A handler that forwards an
+    upstream [426] thus forwards its [Upgrade] field too.
+
+    A [205] (Reset Content) has no content (RFC 9110 15.3.6): the engine sends
+    [Content-Length: 0] and never produces the body.
+
     @raise Invalid_argument
       if [status] is [1xx]: interim responses such as [100 Continue] are the
       protocol engine's to send, and a protocol switch is an {!upgrade}. The
@@ -53,6 +61,12 @@ val upgrade : ?status:Status.t -> ?headers:Headers.t -> (Flow.t -> unit) -> t
     HTTP/1.1 request that asked for an upgrade; a [2xx] must answer a [CONNECT]
     request. Otherwise the client gets a [500] and the error is reported, as for
     a handler that raises.
+
+    Before the switch, the engine reads and discards the rest of the request
+    body. If the request expects [100-continue], the engine first sends
+    [100 Continue]: always before a [101] (RFC 9110 7.8), and before a [2xx]
+    only if a body is still owed. If the rest of the body is known to be larger
+    than [Config.max_drain], the client gets a [500] with no [100].
 
     @raise Invalid_argument if [status] is neither [101] nor [2xx]. *)
 

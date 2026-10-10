@@ -1,9 +1,9 @@
 
 # Test suites with mutation results to merge.
 SUITES = test_core test_h1 test_h1_server test_net test_server test_server_stateful \
-  test_websocket test_client
+  test_websocket test_client test_conformance
 
-.PHONY: build fmt test mutate coverage autobahn
+.PHONY: build fmt test mutate coverage autobahn conformance
 
 build:
 	dune build
@@ -94,3 +94,61 @@ autobahn:
 	  autobahn/reports/servers/index.json
 	jq -e '[.caravan[] | select(.behavior == "FAILED" or .behaviorClose == "FAILED")] | length == 0' \
 	  autobahn/reports/servers/index.json > /dev/null
+
+# The HTTP conformance suite of cispa/http-conformance (commit 24f75be), in a
+# container. The tool sends its probes through mitmproxy, and its direct tests
+# over TCP, to conformance_server.exe on CONFORMANCE_PORT. It keeps its
+# results in a Postgres container on 127.0.0.1:55432. The run takes about 15
+# minutes, and the first build of the image takes some minutes more. All
+# containers use the host network and no proxy. The upstream runner hides its
+# failures, thus the target stops if the run is not valid
+# (conformance/check.sql). The violations go to
+# conformance/reports/violations.tsv, and the number of verdicts for each rule
+# goes to conformance/reports/summary.tsv. The target fails for each violation
+# that matches no row of conformance/expected.tsv, and for each row of
+# expected.tsv that matches no violation (conformance/compare.awk). The target
+# needs podman: it uses --http-proxy=false, which docker does not have.
+CONFORMANCE_PORT ?= 9080
+CONFORMANCE_IMAGE = localhost/caravan-conformance
+CONFORMANCE_PG = caravan-conformance-postgres
+# postgres:16, 2026-10-06.
+CONFORMANCE_PG_IMAGE = docker.io/library/postgres@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+CONFORMANCE_PSQL = $(CONTAINER) exec -i $(CONFORMANCE_PG) psql -X -q -v ON_ERROR_STOP=1 -U postgres -p 55432
+
+conformance:
+	@test "$(notdir $(CONTAINER))" = podman \
+	  || { echo "make conformance needs podman (CONTAINER=podman)."; exit 1; }
+	dune build test/conformance_server.exe
+	mkdir -p conformance/reports
+	$(CONTAINER) build -t $(CONFORMANCE_IMAGE) conformance > conformance/reports/build.log 2>&1 \
+	  || { tail -20 conformance/reports/build.log; exit 1; }
+	: > conformance/reports/server.log
+	./_build/default/test/conformance_server.exe $(CONFORMANCE_PORT) \
+	  > conformance/reports/server.log 2>&1 & server=$$!; \
+	trap 'kill $$server 2>/dev/null; $(CONTAINER) rm -f $(CONFORMANCE_PG) > /dev/null 2>&1' EXIT; \
+	trap 'exit 130' INT TERM; \
+	pw=$$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n'); \
+	for i in $$(seq 50); do grep -q '^listening' conformance/reports/server.log && break; sleep 0.1; done; \
+	grep -q '^listening' conformance/reports/server.log || { echo "The server did not start."; exit 1; }; \
+	$(CONTAINER) rm -f $(CONFORMANCE_PG) > /dev/null 2>&1; \
+	$(CONTAINER) run -d --rm --name $(CONFORMANCE_PG) --network host --http-proxy=false \
+	  -e POSTGRES_PASSWORD=$$pw $(CONFORMANCE_PG_IMAGE) \
+	  postgres -p 55432 -c listen_addresses=127.0.0.1 > /dev/null || exit 1; \
+	for i in $$(seq 60); do \
+	  $(CONTAINER) exec $(CONFORMANCE_PG) pg_isready -q -h 127.0.0.1 -p 55432 && break; sleep 1; \
+	done; \
+	$(CONTAINER) exec $(CONFORMANCE_PG) pg_isready -q -h 127.0.0.1 -p 55432 \
+	  || { echo "Postgres did not start."; exit 1; }; \
+	$(CONTAINER) run --rm --network host --http-proxy=false \
+	  -e PGHOST=127.0.0.1 -e PGPORT=55432 -e PGUSER=postgres -e PGPASSWORD=$$pw \
+	  $(CONFORMANCE_IMAGE) sh -c 'echo caravan_http_port=$(CONFORMANCE_PORT) > testbed/.env \
+	    && exec poetry run python run_checks.py --mode=local --max_workers=1' \
+	  > conformance/reports/run.log 2>&1 \
+	  || { tail -20 conformance/reports/run.log; exit 1; }; \
+	db=$$($(CONFORMANCE_PSQL) -tA -c "SELECT datname FROM pg_database WHERE datname LIKE 'results_local_%'"); \
+	test $$(echo "$$db" | wc -w) -eq 1 || { echo "Expected one result database, found: $$db"; exit 1; }; \
+	$(CONFORMANCE_PSQL) -d $$db < conformance/check.sql > conformance/reports/violations.tsv || exit 1; \
+	$(CONFORMANCE_PSQL) -d $$db < conformance/summary.sql > conformance/reports/summary.tsv || exit 1; \
+	echo "The run is valid. Violations for each rule and verdict:"; \
+	cut -f 2,6 conformance/reports/violations.tsv | sort | uniq -c; \
+	awk -f conformance/compare.awk conformance/expected.tsv conformance/reports/violations.tsv
