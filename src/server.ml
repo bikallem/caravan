@@ -16,8 +16,10 @@ end
 (* The stop cells of the open connections, by id. A connection waits on its own
    cell, not on the cell of the server: in affect 0.0.0 each new waiter of a
    Cell.Once copies all the waiters, so one shared cell costs each wait time in
-   proportion to the open connections (#11). The supervisor adds each connection
-   and sets all the cells at the stop. No effect runs under the lock. *)
+   proportion to the open connections (#11). The supervisor adds each
+   connection. [shutdown] sets all the cells at once, the supervisor sets them
+   again when it ends, and a connection sets its own cell when it ends. No
+   effect runs under the lock. *)
 type registry = {lock: Mutex.t; cells: (int, unit Cell.Once.t) Hashtbl.t}
 
 let register reg id c =
@@ -140,6 +142,10 @@ let supervisor config engine handler ~stopping ~registry ~slots handoff =
             let flow = Tcp.flow ~time:config.Config.mono_time (fst conn) in
             Fun.Async.protect
               ~finally:(fun () ->
+                (* A connection that ends is out of the registry, so the
+                   broadcast misses it: its own cell is set here. A child of the
+                   connection that masks the cancel can still wait on it. *)
+                Cell.Once.try_set own () ;
                 unregister registry id ;
                 Flow.close flow ;
                 Semaphore.release slots )
@@ -149,8 +155,9 @@ let supervisor config engine handler ~stopping ~registry ~slots handoff =
         loop (id + 1)
   in
   (* The supervisor ends at a stop or a cancel (abort, the end of the grace, a
-     cancel of the server's caller). In each case the connections see the
-     stop. *)
+     cancel of the server's caller, a failure of the listener). It sets the
+     cells of the connections that are still in the registry; a connection that
+     ended before sets its own cell. *)
   Fun.Async.protect
     ~finally:(fun () ->
       Cell.Once.try_set stopping () ;

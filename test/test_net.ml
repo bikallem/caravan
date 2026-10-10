@@ -1362,30 +1362,70 @@ let fake_time_tests =
           Server.abort server ;
           within_2s (fun () -> Cell.Once.get saw) ;
           within_2s (fun () -> Server.wait server) )
-    ; test "a response after a shutdown in its handler closes the connection"
-        (fun () ->
-          (* The engine polls the cell of the server: the poll sees the stop at
-             once, before the supervisor sets the cell of the connection. *)
-          let f = Fake.make () in
-          let server_ref = ref None in
-          let handler _ =
-            Server.shutdown (Option.get !server_ref) ;
-            Response.string "bye"
+    ; test
+        "a handler that masks the cancel sees the stop when the caller of the \
+         server is cancelled" (fun () ->
+          (* No shutdown: the cancel of the caller stops the server. *)
+          let started = Cell.Once.make () and saw = Atomic.make false in
+          let handler req =
+            Fun.Async.mask_cancellation (fun () ->
+                Cell.Once.try_set started () ;
+                match
+                  Action.invoke
+                    (Action.choose
+                       [ Action.map
+                           (fun () -> `Stop)
+                           (Conn_info.stopping (Option.get (Request.conn req)))
+                       ; Affect_unix.Mtime.wait_for' Mtime.Span.(3 * s) `Limit
+                       ] )
+                with
+                | `Stop ->
+                    Atomic.set saw true
+                | `Limit ->
+                    () ) ;
+            Response.string "late"
           in
           let fd, c = socket_pair () in
-          with_fake_server f ~handler ~clients:[c] [Conn fd; Gate Action.never]
-          @@ fun _ server _ ->
-          server_ref := Some server ;
-          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+          in_main
+          @@ fun () ->
+          let caller =
+            Fun.Async.call (fun () ->
+                let l = Fake_listener.make [Conn fd; Gate Action.never] in
+                let server =
+                  Server.start_with ~config:quiet
+                    (module Fake_listener)
+                    l handler
+                in
+                Server.wait server )
+          in
+          Stdlib.Fun.protect ~finally:(fun () -> Flow.close c)
+          @@ fun () ->
           Flow.write_string c (get "/") ;
-          let fields = ref [] in
-          ignore
-            (read_response_from
-               ~field:(fun l -> fields := String.lowercase_ascii l :: !fields)
-               (Private.Buf_reader.of_flow c) ) ;
-          is_true
-            ~msg:(String.concat "; " !fields)
-            (List.mem "connection: close" !fields) )
+          within_2s (fun () -> Cell.Once.get started) ;
+          Fun.Async.cancel caller ;
+          (* The masked handler ends at the stop, or after its 3 s limit. *)
+          ( try Fun.Async.get caller with
+          | Fun.Async.Cancelled ->
+              ()
+          | Unix.Unix_error _ ->
+              () ) ;
+          is_true ~msg:"the handler saw the stop" (Atomic.get saw) )
+    ; test "an idle connection closes when the listener fails" (fun () ->
+          (* Only the supervisor sets the cells here: no shutdown. No advance:
+             the idle timeout never ends. *)
+          let f = Fake.make () in
+          let fd, c = socket_pair () in
+          let fail = Cell.Once.make () in
+          with_fake_server f ~clients:[c]
+            [Conn fd; Gate (Cell.Once.get' fail); Error EBADF]
+          @@ fun _ _ _ ->
+          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+          let r = Private.Buf_reader.of_flow c in
+          Flow.write_string c (get "/") ;
+          ignore (read_response_from r) ;
+          Cell.Once.try_set fail () ;
+          equal int ~msg:"the end of the stream" 0
+            (Private.Buf_reader.read_into r (Bytes.create 1) 0 1) )
     ; test "the server forgets each connection that ends" (fun () ->
           let f = Fake.make () in
           let pairs = List.init 50 (fun _ -> socket_pair ()) in
