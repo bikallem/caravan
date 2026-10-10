@@ -1438,6 +1438,10 @@ let upgrade_tests =
                   ; (["echo/2"], "echo/3")
                   ; (["echo/2"], "echo/2")
                   ; (["echo"], "echo/2")
+                  ; (["Echo/V2"], "echo/v2")
+                  ; (["A/b/c"], "a/b/c")
+                  ; (["A/b/c"], "a/B/c")
+                  ; ([""], "echo")
                   ; (["a, b"], "a,b")
                   ; (["a"], "a,b")
                   ; (["a"; "b"], "b")
@@ -1450,6 +1454,10 @@ let upgrade_tests =
             echo/2       -> echo/3   => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: echo/3")
             echo/2       -> echo/2   => HTTP/1.1 101 Switching Protocols
             echo         -> echo/2   => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: echo/2")
+            Echo/V2      -> echo/v2  => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: echo/v2")
+            A/b/c        -> a/b/c    => HTTP/1.1 101 Switching Protocols
+            A/b/c        -> a/B/c    => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: a/B/c")
+                         -> echo     => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 to a request that did not ask for an upgrade")
             a, b         -> a,b      => HTTP/1.1 101 Switching Protocols
             a            -> a,b      => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: b")
             a + b        -> b        => HTTP/1.1 101 Switching Protocols

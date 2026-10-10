@@ -75,28 +75,29 @@ let same_protocol a b =
 let upgrade_error (head : H1_parse.head) response =
   if Status.code (Response.status response) = 101 then
     if head.version <> Version.Http_1_1 then Some "101 to an HTTP/1.0 request"
-    else if
-      not
-        ( Headers.mem "upgrade" head.headers
-        && Headers.has_token "connection" "upgrade" head.headers )
-    then Some "101 to a request that did not ask for an upgrade"
     else
       let offered = Headers.tokens "upgrade" head.headers in
-      match Headers.tokens "upgrade" (Response.headers response) with
-      | [] ->
-          Some "101 without an Upgrade field"
-      | protocols -> (
-        (* RFC 9110 §7.8: no switch to a protocol that the client did not
-           offer. *)
-        match
-          List.find_opt
-            (fun p -> not (List.exists (same_protocol p) offered))
-            protocols
-        with
-        | Some p ->
-            Some ("101 to a protocol that the request did not offer: " ^ p)
-        | None ->
-            None )
+      if
+        not
+          ( offered <> []
+          && Headers.has_token "connection" "upgrade" head.headers )
+      then Some "101 to a request that did not ask for an upgrade"
+      else
+        match Headers.tokens "upgrade" (Response.headers response) with
+        | [] ->
+            Some "101 without an Upgrade field"
+        | protocols -> (
+          (* RFC 9110 §7.8: no switch to a protocol that the client did not
+             offer. *)
+          match
+            List.find_opt
+              (fun p -> not (List.exists (same_protocol p) offered))
+              protocols
+          with
+          | Some p ->
+              Some ("101 to a protocol that the request did not offer: " ^ p)
+          | None ->
+              None )
   else if not (Method.equal head.meth Method.CONNECT) then
     Some (Format.asprintf "2xx upgrade to a %a request" Method.pp head.meth)
   else None

@@ -60,7 +60,8 @@ val upgrade : ?status:Status.t -> ?headers:Headers.t -> (Flow.t -> unit) -> t
     A [101] must name the new protocol in an [Upgrade] field and answer an
     HTTP/1.1 request that asked for an upgrade. Each protocol in the [Upgrade]
     field must be one that the request offered (RFC 9110 7.8): the names compare
-    without case, and the versions must be the same text. A [2xx] must answer a
+    without case, and the versions must be the same text. A protocol without a
+    version matches only a protocol without a version. A [2xx] must answer a
     [CONNECT] request. Otherwise the client gets a [500] and the error is
     reported, as for a handler that raises.
 

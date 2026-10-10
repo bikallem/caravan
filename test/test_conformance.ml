@@ -389,6 +389,7 @@ let app_tests =
                ; r
                    ~headers:[("Connection", "upgrade"); ("Upgrade", "example/1")]
                    "/fixture/upgrade-other"
+               ; r "/fixture/upgrade-other"
                ; r "/fixture/fail"
                ; r "/missing" ] )
           @@ __POS_OF__
@@ -409,6 +410,8 @@ let app_tests =
             rest ""
             GET /fixture/upgrade-other HTTP/1.1 => HTTP/1.1 500 Internal Server Error | Date, Content-Type: text/plain; charset=utf-8, Content-Length: 22, Connection: close | length 22 "Internal Server Error\n"
             rest "" [FIN]
+            GET /fixture/upgrade-other HTTP/1.1 => HTTP/1.1 200 OK | Date, Content-Type: text/plain; charset=utf-8, Content-Length: 10 | length 10 "no upgrade"
+            rest ""
             GET /fixture/fail HTTP/1.1 => HTTP/1.1 500 Internal Server Error | Date, Content-Type: text/plain; charset=utf-8, Content-Length: 22, Connection: close | length 22 "Internal Server Error\n"
             rest "" [FIN]
             GET /missing HTTP/1.1 => HTTP/1.1 404 Not Found | Date, Content-Type: text/plain; charset=utf-8, Content-Length: 9 | length 9 "not found"
@@ -1029,11 +1032,8 @@ let same_protocol a b =
 (* Whether the Connection fields of [r] have the option [o]. *)
 let has_option o r =
   List.exists
-    (fun c ->
-      List.exists
-        (fun x -> String.lowercase_ascii (String.trim x) = o)
-        (String.split_on_char ',' c) )
-    (Wire.find_all "Connection" r)
+    (fun x -> String.lowercase_ascii x = o)
+    (elements (Wire.find_all "Connection" r))
 
 let not_interim _ (r : Wire.response) = r.code >= 200 || r.code = 101
 
@@ -1134,7 +1134,8 @@ let probe_tests =
          request offered (RFC 9110 7.8)" (fun () ->
           (* Upstream compares the two fields as text. The test compares each
              protocol: the names without case, the versions as text. Its oracle
-             reads the raw request, not the parser of caravan. The probe
+             reads the raw request, not the parser of caravan. Its version rule
+             is the one of the engine (a choice: RFC 9110 has none). The probe
              "upgrade-other" gets a 101 to a protocol that it did not offer if
              the engine does not refuse it. *)
           rule ~applies:(is_status [101]) ~must:["upgrade"] (fun p _ r ->
