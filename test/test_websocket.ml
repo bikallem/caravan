@@ -536,6 +536,127 @@ let utf8_tests =
                 if can_start prefix then first (i + 1) prefix ps else Some i
           in
           equal (option int) (first 0 "" parts) (fst (fold_continue parts)) )
+    ; test "continue agrees with the stdlib on each sequence of 1 to 4 bytes"
+        (fun () ->
+          (* Each lead byte, each second byte, and the limits of the ranges
+             (Unicode table 3-7) for the third and the fourth byte. A sequence
+             alone takes the careful path at the end of a range; with ASCII
+             bytes after it, the fast path. *)
+          let limits = [0x7f; 0x80; 0x8f; 0x90; 0x9f; 0xa0; 0xbf; 0xc0] in
+          let ok s =
+            match Utf8.continue "" s with
+            | "" ->
+                true
+            | _ ->
+                false
+            | exception Utf8.Invalid ->
+                false
+          in
+          (* [s] in two parts, cut after [k] bytes: the second part goes after
+             the pending bytes of the first. *)
+          let ok_split s k =
+            match Utf8.continue "" (String.sub s 0 k) with
+            | pending -> (
+              match
+                Utf8.continue pending (String.sub s k (String.length s - k))
+              with
+              | "" ->
+                  true
+              | _ ->
+                  false
+              | exception Utf8.Invalid ->
+                  false )
+            | exception Utf8.Invalid ->
+                false
+          in
+          let bad = ref [] in
+          let check s =
+            List.iter
+              (fun s ->
+                let valid = String.is_valid_utf_8 s in
+                if ok s <> valid then bad := s :: !bad ;
+                for k = 1 to Int.min 3 (String.length s - 1) do
+                  if ok_split s k <> valid then bad := s :: !bad
+                done )
+              [s; s ^ "aaaaaaa"]
+          in
+          for b0 = 0 to 255 do
+            let c0 = String.make 1 (Char.chr b0) in
+            check c0 ;
+            for b1 = 0 to 255 do
+              let c1 = c0 ^ String.make 1 (Char.chr b1) in
+              check c1 ;
+              List.iter
+                (fun b2 ->
+                  let c2 = c1 ^ String.make 1 (Char.chr b2) in
+                  check c2 ;
+                  List.iter
+                    (fun b3 -> check (c2 ^ String.make 1 (Char.chr b3)))
+                    limits )
+                limits
+            done
+          done ;
+          equal (list string) [] (List.rev !bad) )
+    ; test "continue_bytes reads only its range" (fun () ->
+          let r pending s off len =
+            match Utf8.continue_bytes pending (Bytes.of_string s) off len with
+            | p ->
+                Printf.sprintf "%S" p
+            | exception Utf8.Invalid ->
+                "invalid"
+          in
+          equal (list string)
+            [ {|"\226"|}
+            ; {|"\226\130"|}
+            ; {|""|}
+            ; "invalid"
+            ; {|"\240\159"|}
+            ; {|""|} ]
+            [ (* The bytes after the range would complete the sequence. *)
+              r "" "a\xe2\x82\xac" 0 2
+            ; r "" "a\xe2\x82\xac" 0 3
+            ; r "" "a\xe2\x82\xac" 1 3
+              (* The bytes before the range would start a sequence. *)
+            ; r "" "\xe2\x82\xac" 1 2
+            ; r "" "xx\xf0\x9f\x98\x80" 2 2
+            ; r "\xf0\x9f" "xx\x98\x80yy" 2 2 ] ;
+          raises_match
+            (function Invalid_argument _ -> true | _ -> false)
+            (fun () -> Utf8.continue_bytes "" (Bytes.create 2) 1 2) ;
+          (* A pending value that this function cannot give. *)
+          List.iter
+            (fun pending ->
+              raises_match
+                (function Invalid_argument _ -> true | _ -> false)
+                (fun () ->
+                  Utf8.continue_bytes pending (Bytes.of_string "Aabc") 1 3 ) )
+            ["\xff"; "a"; "\xc3\xa9"; "\xf0\x9f\x98\x80"] )
+    ; prop ~count:2000
+        "continue_bytes on a range gives the result of continue on its bytes"
+        Gen.(triple utf8_parts (int_range 0 7) (int_range 0 7))
+        (fun (g, before, after) ->
+          (* Each part sits between bytes that are not in its range: correct and
+             incorrect UTF-8 bytes. *)
+          let junk n = String.init n (fun i -> "\x80\xe2\x82a\xf0".[i mod 5]) in
+          let on_range pending p =
+            let s = junk before ^ p ^ junk after in
+            Utf8.continue_bytes pending (Bytes.of_string s) before
+              (String.length p)
+          in
+          let result f =
+            let rec loop pending = function
+              | [] ->
+                  Some pending
+              | p :: ps -> (
+                match f pending p with
+                | pending ->
+                    loop pending ps
+                | exception Utf8.Invalid ->
+                    None )
+            in
+            loop "" (cut_parts g)
+          in
+          equal (option string) (result Utf8.continue) (result on_range) )
     ; test "an incorrect fragment gives 1007 before the end of the message"
         (fun () ->
           (* Autobahn 6.4.1: the last fragment does not come. *)

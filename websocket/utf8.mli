@@ -1,8 +1,18 @@
-(** UTF-8 in parts, for the text of a fragmented message
+(** UTF-8 in parts, for the text of a message that arrives in parts: the parts
+    of a frame and the frames of a fragmented message
     ({{:https://www.rfc-editor.org/rfc/rfc6455#section-8.1}RFC 6455 §8.1}). *)
 
 (** A byte cannot be part of correct UTF-8. *)
 exception Invalid
+
+val continue_bytes : string -> bytes -> int -> int -> string
+(** [continue_bytes pending buf off len] is {!continue} for the [len] bytes of
+    [buf] from [off]. It reads no byte outside this range.
+
+    @raise Invalid as {!continue}.
+    @raise Invalid_argument
+      if [off] and [len] do not give a range of [buf], or if [pending] is not
+      [""] or a result of {!continue} or [continue_bytes]. *)
 
 val continue : string -> string -> string
 (** [continue pending s] examines the UTF-8 of [s] after the bytes [pending] of
