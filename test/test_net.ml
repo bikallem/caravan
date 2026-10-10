@@ -1013,8 +1013,8 @@ let early_stop_tests =
                after the caller blocks)" Fun.Async.Cancelled (fun () ->
               get_2s w ) ) ]
 
-(* Stop_signal. Only installing: delivering a signal to the test process could
-   kill it, see test_server.ml for that. SIGUSR2 is never sent. *)
+(* Stop_signal. Only installing: SIGUSR2 is never sent. test_stop_signal.ml
+   sends signals to its own process, and test_server.ml to a child process. *)
 
 let stop_signal_tests =
   group "Stop_signal"

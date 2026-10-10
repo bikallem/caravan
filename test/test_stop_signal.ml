@@ -64,6 +64,43 @@ let child_waits ?(signals = signals) () =
   Unix.kill (Unix.getpid ()) Sys.sigusr2 ;
   if next t = Sys.sigusr2 then 0 else 1
 
+(* Installs [signals] for [f], and releases them after. *)
+let with_signals f =
+  let t = Stop_signal.install ~signals () in
+  Stdlib.Fun.protect ~finally:(fun () -> Stop_signal.release t) (fun () -> f t)
+
+let signal_tests =
+  group "Signals"
+    [ test "wait gives the signal that came" (fun () ->
+          with_signals
+          @@ fun t ->
+          main1
+          @@ fun () ->
+          Unix.kill (Unix.getpid ()) Sys.sigusr2 ;
+          equal int Sys.sigusr2 (next t) ;
+          Unix.kill (Unix.getpid ()) Sys.sigusr1 ;
+          equal int Sys.sigusr1 (next t) )
+    ; (* The relay takes two signals. The third gets the action of the process,
+         here the OCaml handler. *)
+      test "a third signal goes to the handler, not to wait" (fun () ->
+          Atomic.set handled 0 ;
+          with_signals
+          @@ fun t ->
+          main1
+          @@ fun () ->
+          Unix.kill (Unix.getpid ()) Sys.sigusr1 ;
+          equal int Sys.sigusr1 (next t) ;
+          Unix.kill (Unix.getpid ()) Sys.sigusr1 ;
+          equal int Sys.sigusr1 (next t) ;
+          Unix.kill (Unix.getpid ()) Sys.sigusr1 ;
+          Server_support.eventually ~msg:"the handler got the third signal"
+            (fun () -> Atomic.get handled = 1 ) ;
+          let c = Affect.Fun.Async.call (fun () -> Stop_signal.wait t) in
+          Stdlib.Fun.protect ~finally:(fun () -> Affect.Fun.Async.cancel c)
+          @@ fun () ->
+          is_false ~msg:"no third signal for wait"
+            (Fake_time.ends_within_50ms c) ) ]
+
 let fork_tests =
   group "After a fork"
     [ test "install in the child starts a new relay" (fun () ->
@@ -135,4 +172,4 @@ let fork_tests =
           in
           is_true ~msg:"release and wait raised" (status = Unix.WEXITED 0) ) ]
 
-let () = exit (run "stop-signal" [fork_tests])
+let () = exit (run "stop-signal" [signal_tests; fork_tests])
