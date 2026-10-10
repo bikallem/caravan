@@ -1876,6 +1876,96 @@ let response_head_tests =
             Connection: Upgrade, keep-alive\r\n
             \r\n
             |} )
+    ; test "a 304 does not send four metadata fields (RFC 9110 15.4.5)"
+        (fun () ->
+          let fields =
+            [ ("Content-Type", "text/html")
+            ; ("CONTENT-ENCODING", "gzip")
+            ; ("Content-Language", "en")
+            ; ("Content-Range", "bytes 0-1/2")
+            ; ("Content-Location", "/a")
+            ; ("ETag", "\"x\"")
+            ; ("Last-Modified", "Sun, 06 Nov 1994 08:49:37 GMT")
+            ; ("Vary", "Accept")
+            ; ("Cache-Control", "max-age=60")
+            ; ("Expires", "Sun, 06 Nov 1994 09:49:37 GMT")
+            ; ("X-Other", "1") ]
+          in
+          let r ?(extra = []) status body =
+            Response.with_status status
+              (Response.make ~headers:(hs (extra @ fields)) body)
+          in
+          expect
+            (String.concat "--\n"
+               [ render ~date (r Status.not_modified (Body.of_string "x"))
+               ; render ~date
+                   (r
+                      ~extra:[("Date", "Mon, 07 Nov 1994 08:49:37 GMT")]
+                      Status.not_modified Body.empty ) ] )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 304 Not Modified\r\n
+            Date: Sun, 06 Nov 1994 08:49:37 GMT\r\n
+            Content-Location: /a\r\n
+            ETag: "x"\r\n
+            Last-Modified: Sun, 06 Nov 1994 08:49:37 GMT\r\n
+            Vary: Accept\r\n
+            Cache-Control: max-age=60\r\n
+            Expires: Sun, 06 Nov 1994 09:49:37 GMT\r\n
+            X-Other: 1\r\n
+            \r\n
+            --
+            HTTP/1.1 304 Not Modified\r\n
+            Date: Mon, 07 Nov 1994 08:49:37 GMT\r\n
+            Content-Location: /a\r\n
+            ETag: "x"\r\n
+            Last-Modified: Sun, 06 Nov 1994 08:49:37 GMT\r\n
+            Vary: Accept\r\n
+            Cache-Control: max-age=60\r\n
+            Expires: Sun, 06 Nov 1994 09:49:37 GMT\r\n
+            X-Other: 1\r\n
+            \r\n
+            |} )
+    ; test "other responses send the four metadata fields" (fun () ->
+          let fields =
+            hs
+              [ ("Content-Type", "text/html")
+              ; ("Content-Encoding", "gzip")
+              ; ("Content-Language", "en")
+              ; ("Content-Range", "bytes 0-1/2") ]
+          in
+          expect
+            (String.concat "--\n"
+               [ render (Response.make ~headers:fields (Body.of_string "x"))
+               ; render
+                   (Response.with_status Status.no_content
+                      (Response.make ~headers:fields Body.empty) )
+               ; render ~meth:Method.HEAD
+                   (Response.stream ~headers:fields ignore) ] )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/html\r\n
+            Content-Encoding: gzip\r\n
+            Content-Language: en\r\n
+            Content-Range: bytes 0-1/2\r\n
+            Content-Length: 1\r\n
+            \r\n
+            --
+            HTTP/1.1 204 No Content\r\n
+            Content-Type: text/html\r\n
+            Content-Encoding: gzip\r\n
+            Content-Language: en\r\n
+            Content-Range: bytes 0-1/2\r\n
+            \r\n
+            --
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/html\r\n
+            Content-Encoding: gzip\r\n
+            Content-Language: en\r\n
+            Content-Range: bytes 0-1/2\r\n
+            \r\n
+            |} )
     ; test "426 without Upgrade gets no upgrade option" (fun () ->
           expect (render (Response.string ~status:Status.upgrade_required "!"))
           @@ __POS_OF__
@@ -1959,7 +2049,6 @@ let response_head_tests =
             \r\n
             --
             HTTP/1.1 304 Not Modified\r\n
-            Content-Type: text/plain; charset=utf-8\r\n
             \r\n
             |} )
     ]

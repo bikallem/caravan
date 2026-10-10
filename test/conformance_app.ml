@@ -68,7 +68,15 @@ let fixture req =
                 [("Content-Length", "5"); ("Transfer-Encoding", "chunked")] )
            (Body.of_string "hello") )
   | "/fixture/not-modified" ->
-      Some (Response.make ~status:Status.not_modified (Body.of_string "hello"))
+      Some
+        (Response.make ~status:Status.not_modified
+           ~headers:
+             (Headers.of_list
+                [ ("Content-Type", "text/plain")
+                ; ("Content-Encoding", "identity")
+                ; ("Content-Language", "en")
+                ; ("Content-Range", "bytes 0-4/5") ] )
+           (Body.of_string "hello") )
   | "/fixture/reset-content" ->
       Some (Response.string ~status:Status.reset_content "hello")
   | "/fixture/stream" ->

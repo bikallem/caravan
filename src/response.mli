@@ -24,6 +24,11 @@ val make : ?status:Status.t -> ?headers:Headers.t -> Body.t -> t
     A [205] (Reset Content) has no content (RFC 9110 15.3.6): the engine sends
     [Content-Length: 0] and never produces the body.
 
+    A [304] (Not Modified) has no content, and the engine does not send its
+    [Content-Type], [Content-Encoding], [Content-Language] and [Content-Range]
+    fields (RFC 9110 15.4.5): a cache updates its stored response from a 304.
+    {!headers} still has them. A handler cannot send them on a 304.
+
     @raise Invalid_argument
       if [status] is [1xx]: interim responses such as [100 Continue] are the
       protocol engine's to send, and a protocol switch is an {!upgrade}. The
@@ -33,7 +38,8 @@ val string :
   ?status:Status.t -> ?headers:Headers.t -> ?content_type:string -> string -> t
 (** [string ~status ~headers ~content_type s] is a response whose body is [s].
     Its [Content-Type] is [content_type] if given, else the one in [headers],
-    else ["text/plain; charset=utf-8"]. *)
+    else ["text/plain; charset=utf-8"]. A [304] made from it does not send its
+    [Content-Type] (see {!make}). *)
 
 val empty : ?status:Status.t -> ?headers:Headers.t -> unit -> t
 (** [empty ~status ~headers ()] is a response without a body. [status] defaults

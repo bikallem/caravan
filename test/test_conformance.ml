@@ -3,7 +3,7 @@
    LICENSE.http-conformance). The tests send the inputs of the upstream rules to
    the HTTP/1.1 engine on in-memory connections, and check the bytes that it
    writes against RFC 9110 and RFC 9112. A comment names each verdict that
-   differs from the upstream rule. *)
+   differs from the upstream rule, and each rule that is not from upstream. *)
 
 open Windtrap
 open Caravan
@@ -1165,6 +1165,24 @@ let probe_tests =
              bytes. *)
           rule ~applies:(is_status [204]) ~must:["GET /fixture/no-content"]
             (fun _ t _ -> check (t.rest = "") "then %S" t.rest ) )
+    ; test
+        "304 metadata: a 304 has no Content-Type, Content-Encoding, \
+         Content-Language or Content-Range (RFC 9110 15.4.5, 14.4)" (fun () ->
+          (* Not an upstream rule: upstream has no check of this SHOULD NOT. The
+             304 of / has none of these fields; the fixture has all four. *)
+          let fields =
+            [ "content-type"
+            ; "content-encoding"
+            ; "content-language"
+            ; "content-range" ]
+          in
+          rule ~applies:(is_status [304])
+            ~must:
+              [ "GET /fixture/not-modified"
+              ; "HEAD /fixture/not-modified"
+              ; "GET set 5 /" ] (fun _ _ r ->
+              let sent = List.filter (fun n -> Wire.find n r <> None) fields in
+              check (sent = []) "sends %s" (String.concat ", " sent) ) )
     ; test "code_304_no_content: no bytes after a 304 head (RFC 9110 15.4.5)"
         (fun () ->
           rule ~applies:(is_status [304])

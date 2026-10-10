@@ -28,6 +28,13 @@ let framing ~meth ~version r =
 
 let wants_close r = Headers.has_token "connection" "close" (Response.headers r)
 
+(* RFC 9110 §15.4.5: the representation metadata that a 304 does not send. A
+   cache updates its stored fields from a 304 (RFC 9111 §4.3.4), so these would
+   change the stored response. Content-Range has no meaning on a 304 (RFC 9110
+   §14.4). *)
+let not_on_304 =
+  ["content-type"; "content-encoding"; "content-language"; "content-range"]
+
 (* Fields that the connection owns: the handler's are dropped. *)
 let connection_fields =
   [ "content-length"
@@ -59,10 +66,12 @@ let head w ?date ~version ~keep_alive framing r =
       field w "Date" d
   | _ ->
       () ) ;
+  let not_modified = Status.code status = 304 in
   let owned name =
     let name = String.lowercase_ascii name in
     List.mem name connection_fields
     && not ((upgrade || advertises) && name = "upgrade")
+    || (not_modified && List.mem name not_on_304)
   in
   Headers.iter (fun n v -> if not (owned n) then field w n v) headers ;
   ( match framing with
