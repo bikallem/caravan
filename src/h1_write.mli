@@ -37,11 +37,12 @@ val head :
       [Content-Length], [Transfer-Encoding], [Connection], [Keep-Alive],
       [Proxy-Connection], [TE], and [Upgrade] except on a 101 or a 426 response.
     - The framing field of [framing], if any.
-    - [Connection: Upgrade] on a 101 response. Otherwise a [Connection] field
-      with these options, if any, in this order: [Upgrade] if a 426 has an
-      [Upgrade] field (RFC 9110 §7.8); [close] if not [keep_alive] or the body
-      is {!Close_delimited}, or [keep-alive] for an HTTP/1.0 request that is
-      kept alive.
+    - [Connection: Upgrade] on a 101 response, and no [Connection] field on a
+      2xx upgrade (a tunnel). For these, [keep_alive] has no effect. For other
+      responses, a [Connection] field with these options, if any, in this order:
+      [Upgrade] if a 426 has an [Upgrade] field (RFC 9110 §7.8); [close] if not
+      [keep_alive] or the body is {!Close_delimited}, or [keep-alive] for an
+      HTTP/1.0 request that is kept alive.
     - The empty line that ends the head. *)
 
 (** {1:request Requests, for a client} *)

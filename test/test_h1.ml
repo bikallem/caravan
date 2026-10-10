@@ -1876,6 +1876,28 @@ let response_head_tests =
             Connection: Upgrade, keep-alive\r\n
             \r\n
             |} )
+    ; test "a 2xx tunnel gets no Connection field" (fun () ->
+          (* After the head the connection is a tunnel: keep-alive has no
+             meaning, and close (RFC 9112 9.6) would end it. The handler's
+             fields are dropped. *)
+          let r =
+            Response.upgrade ~status:Status.ok
+              ~headers:
+                (hs [("Connection", "close"); ("Keep-Alive", "timeout=5")])
+              ignore
+          in
+          expect
+            (String.concat "\n"
+               [ render ~meth:Method.CONNECT ~version:Version.Http_1_0 r
+               ; render ~meth:Method.CONNECT ~keep_alive:false r ] )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 200 OK\r\n
+            \r\n
+
+            HTTP/1.1 200 OK\r\n
+            \r\n
+            |} )
     ; test "426 without Upgrade gets no upgrade option" (fun () ->
           expect (render (Response.string ~status:Status.upgrade_required "!"))
           @@ __POS_OF__
