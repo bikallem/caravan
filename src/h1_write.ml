@@ -12,7 +12,11 @@ let framing ~meth ~version r =
   | Response.Body body -> (
       let code = Status.code (Response.status r) in
       if code < 200 || code = 204 || code = 304 then No_body
-      else if Method.equal meth Method.CONNECT && code < 300 then No_body
+      else if Method.equal meth Method.CONNECT && code < 300 then
+        No_body
+        (* RFC 9110 §15.3.6: no content in a 205. RFC 9112 §6.3 would read a 205
+           without a framing field to the close. *)
+      else if code = 205 then Length_only 0
       else if Method.equal meth Method.HEAD then
         match Body.length body with Some n -> Length_only n | None -> No_body
       else

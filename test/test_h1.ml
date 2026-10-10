@@ -1697,6 +1697,10 @@ let response_framing_tests =
                     ; ("HEAD 200 sized", HEAD, Http_1_1, sized "hello")
                     ; ("HEAD 200 stream", HEAD, Http_1_1, stream_body)
                     ; ("HEAD 304", HEAD, Http_1_1, st 304 (sized "x"))
+                    ; ("GET 205 sized", GET, Http_1_1, st 205 (sized "x"))
+                    ; ("HEAD 205 sized", HEAD, Http_1_1, st 205 (sized "x"))
+                    ; ("GET 205 stream 1.1", GET, Http_1_1, st 205 stream_body)
+                    ; ("GET 205 stream 1.0", GET, Http_1_0, st 205 stream_body)
                     ; ("CONNECT 200", CONNECT, Http_1_1, sized "x")
                     ; ( "CONNECT 200 upgrade"
                       , CONNECT
@@ -1704,6 +1708,7 @@ let response_framing_tests =
                       , Response.upgrade ~status:Status.ok ignore )
                     ; ("CONNECT 404", CONNECT, Http_1_1, st 404 (sized "no"))
                     ; ("CONNECT 299", CONNECT, Http_1_1, st 299 stream_body)
+                    ; ("CONNECT 205", CONNECT, Http_1_1, st 205 (sized "x"))
                     ; ( "CONNECT 300 stream"
                       , CONNECT
                       , Http_1_1
@@ -1723,10 +1728,15 @@ let response_framing_tests =
             HEAD 200 sized             => length only 5
             HEAD 200 stream            => no body
             HEAD 304                   => no body
+            GET 205 sized              => length only 0
+            HEAD 205 sized             => length only 0
+            GET 205 stream 1.1         => length only 0
+            GET 205 stream 1.0         => length only 0
             CONNECT 200                => no body
             CONNECT 200 upgrade        => no body
             CONNECT 404                => length 2
             CONNECT 299                => no body
+            CONNECT 205                => no body
             CONNECT 300 stream         => chunked
             |} )
     ; test "wants_close" (fun () ->

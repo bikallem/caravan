@@ -361,7 +361,7 @@ let app_tests =
             rest ""
             GET /fixture/not-modified HTTP/1.1 => HTTP/1.1 304 Not Modified | Date | no body ""
             rest ""
-            GET /fixture/reset-content HTTP/1.1 => HTTP/1.1 205 Reset Content | Date, Content-Type: text/plain; charset=utf-8, Content-Length: 5 | length 5 "hello"
+            GET /fixture/reset-content HTTP/1.1 => HTTP/1.1 205 Reset Content | Date, Content-Type: text/plain; charset=utf-8, Content-Length: 0 | length 0 ""
             rest ""
             GET /fixture/stream HTTP/1.1 => HTTP/1.1 200 OK | Date, Content-Type: text/plain, Transfer-Encoding: chunked | chunked "hello"
             rest ""
@@ -1084,26 +1084,23 @@ let probe_tests =
           rule ~applies:(is_status [304])
             ~must:["GET /fixture/not-modified"; "GET set 5 /"] (fun _ t _ ->
               check (t.rest = "") "then %S" t.rest ) )
-    ; xfail ~reason:"G2: caravan sends the body of a 205"
-        (test
-           "code_205_no_content_allowed: a 205 has no content (RFC 9110 \
-            15.3.6, RFC 9112 6.3)" (fun () ->
-             rule
-               ~applies:(fun p r -> r.code = 205 && p.meth <> "HEAD")
-               ~must:["GET /fixture/reset-content"]
-               (fun _ t r ->
-                 let framed =
-                   match r.framing with
-                   | Length 0 | Chunked ->
-                       true
-                   | Close_delimited ->
-                       t.fin || t.reset
-                   | _ ->
-                       false
-                 in
-                 check
-                   (r.body = "" && framed)
-                   "%s %S" (framing r.framing) r.body ) ) )
+    ; test
+        "code_205_no_content_allowed: a 205 has no content (RFC 9110 15.3.6, \
+         RFC 9112 6.3)" (fun () ->
+          rule
+            ~applies:(fun p r -> r.code = 205 && p.meth <> "HEAD")
+            ~must:["GET /fixture/reset-content"]
+            (fun _ t r ->
+              let framed =
+                match r.framing with
+                | Length 0 | Chunked ->
+                    true
+                | Close_delimited ->
+                    t.fin || t.reset
+                | _ ->
+                    false
+              in
+              check (r.body = "" && framed) "%s %S" (framing r.framing) r.body ) )
     ; test
         "send_upgrade_426: a 426 has Upgrade and the upgrade option (RFC 9110 \
          15.5.22, 7.8)" (fun () ->

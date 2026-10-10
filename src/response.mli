@@ -21,6 +21,9 @@ val make : ?status:Status.t -> ?headers:Headers.t -> Body.t -> t
     protocols to upgrade to (RFC 9110 15.5.22). A handler that forwards an
     upstream [426] thus forwards its [Upgrade] field too.
 
+    A [205] (Reset Content) has no content (RFC 9110 15.3.6): the engine sends
+    [Content-Length: 0] and never produces the body.
+
     @raise Invalid_argument
       if [status] is [1xx]: interim responses such as [100 Continue] are the
       protocol engine's to send, and a protocol switch is an {!upgrade}. The

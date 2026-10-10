@@ -90,6 +90,9 @@ let handler req =
         Response.make ~status:(Status.v 103) Body.empty
     | "/stream-fail" ->
         Response.stream (fun _ -> failwith "producer")
+    | "/reset" ->
+        Response.stream ~status:Status.reset_content (fun _ ->
+            failwith "the producer of a 205 ran" )
     (* Failures of the handler's own upstream, not of the request. *)
     | "/upstream-truncated" ->
         raise Body.Truncated
@@ -302,6 +305,55 @@ let connection_tests =
       \r\n
       hello
       |} )
+    ; test "a 205 has Content-Length: 0 and never produces its body" (fun () ->
+          (* RFC 9110 15.3.6. The connection stays usable after it. *)
+          expect
+            (String.concat "\n---\n"
+               [ show (get "/reset" ^ get "/")
+               ; show
+                   ("HEAD /reset HTTP/1.1\r\nHost: a.example\r\n\r\n" ^ get "/")
+               ; show (get ~v:"HTTP/1.0" "/reset")
+               ; show
+                   ( get ~v:"HTTP/1.0"
+                       ~headers:[("Connection", "keep-alive")]
+                       "/reset"
+                   ^ get "/" ) ] )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 205 Reset Content\r\n
+            Content-Length: 0\r\n
+            \r\n
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 5\r\n
+            \r\n
+            hello
+            ---
+            HTTP/1.1 205 Reset Content\r\n
+            Content-Length: 0\r\n
+            \r\n
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 5\r\n
+            \r\n
+            hello
+            ---
+            HTTP/1.1 205 Reset Content\r\n
+            Content-Length: 0\r\n
+            Connection: close\r\n
+            \r\n
+            [FIN]
+            ---
+            HTTP/1.1 205 Reset Content\r\n
+            Content-Length: 0\r\n
+            Connection: keep-alive\r\n
+            \r\n
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 5\r\n
+            \r\n
+            hello
+            |} )
     ; test "pipelined requests are answered in order" (fun () ->
           expect (show ~chunk:7 (get "/" ^ get "/info" ^ get "/ignore"))
           @@ __POS_OF__
