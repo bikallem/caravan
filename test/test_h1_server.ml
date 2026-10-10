@@ -1399,7 +1399,8 @@ let upgrade_tests =
           @@ __POS_OF__ {||} )
     ; test "Expect 100-continue in HTTP/1.0 CONNECT with a body: no 100"
         (fun () ->
-          (* RFC 9110 10.1.1: a server ignores the expectation of HTTP/1.0. *)
+          (* RFC 9110 10.1.1: a server ignores the expectation of HTTP/1.0. The
+             head of the HTTP/1.0 tunnel has no Connection field. *)
           expect
             (show
                "CONNECT x.example:443 HTTP/1.0\r\n\
@@ -1411,7 +1412,6 @@ let upgrade_tests =
           @@ __POS_OF__
                {|
             HTTP/1.1 200 OK\r\n
-            Connection: keep-alive\r\n
             \r\n
             got after
             |} )

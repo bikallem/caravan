@@ -258,6 +258,7 @@ let serve : Engine.t =
           | () when not (drain body) ->
               fail_500 head
           | () ->
+              (* The writer ignores keep_alive for an upgrade. *)
               ignore
                 (write ~committed ~body
                    ~keep_alive:(fun () -> true)

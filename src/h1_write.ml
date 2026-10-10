@@ -47,6 +47,14 @@ let field w name value =
 let head w ?date ~version ~keep_alive framing r =
   let status = Response.status r and headers = Response.headers r in
   let upgrade = Status.code status = 101 in
+  (* A 2xx upgrade: a tunnel to a CONNECT request (RFC 9110 §9.3.6). *)
+  let tunnel =
+    match Response.kind r with
+    | Response.Upgrade _ ->
+        not upgrade
+    | Response.Body _ ->
+        false
+  in
   (* RFC 9110 §15.5.22: a 426 names the protocols to upgrade to. *)
   let advertises = Status.code status = 426 && Headers.mem "upgrade" headers in
   Buf_writer.write_string w "HTTP/1.1 " ;
@@ -75,6 +83,9 @@ let head w ?date ~version ~keep_alive framing r =
   (* RFC 9110 §7.8: a sender of Upgrade also sends the upgrade option. *)
   let options =
     if upgrade then ["Upgrade"]
+      (* The connection is a tunnel after the head: no response follows, so
+         keep-alive has no meaning, and close (RFC 9112 §9.6) would end it. *)
+    else if tunnel then []
     else
       (if advertises then ["Upgrade"] else [])
       @
