@@ -65,6 +65,9 @@ let hold = Affect_unix.Mtime.Span.(2 * s)
 (* Set by /endless after it flushed its first bytes. *)
 let flushed = ref (Cell.Once.make ())
 
+(* The writer that /keep-writer keeps after its producer returns. *)
+let kept_writer = ref None
+
 (* Set by /stop, as a server stopping while its response is written. *)
 let stopping = ref false
 
@@ -90,6 +93,18 @@ let handler req =
         Response.make ~status:(Status.v 103) Body.empty
     | "/stream-fail" ->
         Response.stream (fun _ -> failwith "producer")
+    | "/keep-writer" ->
+        Response.stream (fun w ->
+            kept_writer := Some w ;
+            Body.Writer.write_string w "kept" )
+    | "/late-write" -> (
+      match
+        Option.iter (fun w -> Body.Writer.write_string w "LATE") !kept_writer
+      with
+      | () ->
+          Response.string "late write went through"
+      | exception Invalid_argument _ ->
+          Response.string "late write refused" )
     | "/reset" ->
         Response.stream ~status:Status.reset_content (fun _ ->
             failwith "the producer of a 205 ran" )
@@ -362,6 +377,26 @@ let connection_tests =
             Content-Length: 5\r\n
             \r\n
             hello
+            |} )
+    ; test
+        "a producer that keeps its writer cannot write into the next response"
+        (fun () ->
+          kept_writer := None ;
+          expect (show (get "/keep-writer" ^ get "/late-write"))
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 200 OK\r\n
+            Transfer-Encoding: chunked\r\n
+            \r\n
+            4\r\n
+            kept\r\n
+            0\r\n
+            \r\n
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 18\r\n
+            \r\n
+            late write refused
             |} )
     ; test "pipelined requests are answered in order" (fun () ->
           expect (show ~chunk:7 (get "/" ^ get "/info" ^ get "/ignore"))

@@ -28,17 +28,22 @@ module Writer : sig
       Writing zero bytes does nothing.
 
       @raise Invalid_argument
-        if [off] and [len] do not designate a valid range of [buf]. *)
+        if [off] and [len] do not designate a valid range of [buf], or if [w]
+        stopped: the producer that got it returned (see {!of_writer}). *)
 
   val write_string : t -> string -> unit
-  (** [write_string w s] writes all of [s]. *)
+  (** [write_string w s] writes all of [s]. It raises as {!write}. *)
 
   val flush : t -> unit
-  (** [flush w] pushes what was written so far to the peer. *)
+  (** [flush w] pushes what was written so far to the peer.
+
+      @raise Invalid_argument if [w] stopped. *)
 
   val set_trailers : t -> Headers.t -> unit
   (** [set_trailers w h] sets the trailer fields sent after the body. The last
-      call wins. *)
+      call wins.
+
+      @raise Invalid_argument if [w] stopped. *)
 
   val trailers : t -> Headers.t
   (** [trailers w] are the trailer fields set with {!set_trailers}, empty if
@@ -88,6 +93,13 @@ val of_writer : ?length:int -> (Writer.t -> unit) -> t
     if known. [produce] may call {!Writer.flush} to send what it wrote so far,
     for example between events of a stream.
 
+    [produce] gets a writer of its own, which stops when [produce] returns or
+    raises: a later {!Writer.write}, {!Writer.flush} or {!Writer.set_trailers}
+    on it raises [Invalid_argument]. Thus a producer that keeps its writer
+    cannot write into a later message of the connection. The check is at the
+    start of each call: a write that a different fiber of the producer started
+    before the return can still end after it.
+
     @raise Invalid_argument if [length] is negative. *)
 
 (** {1:consume Consuming bodies} *)
@@ -108,11 +120,13 @@ val write_to : t -> Writer.t -> unit
 (** [write_to b w] writes the rest of [b] into [w]. A source is copied with a
     {!Writer.flush} after each chunk it produces, so that streamed data and
     proxied responses reach the peer without delay. A writer body runs its
-    producer on [w]. The body's trailers, if any, are set on [w].
+    producer on a writer of its own, which writes into [w] and stops when the
+    producer returns (see {!of_writer}). The trailers of the body, if there are
+    some, replace those of [w].
 
     @raise Invalid_argument
-      if [b] is a writer body that was already written out, or if [b] was
-      closed. *)
+      if [b] is a writer body that was already written out, if [b] was closed,
+      or if [w] is a writer that stopped. *)
 
 val to_string : ?max:int -> t -> string
 (** [to_string ~max b] is the rest of [b] as a string.
