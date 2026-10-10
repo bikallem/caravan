@@ -235,7 +235,7 @@ let with_server ?(config = config) ?engine ?(handler = handler) f =
 
 (* Runs [f] with the flows of the server and of the peer of a TCP connection.
    The flow of the server is on the time line [time]. *)
-let with_flows ?time f =
+let with_flows ?(domain_count = domain_count) ?time f =
   Affect_unix.Unix.main ~domain_count
   @@ fun () ->
   let l = Tcp.Listener.listen loopback in

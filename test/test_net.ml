@@ -317,6 +317,25 @@ let tcp_tests =
           @@ fun reader ->
           Flow.close server ;
           raises Flow.Closed (fun () -> get_2s reader) )
+    ; (* The check of a passed deadline in Tcp.wait. The read waits with D1.
+         With no yield, the test sets a deadline that has passed (the wait ends,
+         to take the change) and closes the flow. The read waits again: the
+         deadline has passed and the flow is closed. The check gives Timeout.
+         Without it, the choose of the wait gives Closed on one domain, because
+         it is left-leaning; on more domains the test can pass without the
+         check, but it cannot fail on correct code. *)
+      test "a passed deadline wins over a close" (fun () ->
+          let f = Fake.make () in
+          with_flows ~domain_count:1 ~time:(Fake.mono f)
+          @@ fun server _client ->
+          let d1 = Fake.mono_now f +: Mtime.Span.(100 * s) in
+          Flow.set_read_deadline server (Some d1) ;
+          Fake.with_call_at_timer f d1 (fun () ->
+              Flow.read server (Bytes.create 1) 0 1 )
+          @@ fun reader ->
+          Flow.set_read_deadline server (Some (Fake.mono_now f)) ;
+          Flow.close server ;
+          raises Flow.Timeout (fun () -> get_2s reader) )
     ; test "a close ends a write that waits with Closed" (fun () ->
           let f = Fake.make () in
           with_flows ~time:(Fake.mono f)

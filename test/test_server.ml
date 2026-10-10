@@ -294,12 +294,24 @@ let upgrade_tests =
           let t0 = Fake.mono_now f in
           let m = Fake.mark f in
           (* [half_head] asks for "/". *)
+          (* The engine sees its flow through [counted]: [at_switch] gets the
+             last write deadline that it set before the new protocol starts. A
+             write deadline that stays is not seen by the echo, whose writes
+             never block. *)
+          let last = Atomic.make (Some t0)
+          and at_switch = Atomic.make (Some t0) in
+          let engine ctx flow handler =
+            let c = counted ~on_write_deadline:(Atomic.set last) flow in
+            Private.H1_server.serve ctx c.flow handler
+          in
           let handler _ =
             Response.upgrade
               ~headers:(Headers.of_list [("Upgrade", "echo")])
-              (fun flow -> copy flow flow)
+              (fun flow ->
+                Atomic.set at_switch (Atomic.get last) ;
+                copy flow flow )
           in
-          with_fake_time_server f ~handler
+          with_fake_time_server f ~engine ~handler
           @@ fun server ->
           let flow, r = connect server in
           (* In two parts, so that the server reads the second under its head
@@ -319,7 +331,9 @@ let upgrade_tests =
           equal string "still there" (read_n r 11) ;
           Flow.shutdown_send flow ;
           eof r ;
-          Flow.close flow )
+          Flow.close flow ;
+          is_true ~msg:"no write deadline when the new protocol starts"
+            (Option.is_none (Atomic.get at_switch)) )
     ; test "a CONNECT tunnel reaches another server" (fun () ->
           with_server
           @@ fun server ->
