@@ -1403,13 +1403,64 @@ let fake_time_tests =
           Flow.write_string c (get "/") ;
           within_2s (fun () -> Cell.Once.get started) ;
           Fun.Async.cancel caller ;
-          (* The masked handler ends at the stop, or after its 3 s limit. *)
-          ( try Fun.Async.get caller with
-          | Fun.Async.Cancelled ->
+          (* The masked handler ends at the stop, or after its 3 s limit. With 4
+             domains this test can miss a missing stop: the finally of the
+             connection and that of the supervisor race. With 1 or 2 domains it
+             is deterministic. *)
+          ( match
+              Server_support.within
+                Mtime.Span.(5 * s)
+                (fun () -> Fun.Async.get caller)
+            with
+          | () ->
               ()
-          | Unix.Unix_error _ ->
+          | exception Fun.Async.Cancelled ->
               () ) ;
           is_true ~msg:"the handler saw the stop" (Atomic.get saw) )
+    ; test
+        "a connection that ends while the server runs does not enable stopping"
+        (fun () ->
+          let f = Fake.make () in
+          let kept = ref None in
+          let handler req =
+            kept := Request.conn req ;
+            Response.string "one"
+          in
+          let fd, c = socket_pair () in
+          with_fake_server f ~handler ~clients:[c] [Conn fd; Gate Action.never]
+          @@ fun _ server _ ->
+          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+          Flow.write_string c (get ~close:true "/") ;
+          ignore (read_response c) ;
+          Flow.close c ;
+          Server_support.eventually ~msg:"the connection ended" (fun () ->
+              Server.open_connections server = 0 ) ;
+          is_true ~msg:"the action is not enabled"
+            (not (Fake.within_50ms (Conn_info.stopping (Option.get !kept)))) )
+    ; test "a response after a shutdown in its handler closes the connection"
+        (fun () ->
+          (* The engine polls the cell of the server when it decides to keep the
+             connection. *)
+          let f = Fake.make () in
+          let server_ref = ref None in
+          let handler _ =
+            Server.shutdown (Option.get !server_ref) ;
+            Response.string "bye"
+          in
+          let fd, c = socket_pair () in
+          with_fake_server f ~handler ~clients:[c] [Conn fd; Gate Action.never]
+          @@ fun _ server _ ->
+          server_ref := Some server ;
+          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+          Flow.write_string c (get "/") ;
+          let fields = ref [] in
+          ignore
+            (read_response_from
+               ~field:(fun l -> fields := String.lowercase_ascii l :: !fields)
+               (Private.Buf_reader.of_flow c) ) ;
+          is_true
+            ~msg:(String.concat "; " !fields)
+            (List.mem "connection: close" !fields) )
     ; test "an idle connection closes when the listener fails" (fun () ->
           (* Only the supervisor sets the cells here: no shutdown. No advance:
              the idle timeout never ends. *)

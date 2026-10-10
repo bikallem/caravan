@@ -142,10 +142,14 @@ let supervisor config engine handler ~stopping ~registry ~slots handoff =
             let flow = Tcp.flow ~time:config.Config.mono_time (fst conn) in
             Fun.Async.protect
               ~finally:(fun () ->
-                (* A connection that ends is out of the registry, so the
-                   broadcast misses it: its own cell is set here. A child of the
-                   connection that masks the cancel can still wait on it. *)
-                Cell.Once.try_set own () ;
+                (* A connection that ends at a stop or a cancel is out of the
+                   registry, so the broadcast misses it: its own cell is set
+                   here. A child of the connection that masks the cancel can
+                   still wait on it. A connection that ends while the server
+                   runs does not set it. *)
+                if
+                  Fun.Async.is_current_cancelled () || Cell.Once.is_set stopping
+                then Cell.Once.try_set own () ;
                 unregister registry id ;
                 Flow.close flow ;
                 Semaphore.release slots )
@@ -154,10 +158,10 @@ let supervisor config engine handler ~stopping ~registry ~slots handoff =
                   conn ) ) ;
         loop (id + 1)
   in
-  (* The supervisor ends at a stop or a cancel (abort, the end of the grace, a
-     cancel of the server's caller, a failure of the listener). It sets the
-     cells of the connections that are still in the registry; a connection that
-     ended before sets its own cell. *)
+  (* The supervisor ends at a stop (shutdown, a signal, a failure of the
+     listener) or a cancel (abort, the end of the grace, a cancel of the
+     server's caller). It sets the cells of the connections that are still in
+     the registry; a connection that ended before sets its own cell. *)
   Fun.Async.protect
     ~finally:(fun () ->
       Cell.Once.try_set stopping () ;
