@@ -623,7 +623,527 @@ let direct_tests =
           |} )
     ]
 
+(* The probe matrix (plan 4.3). It is a function, not a lazy value: mutation
+   testing starts each mutant from the state of a dry run, and a forced lazy
+   value would hide the mutant. *)
+
+type probe = {label: string; meth: string; v10: bool; close: bool; input: string}
+
+(* The 10 header sets of upstream. Sets 6 and 7 use the fixed time. *)
+let header_sets =
+  [ (1, [])
+  ; (2, [("upgrade-insecure-requests", "1")])
+  ; (3, [("Range", "bytes=0-10")])
+  ; (4, [("If-Match", "*")])
+  ; (5, [("If-None-Match", "*")])
+  ; (6, [("If-Modified-Since", date)])
+  ; (7, [("If-Range", date)])
+  ; (8, [("Early-Data", "1")])
+  ; (9, [("Early-Data", "Abc")])
+  ; (10, [("Connection", "close")]) ]
+
+let probe_methods =
+  ["GET"; "HEAD"; "POST"; "OPTIONS"; "DELETE"; "PUT"; "TRACE"; "PATCH"; "ABC"]
+
+(* A request as httpx sends it through mitmproxy: Host, Content-Length for POST,
+   PUT and PATCH, Accept, Accept-Encoding, Connection (except in set 10, where
+   Connection: close comes last), user-agent, cache-control, then the field of
+   the set. *)
+let httpx_request ?(v = "HTTP/1.1") meth path set =
+  let extra = List.assoc set header_sets in
+  let close = set = 10 in
+  let fields =
+    [("Host", "localhost:8080")]
+    @ ( if List.mem meth ["POST"; "PUT"; "PATCH"] then [("Content-Length", "0")]
+        else [] )
+    @ [("Accept", "*/*"); ("Accept-Encoding", "gzip, deflate, br")]
+    @ (if close then [] else [("Connection", "keep-alive")])
+    @ [("user-agent", "TODO"); ("cache-control", "no-store")]
+    @ extra
+  in
+  Printf.sprintf "%s %s %s\r\n%s\r\n" meth path v
+    (String.concat "" (List.map (fun (n, v) -> n ^ ": " ^ v ^ "\r\n") fields))
+
+let probe ?(v10 = false) ?(close = false) label meth input =
+  {label; meth; v10; close; input}
+
+let fixture_paths =
+  [ "/fixture/no-content"
+  ; "/fixture/not-modified"
+  ; "/fixture/reset-content"
+  ; "/fixture/stream"
+  ; "/fixture/upgrade-required"
+  ; "/fixture/fail" ]
+
+let probes () =
+  let upstream =
+    List.concat_map
+      (fun (path, path_label) ->
+        List.concat_map
+          (fun meth ->
+            List.map
+              (fun (set, _) ->
+                probe ~close:(set = 10)
+                  (Printf.sprintf "%s set %d %s" meth set path_label)
+                  meth
+                  (httpx_request meth path set) )
+              header_sets )
+          probe_methods )
+      [("/", "/"); (random_path, "random")]
+  in
+  let fixtures =
+    List.concat_map
+      (fun path ->
+        List.map
+          (fun meth ->
+            probe (meth ^ " " ^ path) meth (httpx_request meth path 1) )
+          ["GET"; "HEAD"] )
+      fixture_paths
+  in
+  upstream @ fixtures
+  @ [ probe "upgrade" "GET"
+        (request
+           ~headers:[("Connection", "upgrade"); ("Upgrade", "example/1")]
+           "GET" "/fixture/upgrade" )
+    ; probe ~v10:true "1.0 GET /" "GET"
+        (httpx_request ~v:"HTTP/1.0" "GET" "/" 1)
+    ; probe ~v10:true "1.0 GET /fixture/stream" "GET"
+        (httpx_request ~v:"HTTP/1.0" "GET" "/fixture/stream" 1)
+    ; probe "CONNECT" "CONNECT"
+        "CONNECT localhost:8080 HTTP/1.1\r\nHost: localhost:8080\r\n\r\n" ]
+
+(* Each probe with what the server wrote, parsed. *)
+let matrix () =
+  let ps = probes () in
+  let outs = serve (List.map (fun p -> p.input) ps) in
+  List.map2 (fun p out -> (p, parsed ~meth:p.meth out)) ps outs
+
+(* [rule ~applies ~must check] runs [check] on each response of the matrix that
+   [applies] selects. Each probe in [must] must give at least one such response,
+   so that the rule cannot pass with nothing to check. *)
+let rule ?(applies = fun _ _ -> true) ~must check =
+  let units =
+    List.concat_map
+      (fun (p, (t : Wire.t)) ->
+        List.filter_map
+          (fun r -> if applies p r then Some (p, t, r) else None)
+          t.responses )
+      (matrix ())
+  in
+  List.iter
+    (fun label ->
+      if not (List.exists (fun (p, _, _) -> p.label = label) units) then
+        failf "the rule does not apply to the probe %S" label )
+    must ;
+  let violations =
+    List.filter_map
+      (fun (p, t, (r : Wire.response)) ->
+        match check p t r with
+        | Ok () ->
+            None
+        | Error m ->
+            Some (Printf.sprintf "%s: %s: %s" p.label r.status_line m) )
+      units
+  in
+  if violations <> [] then
+    failf "%d violations:\n%s" (List.length violations)
+      (String.concat "\n" violations)
+
+let check ok fmt = Printf.ksprintf (fun m -> if ok then Ok () else Error m) fmt
+
+let absent name _ _ r =
+  check
+    (Wire.find_all name r = [])
+    "%s: %s" name
+    (String.concat ", " (Wire.find_all name r))
+
+let is_status codes _ (r : Wire.response) = List.mem r.code codes
+
+let is_tchar = function
+  | '!'
+  | '#'
+  | '$'
+  | '%'
+  | '&'
+  | '\''
+  | '*'
+  | '+'
+  | '-'
+  | '.'
+  | '^'
+  | '_'
+  | '`'
+  | '|'
+  | '~'
+  | '0' .. '9'
+  | 'a' .. 'z'
+  | 'A' .. 'Z' ->
+      true
+  | _ ->
+      false
+
+let is_token s = s <> "" && String.for_all is_tchar s
+
+let is_ows c = c = ' ' || c = '\t'
+
+let is_digit c = c >= '0' && c <= '9'
+
+(* A small parser for the field grammars: a position in a string. *)
+let skip_ows s i =
+  let i = ref i in
+  while !i < String.length s && is_ows s.[!i] do
+    incr i
+  done ;
+  !i
+
+let token_at s i =
+  let j = ref i in
+  while !j < String.length s && is_tchar s.[!j] do
+    incr j
+  done ;
+  if !j = i then None else Some !j
+
+(* quoted-string = DQUOTE *( qdtext / quoted-pair ) DQUOTE *)
+let quoted_at s i =
+  let n = String.length s in
+  if i >= n || s.[i] <> '"' then None
+  else
+    let rec go j =
+      if j >= n then None
+      else
+        match s.[j] with
+        | '"' ->
+            Some (j + 1)
+        | '\\'
+          when j + 1 < n
+               && (s.[j + 1] = '\t' || s.[j + 1] >= ' ')
+               && s.[j + 1] <> '\x7f' ->
+            go (j + 2)
+        | c
+          when c = '\t' || c = ' ' || c = '!'
+               || (c >= '#' && c <= '[')
+               || (c >= ']' && c <= '~')
+               || c >= '\x80' ->
+            go (j + 1)
+        | _ ->
+            None
+    in
+    go (i + 1)
+
+(* *( OWS ";" OWS token BWS "=" BWS ( token / quoted-string ) ), then the end.
+   [bws] permits the BWS around "=" (transfer-coding), else none
+   (media-type). *)
+let rec params ~bws s i =
+  let n = String.length s in
+  let i' = skip_ows s i in
+  if i' = n then i = n
+  else if s.[i'] <> ';' then false
+  else
+    let ws j = if bws then skip_ows s j else j in
+    match token_at s (skip_ows s (i' + 1)) with
+    | None ->
+        false
+    | Some j -> (
+        let j = ws j in
+        if j >= n || s.[j] <> '=' then false
+        else
+          let k = ws (j + 1) in
+          match
+            match token_at s k with Some e -> Some e | None -> quoted_at s k
+          with
+          | Some e ->
+              params ~bws s e
+          | None ->
+              false )
+
+(* 1#element: elements separated by OWS "," OWS, none empty. It splits at each
+   comma, also in a quoted-string: caravan writes no quoted-string in these
+   fields. *)
+let list_of element s =
+  List.for_all
+    (fun e -> e <> "" && element e)
+    (List.map String.trim (String.split_on_char ',' s))
+
+let is_transfer_coding c =
+  match token_at c 0 with Some i -> params ~bws:true c i | None -> false
+
+let is_media_type s =
+  match token_at s 0 with
+  | Some i when i < String.length s && s.[i] = '/' -> (
+    match token_at s (i + 1) with
+    | Some j ->
+        params ~bws:false s j
+    | None ->
+        false )
+  | _ ->
+      false
+
+(* IMF-fixdate = day-name "," SP 2DIGIT SP month SP 4DIGIT SP 2DIGIT ":" 2DIGIT
+   ":" 2DIGIT SP "GMT" (RFC 9110 5.6.7) *)
+let is_imf_fixdate s =
+  let digits i n = String.for_all is_digit (String.sub s i n) in
+  String.length s = 29
+  && List.mem (String.sub s 0 3)
+       ["Mon"; "Tue"; "Wed"; "Thu"; "Fri"; "Sat"; "Sun"]
+  && String.sub s 3 2 = ", "
+  && digits 5 2
+  && s.[7] = ' '
+  && List.mem (String.sub s 8 3)
+       [ "Jan"
+       ; "Feb"
+       ; "Mar"
+       ; "Apr"
+       ; "May"
+       ; "Jun"
+       ; "Jul"
+       ; "Aug"
+       ; "Sep"
+       ; "Oct"
+       ; "Nov"
+       ; "Dec" ]
+  && s.[11] = ' '
+  && digits 12 4
+  && s.[16] = ' '
+  && digits 17 2
+  && s.[19] = ':'
+  && digits 20 2
+  && s.[22] = ':'
+  && digits 23 2
+  && String.sub s 25 4 = " GMT"
+
+(* The names that upstream permits to occur more than one time. *)
+let repeatable =
+  [ "set-cookie"
+  ; "content-language"
+  ; "vary"
+  ; "server-timing"
+  ; "link"
+  ; "accept-ch"
+  ; "cache-control"
+  ; "p3p"
+  ; "content-security-policy"
+  ; "connection"
+  ; "referrer-policy"
+  ; "via"
+  ; "alt-svc"
+  ; "content-security-policy-report-only"
+  ; "accept-ranges"
+  ; "allow"
+  ; "www-authenticate"
+  ; "pragma" ]
+
+let not_interim _ (r : Wire.response) = r.code >= 200 || r.code = 101
+
+let with_field name _ r = Wire.find_all name r <> []
+
+let probe_tests =
+  group "probe rules"
+    [ test
+        "duplicate_fields: no field occurs two times, except the fields of a \
+         list (RFC 9110 5.3)" (fun () ->
+          (* Upstream gives only "unclear" for a repeated Content-Length, Date
+             or Transfer-Encoding. The test refuses them. *)
+          rule ~must:["GET set 1 /"] (fun _ _ r ->
+              let names =
+                List.map (fun (n, _) -> String.lowercase_ascii n) r.fields
+              in
+              let repeated =
+                List.sort_uniq compare
+                  (List.filter
+                     (fun n ->
+                       List.length (List.filter (String.equal n) names) > 1
+                       && not (List.mem n repeatable) )
+                     names )
+              in
+              check (repeated = []) "repeated %s" (String.concat ", " repeated) ) )
+    ; test
+        "content_length_1XX_204: no Content-Length in a 1xx or 204 (RFC 9110 \
+         8.6)" (fun () ->
+          rule
+            ~applies:(fun _ r -> r.code < 200 || r.code = 204)
+            ~must:["GET /fixture/no-content"; "OPTIONS set 1 /"; "upgrade"]
+            (absent "Content-Length") )
+    ; test
+        "no_transfer_encoding_1xx_204: no Transfer-Encoding in a 1xx or 204 \
+         (RFC 9112 6.1)" (fun () ->
+          rule
+            ~applies:(fun _ r -> r.code < 200 || r.code = 204)
+            ~must:["GET /fixture/no-content"; "OPTIONS set 1 /"; "upgrade"]
+            (absent "Transfer-Encoding") )
+    ; test "send_upgrade_101: a 101 has Upgrade (RFC 9110 7.8)" (fun () ->
+          rule ~applies:(is_status [101]) ~must:["upgrade"] (fun _ _ r ->
+              check (Wire.find "Upgrade" r <> None) "no Upgrade" ) )
+    ; test
+        "date_header_required: each response that is not 1xx has Date (RFC \
+         9110 6.6.1)" (fun () ->
+          (* Upstream does not examine 5xx. Caravan sends Date on 5xx too. *)
+          rule
+            ~applies:(fun _ r -> r.code >= 200)
+            ~must:["GET set 1 /"; "GET /fixture/fail"]
+            (fun _ _ r -> check (Wire.find "Date" r <> None) "no Date") )
+    ; test "date_grammar: Date is an IMF-fixdate (RFC 9110 5.6.7)" (fun () ->
+          (* Upstream also accepts the obsolete forms, but a sender must use
+             IMF-fixdate. *)
+          rule ~applies:(with_field "Date") ~must:["GET set 1 /"] (fun _ _ r ->
+              let ds = Wire.find_all "Date" r in
+              check
+                (List.for_all is_imf_fixdate ds)
+                "Date %s" (String.concat ", " ds) ) )
+    ; test "content_length_grammar: Content-Length is 1*DIGIT (RFC 9110 8.6)"
+        (fun () ->
+          (* Upstream uses the Python int(), which also accepts "+14". *)
+          rule ~applies:(with_field "Content-Length") ~must:["GET set 1 /"]
+            (fun _ _ r ->
+              let ls = Wire.find_all "Content-Length" r in
+              check
+                (List.for_all
+                   (fun l -> l <> "" && String.for_all is_digit l)
+                   ls )
+                "Content-Length %s" (String.concat ", " ls) ) )
+    ; test "connection_grammar: Connection is 1#token (RFC 9110 7.6.1)"
+        (fun () ->
+          rule ~applies:(with_field "Connection")
+            ~must:["GET set 10 /"; "upgrade"] (fun _ _ r ->
+              let cs = Wire.find_all "Connection" r in
+              check
+                (List.for_all (list_of is_token) cs)
+                "Connection %s" (String.concat ", " cs) ) )
+    ; test
+        "transfer_encoding_grammar: Transfer-Encoding is 1#transfer-coding \
+         (RFC 9112 6.1)" (fun () ->
+          rule ~applies:(with_field "Transfer-Encoding")
+            ~must:["GET /fixture/stream"] (fun _ _ r ->
+              let ts = Wire.find_all "Transfer-Encoding" r in
+              check
+                (List.for_all (list_of is_transfer_coding) ts)
+                "Transfer-Encoding %s" (String.concat ", " ts) ) )
+    ; test
+        "content_type_grammar: each Content-Type is a media-type (RFC 9110 8.3)"
+        (fun () ->
+          rule ~applies:(with_field "Content-Type")
+            ~must:["GET set 1 /"; "GET /fixture/fail"] (fun _ _ r ->
+              let ts = Wire.find_all "Content-Type" r in
+              check
+                (List.for_all is_media_type ts)
+                "Content-Type %s" (String.concat ", " ts) ) )
+    ; test
+        "content_type_header_required: a response with content has \
+         Content-Type (RFC 9110 8.3)" (fun () ->
+          rule
+            ~applies:(fun _ r -> r.body <> "")
+            ~must:["GET set 1 /"; "GET /fixture/fail"]
+            (fun _ _ r ->
+              check (Wire.find "Content-Type" r <> None) "no Content-Type" ) )
+    ; test
+        "transfer_encoding_http11: no Transfer-Encoding in a response to \
+         HTTP/1.0 (RFC 9112 6.1)" (fun () ->
+          (* Upstream never sends HTTP/1.0, so this rule always passes there. *)
+          rule
+            ~applies:(fun p _ -> p.v10)
+            ~must:["1.0 GET /"; "1.0 GET /fixture/stream"]
+            (absent "Transfer-Encoding") )
+    ; test
+        "close_option_in_final_response: the response to Connection: close has \
+         close and the server closes (RFC 9112 9.6)" (fun () ->
+          (* Upstream examines only the field (a SHOULD). The test also asserts
+             that the server closes (a MUST). *)
+          rule
+            ~applies:(fun p r -> p.close && not_interim p r)
+            ~must:["GET set 10 /"; "ABC set 10 random"]
+            (fun _ t r ->
+              let close =
+                List.exists
+                  (fun c ->
+                    List.exists
+                      (fun o -> String.lowercase_ascii (String.trim o) = "close")
+                      (String.split_on_char ',' c) )
+                  (Wire.find_all "Connection" r)
+              in
+              check (close && t.fin) "close option %b, half-close %b" close
+                t.fin ) )
+    ; test "no_bare_cr: no CR without LF in a head (RFC 9112 2.2)" (fun () ->
+          rule ~must:["GET set 1 /"] (fun _ _ r ->
+              let bare = ref false in
+              String.iteri
+                (fun i c ->
+                  if
+                    c = '\r'
+                    && (i + 1 >= String.length r.head || r.head.[i + 1] <> '\n')
+                  then bare := true )
+                r.head ;
+              check (not !bare) "bare CR" ) )
+    ; test
+        "code_204_no_additional_content: no bytes after a 204 head (RFC 9110 \
+         15.3.5)" (fun () ->
+          (* mitmproxy reads no body for a 204, so upstream cannot see the
+             bytes. *)
+          rule ~applies:(is_status [204]) ~must:["GET /fixture/no-content"]
+            (fun _ t _ -> check (t.rest = "") "then %S" t.rest ) )
+    ; test "code_304_no_content: no bytes after a 304 head (RFC 9110 15.4.5)"
+        (fun () ->
+          rule ~applies:(is_status [304])
+            ~must:["GET /fixture/not-modified"; "GET set 5 /"] (fun _ t _ ->
+              check (t.rest = "") "then %S" t.rest ) )
+    ; xfail ~reason:"G2: caravan sends the body of a 205"
+        (test
+           "code_205_no_content_allowed: a 205 has no content (RFC 9110 \
+            15.3.6, RFC 9112 6.3)" (fun () ->
+             rule
+               ~applies:(fun p r -> r.code = 205 && p.meth <> "HEAD")
+               ~must:["GET /fixture/reset-content"]
+               (fun _ t r ->
+                 let framed =
+                   match r.framing with
+                   | Length 0 | Chunked ->
+                       true
+                   | Close_delimited ->
+                       t.fin || t.reset
+                   | _ ->
+                       false
+                 in
+                 check
+                   (r.body = "" && framed)
+                   "%s %S" (framing r.framing) r.body ) ) )
+    ; xfail ~reason:"G1: the writer drops Upgrade from a 426"
+        (test
+           "send_upgrade_426: a 426 has Upgrade and the upgrade option (RFC \
+            9110 15.5.22, 7.8)" (fun () ->
+             rule ~applies:(is_status [426])
+               ~must:["GET /fixture/upgrade-required"] (fun _ _ r ->
+                 let upgrade_option =
+                   List.exists
+                     (fun c ->
+                       List.exists
+                         (fun o ->
+                           String.lowercase_ascii (String.trim o) = "upgrade" )
+                         (String.split_on_char ',' c) )
+                     (Wire.find_all "Connection" r)
+                 in
+                 check
+                   (Wire.find "Upgrade" r <> None && upgrade_option)
+                   "Upgrade %s, Connection %s"
+                   (Option.value (Wire.find "Upgrade" r) ~default:"none")
+                   (String.concat ", " (Wire.find_all "Connection" r)) ) ) )
+    ; test
+        "field syntax: each name is a token and no value has NUL, CR or LF \
+         (RFC 9110 5.1, 5.5)" (fun () ->
+          (* The HTTP/1 form of the HTTP/2 rules of upstream. *)
+          rule ~must:["GET set 1 /"] (fun _ _ r ->
+              let bad =
+                List.filter
+                  (fun (n, v) ->
+                    (not (is_token n))
+                    || String.exists
+                         (fun c -> c = '\000' || c = '\r' || c = '\n')
+                         v )
+                  r.fields
+              in
+              check (bad = []) "bad fields %s"
+                (String.concat ", "
+                   (List.map (fun (n, v) -> Printf.sprintf "%S: %S" n v) bad) ) ) )
+    ]
+
 let () =
   exit
     (run "conformance"
-       [wire_tests; memory_server_tests; app_tests; direct_tests] )
+       [wire_tests; memory_server_tests; app_tests; direct_tests; probe_tests] )
