@@ -2,23 +2,38 @@
    Copyright (c) 2023 Jannis Rautenstrauch, MIT license: see
    LICENSE.http-conformance). The tests send the inputs of the upstream rules to
    the HTTP/1.1 engine on in-memory connections, and check the bytes that it
-   writes against RFC 9110 and RFC 9112. The plan is
-   caravan-http-conformance.md. *)
+   writes against RFC 9110 and RFC 9112. A comment names each verdict that
+   differs from the upstream rule. *)
 
 open Windtrap
 open Caravan
+
+(* The errors that the engine reported, for example a handler that raised. *)
+let errors = ref []
 
 (* The fixed time of the Date fields: Sun, 06 Nov 1994 08:49:37 GMT. *)
 let config =
   { Config.default with
     date_header= true
   ; posix_time= Fake_time.posix (Fake_time.make ())
-  ; on_error= (fun _ _ -> ()) }
+  ; on_error= (fun e _ -> errors := Printexc.to_string e :: !errors) }
 
 let date = "Sun, 06 Nov 1994 08:49:37 GMT"
 
+(* Only /fixture/fail makes the engine report an error. *)
+let expected_error = Printexc.to_string (Failure "the fixture fails")
+
 let serve ?(fixtures = true) inputs =
-  Memory_server.serve ~config (Conformance_app.handler ~fixtures) inputs
+  errors := [] ;
+  let outs =
+    Memory_server.serve ~config (Conformance_app.handler ~fixtures) inputs
+  in
+  ( match List.filter (fun e -> e <> expected_error) !errors with
+  | [] ->
+      ()
+  | es ->
+      failf "the server reported: %s" (String.concat "; " (List.rev es)) ) ;
+  outs
 
 let serve_one ?fixtures input = List.hd (serve ?fixtures [input])
 
@@ -220,7 +235,18 @@ let wire_tests =
                     ab"
                ; one
                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nz\r\n"
-               ] )
+               ; one
+                   "HTTP/1.1 200 OK\r\n\
+                    Transfer-Encoding: chunked\r\n\
+                    \r\n\
+                    1_0\r\n"
+               ; one
+                   "HTTP/1.1 200 OK\r\n\
+                    Transfer-Encoding: chunked\r\n\
+                    Content-Length: 5\r\n\
+                    \r\n\
+                    0\r\n\
+                    \r\n" ] )
           @@ __POS_OF__
                {|
           error: no complete head
@@ -232,6 +258,8 @@ let wire_tests =
           error: bad Content-Length values
           error: chunked body: short chunk
           error: chunked body: bad size "z"
+          error: chunked body: bad size "1_0"
+          error: both Transfer-Encoding and Content-Length
           |} )
     ]
 
@@ -826,31 +854,37 @@ let quoted_at s i =
     in
     go (i + 1)
 
-(* *( OWS ";" OWS token BWS "=" BWS ( token / quoted-string ) ), then the end.
-   [bws] permits the BWS around "=" (transfer-coding), else none
-   (media-type). *)
+(* The parameters after a media type or a transfer coding, then the end: -
+   media-type (RFC 9110 5.6.6): *( OWS ";" OWS [ token "=" ( token /
+   quoted-string ) ] ). A parameter can be empty, and there is no space around
+   "=". - transfer-coding (RFC 9112 7): *( OWS ";" OWS token BWS "=" BWS ( token
+   / quoted-string ) ). [bws] permits the spaces around "=", and no parameter is
+   empty. *)
 let rec params ~bws s i =
   let n = String.length s in
   let i' = skip_ows s i in
   if i' = n then i = n
   else if s.[i'] <> ';' then false
   else
-    let ws j = if bws then skip_ows s j else j in
-    match token_at s (skip_ows s (i' + 1)) with
-    | None ->
-        false
-    | Some j -> (
-        let j = ws j in
-        if j >= n || s.[j] <> '=' then false
-        else
-          let k = ws (j + 1) in
-          match
-            match token_at s k with Some e -> Some e | None -> quoted_at s k
-          with
-          | Some e ->
-              params ~bws s e
-          | None ->
-              false )
+    let p = skip_ows s (i' + 1) in
+    if (not bws) && (p = n || s.[p] = ';') then p = n || params ~bws s p
+    else
+      let ws j = if bws then skip_ows s j else j in
+      match token_at s p with
+      | None ->
+          false
+      | Some j -> (
+          let j = ws j in
+          if j >= n || s.[j] <> '=' then false
+          else
+            let k = ws (j + 1) in
+            match
+              match token_at s k with Some e -> Some e | None -> quoted_at s k
+            with
+            | Some e ->
+                params ~bws s e
+            | None ->
+                false )
 
 (* 1#element: elements separated by OWS "," OWS, none empty. It splits at each
    comma, also in a quoted-string: caravan writes no quoted-string in these
@@ -906,6 +940,11 @@ let is_imf_fixdate s =
   && s.[22] = ':'
   && digits 23 2
   && String.sub s 25 4 = " GMT"
+  (* The ranges of the day, the hour, the minute and the second (60 for a leap
+     second). The test does not compute the weekday of the date. *)
+  &&
+  let n i = int_of_string (String.sub s i 2) in
+  n 5 >= 1 && n 5 <= 31 && n 17 <= 23 && n 20 <= 59 && n 23 <= 60
 
 (* The names that upstream permits to occur more than one time. *)
 let repeatable =
@@ -928,9 +967,62 @@ let repeatable =
   ; "www-authenticate"
   ; "pragma" ]
 
+(* Whether the Connection fields of [r] have the option [o]. *)
+let has_option o r =
+  List.exists
+    (fun c ->
+      List.exists
+        (fun x -> String.lowercase_ascii (String.trim x) = o)
+        (String.split_on_char ',' c) )
+    (Wire.find_all "Connection" r)
+
 let not_interim _ (r : Wire.response) = r.code >= 200 || r.code = 101
 
 let with_field name _ r = Wire.find_all name r <> []
+
+let grammar_tests =
+  group "grammar checks of the probe rules"
+    [ test "media-type (RFC 9110 8.3.1, 5.6.6)" (fun () ->
+          let valid =
+            [ "text/plain"
+            ; "text/plain;"
+            ; "text/plain; charset=utf-8"
+            ; "text/plain; charset=utf-8;"
+            ; "text/plain;;a=b"
+            ; "text/plain ; a=\"q;\\\"\"" ]
+          and invalid =
+            [ "text"
+            ; "text/"
+            ; "/plain"
+            ; "text/plain; charset"
+            ; "text/plain; a = b"
+            ; "text/plain; a=\"open"
+            ; "text/plain x" ]
+          in
+          equal (list string) []
+            (List.filter (fun s -> not (is_media_type s)) valid) ;
+          equal (list string) [] (List.filter is_media_type invalid) )
+    ; test "transfer-coding (RFC 9112 7)" (fun () ->
+          let valid = ["chunked"; "gzip, chunked"; "x ; a = b"; "x;a=\"q\""]
+          and invalid = ["chunked;"; "chunked, "; "x; a"; ", chunked"] in
+          equal (list string) []
+            (List.filter (fun s -> not (list_of is_transfer_coding s)) valid) ;
+          equal (list string) []
+            (List.filter (list_of is_transfer_coding) invalid) )
+    ; test "IMF-fixdate (RFC 9110 5.6.7)" (fun () ->
+          let valid = [date; "Wed, 31 Dec 1999 23:59:60 GMT"]
+          and invalid =
+            [ "Sun, 6 Nov 1994 08:49:37 GMT"
+            ; "Sun, 00 Nov 1994 08:49:37 GMT"
+            ; "Sun, 06 Nov 1994 24:00:00 GMT"
+            ; "Sun, 06 Nov 1994 08:60:37 GMT"
+            ; "Sunday, 06-Nov-94 08:49:37 GMT"
+            ; "Sun Nov  6 08:49:37 1994"
+            ; "Sun, 06 nov 1994 08:49:37 GMT" ]
+          in
+          equal (list string) []
+            (List.filter (fun s -> not (is_imf_fixdate s)) valid) ;
+          equal (list string) [] (List.filter is_imf_fixdate invalid) ) ]
 
 let probe_tests =
   group "probe rules"
@@ -970,9 +1062,11 @@ let probe_tests =
           rule ~applies:(is_status [101]) ~must:["upgrade"] (fun _ _ r ->
               check (Wire.find "Upgrade" r <> None) "no Upgrade" ) )
     ; test
-        "date_header_required: each response that is not 1xx has Date (RFC \
-         9110 6.6.1)" (fun () ->
-          (* Upstream does not examine 5xx. Caravan sends Date on 5xx too. *)
+        "date_header_required: caravan sends Date on each response that is not \
+         1xx (RFC 9110 6.6.1)" (fun () ->
+          (* RFC 9110 6.6.1 requires Date on 2xx, 3xx and 4xx, and permits it on
+             5xx. Upstream does not examine 5xx. Caravan sends Date on 5xx too,
+             and the test asserts this. *)
           rule
             ~applies:(fun _ r -> r.code >= 200)
             ~must:["GET set 1 /"; "GET /fixture/fail"]
@@ -1047,14 +1141,10 @@ let probe_tests =
             ~applies:(fun p r -> p.close && not_interim p r)
             ~must:["GET set 10 /"; "ABC set 10 random"]
             (fun _ t r ->
-              let close =
-                List.exists
-                  (fun c ->
-                    List.exists
-                      (fun o -> String.lowercase_ascii (String.trim o) = "close")
-                      (String.split_on_char ',' c) )
-                  (Wire.find_all "Connection" r)
-              in
+              (* Upstream needs the field to be exactly "close". The test
+                 accepts "close" in a list, for example "Upgrade, close" on a
+                 426. *)
+              let close = has_option "close" r in
               check (close && t.fin) "close option %b, half-close %b" close
                 t.fin ) )
     ; test "no_bare_cr: no CR without LF in a head (RFC 9112 2.2)" (fun () ->
@@ -1102,15 +1192,9 @@ let probe_tests =
          15.5.22, 7.8)" (fun () ->
           rule ~applies:(is_status [426])
             ~must:["GET /fixture/upgrade-required"] (fun _ _ r ->
-              let upgrade_option =
-                List.exists
-                  (fun c ->
-                    List.exists
-                      (fun o ->
-                        String.lowercase_ascii (String.trim o) = "upgrade" )
-                      (String.split_on_char ',' c) )
-                  (Wire.find_all "Connection" r)
-              in
+              (* Upstream examines only Upgrade. RFC 9110 7.8 also requires the
+                 upgrade option. *)
+              let upgrade_option = has_option "upgrade" r in
               check
                 (Wire.find "Upgrade" r <> None && upgrade_option)
                 "Upgrade %s, Connection %s"
@@ -1257,7 +1341,7 @@ let multi_tests =
               ["GET"; "HEAD"]
           in
           pair_rule ~pairs
-            ~applies:(fun r _ -> r.code = 304)
+            ~applies:(fun r304 r200 -> r304.code = 304 && r200.code = 200)
             ~must:["GET set 5 /"; "HEAD set 5 /"]
             (fun (_, r304) (_, r200) ->
               let missing =
@@ -1275,5 +1359,6 @@ let () =
        ; memory_server_tests
        ; app_tests
        ; direct_tests
+       ; grammar_tests
        ; probe_tests
        ; multi_tests ] )

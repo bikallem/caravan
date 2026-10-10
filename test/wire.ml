@@ -144,8 +144,14 @@ let chunked s pos =
         | None ->
             size_line
       in
+      let is_hex = function
+        | '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' ->
+            true
+        | _ ->
+            false
+      in
       match int_of_string_opt ("0x" ^ hex) with
-      | Some n when n >= 0 && hex <> "" ->
+      | Some n when n >= 0 && hex <> "" && String.for_all is_hex hex ->
           n
       | _ ->
           malformed "chunked body: bad size %S" size_line
@@ -198,6 +204,9 @@ let parse_exn ~meth (out : Memory_server.output) =
       finish No_body "" head_end
     else
       match (codings fields, content_length fields) with
+      (* RFC 9112 6.2: a sender must not send the two. *)
+      | _ :: _, Some _ ->
+          malformed "both Transfer-Encoding and Content-Length"
       | (_ :: _ as cs), _ when List.nth cs (List.length cs - 1) = "chunked" ->
           let body, next = chunked s head_end in
           finish Chunked body next

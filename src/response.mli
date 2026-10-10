@@ -62,6 +62,12 @@ val upgrade : ?status:Status.t -> ?headers:Headers.t -> (Flow.t -> unit) -> t
     request. Otherwise the client gets a [500] and the error is reported, as for
     a handler that raises.
 
+    Before the switch, the engine reads and discards the rest of the request
+    body. If the request expects [100-continue], the engine first sends
+    [100 Continue]: always before a [101] (RFC 9110 7.8), and before a [2xx]
+    only if a body is still owed. If the rest of the body is known to be larger
+    than [Config.max_drain], the client gets a [500] with no [100].
+
     @raise Invalid_argument if [status] is neither [101] nor [2xx]. *)
 
 val status : t -> Status.t

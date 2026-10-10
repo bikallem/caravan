@@ -80,9 +80,9 @@ val send_continue : t -> unit
     complete. Else it does nothing. It raises what [expect_continue] raises. *)
 
 val continue_owed : t -> bool
-(** [continue_owed t] is [true] iff the request expects [100-continue], the body
-    has not been read yet, so [100 Continue] was not sent, and is not complete:
-    the client may be holding the body back. *)
+(** [continue_owed t] is [true] iff the request expects [100-continue],
+    [100 Continue] was not sent (by a read or by {!send_continue}), and the body
+    is not complete: the client may be holding the body back. *)
 
 val drain : t -> max:int -> bool
 (** [drain t ~max] reads and discards what remains of the body, so that the next

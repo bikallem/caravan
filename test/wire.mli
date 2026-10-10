@@ -35,8 +35,8 @@ val parse : meth:string -> Memory_server.output -> (t, string) result
 (** [parse ~meth out] parses the responses in [out] to a request with the method
     [meth]. It stops after the first response that is not interim. It is an
     error if a head is not complete, if a status line or a field line is
-    malformed, if the Content-Length values are not equal digits, or if a body
-    is short. *)
+    malformed, if the Content-Length values are not equal digits, if a response
+    has both Transfer-Encoding and Content-Length, or if a body is short. *)
 
 val final : t -> response
 (** [final t] is the last response of [t]. *)

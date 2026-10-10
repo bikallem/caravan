@@ -54,20 +54,24 @@ BEGIN
 END $$;
 
 -- The direct tests: 9 rules for each URL and 2 rules for the base URL only,
--- each with a verdict.
+-- each with a verdict. A test that raised leaves a row with no verdict and a
+-- row with its error: the message names them.
 DO $$
 DECLARE
   n int;
   pairs int;
   base int;
   empty int;
+  errors text;
 BEGIN
+  SELECT string_agg(name || ': ' || test_error, '; ') INTO errors
+    FROM directtest WHERE test_error <> '';
   SELECT count(*), count(DISTINCT (d.url_id, d.name)),
          count(*) FILTER (WHERE u.is_base), count(*) FILTER (WHERE d.violation = '')
     INTO n, pairs, base, empty
     FROM directtest d JOIN url u ON u.id = d.url_id;
   IF n <> 20 OR pairs <> 20 OR base <> 11 OR empty <> 0 THEN
-    RAISE EXCEPTION 'invalid run: directtest has % rows (expected 20), % rules and URLs (expected 20), % rows for the base URL (expected 11), % rows without a verdict (expected 0)', n, pairs, base, empty;
+    RAISE EXCEPTION 'invalid run: directtest has % rows (expected 20), % rules and URLs (expected 20), % rows for the base URL (expected 11), % rows without a verdict (expected 0); test errors: %', n, pairs, base, empty, coalesce(errors, 'none');
   END IF;
 END $$;
 

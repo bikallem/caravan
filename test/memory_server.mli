@@ -16,4 +16,5 @@ val serve : config:Config.t -> Handler.t -> string list -> output list
     close: [serve] sets [cancel_on_disconnect] to [false]. Call it outside
     [Unix.main].
 
-    @raise Failure if the server writes after it half-closed or reset. *)
+    A write after a half-close raises [Failure] in the server. A write after a
+    reset raises [Flow.Closed] in the server, and the bytes are dropped. *)
