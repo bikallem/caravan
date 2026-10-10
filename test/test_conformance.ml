@@ -384,4 +384,246 @@ let app_tests =
                      (serve_one ~fixtures:false (request "GET" "/fixture/fail")) ) ) )
               .status_line ) ]
 
-let () = exit (run "conformance" [wire_tests; memory_server_tests; app_tests])
+(* The DIRECT rules (plan 5.1). Upstream sends each to the base URL and to a
+   random path. *)
+
+let random_path = "/q7w2e9r4t1y6u3i8o5p0a2s7d4f9g1h6"
+
+let paths = ["/"; random_path]
+
+let host = "Host: localhost:8080\r\n"
+
+(* The request of upstream [build_request]: the request line, then Host, Accept,
+   Accept-Encoding, Cache-Control, User-Agent, Connection, the additional
+   fields, and the empty line. *)
+let direct ?(meth = "GET") ?(host = host)
+    ?(connection = "Connection: keep-alive\r\n") ?(additional = "") path =
+  Printf.sprintf
+    "%s %s HTTP/1.1\r\n\
+     %sAccept: */*\r\n\
+     Accept-Encoding: gzip, deflate, br\r\n\
+     Cache-Control: no-store\r\n\
+     User-Agent: test\r\n\
+     %s%s\r\n"
+    meth path host connection additional
+
+let parsed ~meth out =
+  match Wire.parse ~meth out with
+  | Ok t ->
+      t
+  | Error e ->
+      failf "the response is malformed: %s in %S" e out.Memory_server.written
+
+(* The status codes of the responses, and the extra bytes if any. *)
+let codes ~meth out =
+  let t = parsed ~meth out in
+  String.concat " "
+    (List.map (fun (r : Wire.response) -> string_of_int r.code) t.responses)
+  ^ if t.rest = "" then "" else Printf.sprintf " + %S" t.rest
+
+(* One line for each labeled input: its path, label and codes. *)
+let outcomes ?(meth = "GET") inputs =
+  let outs = serve (List.map (fun (_, _, input) -> input) inputs) in
+  String.concat "\n"
+    (List.map2
+       (fun (path, label, _) out ->
+         Printf.sprintf "%s %s => %s" path label (codes ~meth out) )
+       inputs outs )
+
+let on_paths f = List.concat_map f paths
+
+let direct_tests =
+  group "DIRECT rules"
+    [ test
+        "reject_fields_contaning_cr_lf_nul: 400 for NUL, CR or LF in a value \
+         (RFC 9110 5.5)" (fun () ->
+          (* RFC 9112 2.2 permits a recipient to take a bare LF as a line end,
+             and then this head ends early. Caravan refuses it, and the test
+             asserts this stricter 400. *)
+          expect
+            (outcomes
+               (on_paths (fun path ->
+                    List.map
+                      (fun (label, x) ->
+                        ( path
+                        , label
+                        , direct ~additional:("Invalid: a" ^ x ^ "\r\n") path ) )
+                      [("NUL", "\000"); ("CR", "\r"); ("LF", "\n")] ) ) )
+          @@ __POS_OF__
+               {|
+          / NUL => 400
+          / CR => 400
+          / LF => 400
+          /q7w2e9r4t1y6u3i8o5p0a2s7d4f9g1h6 NUL => 400
+          /q7w2e9r4t1y6u3i8o5p0a2s7d4f9g1h6 CR => 400
+          /q7w2e9r4t1y6u3i8o5p0a2s7d4f9g1h6 LF => 400
+          |} )
+    ; test
+        "code_400_after_bad_host_request: 400 for no Host, two Hosts or an \
+         invalid Host (RFC 9112 3.2)" (fun () ->
+          let inv = "inv: a\r\ninv: ab\r\n" in
+          expect
+            (outcomes
+               (on_paths (fun path ->
+                    List.map
+                      (fun (label, host) ->
+                        (path, label, direct ~host ~additional:inv path) )
+                      [ ("no Host", "")
+                      ; ("two Hosts", host ^ host)
+                      ; ("Host ###", "Host: ###\r\n") ] ) ) )
+          @@ __POS_OF__
+               {|
+          / no Host => 400
+          / two Hosts => 400
+          / Host ### => 400
+          /q7w2e9r4t1y6u3i8o5p0a2s7d4f9g1h6 no Host => 400
+          /q7w2e9r4t1y6u3i8o5p0a2s7d4f9g1h6 two Hosts => 400
+          /q7w2e9r4t1y6u3i8o5p0a2s7d4f9g1h6 Host ### => 400
+          |} )
+    ; test
+        "allow_crlf_start: an empty line before the request line is ignored \
+         (RFC 9112 2.2)" (fun () ->
+          expect
+            (outcomes
+               (on_paths (fun path ->
+                    [(path, "CRLF first", "\r\n" ^ direct path)] ) ) )
+          @@ __POS_OF__
+               {|
+          / CRLF first => 200
+          /q7w2e9r4t1y6u3i8o5p0a2s7d4f9g1h6 CRLF first => 404
+          |} )
+    ; test
+        "reject_msgs_with_whitespace_between_startline_and_first_header_field: \
+         400 (RFC 9112 2.2)" (fun () ->
+          (* Upstream puts a space before each field line. *)
+          let indent req =
+            let lines = String.split_on_char '\n' req in
+            let lines =
+              List.filteri (fun i _ -> i < List.length lines - 2) lines
+            in
+            String.concat "\n " lines ^ "\n\r\n"
+          in
+          expect
+            (outcomes
+               (on_paths (fun path ->
+                    [(path, "indented fields", indent (direct path))] ) ) )
+          @@ __POS_OF__
+               {|
+          / indented fields => 400
+          /q7w2e9r4t1y6u3i8o5p0a2s7d4f9g1h6 indented fields => 400
+          |} )
+    ; test
+        "code_400_if_msg_with_whitespace_between_header_field_and_colon: 400 \
+         (RFC 9112 5.1)" (fun () ->
+          expect
+            (outcomes
+               (on_paths (fun path ->
+                    [ ( path
+                      , "Space : Ohno"
+                      , direct ~additional:"Space : Ohno\r\n" path ) ] ) ) )
+          @@ __POS_OF__
+               {|
+          / Space : Ohno => 400
+          /q7w2e9r4t1y6u3i8o5p0a2s7d4f9g1h6 Space : Ohno => 400
+          |} )
+    ; test
+        "content_head_request: no content in a HEAD response (RFC 9110 9.3.2)"
+        (fun () ->
+          expect
+            (outcomes ~meth:"HEAD"
+               (on_paths (fun path ->
+                    [(path, "HEAD", direct ~meth:"HEAD" path)] ) ) )
+          @@ __POS_OF__
+               {|
+          / HEAD => 200
+          /q7w2e9r4t1y6u3i8o5p0a2s7d4f9g1h6 HEAD => 404
+          |} )
+    ; xfail
+        ~reason:
+          "G3: caravan sends the 101 with no 100 when the request has no body"
+        (test
+           "continue_before_upgrade: 100 before 101 for Upgrade and Expect \
+            100-continue, no body (RFC 9110 7.8)" (fun () ->
+             (* Upstream sends this to its URLs. The fixture path makes the
+                application switch protocols. *)
+             let input =
+               direct ~connection:"Connection: upgrade\r\n"
+                 ~additional:"Upgrade: https\r\nExpect: 100-continue\r\n"
+                 "/fixture/upgrade"
+             in
+             equal string "100 101" (codes ~meth:"GET" (serve_one input)) ) )
+    ; test
+        "continue_before_upgrade: with a body that the handler does not read, \
+         the result is 500 (not an upstream case)" (fun () ->
+          (* No 101 goes out, so RFC 9110 7.8 does not apply. This records the
+             behavior until the issue of the plan is fixed. *)
+          let input =
+            direct ~connection:"Connection: upgrade\r\n"
+              ~additional:
+                "Upgrade: https\r\n\
+                 Expect: 100-continue\r\n\
+                 Content-Length: 5\r\n"
+              "/fixture/upgrade"
+            ^ "hello"
+          in
+          equal string "500" (codes ~meth:"GET" (serve_one input)) )
+    ; test
+        "content_length_2XX_connect: no Content-Length in a 2xx to CONNECT \
+         (RFC 9110 8.6)" (fun () ->
+          let r =
+            Wire.final
+              (parsed ~meth:"CONNECT"
+                 (serve_one
+                    "CONNECT localhost:8080 HTTP/1.1\r\n\
+                     Host: localhost:8080\r\n\
+                     \r\n" ) )
+          in
+          equal int 200 r.code ;
+          equal (list string) [] (Wire.find_all "Content-Length" r) )
+    ; test
+        "transfer_encoding_2XX_connect: no Transfer-Encoding in a 2xx to \
+         CONNECT (RFC 9112 6.1)" (fun () ->
+          let r =
+            Wire.final
+              (parsed ~meth:"CONNECT"
+                 (serve_one
+                    "CONNECT localhost:8080 HTTP/1.1\r\n\
+                     Host: localhost:8080\r\n\
+                     \r\n" ) )
+          in
+          equal int 200 r.code ;
+          equal (list string) [] (Wire.find_all "Transfer-Encoding" r) )
+    ; test
+        "code_501_unknown_methods: 501 for an unknown method (RFC 9110 9.1, an \
+         application rule)" (fun () ->
+          expect
+            (outcomes
+               (on_paths (fun path -> [(path, "ABC", direct ~meth:"ABC" path)])) )
+          @@ __POS_OF__
+               {|
+          / ABC => 501
+          /q7w2e9r4t1y6u3i8o5p0a2s7d4f9g1h6 ABC => 501
+          |} )
+    ; test
+        "code_405_blocked_methods: 405 for TRACE, 400 for CONNECT with a path \
+         (RFC 9110 9.1, 9.3.6)" (fun () ->
+          (* Upstream wants 405 also for CONNECT with a path. The target of
+             CONNECT must be host:port (RFC 9112 3.2.3), so 400 is correct. *)
+          expect
+            (outcomes
+               (on_paths (fun path ->
+                    [ (path, "TRACE", direct ~meth:"TRACE" path)
+                    ; (path, "CONNECT", direct ~meth:"CONNECT" path) ] ) ) )
+          @@ __POS_OF__
+               {|
+          / TRACE => 405
+          / CONNECT => 400
+          /q7w2e9r4t1y6u3i8o5p0a2s7d4f9g1h6 TRACE => 405
+          /q7w2e9r4t1y6u3i8o5p0a2s7d4f9g1h6 CONNECT => 400
+          |} )
+    ]
+
+let () =
+  exit
+    (run "conformance"
+       [wire_tests; memory_server_tests; app_tests; direct_tests] )
