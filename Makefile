@@ -1,7 +1,7 @@
 
 # Test suites with mutation results to merge.
 SUITES = test_core test_h1 test_h1_server test_net test_server test_server_stateful \
-  test_websocket test_client
+  test_websocket test_client test_conformance
 
 .PHONY: build fmt test mutate coverage autobahn
 
