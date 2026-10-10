@@ -9,7 +9,9 @@ type t =
   { signals: int list
   ; read: Unix.file_descr
   ; active: bool Atomic.t
-  ; count: int Atomic.t (* signals taken since installed *) }
+  ; count: int Atomic.t (* signals taken since installed *)
+  ; write: Unix.file_descr
+  ; pid: int (* the process of the relay thread *) }
 
 let lock = Mutex.create ()
 
@@ -55,12 +57,26 @@ let start signals =
     end
   in
   ignore (Thread.create relay ()) ;
-  {signals; read; active; count}
+  {signals; read; write; active; count; pid= Unix.getpid ()}
 
 let install ?(signals = [Sys.sigint; Sys.sigterm]) () =
   Mutex.protect lock
   @@ fun () ->
   match !installed with
+  (* A fork keeps only the thread that forks: the relay of [t] is not in this
+     process, and its pipe is also the pipe of the parent. The signals of [t]
+     that the child does not install get their action again. *)
+  | Some t when t.pid <> Unix.getpid () ->
+      let close fd = try Unix.close fd with Unix.Unix_error _ -> () in
+      close t.read ;
+      close t.write ;
+      installed := None ;
+      ignore
+        (Thread.sigmask Unix.SIG_UNBLOCK
+           (List.filter (fun s -> not (List.mem s signals)) t.signals) ) ;
+      let t = start signals in
+      installed := Some t ;
+      t
   | Some t when t.signals <> signals ->
       invalid_arg "Stop_signal.install: already installed with other signals"
   | Some t ->
@@ -76,7 +92,14 @@ let install ?(signals = [Sys.sigint; Sys.sigterm]) () =
       installed := Some t ;
       t
 
+(* The value of the parent is not valid in a child after a fork: its pipe is
+   also the pipe of the parent. *)
+let check t name =
+  if t.pid <> Unix.getpid () then
+    invalid_arg ("Stop_signal." ^ name ^ ": a value of another process")
+
 let release t =
+  check t "release" ;
   Mutex.protect lock
   @@ fun () ->
   if Atomic.exchange t.active false then begin
@@ -84,11 +107,15 @@ let release t =
     ignore (Thread.sigmask Unix.SIG_UNBLOCK t.signals)
   end
 
-let rec wait t =
-  Affect.Action.invoke (Affect_unix.Unix.wait_readable t.read ()) ;
-  let b = Bytes.create 1 in
-  match Unix.read t.read b 0 1 with
-  | _ ->
-      List.nth t.signals (Char.code (Bytes.get b 0))
-  | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK | EINTR), _, _) ->
-      wait t
+let wait t =
+  check t "wait" ;
+  let rec loop () =
+    Affect.Action.invoke (Affect_unix.Unix.wait_readable t.read ()) ;
+    let b = Bytes.create 1 in
+    match Unix.read t.read b 0 1 with
+    | _ ->
+        List.nth t.signals (Char.code (Bytes.get b 0))
+    | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK | EINTR), _, _) ->
+        loop ()
+  in
+  loop ()

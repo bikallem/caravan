@@ -6,6 +6,7 @@
   test_net
   test_server
   test_server_stateful
+  test_stop_signal
   test_websocket
   test_client
   test_conformance)
@@ -16,6 +17,7 @@
   test_net
   test_server
   test_server_stateful
+  test_stop_signal
   test_websocket
   test_client
   test_conformance
