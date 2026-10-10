@@ -118,8 +118,8 @@ type message =
     - The code that we sent because the peer did not obey the protocol: 1002 for
       a protocol error, 1007 for text that is not UTF-8, 1009 for a message that
       is too large. The reason tells the problem. The connection examines each
-      fragment of a text message when it comes, thus 1007 can come before the
-      end of the message.
+      part of a text frame as it arrives, thus 1007 can come before the end of
+      the frame or of the message.
     - 1001 with the reason ["read timeout"] or ["idle timeout"] if no byte came
       in the [read_timeout] or the [idle_timeout] of {!accept}.
     - The code and the reason of our Close frame, until the reply of the peer

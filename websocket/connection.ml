@@ -246,19 +246,8 @@ let after_close_deadline t =
   | None ->
       false
 
-let message t (op : Frame.opcode) payload =
-  if op <> Text then Binary payload
-  else if String.is_valid_utf_8 payload then Text payload
-  else fail t 1007 "text is not UTF-8"
-
-(* The UTF-8 of a fragment of a message with the opcode [op], after the
-   [pending] bytes of an incomplete sequence (RFC 6455 §8.1: we fail at once). A
-   binary message has no check. *)
-let continue t (op : Frame.opcode) pending s =
-  if op <> Text then ""
-  else
-    try Utf8.continue pending s
-    with Utf8.Invalid -> fail t 1007 "text is not UTF-8"
+(* Raised by the UTF-8 check of a part of a text message. *)
+exception Bad_text
 
 (* Adds [s] to the [len] bytes of the message buffer [b]. The capacity doubles,
    but it never goes over [max_message]: [Frame.read] makes sure that the
@@ -289,7 +278,29 @@ let rec next t part =
   t.in_frame <- Buf_reader.buffered t.r > 0 ;
   if not t.in_frame then set_read_deadline t t.idle_timeout ;
   let start = Buf_reader.consumed t.r in
-  match Frame.read t.r ~masked:true ~max:(t.max_message - size) with
+  (* The UTF-8 of a text message, checked for each part of a frame as it
+     arrives, after the [pending] bytes of an incomplete sequence (RFC 6455
+     §8.1: we fail at the first incorrect byte, not at the end of the frame). A
+     binary message has no check. While the connection closes, data frames are
+     dropped, and they get no check. *)
+  let pending =
+    ref (match part with Some (Frame.Text, _, pending) -> pending | _ -> "")
+  in
+  let on_data (op : Frame.opcode) buf off len =
+    if Atomic.get t.closing = None then
+      match (op, part) with
+      | Text, None | Continuation, Some (Text, _, _) -> (
+        match Utf8.continue_bytes !pending buf off len with
+        | p ->
+            pending := p
+        | exception Utf8.Invalid ->
+            raise Bad_text )
+      | _ ->
+          ()
+  in
+  match Frame.read ~on_data t.r ~masked:true ~max:(t.max_message - size) with
+  | exception Bad_text ->
+      fail t 1007 "text is not UTF-8"
   | exception Frame.Error (Protocol_error reason) ->
       fail t 1002 reason
   | exception Frame.Error Too_big ->
@@ -328,17 +339,19 @@ let rec next t part =
     | Continuation, None ->
         fail t 1002 "continuation frame without a message"
     | (Text | Binary), None when fin ->
-        message t opcode payload
+        if opcode = Binary then Binary payload
+        else if !pending <> "" then fail t 1007 "text is not UTF-8"
+        else Text payload
     | (Text | Binary), None ->
-        let pending = continue t opcode "" payload in
+        let pending = !pending in
         (* [Frame.read] gives a new string: nothing else has it. *)
         next t
           (Some
              ( opcode
              , (Bytes.unsafe_of_string payload, String.length payload)
              , pending ) )
-    | Continuation, Some (op, data, pending) ->
-        let pending = continue t op pending payload in
+    | Continuation, Some (op, data, _) ->
+        let pending = !pending in
         if fin && pending <> "" then fail t 1007 "text is not UTF-8" ;
         let ((b, len) as data) = append t data payload in
         if not fin then next t (Some (op, data, pending))

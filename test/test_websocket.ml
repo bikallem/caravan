@@ -379,12 +379,13 @@ let frames out =
 
 (* Runs [app] on a server connection that reads [input]. The result is the lines
    that [app] logs, a "--" line, then the frames that the server sent. *)
-let converse ?max_message input app =
+let converse ?max_message ?chunk input app =
   let out = Buffer.create 64 and log = ref [] in
   let note s = log := s :: !log in
   Affect_unix.Unix.main ~domain_count:1 (fun () ->
       app note
-        (Ws.Private.of_flow ?max_message (Caravan.Flow.of_string input out)) ) ;
+        (Ws.Private.of_flow ?max_message
+           (Caravan.Flow.of_string ?chunk input out) ) ) ;
   String.concat "\n" (List.rev !log @ ("--" :: frames (Buffer.contents out)))
 
 let note_closed note = function
@@ -669,6 +670,35 @@ let utf8_tests =
             loop "" (cut_parts g)
           in
           equal (option string) (result Utf8.continue) (result on_range) )
+    ; test "an incorrect byte gives 1007 before the end of its frame" (fun () ->
+          (* Autobahn 6.4.3: the rest of the frame does not come. *)
+          let frame =
+            client Text (of_hex "cebae1bdb9cf83cebcceb5f4908080656469746564")
+          in
+          expect (converse (String.sub frame 0 (6 + 15)) echo)
+          @@ __POS_OF__
+               {|
+            closed 1007 "text is not UTF-8"
+            --
+            close 1007
+            |} )
+    ; test "an incorrect byte in a continuation gives 1007 before its end"
+        (fun () ->
+          (* Autobahn 6.4.4, in a continuation frame. *)
+          let frame =
+            client Continuation
+              (of_hex "cebae1bdb9cf83cebcceb5f4908080656469746564")
+          in
+          expect
+            (converse
+               (client ~fin:false Text "ok" ^ String.sub frame 0 (6 + 13))
+               echo )
+          @@ __POS_OF__
+               {|
+            closed 1007 "text is not UTF-8"
+            --
+            close 1007
+            |} )
     ; test "an incorrect fragment gives 1007 before the end of the message"
         (fun () ->
           (* Autobahn 6.4.1: the last fragment does not come. *)
@@ -825,8 +855,20 @@ let connection_tests =
               , client ~fin:false Text "a" ^ client Text "b"
               , None )
             ; ("text not UTF-8", client Text "\xff", None)
+            ; ("text that ends inside a sequence", client Text "\xe2\x82", None)
             ; ( "fragments not UTF-8"
               , client ~fin:false Text "\xe2\x82" ^ client Continuation "x"
+              , None )
+            ; ( "fragments that end inside a sequence"
+              , client ~fin:false Text "\xe2\x82" ^ client Continuation ""
+              , None )
+              (* A protocol error comes before the UTF-8 of its frame. *)
+            ; ( "message in a message, not UTF-8"
+              , client ~fin:false Text "a" ^ client Text "\xff"
+              , None )
+            ; ("continuation first, not UTF-8", client Continuation "\xff", None)
+            ; ( "text in a binary message, not UTF-8"
+              , client ~fin:false Binary "a" ^ client Text "\xff"
               , None )
             ; ("close of 1 byte", client Close "\x03", None)
             ; ( "close reason not UTF-8"
@@ -860,7 +902,12 @@ let connection_tests =
             continuation first: closed 1002 "continuation frame without a message" | -- | close 1002
             message in a message: closed 1002 "new message inside a fragmented message" | -- | close 1002
             text not UTF-8: closed 1007 "text is not UTF-8" | -- | close 1007
+            text that ends inside a sequence: closed 1007 "text is not UTF-8" | -- | close 1007
             fragments not UTF-8: closed 1007 "text is not UTF-8" | -- | close 1007
+            fragments that end inside a sequence: closed 1007 "text is not UTF-8" | -- | close 1007
+            message in a message, not UTF-8: closed 1002 "new message inside a fragmented message" | -- | close 1002
+            continuation first, not UTF-8: closed 1002 "continuation frame without a message" | -- | close 1002
+            text in a binary message, not UTF-8: closed 1002 "new message inside a fragmented message" | -- | close 1002
             close of 1 byte: closed 1002 "close frame of 1 byte" | -- | close 1002
             close reason not UTF-8: closed 1007 "close reason is not UTF-8" | -- | close 1007
             close code 0: closed 1002 "close code 0" | -- | close 1002
@@ -1081,19 +1128,21 @@ let connection_tests =
             ping "ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
             binary "\255"
             |} )
-    ; prop "recv joins fragments and answers Pings"
+    ; prop "recv joins fragments and answers Pings, however the input is split"
         Gen.(
-          list ~size:(int_range 0 4)
-            (triple bool
-               (list ~size:(int_range 0 6)
-                  (of_list
-                     [ "a"
-                     ; "\xc3\xa9"
-                     ; "\xe2\x82\xac"
-                     ; "\xf0\x9d\x84\x9e"
-                     ; "\x00" ] ) )
-               (list ~size:(int_range 0 4) (int_range 0 5)) ) )
-        (fun messages ->
+          pair
+            (list ~size:(int_range 0 4)
+               (triple bool
+                  (list ~size:(int_range 0 6)
+                     (of_list
+                        [ "a"
+                        ; "\xc3\xa9"
+                        ; "\xe2\x82\xac"
+                        ; "\xf0\x9d\x84\x9e"
+                        ; "\x00" ] ) )
+                  (list ~size:(int_range 0 4) (int_range 0 5)) ) )
+            (int_range 1 9) )
+        (fun (messages, chunk) ->
           (* Cut [s] in fragments of the given sizes and a last fragment. *)
           let rec cut s = function
             | [] ->
@@ -1133,7 +1182,7 @@ let connection_tests =
           equal string
             (String.concat "\n"
                (List.rev !log @ ["closed 1006 \"\""; "--"] @ List.rev !expected) )
-            (converse (Buffer.contents input) echo) ) ]
+            (converse ~chunk (Buffer.contents input) echo) ) ]
 
 let close_tests =
   let try_note note f = try f () with e -> note_closed note e in
@@ -1141,7 +1190,8 @@ let close_tests =
     [ test "close sends a Close frame and reads until the reply" (fun () ->
           expect
             (converse
-               ( client Text "discarded" ^ client Ping "no pong"
+               ( client Text "discarded" ^ client Text "\xff"
+               ^ client Ping "no pong"
                ^ client Close (code_reason 1000 "ok") )
                (fun note c ->
                  Ws.close ~code:1001 ~reason:"bye" c ;
