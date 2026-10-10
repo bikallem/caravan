@@ -1,6 +1,6 @@
 type framing =
   | No_body
-  | Head_length of int
+  | Length_only of int
   | Length of int
   | Chunked
   | Close_delimited
@@ -14,7 +14,7 @@ let framing ~meth ~version r =
       if code < 200 || code = 204 || code = 304 then No_body
       else if Method.equal meth Method.CONNECT && code < 300 then No_body
       else if Method.equal meth Method.HEAD then
-        match Body.length body with Some n -> Head_length n | None -> No_body
+        match Body.length body with Some n -> Length_only n | None -> No_body
       else
         match Body.length body with
         | Some n ->
@@ -62,7 +62,7 @@ let head w ?date ~version ~keep_alive framing r =
   in
   Headers.iter (fun n v -> if not (owned n) then field w n v) headers ;
   ( match framing with
-  | Length n | Head_length n ->
+  | Length n | Length_only n ->
       field w "Content-Length" (string_of_int n)
   | Chunked ->
       field w "Transfer-Encoding" "chunked"
@@ -152,7 +152,7 @@ let request_head w framing req =
       field w "Content-Length" (string_of_int n)
   | Chunked ->
       field w "Transfer-Encoding" "chunked"
-  | No_body | Head_length _ | Close_delimited ->
+  | No_body | Length_only _ | Close_delimited ->
       () ) ;
   if request_closes req then field w "Connection" "close" ;
   Buf_writer.write_string w "\r\n"
@@ -223,7 +223,7 @@ let body ?(before = ignore) w framing b =
     flush ()
   in
   match framing with
-  | No_body | Head_length _ ->
+  | No_body | Length_only _ ->
       flush ()
   | Close_delimited ->
       write_all (Buf_writer.write_bytes w)

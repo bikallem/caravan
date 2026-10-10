@@ -1659,8 +1659,8 @@ let show_framing_of ~meth ~version r =
   match H1_write.framing ~meth ~version r with
   | H1_write.No_body ->
       "no body"
-  | Head_length n ->
-      Printf.sprintf "head, length %d" n
+  | Length_only n ->
+      Printf.sprintf "length only %d" n
   | Length n ->
       Printf.sprintf "length %d" n
   | Chunked ->
@@ -1720,7 +1720,7 @@ let response_framing_tests =
             GET 204 with a body        => no body
             GET 304                    => no body
             GET 404 sized              => length 4
-            HEAD 200 sized             => head, length 5
+            HEAD 200 sized             => length only 5
             HEAD 200 stream            => no body
             HEAD 304                   => no body
             CONNECT 200                => no body
@@ -2057,7 +2057,7 @@ let response_body_tests =
             ; ("chunked empty", Chunked, Body.empty)
             ; ("close-delimited", Close_delimited, pieces_source ["ab"; "cd"])
             ; ("no body", No_body, Body.of_string "hidden")
-            ; ("head", Head_length 6, Body.of_string "hidden") ]
+            ; ("head", Length_only 6, Body.of_string "hidden") ]
           in
           expect
             (String.concat "\n"
@@ -2128,7 +2128,7 @@ let response_body_tests =
               equal string ""
                 (fst
                    (write_body framing (Body.of_writer (fun _ -> ran := true))) ) )
-            H1_write.[No_body; Head_length 1] ;
+            H1_write.[No_body; Length_only 1] ;
           equal int 2 !closes ;
           is_true (not !ran) )
     ; test "framings without a body still flush the head" (fun () ->
@@ -2138,7 +2138,7 @@ let response_body_tests =
               Buf_writer.write_string w "HTTP/1.1 204 No Content\r\n\r\n" ;
               H1_write.body w framing Body.empty ;
               equal (list string) ["HTTP/1.1 204 No Content\r\n\r\n"] (calls ()) )
-            H1_write.[No_body; Head_length 5] )
+            H1_write.[No_body; Length_only 5] )
     ; test "the body is closed once, also when writing fails" (fun () ->
           let closes = ref 0 in
           ignore

@@ -5,9 +5,9 @@ type framing =
   | No_body
       (** No body and no framing field: 1xx, 204 and 304 responses, 2xx
           responses to [CONNECT], and upgrades. *)
-  | Head_length of int
-      (** The response to a [HEAD] request whose body length is known: a
-          [Content-Length] field, and no body. *)
+  | Length_only of int
+      (** A [Content-Length] field and no body: the response to a [HEAD] request
+          whose body length is known. *)
   | Length of int  (** A body of this length, with [Content-Length]. *)
   | Chunked  (** A chunked body, for HTTP/1.1 clients. *)
   | Close_delimited
@@ -93,7 +93,7 @@ val body : ?before:(unit -> unit) -> Buf_writer.t -> framing -> Body.t -> unit
     [w]. [before ()] runs once, just before the first byte or flush of the body
     reaches [w]: the engine writes the head from it, so that the response stays
     uncommitted while [b] has produced nothing. Framings:
-    - {!No_body} and {!Head_length} write nothing; a writer body never runs.
+    - {!No_body} and {!Length_only} write nothing; a writer body never runs.
     - [Length n] writes exactly [n] bytes. It raises {!Length_mismatch} before
       writing a byte past [n], or at the end if [b] was shorter.
     - {!Chunked} writes each write of [b] as a chunk, then the last chunk, the
