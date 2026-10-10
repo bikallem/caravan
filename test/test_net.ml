@@ -1301,6 +1301,201 @@ let fake_time_tests =
           equal int ~msg:"the end of the stream" 0
             (Private.Buf_reader.read_into r (Bytes.create 1) 0 1) ;
           within_2s (fun () -> Server.wait server) )
+    ; test "each of 20 idle connections closes on shutdown" (fun () ->
+          (* Each connection waits on its own stop cell (#11): the stop must
+             reach each one. No advance, as above. *)
+          let f = Fake.make () in
+          let pairs = List.init 20 (fun _ -> socket_pair ()) in
+          let clients = List.map snd pairs in
+          with_fake_server f ~clients
+            ( List.map (fun (fd, _) -> Fake_listener.Conn fd) pairs
+            @ [Gate Action.never] )
+          @@ fun _ server _ ->
+          let readers =
+            List.map
+              (fun c ->
+                Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+                let r = Private.Buf_reader.of_flow c in
+                Flow.write_string c (get "/") ;
+                ignore (read_response_from r) ;
+                r )
+              clients
+          in
+          Server.shutdown server ;
+          List.iteri
+            (fun i r ->
+              equal int
+                ~msg:(Printf.sprintf "the end of stream %d" i)
+                0
+                (Private.Buf_reader.read_into r (Bytes.create 1) 0 1) )
+            readers ;
+          within_2s (fun () -> Server.wait server) )
+    ; test "a handler that masks the cancel sees the stop after abort"
+        (fun () ->
+          let f = Fake.make () in
+          let started = Cell.Once.make () and saw = Cell.Once.make () in
+          let handler req =
+            Fun.Async.mask_cancellation (fun () ->
+                Cell.Once.try_set started () ;
+                (* The real limit ends the handler if the stop does not come:
+                   then the test fails, and does not hang. *)
+                match
+                  Action.invoke
+                    (Action.choose
+                       [ Action.map
+                           (fun () -> `Stop)
+                           (Conn_info.stopping (Option.get (Request.conn req)))
+                       ; Affect_unix.Mtime.wait_for' Mtime.Span.(3 * s) `Limit
+                       ] )
+                with
+                | `Stop ->
+                    Cell.Once.try_set saw ()
+                | `Limit ->
+                    () ) ;
+            Response.string "late"
+          in
+          let fd, c = socket_pair () in
+          with_fake_server f ~handler ~clients:[c] [Conn fd; Gate Action.never]
+          @@ fun _ server _ ->
+          Flow.write_string c (get "/") ;
+          within_2s (fun () -> Cell.Once.get started) ;
+          Server.abort server ;
+          within_2s (fun () -> Cell.Once.get saw) ;
+          within_2s (fun () -> Server.wait server) )
+    ; test
+        "a handler that masks the cancel sees the stop when the caller of the \
+         server is cancelled" (fun () ->
+          (* No shutdown: the cancel of the caller stops the server. *)
+          let started = Cell.Once.make () and saw = Atomic.make false in
+          let handler req =
+            Fun.Async.mask_cancellation (fun () ->
+                Cell.Once.try_set started () ;
+                match
+                  Action.invoke
+                    (Action.choose
+                       [ Action.map
+                           (fun () -> `Stop)
+                           (Conn_info.stopping (Option.get (Request.conn req)))
+                       ; Affect_unix.Mtime.wait_for' Mtime.Span.(3 * s) `Limit
+                       ] )
+                with
+                | `Stop ->
+                    Atomic.set saw true
+                | `Limit ->
+                    () ) ;
+            Response.string "late"
+          in
+          let fd, c = socket_pair () in
+          in_main
+          @@ fun () ->
+          let caller =
+            Fun.Async.call (fun () ->
+                let l = Fake_listener.make [Conn fd; Gate Action.never] in
+                let server =
+                  Server.start_with ~config:quiet
+                    (module Fake_listener)
+                    l handler
+                in
+                Server.wait server )
+          in
+          Stdlib.Fun.protect ~finally:(fun () -> Flow.close c)
+          @@ fun () ->
+          Flow.write_string c (get "/") ;
+          within_2s (fun () -> Cell.Once.get started) ;
+          Fun.Async.cancel caller ;
+          (* The masked handler ends at the stop, or after its 3 s limit. With 4
+             domains this test can miss a missing stop: the finally of the
+             connection and that of the supervisor race. With 1 or 2 domains it
+             is deterministic. *)
+          ( match
+              Server_support.within
+                Mtime.Span.(5 * s)
+                (fun () -> Fun.Async.get caller)
+            with
+          | () ->
+              ()
+          | exception Fun.Async.Cancelled ->
+              () ) ;
+          is_true ~msg:"the handler saw the stop" (Atomic.get saw) )
+    ; test
+        "a connection that ends while the server runs does not enable stopping"
+        (fun () ->
+          let f = Fake.make () in
+          let kept = ref None in
+          let handler req =
+            kept := Request.conn req ;
+            Response.string "one"
+          in
+          let fd, c = socket_pair () in
+          with_fake_server f ~handler ~clients:[c] [Conn fd; Gate Action.never]
+          @@ fun _ server _ ->
+          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+          Flow.write_string c (get ~close:true "/") ;
+          ignore (read_response c) ;
+          Flow.close c ;
+          Server_support.eventually ~msg:"the connection ended" (fun () ->
+              Server.open_connections server = 0 ) ;
+          is_true ~msg:"the action is not enabled"
+            (not (Fake.within_50ms (Conn_info.stopping (Option.get !kept)))) )
+    ; test "a response after a shutdown in its handler closes the connection"
+        (fun () ->
+          (* The engine polls the cell of the server when it decides to keep the
+             connection. *)
+          let f = Fake.make () in
+          let server_ref = ref None in
+          let handler _ =
+            Server.shutdown (Option.get !server_ref) ;
+            Response.string "bye"
+          in
+          let fd, c = socket_pair () in
+          with_fake_server f ~handler ~clients:[c] [Conn fd; Gate Action.never]
+          @@ fun _ server _ ->
+          server_ref := Some server ;
+          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+          Flow.write_string c (get "/") ;
+          let fields = ref [] in
+          ignore
+            (read_response_from
+               ~field:(fun l -> fields := String.lowercase_ascii l :: !fields)
+               (Private.Buf_reader.of_flow c) ) ;
+          is_true
+            ~msg:(String.concat "; " !fields)
+            (List.mem "connection: close" !fields) )
+    ; test "an idle connection closes when the listener fails" (fun () ->
+          (* Only the supervisor sets the cells here: no shutdown. No advance:
+             the idle timeout never ends. *)
+          let f = Fake.make () in
+          let fd, c = socket_pair () in
+          let fail = Cell.Once.make () in
+          with_fake_server f ~clients:[c]
+            [Conn fd; Gate (Cell.Once.get' fail); Error EBADF]
+          @@ fun _ _ _ ->
+          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+          let r = Private.Buf_reader.of_flow c in
+          Flow.write_string c (get "/") ;
+          ignore (read_response_from r) ;
+          Cell.Once.try_set fail () ;
+          equal int ~msg:"the end of the stream" 0
+            (Private.Buf_reader.read_into r (Bytes.create 1) 0 1) )
+    ; test "the server forgets each connection that ends" (fun () ->
+          let f = Fake.make () in
+          let pairs = List.init 50 (fun _ -> socket_pair ()) in
+          let clients = List.map snd pairs in
+          with_fake_server f ~clients
+            ( List.map (fun (fd, _) -> Fake_listener.Conn fd) pairs
+            @ [Gate Action.never] )
+          @@ fun _ server _ ->
+          List.iter
+            (fun c ->
+              Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+              Flow.write_string c (get ~close:true "/") ;
+              ignore (read_response c) ;
+              (* The server lingers until the client closes: the fake linger
+                 timeout never ends. *)
+              Flow.close c )
+            clients ;
+          Server_support.eventually ~msg:"no open connection" (fun () ->
+              Server.open_connections server = 0 ) )
     ; test "a connection that the server ends lingers for the linger timeout"
         (fun () ->
           let f = Fake.make () in

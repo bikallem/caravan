@@ -9,10 +9,14 @@ type ctx =
   { config: Config.t  (** The server's configuration. *)
   ; conn: Conn_info.t  (** The connection being served. *)
   ; stopping: unit Affect.Action.t
-        (** Enabled once the server is stopping: an engine finishes the request
-            in progress and stops taking new ones. The server makes it from the
-            same cell as {!Conn_info.stopping} of [conn]. *)
-  ; is_stopping: unit -> bool  (** Whether {!stopping} is enabled. *) }
+        (** Enabled soon after the server starts to stop: an engine finishes the
+            request in progress and stops taking new ones. The server makes it
+            from the same cell as {!Conn_info.stopping} of [conn], one cell for
+            each connection. *)
+  ; is_stopping: unit -> bool
+        (** Whether the server is stopping. It is [true] from the moment the
+            server starts to stop, also a little before {!stopping} is enabled.
+        *) }
 
 (** The type for engines. [engine ctx flow handler] serves the connection [flow]
     until it should close, then returns; the server closes [flow]. *)
