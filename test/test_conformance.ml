@@ -365,7 +365,7 @@ let app_tests =
             rest ""
             GET /fixture/stream HTTP/1.1 => HTTP/1.1 200 OK | Date, Content-Type: text/plain, Transfer-Encoding: chunked | chunked "hello"
             rest ""
-            GET /fixture/upgrade-required HTTP/1.1 => HTTP/1.1 426 Upgrade Required | Date, Content-Type: text/plain; charset=utf-8, Content-Length: 16 | length 16 "upgrade required"
+            GET /fixture/upgrade-required HTTP/1.1 => HTTP/1.1 426 Upgrade Required | Date, Upgrade: example/1, Content-Type: text/plain; charset=utf-8, Content-Length: 16, Connection: Upgrade | length 16 "upgrade required"
             rest ""
             GET /fixture/upgrade HTTP/1.1 => HTTP/1.1 101 Switching Protocols | Date, Upgrade: example/1, Connection: Upgrade | tunnel ""
             rest ""
@@ -1104,26 +1104,25 @@ let probe_tests =
                  check
                    (r.body = "" && framed)
                    "%s %S" (framing r.framing) r.body ) ) )
-    ; xfail ~reason:"G1: the writer drops Upgrade from a 426"
-        (test
-           "send_upgrade_426: a 426 has Upgrade and the upgrade option (RFC \
-            9110 15.5.22, 7.8)" (fun () ->
-             rule ~applies:(is_status [426])
-               ~must:["GET /fixture/upgrade-required"] (fun _ _ r ->
-                 let upgrade_option =
-                   List.exists
-                     (fun c ->
-                       List.exists
-                         (fun o ->
-                           String.lowercase_ascii (String.trim o) = "upgrade" )
-                         (String.split_on_char ',' c) )
-                     (Wire.find_all "Connection" r)
-                 in
-                 check
-                   (Wire.find "Upgrade" r <> None && upgrade_option)
-                   "Upgrade %s, Connection %s"
-                   (Option.value (Wire.find "Upgrade" r) ~default:"none")
-                   (String.concat ", " (Wire.find_all "Connection" r)) ) ) )
+    ; test
+        "send_upgrade_426: a 426 has Upgrade and the upgrade option (RFC 9110 \
+         15.5.22, 7.8)" (fun () ->
+          rule ~applies:(is_status [426])
+            ~must:["GET /fixture/upgrade-required"] (fun _ _ r ->
+              let upgrade_option =
+                List.exists
+                  (fun c ->
+                    List.exists
+                      (fun o ->
+                        String.lowercase_ascii (String.trim o) = "upgrade" )
+                      (String.split_on_char ',' c) )
+                  (Wire.find_all "Connection" r)
+              in
+              check
+                (Wire.find "Upgrade" r <> None && upgrade_option)
+                "Upgrade %s, Connection %s"
+                (Option.value (Wire.find "Upgrade" r) ~default:"none")
+                (String.concat ", " (Wire.find_all "Connection" r)) ) )
     ; test
         "field syntax: each name is a token and no value has NUL, CR or LF \
          (RFC 9110 5.1, 5.5)" (fun () ->

@@ -43,6 +43,8 @@ let field w name value =
 let head w ?date ~version ~keep_alive framing r =
   let status = Response.status r and headers = Response.headers r in
   let upgrade = Status.code status = 101 in
+  (* RFC 9110 §15.5.22: a 426 names the protocols to upgrade to. *)
+  let advertises = Status.code status = 426 && Headers.mem "upgrade" headers in
   Buf_writer.write_string w "HTTP/1.1 " ;
   Buf_writer.write_string w (string_of_int (Status.code status)) ;
   Buf_writer.write_char w ' ' ;
@@ -55,7 +57,8 @@ let head w ?date ~version ~keep_alive framing r =
       () ) ;
   let owned name =
     let name = String.lowercase_ascii name in
-    List.mem name connection_fields && not (upgrade && name = "upgrade")
+    List.mem name connection_fields
+    && not ((upgrade || advertises) && name = "upgrade")
   in
   Headers.iter (fun n v -> if not (owned n) then field w n v) headers ;
   ( match framing with
@@ -65,10 +68,17 @@ let head w ?date ~version ~keep_alive framing r =
       field w "Transfer-Encoding" "chunked"
   | No_body | Close_delimited ->
       () ) ;
-  if upgrade then field w "Connection" "Upgrade"
-  else if (not keep_alive) || framing = Close_delimited then
-    field w "Connection" "close"
-  else if version = Version.Http_1_0 then field w "Connection" "keep-alive" ;
+  (* RFC 9110 §7.8: a sender of Upgrade also sends the upgrade option. *)
+  let options =
+    if upgrade then ["Upgrade"]
+    else
+      (if advertises then ["Upgrade"] else [])
+      @
+      if (not keep_alive) || framing = Close_delimited then ["close"]
+      else if version = Version.Http_1_0 then ["keep-alive"]
+      else []
+  in
+  if options <> [] then field w "Connection" (String.concat ", " options) ;
   Buf_writer.write_string w "\r\n"
 
 (* Requests, for a client *)

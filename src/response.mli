@@ -16,6 +16,11 @@ val make : ?status:Status.t -> ?headers:Headers.t -> Body.t -> t
     {!Status.ok}, [headers] to {!Headers.empty}. The protocol engine adds
     framing fields such as [Content-Length]; handlers do not set them.
 
+    [Upgrade] is a field of the connection. The engine sends it only on a [101]
+    and on a [426] (Upgrade Required), whose [Upgrade] field must name the
+    protocols to upgrade to (RFC 9110 15.5.22). A handler that forwards an
+    upstream [426] thus forwards its [Upgrade] field too.
+
     @raise Invalid_argument
       if [status] is [1xx]: interim responses such as [100 Continue] are the
       protocol engine's to send, and a protocol switch is an {!upgrade}. The

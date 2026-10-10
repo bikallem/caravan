@@ -128,7 +128,9 @@ let accept ?(protocols = []) ?origin ?max_message ?close_timeout ?write_timeout
     refuse "no Connection: upgrade"
   else if Headers.find "sec-websocket-version" h <> Some "13" then
     refuse ~status:Status.upgrade_required
-      ~headers:(Headers.of_list [("Sec-WebSocket-Version", "13")])
+      ~headers:
+        (Headers.of_list
+           [("Upgrade", "websocket"); ("Sec-WebSocket-Version", "13")] )
       "the version must be 13"
   else
     match Headers.find "sec-websocket-key" h with

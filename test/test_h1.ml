@@ -1831,6 +1831,50 @@ let response_head_tests =
             Connection: Upgrade\r\n
             \r\n
             |} )
+    ; test "426 keeps Upgrade and adds the upgrade option (RFC 9110 7.8)"
+        (fun () ->
+          let r =
+            Response.string ~status:Status.upgrade_required
+              ~headers:(hs [("Upgrade", "example/1"); ("Connection", "x")])
+              "!"
+          in
+          expect
+            (String.concat "\n"
+               [ render r
+               ; render ~keep_alive:false r
+               ; render ~version:Version.Http_1_0 r ] )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 426 Upgrade Required\r\n
+            Upgrade: example/1\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 1\r\n
+            Connection: Upgrade\r\n
+            \r\n
+
+            HTTP/1.1 426 Upgrade Required\r\n
+            Upgrade: example/1\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 1\r\n
+            Connection: Upgrade, close\r\n
+            \r\n
+
+            HTTP/1.1 426 Upgrade Required\r\n
+            Upgrade: example/1\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 1\r\n
+            Connection: Upgrade, keep-alive\r\n
+            \r\n
+            |} )
+    ; test "426 without Upgrade gets no upgrade option" (fun () ->
+          expect (render (Response.string ~status:Status.upgrade_required "!"))
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 426 Upgrade Required\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 1\r\n
+            \r\n
+            |} )
     ; test "an unregistered status has an empty reason" (fun () ->
           expect (render (Response.with_status (Status.v 299) (sized "")))
           @@ __POS_OF__

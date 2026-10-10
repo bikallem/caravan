@@ -36,8 +36,8 @@ val accept :
     ({{:https://www.rfc-editor.org/rfc/rfc6455#section-4.2}RFC 6455 §4.2}). If
     [req] is a correct request, the response is a [101] that gives the
     connection to [f]. If not, the response is an error:
-    - [426] with [Sec-WebSocket-Version: 13] if [req] asks for a different
-      version of the protocol.
+    - [426] with [Upgrade: websocket] and [Sec-WebSocket-Version: 13] if [req]
+      asks for a different version of the protocol.
     - [403] if the origin of [req] is not permitted.
     - [400] for other problems: a method that is not [GET], a version that is
       not HTTP/1.1, no [Upgrade: websocket] or [Connection: upgrade] token, no
