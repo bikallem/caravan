@@ -49,8 +49,8 @@ let report (config : Config.t) e =
 (* Accepts a pending connection, if there is one: readiness can be spurious.
    Errors that do not concern the listener are ridden out: a connection that
    failed while queued, or running out of file descriptors, which is reported
-   and waited out. *)
-let accept config (module L : LISTENER) listener =
+   and waited out for 100 ms, or until the stop. *)
+let accept config (module L : LISTENER) listener ~stopping =
   match L.try_accept listener with
   | conn ->
       conn
@@ -60,7 +60,11 @@ let accept config (module L : LISTENER) listener =
         None
     | `Resources ->
         report config e ;
-        Time.sleep config.Config.mono_time Mtime.Span.(100 * ms) ;
+        let time = config.Config.mono_time in
+        Action.invoke
+          (Action.choose
+             [ Time.at time (Time.after time Mtime.Span.(100 * ms)) ()
+             ; Cell.Once.get' stopping ] ) ;
         None
     | `Listener ->
         raise e )
@@ -92,10 +96,14 @@ let serve_connection (config : Config.t) engine handler ~stopping ~own ~id flow
    supervisor, until [stopping] is set. Then closes the listener, so that new
    clients are refused. *)
 let acceptor config (module L : LISTENER) listener ~stopping ~slots handoff =
+  (* The check before the choose does not rely on the order of choose: after a
+     stop, a listener that stays ready does not win again. *)
   let wait action =
-    Action.invoke
-      (Action.choose
-         [Action.map (fun () -> `Stop) (Cell.Once.get' stopping); action] )
+    if Cell.Once.is_set stopping then `Stop
+    else
+      Action.invoke
+        (Action.choose
+           [Action.map (fun () -> `Stop) (Cell.Once.get' stopping); action] )
   in
   let rec loop () =
     match wait (Semaphore.acquire' slots `Slot) with
@@ -108,7 +116,7 @@ let acceptor config (module L : LISTENER) listener ~stopping ~slots handoff =
     | `Stop ->
         Semaphore.release slots
     | `Ready -> (
-      match accept config (module L) listener with
+      match accept config (module L) listener ~stopping with
       | exception e ->
           Semaphore.release slots ; raise e
       | None ->

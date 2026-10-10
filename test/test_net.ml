@@ -1100,8 +1100,7 @@ let fake_config = Server_support.fake_config
 
 (* [with_fake_listener] with the fake time [f] and the config [config] (default
    [fake_config f]). When [test] ends, also by a failure, the fake time advances
-   one day: then each wait on it ends, for example an accept pause, and the
-   server can stop. *)
+   one day: then each wait on it ends, and the server can stop. *)
 let with_fake_server f ?(config = fake_config f) ?handler ?engine ~clients steps
     test =
   with_fake_listener ~config ?handler ?engine ~clients steps
@@ -1155,6 +1154,21 @@ let fake_time_tests =
           equal int ~msg:"calls of try_accept: the EMFILE and the connection" 2
             (List.length (Atomic.get l.calls)) ;
           equal bool true (Server.local_addr server = Unix.ADDR_UNIX "fake") )
+    ; (* No advance of the fake time: only the stop can end the pause. *)
+      test "a shutdown ends the pause after EMFILE at once" (fun () ->
+          let f = Fake.make () in
+          let t0 = Fake.mono_now f and m = Fake.mark f in
+          with_fake_server f ~clients:[] [Error EMFILE; Gate Action.never]
+          @@ fun _ server errors ->
+          Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.(100 * ms)) ;
+          is_true ~msg:"the EMFILE reported before the pause"
+            ( match Atomic.get errors with
+            | [Unix.Unix_error (EMFILE, "accept", _)] ->
+                true
+            | _ ->
+                false ) ;
+          Server.shutdown server ;
+          within_2s (fun () -> Server.wait server) )
     ; test "a head that completes 1 ns before the header timeout gets 200"
         (fun () ->
           let f = Fake.make () in
