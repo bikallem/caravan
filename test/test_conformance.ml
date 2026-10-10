@@ -1143,7 +1143,145 @@ let probe_tests =
                    (List.map (fun (n, v) -> Printf.sprintf "%S: %S" n v) bad) ) ) )
     ]
 
+(* The multi rules (plan 5.3) compare the final responses of two probes. *)
+
+(* [pair_rule ~pairs ~must check] runs [check] on the final responses of each
+   pair of probe labels that [applies] selects. Each label in [must] must be the
+   first label of a pair that applies. *)
+let pair_rule ?(applies = fun _ _ -> true) ~pairs ~must check =
+  let m = matrix () in
+  let final label =
+    match List.find_opt (fun (p, _) -> p.label = label) m with
+    | Some (_, t) ->
+        (t, Wire.final t)
+    | None ->
+        failf "no probe %S" label
+  in
+  let units =
+    List.filter_map
+      (fun (a, b) ->
+        let ((_, ra) as x) = final a and ((_, rb) as y) = final b in
+        if applies ra rb then Some (a, b, x, y) else None )
+      pairs
+  in
+  List.iter
+    (fun label ->
+      if not (List.exists (fun (a, _, _, _) -> a = label) units) then
+        failf "the rule does not apply to the probe %S" label )
+    must ;
+  let violations =
+    List.filter_map
+      (fun (a, b, x, y) ->
+        match check x y with
+        | Ok () ->
+            None
+        | Error m ->
+            Some (Printf.sprintf "%s / %s: %s" a b m) )
+      units
+  in
+  if violations <> [] then
+    failf "%d violations:\n%s" (List.length violations)
+      (String.concat "\n" violations)
+
+let path_labels = ["/"; "random"]
+
+(* HEAD with GET: the same header set and path, and each fixture. *)
+let head_get_pairs =
+  List.concat_map
+    (fun path ->
+      List.map
+        (fun (set, _) ->
+          ( Printf.sprintf "HEAD set %d %s" set path
+          , Printf.sprintf "GET set %d %s" set path ) )
+        header_sets )
+    path_labels
+  @ List.map (fun path -> ("HEAD " ^ path, "GET " ^ path)) fixture_paths
+
+let names (r : Wire.response) ~except =
+  List.sort_uniq compare
+    (List.filter
+       (fun n -> not (List.mem n except))
+       (List.map (fun (n, _) -> String.lowercase_ascii n) r.fields) )
+
+let multi_tests =
+  group "multi rules"
+    [ test
+        "content_length_same_head_get: the Content-Length of a HEAD is that of \
+         the GET (RFC 9110 8.6)" (fun () ->
+          pair_rule ~pairs:head_get_pairs
+            ~applies:(fun h _ -> Wire.find "Content-Length" h <> None)
+            ~must:["HEAD set 1 /"]
+            (fun (_, h) (_, g) ->
+              let cl r = Wire.find "Content-Length" r in
+              check
+                (cl h = cl g)
+                "HEAD %s, GET %s"
+                (Option.value (cl h) ~default:"none")
+                (Option.value (cl g) ~default:"none") ) )
+    ; test
+        "head_get_headers: a HEAD has the status and the field names of the \
+         GET (RFC 9110 9.3.2)" (fun () ->
+          let except =
+            ["content-length"; "vary"; "transfer-encoding"; "content-encoding"]
+          in
+          pair_rule ~pairs:head_get_pairs ~must:(List.map fst head_get_pairs)
+            (fun (_, h) (_, g) ->
+              check
+                (h.code = g.code && names h ~except = names g ~except)
+                "HEAD %d %s, GET %d %s" h.code
+                (String.concat " " (names h ~except))
+                g.code
+                (String.concat " " (names g ~except)) ) )
+    ; test
+        "content_length_same_304_200: no 304 has Content-Length (RFC 9110 8.6)"
+        (fun () ->
+          (* Upstream compares the Content-Length of a 304 with that of a 200.
+             Caravan writes none on a 304, so the test asserts this. *)
+          rule ~applies:(is_status [304])
+            ~must:["GET /fixture/not-modified"; "GET set 5 /"]
+            (absent "Content-Length") )
+    ; test
+        "code_304_headers: a 304 has the Date, Cache-Control, ETag, Expires, \
+         Content-Location and Vary of the 200 (RFC 9110 15.4.5)" (fun () ->
+          let fields =
+            [ "date"
+            ; "cache-control"
+            ; "etag"
+            ; "expires"
+            ; "content-location"
+            ; "vary" ]
+          in
+          let pairs =
+            List.concat_map
+              (fun meth ->
+                List.concat_map
+                  (fun path ->
+                    List.map
+                      (fun set ->
+                        ( Printf.sprintf "%s set %d %s" meth set path
+                        , Printf.sprintf "%s set 1 %s" meth path ) )
+                      [4; 5; 6; 7] )
+                  path_labels )
+              ["GET"; "HEAD"]
+          in
+          pair_rule ~pairs
+            ~applies:(fun r _ -> r.code = 304)
+            ~must:["GET set 5 /"; "HEAD set 5 /"]
+            (fun (_, r304) (_, r200) ->
+              let missing =
+                List.filter
+                  (fun n -> Wire.find n r200 <> None && Wire.find n r304 = None)
+                  fields
+              in
+              check (missing = []) "missing %s" (String.concat ", " missing) ) )
+    ]
+
 let () =
   exit
     (run "conformance"
-       [wire_tests; memory_server_tests; app_tests; direct_tests; probe_tests] )
+       [ wire_tests
+       ; memory_server_tests
+       ; app_tests
+       ; direct_tests
+       ; probe_tests
+       ; multi_tests ] )
