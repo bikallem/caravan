@@ -1878,8 +1878,8 @@ let response_head_tests =
             |} )
     ; test "a 2xx tunnel gets no Connection field" (fun () ->
           (* After the head the connection is a tunnel: keep-alive has no
-             meaning, and close (RFC 9112 9.6) would end it. The handler's
-             fields are dropped. *)
+             meaning, and close (RFC 9112 9.6) would end it. The writer drops
+             the fields of the handler. *)
           let r =
             Response.upgrade ~status:Status.ok
               ~headers:
