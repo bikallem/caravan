@@ -2051,10 +2051,23 @@ let name = function
 (* The handler of the tests: "/id" gives the id of the connection, "/conn" the
    Connection field and the id, and the others go to the handler of
    Server_support. *)
+(* The cell that lets the second half of /two-part go. *)
+let two_part_go = ref (Cell.Once.make ())
+
 let api_handler req =
   match Request.path_only req with
   | "/id" ->
       id_handler req
+  | "/two-part" ->
+      (* Half of the body, then the rest when the test lets it go. *)
+      let c = Option.value (Request.query req) ~default:"x" in
+      let go = !two_part_go in
+      Response.stream (fun w ->
+          Body.Writer.write_string w
+            (String.concat "" (List.init 50 (fun _ -> c))) ;
+          Body.Writer.flush w ;
+          Cell.Once.get go ;
+          Body.Writer.write_string w (String.make 50 'z') )
   | "/long-head" ->
       Response.string
         ~headers:(Headers.of_list [("X-Long", String.make 6000 'h')])
@@ -2271,9 +2284,22 @@ let api_tests =
           equal string
             (String.make 50 'b' ^ String.make 50 'z')
             (Fun.Async.get b) )
+    ; test "two responses wait half read in their buffers at the same time"
+        (fun () ->
+          (* Each response is half read when the other one comes in. A read
+             buffer that two connections share mixes the two responses. *)
+          with_client
+          @@ fun client url ->
+          two_part_go := Cell.Once.make () ;
+          let a = C.get client (url ^ "/two-part?a") in
+          let b = C.get client (url ^ "/two-part?b") in
+          Cell.Once.try_set !two_part_go () ;
+          equal string (String.make 50 'a' ^ String.make 50 'z') (text a) ;
+          equal string (String.make 50 'b' ^ String.make 50 'z') (text b) )
     ; test "a response head larger than the read buffer" (fun () ->
           with_client
           @@ fun client url ->
+          let id0 = get_text client (url ^ "/id") in
           List.iter
             (fun _ ->
               let resp = C.get client (url ^ "/long-head") in
@@ -2283,7 +2309,8 @@ let api_tests =
                       (Headers.find "X-Long" (Response.headers resp)) ) ) ;
               equal string "long" (text resp) )
             [1; 2] ;
-          equal string "hello" (get_text client (url ^ "/hello")) )
+          equal string "hello" (get_text client (url ^ "/hello")) ;
+          equal string ~msg:"one connection" id0 (get_text client (url ^ "/id")) )
     ; test "two exchanges at the same time on two connections" (fun () ->
           with_client
           @@ fun client url ->

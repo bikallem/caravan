@@ -9,21 +9,22 @@ module Writer = struct
 
   let check w name =
     if not w.live then
-      invalid_arg
-        ("Body.Writer." ^ name ^ ": the producer of the body has returned")
+      invalid_arg (name ^ ": the producer of the body has returned")
 
   let write w buf off len =
-    check w "write" ;
+    check w "Body.Writer.write" ;
     if off < 0 || len < 0 || off > Bytes.length buf - len then
       invalid_arg "Body.Writer.write: invalid range" ;
     if len > 0 then w.write buf off len
 
   let write_string w s = write w (Bytes.unsafe_of_string s) 0 (String.length s)
 
-  let flush w = check w "flush" ; w.flush ()
+  let flush w =
+    check w "Body.Writer.flush" ;
+    w.flush ()
 
   let set_trailers w h =
-    check w "set_trailers" ;
+    check w "Body.Writer.set_trailers" ;
     w.trailers <- h
 
   let trailers w = w.trailers
@@ -104,6 +105,7 @@ let read b buf off len =
 let chunk_size = 16384
 
 let write_to b w =
+  Writer.check w "Body.write_to" ;
   match b.kind with
   | Empty ->
       ()
@@ -127,20 +129,16 @@ let write_to b w =
       copy () ;
       if not (Headers.is_empty b.trailers) then Writer.set_trailers w b.trailers
   | Producer produce ->
-      Writer.check w "write_to" ;
       if Atomic.exchange b.closed true then
         invalid_arg "Body.write_to: body already written out or closed" ;
       (* The producer gets its own writer, which stops when it returns: a write
          after that must not reach [w], whose sink can serve a later message of
          the connection. It writes through the checks of [w], so that it also
-         stops when [w] stops (a nested producer). It starts with the trailers
-         of [w]. *)
+         stops when [w] stops (a nested producer). *)
       let own =
-        { (Writer.make
-             ~write:(fun buf off len -> Writer.write w buf off len)
-             ~flush:(fun () -> Writer.flush w) )
-          with
-          trailers= w.trailers }
+        Writer.make
+          ~write:(fun buf off len -> Writer.write w buf off len)
+          ~flush:(fun () -> Writer.flush w)
       in
       ( match produce own with
       | () ->
@@ -148,7 +146,10 @@ let write_to b w =
       | exception e ->
           own.live <- false ;
           raise e ) ;
-      w.trailers <- own.trailers ;
+      (* As for a source: trailers replace those of [w] only if there are
+         some. *)
+      if not (Headers.is_empty own.trailers) then
+        Writer.set_trailers w own.trailers ;
       b.finished <- true ;
       b.trailers <- own.trailers
 

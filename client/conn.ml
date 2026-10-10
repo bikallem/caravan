@@ -13,8 +13,9 @@ type t =
            it gives the connection back, and a request body that ends after the
            response keeps the connection until its writer ends
            (Writers.when_done). The writer of a body producer stops when the
-           producer returns, so a producer cannot write into a later
-           exchange. *)
+           producer returns. A write that a different fiber of the producer
+           started before the return can still end after it (see
+           Body.of_writer): such a producer can write into a later exchange. *)
   ; mutable released_at: Mtime.t
         (* The time of the last release. Pool.release sets it before the
            connection goes idle, and only idle connections read it. *) }

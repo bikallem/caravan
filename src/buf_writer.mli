@@ -10,7 +10,7 @@ val make : ?size:int -> ?buffer:bytes -> (bytes -> int -> int -> unit) -> t
 
     With [buffer], the writer uses these bytes as its buffer, and [size] is
     their length. The caller must not use them, or give them to a different
-    writer, until it stops to use this writer.
+    writer, while this writer can use them.
 
     @raise Invalid_argument
       if [size <= 0], if [buffer] is empty, or if [size] and [buffer] are both

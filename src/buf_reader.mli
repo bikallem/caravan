@@ -28,8 +28,8 @@ val make :
 
     With [buffer], the reader uses these bytes as its first buffer, and [size]
     is their length. The caller must not use them, or give them to a different
-    reader, until it stops to use this reader. If the reader grows, it uses a
-    new buffer and no longer uses [buffer].
+    reader, while this reader can use them. If the reader grows, it uses a new
+    buffer and no longer uses [buffer].
 
     @raise Invalid_argument
       if [size <= 0], if [buffer] is empty, or if [size] and [buffer] are both

@@ -784,7 +784,12 @@ let body_tests =
               Body.write_to
                 (Body.of_writer (fun w2 -> Body.Writer.write_string w2 "LATE"))
                 own ) ;
-          equal (list string) ["abc"] (events ()) )
+          equal (list string) ["abc"] (events ()) ;
+          (* write_to refuses a stopped writer for each kind of body. *)
+          List.iter
+            (fun b ->
+              raises_match is_invalid_arg (fun () -> Body.write_to b own) )
+            [Body.empty; Body.of_string ""; Body.of_string "abc"] )
     ; test "a writer body keeps the trailers that the sink has" (fun () ->
           let w, _ = recording_writer () in
           Body.write_to

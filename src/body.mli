@@ -121,8 +121,8 @@ val write_to : t -> Writer.t -> unit
     {!Writer.flush} after each chunk it produces, so that streamed data and
     proxied responses reach the peer without delay. A writer body runs its
     producer on a writer of its own, which writes into [w] and stops when the
-    producer returns (see {!of_writer}). The trailers that the body sets go to
-    [w].
+    producer returns (see {!of_writer}). The trailers of the body, if there are
+    some, replace those of [w].
 
     @raise Invalid_argument
       if [b] is a writer body that was already written out, if [b] was closed,
