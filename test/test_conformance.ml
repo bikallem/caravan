@@ -556,7 +556,7 @@ let direct_tests =
         "continue_before_upgrade: with a body that the handler does not read, \
          the result is 500 (not an upstream case)" (fun () ->
           (* No 101 goes out, so RFC 9110 7.8 does not apply. This records the
-             behavior until the issue of the plan is fixed. *)
+             behavior until issue #23 is fixed. *)
           let input =
             direct ~connection:"Connection: upgrade\r\n"
               ~additional:
