@@ -747,6 +747,35 @@ let body_tests =
           is_true (Headers.equal trailers_x (Body.Writer.trailers w)) ;
           is_true (Headers.equal trailers_x (Body.trailers b)) ;
           raises_match is_invalid_arg (fun () -> Body.write_to b w) )
+    ; test "the writer of a producer stops when the producer returns" (fun () ->
+          let kept = ref None in
+          let keep w =
+            kept := Some w ;
+            Body.Writer.write_string w "abc"
+          in
+          let w, events = recording_writer () in
+          Body.write_to (Body.of_writer keep) w ;
+          let own = Option.get !kept in
+          raises_match is_invalid_arg (fun () ->
+              Body.Writer.write_string own "late" ) ;
+          raises_match is_invalid_arg (fun () -> Body.Writer.flush own) ;
+          raises_match is_invalid_arg (fun () ->
+              Body.Writer.set_trailers own trailers_x ) ;
+          equal (list string) ["abc"] (events ()) ;
+          (* Also after the producer raises. *)
+          let raising w =
+            kept := Some w ;
+            failwith "producer"
+          in
+          let w, events = recording_writer () in
+          raises (Failure "producer") (fun () ->
+              Body.write_to (Body.of_writer raising) w ) ;
+          raises_match is_invalid_arg (fun () ->
+              Body.Writer.write_string (Option.get !kept) "late" ) ;
+          equal (list string) [] (events ()) ;
+          (* The sink of the consumer stays usable. *)
+          Body.Writer.write_string w "next" ;
+          equal (list string) ["next"] (events ()) )
     ; test "a closed writer body never runs" (fun () ->
           let ran = ref false in
           let b = Body.of_writer (fun _ -> ran := true) in

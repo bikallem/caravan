@@ -88,6 +88,11 @@ val of_writer : ?length:int -> (Writer.t -> unit) -> t
     if known. [produce] may call {!Writer.flush} to send what it wrote so far,
     for example between events of a stream.
 
+    [produce] gets a writer of its own, which stops when [produce] returns or
+    raises: a later {!Writer.write}, {!Writer.flush} or {!Writer.set_trailers}
+    on it raises [Invalid_argument]. Thus a producer that keeps its writer
+    cannot write into a later message of the connection.
+
     @raise Invalid_argument if [length] is negative. *)
 
 (** {1:consume Consuming bodies} *)

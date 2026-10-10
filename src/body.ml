@@ -2,20 +2,29 @@ module Writer = struct
   type t =
     { write: bytes -> int -> int -> unit
     ; flush: unit -> unit
-    ; mutable trailers: Headers.t }
+    ; mutable trailers: Headers.t
+    ; mutable live: bool (* false once the producer that got it returned *) }
 
-  let make ~write ~flush = {write; flush; trailers= Headers.empty}
+  let make ~write ~flush = {write; flush; trailers= Headers.empty; live= true}
+
+  let check w name =
+    if not w.live then
+      invalid_arg
+        ("Body.Writer." ^ name ^ ": the producer of the body has returned")
 
   let write w buf off len =
+    check w "write" ;
     if off < 0 || len < 0 || off > Bytes.length buf - len then
       invalid_arg "Body.Writer.write: invalid range" ;
     if len > 0 then w.write buf off len
 
   let write_string w s = write w (Bytes.unsafe_of_string s) 0 (String.length s)
 
-  let flush w = w.flush ()
+  let flush w = check w "flush" ; w.flush ()
 
-  let set_trailers w h = w.trailers <- h
+  let set_trailers w h =
+    check w "set_trailers" ;
+    w.trailers <- h
 
   let trailers w = w.trailers
 end
@@ -120,9 +129,19 @@ let write_to b w =
   | Producer produce ->
       if Atomic.exchange b.closed true then
         invalid_arg "Body.write_to: body already written out or closed" ;
-      produce w ;
+      (* The producer gets its own writer, which stops when it returns: a write
+         after that must not reach [w], whose sink can serve a later message of
+         the connection. *)
+      let own = Writer.make ~write:w.write ~flush:w.flush in
+      ( match produce own with
+      | () ->
+          own.live <- false
+      | exception e ->
+          own.live <- false ;
+          raise e ) ;
+      w.trailers <- own.trailers ;
       b.finished <- true ;
-      b.trailers <- Writer.trailers w
+      b.trailers <- own.trailers
 
 let to_string ?(max = max_int) b =
   let out = Buffer.create 256 in
