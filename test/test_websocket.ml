@@ -325,8 +325,20 @@ top bit: protocol error: length with its top bit set
             else f ~fin opcode payload
           in
           let r = Buf_reader.of_string ~size ~chunk (encode ?mask fr) in
-          equal frame fr (Frame.read r ~masked:(mask <> None) ~max:300) ;
-          is_true (Buf_reader.peek_eof r) ) ]
+          (* The parts that on_data gets: not empty, in order, and the payload,
+             unmasked. None for a control frame. *)
+          let parts = Buffer.create 64 and empty = ref false in
+          let on_data op buf off len =
+            equal string (opcode_name opcode) (opcode_name op) ;
+            if len = 0 then empty := true ;
+            Buffer.add_subbytes parts buf off len
+          in
+          equal frame fr (Frame.read ~on_data r ~masked:(mask <> None) ~max:300) ;
+          is_true (Buf_reader.peek_eof r) ;
+          is_true ~msg:"no empty part" (not !empty) ;
+          equal string
+            (if Frame.is_control opcode then "" else fr.payload)
+            (Buffer.contents parts) ) ]
 
 module Ws = Caravan_websocket
 

@@ -19,10 +19,22 @@ exception Error of error
 val is_control : opcode -> bool
 (** [is_control op] is [true] for [Close], [Ping] and [Pong]. *)
 
-val read : Buf_reader.t -> masked:bool -> max:int -> t
-(** [read r ~masked ~max] reads a frame. The payload of a data frame is at most
-    [max] bytes. The payload of a control frame is at most 125 bytes, whatever
-    [max] is. A server reads with [~masked:true], a client with [~masked:false].
+val read :
+     ?on_data:(opcode -> bytes -> int -> int -> unit)
+  -> Buf_reader.t
+  -> masked:bool
+  -> max:int
+  -> t
+(** [read ~on_data r ~masked ~max] reads a frame. The payload of a data frame is
+    at most [max] bytes. The payload of a control frame is at most 125 bytes,
+    whatever [max] is. A server reads with [~masked:true], a client with
+    [~masked:false].
+
+    For a data frame, [on_data opcode buf off len] gets each part of the payload
+    that a read gives, unmasked, in order, before the next read: the [len] bytes
+    of [buf] from [off], at most valid until [on_data] returns. The parts are
+    not empty and make the whole payload. An exception from [on_data] goes out
+    of [read]: the frame is then not read to its end.
 
     @raise Error
       if the frame has a reserved bit or opcode, is a control frame that is

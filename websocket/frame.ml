@@ -46,12 +46,26 @@ let is_control = function
   | Continuation | Text | Binary ->
       false
 
-(* XORs [len] bytes of [buf] from [off] with the 4-byte [key]. Masking and
-   unmasking are the same operation. The loop does 8 bytes at a time with the
-   key two times in a 64-bit word, then the remaining bytes. *)
-let apply_mask key buf off len =
+(* XORs [len] bytes of [buf] from [off] with the 4-byte [key], from the byte
+   [phase] of the key: a range that starts at the position [p] of a payload has
+   the phase [p land 3]. Masking and unmasking are the same operation. The loop
+   does 8 bytes at a time with the key two times in a 64-bit word, then the
+   remaining bytes. *)
+let apply_mask ?(phase = 0) key buf off len =
   let k =
     Int64.logand (Int64.of_int32 (String.get_int32_le key 0)) 0xffff_ffffL
+  in
+  (* The byte [j] of the word is the byte [j + phase] of the key: a turn of the
+     little-endian word by [phase] bytes. *)
+  let k =
+    if phase = 0 then k
+    else
+      let s = 8 * phase in
+      Int64.logand
+        (Int64.logor
+           (Int64.shift_right_logical k s)
+           (Int64.shift_left k (32 - s)) )
+        0xffff_ffffL
   in
   let k = Int64.logor k (Int64.shift_left k 32) in
   let words = len / 8 in
@@ -60,7 +74,10 @@ let apply_mask key buf off len =
     Bytes.set_int64_le buf i (Int64.logxor (Bytes.get_int64_le buf i) k)
   done ;
   for i = 8 * words to len - 1 do
-    let b = Char.code (Bytes.get buf (off + i)) lxor Char.code key.[i land 3] in
+    let b =
+      Char.code (Bytes.get buf (off + i))
+      lxor Char.code key.[(i + phase) land 3]
+    in
     Bytes.set buf (off + i) (Char.chr b)
   done
 
@@ -71,9 +88,11 @@ let rec really_read r buf off len =
     really_read r buf (off + n) (len - n)
   end
 
-(* Reads [len] bytes. The buffer grows as the bytes arrive, thus a peer that
-   declares a large length and sends no payload does not take that memory. *)
-let read_payload r len =
+(* Reads [len] bytes, unmasked with [key] if it is not [""]. The buffer grows as
+   the bytes arrive, thus a peer that declares a large length and sends no
+   payload does not take that memory. Each part that a read gives goes to
+   [on_data] after its unmask, before the next read. *)
+let read_payload r ~key ~on_data len =
   let rec loop buf pos =
     if pos = len then buf
     else begin
@@ -83,12 +102,14 @@ let read_payload r len =
       in
       let n = Buf_reader.read_into r buf pos (Bytes.length buf - pos) in
       if n = 0 then raise End_of_file ;
+      if key <> "" then apply_mask ~phase:(pos land 3) key buf pos n ;
+      on_data buf pos n ;
       loop buf (pos + n)
     end
   in
   loop (Bytes.create (Int.min len 65536)) 0
 
-let read r ~masked ~max =
+let read ?on_data r ~masked ~max =
   let hdr = Bytes.create 8 in
   really_read r hdr 0 2 ;
   let b0 = Bytes.get_uint8 hdr 0 and b1 = Bytes.get_uint8 hdr 1 in
@@ -119,8 +140,14 @@ let read r ~masked ~max =
   let key =
     if masked then (really_read r hdr 0 4 ; Bytes.sub_string hdr 0 4) else ""
   in
-  let payload = read_payload r len in
-  if masked then apply_mask key payload 0 len ;
+  let on_data =
+    match on_data with
+    | Some f when not (is_control opcode) ->
+        f opcode
+    | _ ->
+        fun _ _ _ -> ()
+  in
+  let payload = read_payload r ~key ~on_data len in
   {fin; opcode; payload= Bytes.unsafe_to_string payload}
 
 let write ?mask w {fin; opcode; payload} =
