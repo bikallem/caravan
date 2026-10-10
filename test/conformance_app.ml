@@ -83,6 +83,13 @@ let fixture req =
            "upgrade required" )
   | "/fixture/upgrade" ->
       Some (upgrade req)
+  | "/fixture/upgrade-other" ->
+      Some
+        ( if Headers.mem "Upgrade" (Request.headers req) then
+            Response.upgrade
+              ~headers:(Headers.of_list [("Upgrade", "other/1")])
+              (fun _ -> ())
+          else Response.string "no upgrade" )
   | "/fixture/fail" ->
       failwith "the fixture fails"
   | _ ->

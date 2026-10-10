@@ -1,6 +1,8 @@
 (** The application that the conformance tests serve (plan D1). It obeys the
     rules that the application controls, so that each violation that the tests
-    find is a violation of caravan. It examines the method before the path:
+    find is a violation of caravan. Only some fixtures break a rule on purpose,
+    to show that the engine refuses or repairs the response. It examines the
+    method before the path:
 
     - An unknown method: 501.
     - CONNECT: a 200 tunnel. The handler sets [Content-Length: 0] and
@@ -26,4 +28,8 @@ val handler : fixtures:bool -> Caravan.Handler.t
     - [/fixture/upgrade-required]: a 426 with [Upgrade: example/1].
     - [/fixture/upgrade]: a 101 to the first protocol that the request offers in
       [Upgrade], and the tunnel ends at once. Without [Upgrade]: 200.
+    - [/fixture/upgrade-other]: a 101 to [other/1], a protocol that no test
+      offers, if the request has [Upgrade]. Else 200. The engine must refuse it.
+      A request with [Upgrade] and without [Connection: upgrade] makes the
+      engine report an error that the tests do not expect.
     - [/fixture/fail]: the handler raises [Failure]. *)

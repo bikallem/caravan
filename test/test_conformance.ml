@@ -20,15 +20,20 @@ let config =
 
 let date = "Sun, 06 Nov 1994 08:49:37 GMT"
 
-(* Only /fixture/fail makes the engine report an error. *)
-let expected_error = Printexc.to_string (Failure "the fixture fails")
+(* The errors that the fixtures make the engine report. *)
+let expected_errors =
+  [ Printexc.to_string (Failure "the fixture fails")
+  ; Printexc.to_string
+      (Failure
+         "Response.upgrade: 101 to a protocol that the request did not offer: \
+          other/1" ) ]
 
 let serve ?(fixtures = true) inputs =
   errors := [] ;
   let outs =
     Memory_server.serve ~config (Conformance_app.handler ~fixtures) inputs
   in
-  ( match List.filter (fun e -> e <> expected_error) !errors with
+  ( match List.filter (fun e -> not (List.mem e expected_errors)) !errors with
   | [] ->
       ()
   | es ->
@@ -381,6 +386,10 @@ let app_tests =
                      [("Connection", "upgrade"); ("Upgrade", "example/1, b/2")]
                    "/fixture/upgrade"
                ; r "/fixture/upgrade"
+               ; r
+                   ~headers:[("Connection", "upgrade"); ("Upgrade", "example/1")]
+                   "/fixture/upgrade-other"
+               ; r "/fixture/upgrade-other"
                ; r "/fixture/fail"
                ; r "/missing" ] )
           @@ __POS_OF__
@@ -398,6 +407,10 @@ let app_tests =
             GET /fixture/upgrade HTTP/1.1 => HTTP/1.1 101 Switching Protocols | Date, Upgrade: example/1, Connection: Upgrade | tunnel ""
             rest ""
             GET /fixture/upgrade HTTP/1.1 => HTTP/1.1 200 OK | Date, Content-Type: text/plain; charset=utf-8, Content-Length: 10 | length 10 "no upgrade"
+            rest ""
+            GET /fixture/upgrade-other HTTP/1.1 => HTTP/1.1 500 Internal Server Error | Date, Content-Type: text/plain; charset=utf-8, Content-Length: 22, Connection: close | length 22 "Internal Server Error\n"
+            rest "" [FIN]
+            GET /fixture/upgrade-other HTTP/1.1 => HTTP/1.1 200 OK | Date, Content-Type: text/plain; charset=utf-8, Content-Length: 10 | length 10 "no upgrade"
             rest ""
             GET /fixture/fail HTTP/1.1 => HTTP/1.1 500 Internal Server Error | Date, Content-Type: text/plain; charset=utf-8, Content-Length: 22, Connection: close | length 22 "Internal Server Error\n"
             rest "" [FIN]
@@ -729,6 +742,10 @@ let probes () =
         (request
            ~headers:[("Connection", "upgrade"); ("Upgrade", "example/1")]
            "GET" "/fixture/upgrade" )
+    ; probe "upgrade-other" "GET"
+        (request
+           ~headers:[("Connection", "upgrade"); ("Upgrade", "example/1")]
+           "GET" "/fixture/upgrade-other" )
     ; probe ~v10:true "1.0 GET /" "GET"
         (httpx_request ~v:"HTTP/1.0" "GET" "/" 1)
     ; probe ~v10:true "1.0 GET /fixture/stream" "GET"
@@ -967,14 +984,56 @@ let repeatable =
   ; "www-authenticate"
   ; "pragma" ]
 
+(* The trimmed elements of comma-separated field values. *)
+let elements values =
+  List.filter
+    (fun e -> e <> "")
+    (List.map String.trim (List.concat_map (String.split_on_char ',') values))
+
+(* The protocols that a raw request offers in its Upgrade fields. *)
+let offers input =
+  let rec fields = function
+    | [] | "" :: _ ->
+        []
+    | line :: rest -> (
+      match String.index_opt line ':' with
+      | Some i
+        when String.lowercase_ascii (String.trim (String.sub line 0 i))
+             = "upgrade" ->
+          String.sub line (i + 1) (String.length line - i - 1) :: fields rest
+      | _ ->
+          fields rest )
+  in
+  (* The lines after the request line, to the empty line. *)
+  let lines = String.split_on_char '\n' input in
+  let lines =
+    List.map
+      (fun l ->
+        if String.ends_with ~suffix:"\r" l then
+          String.sub l 0 (String.length l - 1)
+        else l )
+      lines
+  in
+  elements (fields (List.tl lines))
+
+(* Whether [a] and [b] name the same protocol: the names (before the first '/')
+   without case, the versions as text. *)
+let same_protocol a b =
+  let split p =
+    match String.index_opt p '/' with
+    | Some i ->
+        ( String.lowercase_ascii (String.sub p 0 i)
+        , Some (String.sub p (i + 1) (String.length p - i - 1)) )
+    | None ->
+        (String.lowercase_ascii p, None)
+  in
+  split a = split b
+
 (* Whether the Connection fields of [r] have the option [o]. *)
 let has_option o r =
   List.exists
-    (fun c ->
-      List.exists
-        (fun x -> String.lowercase_ascii (String.trim x) = o)
-        (String.split_on_char ',' c) )
-    (Wire.find_all "Connection" r)
+    (fun x -> String.lowercase_ascii x = o)
+    (elements (Wire.find_all "Connection" r))
 
 let not_interim _ (r : Wire.response) = r.code >= 200 || r.code = 101
 
@@ -1061,6 +1120,33 @@ let probe_tests =
     ; test "send_upgrade_101: a 101 has Upgrade (RFC 9110 7.8)" (fun () ->
           rule ~applies:(is_status [101]) ~must:["upgrade"] (fun _ _ r ->
               check (Wire.find "Upgrade" r <> None) "no Upgrade" ) )
+    ; test
+        "switch_protocol_without_client: the engine refuses a 101 to a \
+         protocol that the request did not offer" (fun () ->
+          let _, t =
+            List.find (fun (p, _) -> p.label = "upgrade-other") (matrix ())
+          in
+          let r = Wire.final t in
+          equal int 500 r.code ;
+          is_true ~msg:"the connection closes" t.fin )
+    ; test
+        "switch_protocol_without_client: a 101 names only protocols that the \
+         request offered (RFC 9110 7.8)" (fun () ->
+          (* Upstream compares the two fields as text. The test compares each
+             protocol: the names without case, the versions as text. Its oracle
+             reads the raw request, not the parser of caravan. Its version rule
+             is the one of the engine (a choice: RFC 9110 has none). The probe
+             "upgrade-other" gets a 101 to a protocol that it did not offer if
+             the engine does not refuse it. *)
+          rule ~applies:(is_status [101]) ~must:["upgrade"] (fun p _ r ->
+              let offered = offers p.input in
+              let unknown =
+                List.filter
+                  (fun x -> not (List.exists (same_protocol x) offered))
+                  (elements (Wire.find_all "Upgrade" r))
+              in
+              check (unknown = []) "not offered: %s"
+                (String.concat ", " unknown) ) )
     ; test
         "date_header_required: caravan sends Date on each response that is not \
          1xx (RFC 9110 6.6.1)" (fun () ->
