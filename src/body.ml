@@ -127,12 +127,21 @@ let write_to b w =
       copy () ;
       if not (Headers.is_empty b.trailers) then Writer.set_trailers w b.trailers
   | Producer produce ->
+      Writer.check w "write_to" ;
       if Atomic.exchange b.closed true then
         invalid_arg "Body.write_to: body already written out or closed" ;
       (* The producer gets its own writer, which stops when it returns: a write
          after that must not reach [w], whose sink can serve a later message of
-         the connection. *)
-      let own = Writer.make ~write:w.write ~flush:w.flush in
+         the connection. It writes through the checks of [w], so that it also
+         stops when [w] stops (a nested producer). It starts with the trailers
+         of [w]. *)
+      let own =
+        { (Writer.make
+             ~write:(fun buf off len -> Writer.write w buf off len)
+             ~flush:(fun () -> Writer.flush w) )
+          with
+          trailers= w.trailers }
+      in
       ( match produce own with
       | () ->
           own.live <- false

@@ -9,7 +9,12 @@ type t =
   ; write_buf: bytes
         (* The buffers of the reader and the writer of each exchange. The pool
            gives the connection to one exchange at a time, so one exchange at a
-           time uses them. *)
+           time uses them. An exchange does not touch its reader or writer after
+           it gives the connection back, and a request body that ends after the
+           response keeps the connection until its writer ends
+           (Writers.when_done). The writer of a body producer stops when the
+           producer returns, so a producer cannot write into a later
+           exchange. *)
   ; mutable released_at: Mtime.t
         (* The time of the last release. Pool.release sets it before the
            connection goes idle, and only idle connections read it. *) }

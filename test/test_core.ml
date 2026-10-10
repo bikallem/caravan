@@ -775,7 +775,23 @@ let body_tests =
           equal (list string) [] (events ()) ;
           (* The sink of the consumer stays usable. *)
           Body.Writer.write_string w "next" ;
-          equal (list string) ["next"] (events ()) )
+          equal (list string) ["next"] (events ()) ;
+          (* A stopped writer given to a nested producer stops it too. *)
+          let w, events = recording_writer () in
+          Body.write_to (Body.of_writer keep) w ;
+          let own = Option.get !kept in
+          raises_match is_invalid_arg (fun () ->
+              Body.write_to
+                (Body.of_writer (fun w2 -> Body.Writer.write_string w2 "LATE"))
+                own ) ;
+          equal (list string) ["abc"] (events ()) )
+    ; test "a writer body keeps the trailers that the sink has" (fun () ->
+          let w, _ = recording_writer () in
+          Body.write_to
+            (Body.of_writer (fun o -> Body.Writer.set_trailers o trailers_x))
+            w ;
+          Body.write_to (Body.of_writer (fun _ -> ())) w ;
+          is_true (Headers.equal trailers_x (Body.Writer.trailers w)) )
     ; test "a closed writer body never runs" (fun () ->
           let ran = ref false in
           let b = Body.of_writer (fun _ -> ran := true) in

@@ -1749,11 +1749,14 @@ let pool_tests =
           eventually ~msg:"the connection is back in the pool" (fun () ->
               Pool.idle_hosts pool = 1 ) ;
           let sent = String.init 9000 (fun i -> Char.chr (97 + (i mod 26))) in
-          equal string sent
-            (Body.to_string
-               (body
-                  (pooled pool writers ~port
-                     (req ~meth:Method.POST ~body:(Body.of_string sent) "/echo") ) ) ) )
+          let c, tag = Pool.checkout pool ~host:"127.0.0.1" ~port in
+          is_true ~msg:"the same connection" (tag = `Reused) ;
+          let resp =
+            Exchange.run Client_config.default writers c
+              ~on_release:(fun c ~reusable -> Pool.release pool c ~reusable)
+              (req ~meth:Method.POST ~body:(Body.of_string sent) "/echo")
+          in
+          equal string sent (Body.to_string (body resp)) )
     ; test "two requests in sequence use one connection" (fun () ->
           with_pool
           @@ fun pool writers port ->
@@ -2052,6 +2055,10 @@ let api_handler req =
   match Request.path_only req with
   | "/id" ->
       id_handler req
+  | "/long-head" ->
+      Response.string
+        ~headers:(Headers.of_list [("X-Long", String.make 6000 'h')])
+        "long"
   | "/conn" ->
       Response.string
         ( Option.value ~default:"-"
@@ -2175,22 +2182,34 @@ let api_tests =
                   (post (fun w ->
                        kept := Some w ;
                        Body.Writer.write_string w "one" ) ) ) ) ;
-          let late = ref "" in
+          let late = ref "" and nested = ref "" in
           let second =
             text
               (C.request client
                  (post (fun w ->
                       Body.Writer.write_string w "hello" ;
-                      match
-                        Body.Writer.write_string (Option.get !kept) "XXXX"
-                      with
+                      ( match
+                          Body.Writer.write_string (Option.get !kept) "XXXX"
+                        with
                       | () ->
                           late := "went through"
                       | exception Invalid_argument _ ->
-                          late := "refused" ) ) )
+                          late := "refused" ) ;
+                      (* The stopped writer given to a nested writer body. *)
+                      match
+                        Body.write_to
+                          (Body.of_writer (fun w2 ->
+                               Body.Writer.write_string w2 "YYYY" ) )
+                          (Option.get !kept)
+                      with
+                      | () ->
+                          nested := "went through"
+                      | exception Invalid_argument _ ->
+                          nested := "refused" ) ) )
           in
           equal string "hello" second ;
           equal string "refused" !late ;
+          equal string "refused" !nested ;
           equal string ~msg:"one connection" id0 (get_text client (url ^ "/id")) )
     ; test "a response that arrives while request bytes wait in the buffer"
         (fun () ->
@@ -2218,6 +2237,53 @@ let api_tests =
           in
           Cell.Once.try_set go_on () ;
           equal string (x ^ y ^ z) (text resp) )
+    ; test "two exchanges hold request bytes in their buffers at the same time"
+        (fun () ->
+          (* Each producer leaves bytes unsent in its write buffer and waits. A
+             buffer that two connections share mixes the two requests. *)
+          with_client
+          @@ fun client url ->
+          let port = port_of url in
+          let echo c ~waiting ~go_on =
+            Fun.Async.call (fun () ->
+                let first = String.make 50 c and second = String.make 50 'z' in
+                let produce w =
+                  Body.Writer.write_string w first ;
+                  Cell.Once.try_set waiting () ;
+                  Cell.Once.get go_on ;
+                  Body.Writer.write_string w second
+                in
+                text
+                  (C.request client
+                     (at_port port ~meth:Method.POST
+                        ~body:(Body.of_writer produce) "/echo" ) ) )
+          in
+          let wa = Cell.Once.make () and wb = Cell.Once.make () in
+          let go_on = Cell.Once.make () in
+          let a = echo 'a' ~waiting:wa ~go_on in
+          within_2s (fun () -> Cell.Once.get wa) ;
+          let b = echo 'b' ~waiting:wb ~go_on in
+          within_2s (fun () -> Cell.Once.get wb) ;
+          Cell.Once.try_set go_on () ;
+          equal string
+            (String.make 50 'a' ^ String.make 50 'z')
+            (Fun.Async.get a) ;
+          equal string
+            (String.make 50 'b' ^ String.make 50 'z')
+            (Fun.Async.get b) )
+    ; test "a response head larger than the read buffer" (fun () ->
+          with_client
+          @@ fun client url ->
+          List.iter
+            (fun _ ->
+              let resp = C.get client (url ^ "/long-head") in
+              equal int 6000
+                (String.length
+                   (Option.value ~default:""
+                      (Headers.find "X-Long" (Response.headers resp)) ) ) ;
+              equal string "long" (text resp) )
+            [1; 2] ;
+          equal string "hello" (get_text client (url ^ "/hello")) )
     ; test "two exchanges at the same time on two connections" (fun () ->
           with_client
           @@ fun client url ->

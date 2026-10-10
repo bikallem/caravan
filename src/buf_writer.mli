@@ -9,7 +9,8 @@ val make : ?size:int -> ?buffer:bytes -> (bytes -> int -> int -> unit) -> t
     default. The buffer is allocated by the first write that needs it.
 
     With [buffer], the writer uses these bytes as its buffer, and [size] is
-    their length. The caller must not use them while the writer uses them.
+    their length. The caller must not use them, or give them to a different
+    writer, until it stops to use this writer.
 
     @raise Invalid_argument
       if [size <= 0], if [buffer] is empty, or if [size] and [buffer] are both
