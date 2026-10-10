@@ -90,6 +90,10 @@ module type LISTENER = sig
   val close : t -> unit
 end
 
+val open_connections : t -> int
+(** [open_connections s] is the number of connections that [s] serves at this
+    time. *)
+
 val start_with :
      ?config:Config.t
   -> ?engine:Engine.t

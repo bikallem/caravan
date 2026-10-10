@@ -37,11 +37,13 @@ val alpn : t -> string option
 
 val stopping : t -> unit Affect.Action.t
 (** [stopping c] is an action that is enabled when the server starts to stop:
-    after {!Server.shutdown} or {!Server.abort}, the first signal of
-    {!Server.run}, or a failure of the listener. It stays enabled. A handler
-    that runs for a long time, for example a stream of events or a WebSocket
-    handler, can choose it with its other actions. Then the handler can end
-    before the server cancels it at the end of [shutdown_grace]. *)
+    soon after {!Server.shutdown} or {!Server.abort}, the first signal of
+    {!Server.run}, or a failure of the listener. "Soon" is one step of the
+    server's supervisor, which sets the action of each connection. It stays
+    enabled. A handler that runs for a long time, for example a stream of events
+    or a WebSocket handler, can choose it with its other actions. Then the
+    handler can end before the server cancels it at the end of [shutdown_grace].
+*)
 
 val pp_addr : Format.formatter -> Unix.sockaddr -> unit
 (** [pp_addr] formats a socket address as [host:port], [[ipv6]:port] or a Unix

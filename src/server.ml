@@ -13,12 +13,33 @@ module type LISTENER = sig
   val close : t -> unit
 end
 
+(* The stop cells of the open connections, by id. A connection waits on its own
+   cell, not on the cell of the server: in affect 0.0.0 each new waiter of a
+   Cell.Once copies all the waiters, so one shared cell costs each wait time in
+   proportion to the open connections (#11). The supervisor adds each connection
+   and sets all the cells at the stop. No effect runs under the lock. *)
+type registry = {lock: Mutex.t; cells: (int, unit Cell.Once.t) Hashtbl.t}
+
+let register reg id c =
+  Mutex.protect reg.lock (fun () -> Hashtbl.replace reg.cells id c)
+
+let unregister reg id =
+  Mutex.protect reg.lock (fun () -> Hashtbl.remove reg.cells id)
+
+let broadcast reg =
+  let cells =
+    Mutex.protect reg.lock (fun () ->
+        Hashtbl.fold (fun _ c acc -> c :: acc) reg.cells [] )
+  in
+  List.iter (fun c -> Cell.Once.try_set c ()) cells
+
 type t =
   { addr: Unix.sockaddr
   ; acceptor: unit Fun.Async.t
   ; supervisor: unit Fun.Async.t
   ; grace: unit Fun.Async.t
-  ; stopping: unit Cell.Once.t }
+  ; stopping: unit Cell.Once.t
+  ; registry: registry }
 
 let report (config : Config.t) e =
   config.on_error e (Printexc.get_raw_backtrace ())
@@ -42,16 +63,19 @@ let accept config (module L : LISTENER) listener =
     | `Listener ->
         raise e )
 
-let serve_connection (config : Config.t) engine handler ~stopping ~id flow
+(* [own] is the stop cell of the connection, for the actions that wait. A poll
+   reads the cell of the server: it adds no waiter, and it sees the stop at
+   once. *)
+let serve_connection (config : Config.t) engine handler ~stopping ~own ~id flow
     (fd, peer) =
   let local = try Unix.getsockname fd with Unix.Unix_error _ -> peer in
   let conn =
-    Conn_info.make ~id ~peer ~local ~stopping:(Cell.Once.get' stopping) ()
+    Conn_info.make ~id ~peer ~local ~stopping:(Cell.Once.get' own) ()
   in
   let ctx =
     { Engine.config
     ; conn
-    ; stopping= Cell.Once.get' stopping
+    ; stopping= Cell.Once.get' own
     ; is_stopping= (fun () -> Cell.Once.is_set stopping) }
   in
   match engine ctx flow handler with
@@ -100,7 +124,7 @@ let acceptor config (module L : LISTENER) listener ~stopping ~slots handoff =
 
 (* Owns the connections: each one is an asynchronous call of the supervisor,
    which therefore returns only once they have all finished. *)
-let supervisor config engine handler ~stopping ~slots handoff =
+let supervisor config engine handler ~stopping ~registry ~slots handoff =
   let conn = Action.map (fun c -> `Conn c) (Port.take' handoff) in
   let stop = Action.map (fun () -> `Stop) (Cell.Once.get' stopping) in
   let rec loop id =
@@ -108,15 +132,30 @@ let supervisor config engine handler ~stopping ~slots handoff =
     | `Stop ->
         ()
     | `Conn conn ->
+        let own = Cell.Once.make () in
+        (* Added before the call starts. The supervisor also sets the cells at
+           the stop, so each connection that it starts sees the stop. *)
+        register registry id own ;
         Fun.Async.call_trap_exn (fun () ->
             let flow = Tcp.flow ~time:config.Config.mono_time (fst conn) in
             Fun.Async.protect
-              ~finally:(fun () -> Flow.close flow ; Semaphore.release slots)
+              ~finally:(fun () ->
+                unregister registry id ;
+                Flow.close flow ;
+                Semaphore.release slots )
               (fun () ->
-                serve_connection config engine handler ~stopping ~id flow conn ) ) ;
+                serve_connection config engine handler ~stopping ~own ~id flow
+                  conn ) ) ;
         loop (id + 1)
   in
-  loop 0
+  (* The supervisor ends at a stop or a cancel (abort, the end of the grace, a
+     cancel of the server's caller). In each case the connections see the
+     stop. *)
+  Fun.Async.protect
+    ~finally:(fun () ->
+      Cell.Once.try_set stopping () ;
+      broadcast registry )
+    (fun () -> loop 0)
 
 let start_with ?(config = Config.default) ?(engine = H1_server.serve)
     (module L : LISTENER) listener handler =
@@ -130,10 +169,11 @@ let start_with ?(config = Config.default) ?(engine = H1_server.serve)
         Printexc.raise_with_backtrace e bt
   in
   let stopping = Cell.Once.make () in
+  let registry = {lock= Mutex.create (); cells= Hashtbl.create 64} in
   let handoff = Port.make () in
   let supervisor =
     Fun.Async.call (fun () ->
-        supervisor config engine handler ~stopping ~slots handoff )
+        supervisor config engine handler ~stopping ~registry ~slots handoff )
   in
   let acceptor =
     Fun.Async.call (fun () ->
@@ -166,7 +206,7 @@ let start_with ?(config = Config.default) ?(engine = H1_server.serve)
           when not (Fun.Async.is_current_cancelled ()) ->
             () )
   in
-  {addr; acceptor; supervisor; grace; stopping}
+  {addr; acceptor; supervisor; grace; stopping; registry}
 
 let start ?(config = Config.default) ?engine handler =
   let listener = Tcp.Listener.listen ~backlog:config.backlog config.addr in
@@ -174,7 +214,14 @@ let start ?(config = Config.default) ?engine handler =
 
 let local_addr s = s.addr
 
-let shutdown s = Cell.Once.try_set s.stopping ()
+let open_connections s =
+  Mutex.protect s.registry.lock (fun () -> Hashtbl.length s.registry.cells)
+
+(* The cells of the open connections are set here at once, and again by the
+   supervisor when it ends, for a connection that it adds at the same time. *)
+let shutdown s =
+  Cell.Once.try_set s.stopping () ;
+  broadcast s.registry
 
 let abort s =
   shutdown s ;
