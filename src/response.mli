@@ -26,8 +26,8 @@ val make : ?status:Status.t -> ?headers:Headers.t -> Body.t -> t
 
     A [304] (Not Modified) has no content, and the engine does not send its
     [Content-Type], [Content-Encoding], [Content-Language] and [Content-Range]
-    fields (RFC 9110 15.4.5): a cache updates its stored response from a 304.
-    {!headers} still has them. A handler cannot send them on a 304.
+    fields (RFC 9110 15.4.5, 14.4): a cache updates its stored response from a
+    304. {!headers} keeps them. A handler cannot send them on a 304.
 
     @raise Invalid_argument
       if [status] is [1xx]: interim responses such as [100 Continue] are the
@@ -86,7 +86,8 @@ val kind : t -> kind
 (** [kind r] is what follows the head of [r]. *)
 
 val with_status : Status.t -> t -> t
-(** [with_status s r] is [r] with status [s].
+(** [with_status s r] is [r] with status [s]. A [304] does not send some fields
+    of [r] (see {!make}).
 
     @raise Invalid_argument
       if [s] is not allowed for [r]'s {!kind}: [1xx] for a body, anything but

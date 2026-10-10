@@ -1876,7 +1876,17 @@ let response_head_tests =
             Connection: Upgrade, keep-alive\r\n
             \r\n
             |} )
-    ; test "a 304 does not send four metadata fields (RFC 9110 15.4.5)"
+    ; test "426 without Upgrade gets no upgrade option" (fun () ->
+          expect (render (Response.string ~status:Status.upgrade_required "!"))
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 426 Upgrade Required\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 1\r\n
+            \r\n
+            |} )
+    ; test
+        "a 304 does not send four fields of the handler (RFC 9110 15.4.5, 14.4)"
         (fun () ->
           let fields =
             [ ("Content-Type", "text/html")
@@ -1926,7 +1936,7 @@ let response_head_tests =
             X-Other: 1\r\n
             \r\n
             |} )
-    ; test "other responses send the four metadata fields" (fun () ->
+    ; test "other responses send the four fields" (fun () ->
           let fields =
             hs
               [ ("Content-Type", "text/html")
@@ -1964,15 +1974,6 @@ let response_head_tests =
             Content-Encoding: gzip\r\n
             Content-Language: en\r\n
             Content-Range: bytes 0-1/2\r\n
-            \r\n
-            |} )
-    ; test "426 without Upgrade gets no upgrade option" (fun () ->
-          expect (render (Response.string ~status:Status.upgrade_required "!"))
-          @@ __POS_OF__
-               {|
-            HTTP/1.1 426 Upgrade Required\r\n
-            Content-Type: text/plain; charset=utf-8\r\n
-            Content-Length: 1\r\n
             \r\n
             |} )
     ; test "an unregistered status has an empty reason" (fun () ->

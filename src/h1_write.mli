@@ -36,9 +36,9 @@ val head :
     - The fields of [r], in order, except those the connection owns:
       [Content-Length], [Transfer-Encoding], [Connection], [Keep-Alive],
       [Proxy-Connection], [TE], and [Upgrade] except on a 101 or a 426 response.
-      On a 304 also [Content-Type], [Content-Encoding], [Content-Language] and
-      [Content-Range] (RFC 9110 §15.4.5, §14.4): a cache updates its stored
-      response from a 304.
+      Also, on a 304, the writer drops [Content-Type], [Content-Encoding],
+      [Content-Language] and [Content-Range] (RFC 9110 §15.4.5, §14.4): a cache
+      updates its stored response from a 304.
     - The framing field of [framing], if any.
     - [Connection: Upgrade] on a 101 response. Otherwise a [Connection] field
       with these options, if any, in this order: [Upgrade] if a 426 has an

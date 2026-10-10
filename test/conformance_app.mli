@@ -22,7 +22,7 @@ val handler : fixtures:bool -> Caravan.Handler.t
       [Transfer-Encoding: chunked] and gives the body [hello].
     - [/fixture/not-modified]: a 304 with the body [hello] and the fields
       [Content-Type], [Content-Encoding], [Content-Language] and
-      [Content-Range], which the engine must not send.
+      [Content-Range], which the engine does not send.
     - [/fixture/reset-content]: a 205 with the body [hello].
     - [/fixture/stream]: [hello] as a stream with no length.
     - [/fixture/upgrade-required]: a 426 with [Upgrade: example/1].
