@@ -12,3 +12,6 @@ _build/
 
 # Autobahn test suite reports
 autobahn/reports/
+
+# HTTP conformance test suite reports
+conformance/reports/
