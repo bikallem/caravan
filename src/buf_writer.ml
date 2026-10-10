@@ -4,9 +4,22 @@ type t =
   ; mutable buf: bytes (* empty until the first buffered byte *)
   ; mutable len: int (* buffered bytes, from 0 *) }
 
-let make ?(size = 4096) write =
+let make ?size ?buffer write =
+  let size =
+    match (size, buffer) with
+    | Some _, Some _ ->
+        invalid_arg "Buf_writer.make: size and buffer are exclusive"
+    | _, Some b when Bytes.length b = 0 ->
+        invalid_arg "Buf_writer.make: buffer must not be empty"
+    | _, Some b ->
+        Bytes.length b
+    | Some s, None ->
+        s
+    | None, None ->
+        4096
+  in
   if size <= 0 then invalid_arg "Buf_writer.make: size must be positive" ;
-  {write; size; buf= Bytes.empty; len= 0}
+  {write; size; buf= Option.value buffer ~default:Bytes.empty; len= 0}
 
 let ensure_buffer w =
   if Bytes.length w.buf = 0 then w.buf <- Bytes.create w.size

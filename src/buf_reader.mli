@@ -15,17 +15,24 @@ exception Bad_line_ending
 
 val make :
      ?size:int
+  -> ?buffer:bytes
   -> ?read_now:(bytes -> int -> int -> int option)
   -> (bytes -> int -> int -> int)
   -> t
-(** [make ~size ~read_now read] reads from [read buf off len], which returns the
-    number of bytes it read, at most [len > 0], and [0] at the end of the input.
-    [read_now] is like [read] but returns [None] rather than block, for
-    {!fill_now}; by default [read] is taken never to block. [size] is the
-    initial buffer size, 4 KiB by default. The buffer is allocated by the first
-    read that needs it, and grows to hold long lines.
+(** [make ~size ~buffer ~read_now read] reads from [read buf off len], which
+    returns the number of bytes it read, at most [len > 0], and [0] at the end
+    of the input. [read_now] is like [read] but returns [None] rather than
+    block, for {!fill_now}; by default [read] is taken never to block. [size] is
+    the initial buffer size, 4 KiB by default. The buffer is allocated by the
+    first read that needs it, and grows to hold long lines.
 
-    @raise Invalid_argument if [size <= 0]. *)
+    With [buffer], the reader uses these bytes as its first buffer, and [size]
+    is their length. The caller must not use them while the reader uses them. If
+    the reader grows, it uses a new buffer and no longer uses [buffer].
+
+    @raise Invalid_argument
+      if [size <= 0], if [buffer] is empty, or if [size] and [buffer] are both
+      given. *)
 
 val of_flow : ?size:int -> Flow.t -> t
 (** [of_flow ~size flow] reads from [flow]. *)
@@ -74,7 +81,8 @@ val take_buffered : t -> string
 (** [take_buffered r] consumes and returns the buffered bytes. *)
 
 val capacity : t -> int
-(** [capacity r] is the size of [r]'s buffer, [0] until it is allocated. *)
+(** [capacity r] is the size of [r]'s buffer, [0] until it is allocated. With a
+    [buffer] given to {!make}, the buffer is there from the start. *)
 
 val consumed : t -> int
 (** [consumed r] is the number of bytes consumed from [r] so far. *)

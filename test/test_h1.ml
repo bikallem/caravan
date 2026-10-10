@@ -44,6 +44,30 @@ let buf_reader_tests =
             (Buf_reader.capacity r) ;
           equal string "89abcdefghij" (Buf_reader.read_line r ~max:100) ;
           equal int ~msg:"grown for a long line" 16 (Buf_reader.capacity r) )
+    ; test "a given buffer is used from the start, until the reader grows"
+        (fun () ->
+          let buffer = Bytes.make 16 '.' in
+          let input = "abc\r\n0123456789abcdefghijklmnop\r\n" in
+          let pos = ref 0 in
+          let r =
+            Buf_reader.make ~buffer (fun buf off len ->
+                let n = Int.min len (String.length input - !pos) in
+                Bytes.blit_string input !pos buf off n ;
+                pos := !pos + n ;
+                n )
+          in
+          equal int 16 (Buf_reader.capacity r) ;
+          equal string "abc" (Buf_reader.read_line r ~max:100) ;
+          equal string ~msg:"the first read went into the given bytes"
+            "abc\r\n0123456789a" (Bytes.to_string buffer) ;
+          equal string "0123456789abcdefghijklmnop"
+            (Buf_reader.read_line r ~max:100) ;
+          equal int ~msg:"grown for a long line" 32 (Buf_reader.capacity r) ;
+          let read _ _ _ = 0 in
+          raises_match is_invalid_arg (fun () ->
+              Buf_reader.make ~size:8 ~buffer read ) ;
+          raises_match is_invalid_arg (fun () ->
+              Buf_reader.make ~buffer:Bytes.empty read ) )
     ; test "lines without their CRLF" (fun () ->
           equal (list string)
             ["GET / HTTP/1.1"; "Host: x"; ""]
@@ -1586,6 +1610,24 @@ let buf_writer_tests =
           Buf_writer.write_string w "abc" ;
           equal int 8 (Buf_writer.capacity w) ;
           equal (list string) ["12345678"] (calls ()) )
+    ; test "a given buffer is used from the start" (fun () ->
+          let buffer = Bytes.make 8 '.' in
+          let calls = ref [] in
+          let w =
+            Buf_writer.make ~buffer (fun buf off len ->
+                calls := Bytes.sub_string buf off len :: !calls )
+          in
+          equal int 8 (Buf_writer.capacity w) ;
+          Buf_writer.write_string w "abc" ;
+          equal string ~msg:"the write went into the given bytes" "abc....."
+            (Bytes.to_string buffer) ;
+          Buf_writer.flush w ;
+          equal (list string) ["abc"] (List.rev !calls) ;
+          let write _ _ _ = () in
+          raises_match is_invalid_arg (fun () ->
+              Buf_writer.make ~size:8 ~buffer write ) ;
+          raises_match is_invalid_arg (fun () ->
+              Buf_writer.make ~buffer:Bytes.empty write ) )
     ; test "writes are buffered until flush" (fun () ->
           let w, calls = recorded () in
           Buf_writer.write_string w "HTTP/1.1 200 OK\r\n" ;
