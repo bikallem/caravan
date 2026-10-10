@@ -1702,8 +1702,9 @@ let server_tests =
             (Some
                "Caravan_websocket__Connection.Closed(1001, \"server shutdown\")"
             ) (Atomic.get recorded) )
-    ; test "a stop before the handler starts sends the 101, then Close 1001"
-        (fun () ->
+    ; test
+        "a stop before the handler gives its response: 503, and no WebSocket \
+         connection" (fun () ->
           let open Affect in
           started := Cell.Once.make () ;
           let config = {Server_support.config with shutdown_grace= ms 30_000} in
@@ -1711,19 +1712,53 @@ let server_tests =
             (Server_support.with_server ~config ~handler:server_handler
                (fun server ->
                  (* The response comes only after the stop. *)
-                 let s = Fun.Async.call (fun () -> session server "/late") in
+                 let s =
+                   Fun.Async.call (fun () ->
+                       let flow =
+                         Caravan.Tcp.connect (Caravan.Server.local_addr server)
+                       in
+                       Stdlib.Fun.protect ~finally:(fun () ->
+                           Caravan.Flow.close flow )
+                       @@ fun () ->
+                       Caravan.Flow.write_string flow (upgrade_request "/late") ;
+                       let r = Buf_reader.of_flow flow in
+                       let head = response_head r in
+                       let buf = Bytes.create 256 and body = Buffer.create 64 in
+                       let rec rest () =
+                         match Buf_reader.read_into r buf 0 256 with
+                         | 0 ->
+                             ()
+                         | n ->
+                             Buffer.add_subbytes body buf 0 n ;
+                             rest ()
+                       in
+                       rest () ;
+                       String.concat "\n" (head @ ["--"; Buffer.contents body]) )
+                 in
                  within_2s (fun () -> Cell.Once.get !started) ;
                  Caravan.Server.shutdown server ;
                  within_2s (fun () -> Fun.Async.get s) ) )
           @@ __POS_OF__
                {|
-            HTTP/1.1 101 Switching Protocols
-            Upgrade: websocket
-            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
-            Connection: Upgrade
+            HTTP/1.1 503 Service Unavailable
+            Content-Type: text/plain; charset=utf-8
+            Content-Length: 20
+            Connection: close
             --
-            close 1001 "server shutdown"
+            Service Unavailable
             |} )
+    ; test "a stop that is already set when the handler starts: Close 1001"
+        (fun () ->
+          (* A stop can start while the engine writes the 101, after its last
+             check: the handler then starts with the stop set. *)
+          let input = client Close (code_reason 1001 "") in
+          let out = Buffer.create 16 in
+          Affect_unix.Unix.main ~domain_count:1 (fun () ->
+              within_2s (fun () ->
+                  run_handler ~stopping:(Affect.Action.always ())
+                    (fun c -> try ignore (Ws.recv c) with Ws.Closed _ -> ())
+                    (Caravan.Flow.of_string input out) ) ) ;
+          equal (list string) ["close 1001"] (frames (Buffer.contents out)) )
     ; test "the end of the handler stops the wait for the stop" (fun () ->
           let input = client Close (code_reason 1000 "") in
           let out = Buffer.create 16 in

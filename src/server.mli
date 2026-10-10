@@ -31,8 +31,10 @@ val shutdown : t -> unit
     are refused, and idle connections close. Requests in progress get
     [config.shutdown_grace] to finish, their responses ending their connections;
     then they are cancelled. A handler can see the stop with
-    {!Conn_info.stopping}. [shutdown] returns at once; see {!wait}. It takes a
-    lock: do not call it from an OCaml signal handler. *)
+    {!Conn_info.stopping}. A response that would switch protocols (an upgrade or
+    a tunnel) gets a [503] in place of the switch (see {!Response.upgrade}).
+    [shutdown] returns at once; see {!wait}. It takes a lock: do not call it
+    from an OCaml signal handler. *)
 
 val abort : t -> unit
 (** [abort s] is like {!shutdown} but cancels the connections in progress at

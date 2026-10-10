@@ -80,13 +80,16 @@ val accept :
     A [Cancelled] from a call that [f] made goes to the server as a [Failure].
     [accept] does not accept extensions.
 
-    When the server starts to stop ({!Caravan.Conn_info.stopping}), [accept]
-    does as {!close} with the code 1001 and the reason ["server shutdown"]. Thus
-    {!recv} raises {!Closed} with the reply of the peer, or with 1006 at the
-    close timeout. {!send} and {!ping} raise {!Closed} at once, thus [f] cannot
-    send a last message. When [f] ends, [accept] waits for the end of this
-    closing handshake. If [f] does not end, the server cancels it at the end of
-    its [shutdown_grace]. A cancel of [f] does not send a Close frame.
+    If the server starts to stop before the engine writes the head of the 101,
+    the client gets a [503] and [f] does not run (see
+    {!Caravan.Response.upgrade}). Else, when the server starts to stop
+    ({!Caravan.Conn_info.stopping}), [accept] does as {!close} with the code
+    1001 and the reason ["server shutdown"]. Thus {!recv} raises {!Closed} with
+    the reply of the peer, or with 1006 at the close timeout. {!send} and
+    {!ping} raise {!Closed} at once, thus [f] cannot send a last message. When
+    [f] ends, [accept] waits for the end of this closing handshake. If [f] does
+    not end, the server cancels it at the end of its [shutdown_grace]. A cancel
+    of [f] does not send a Close frame.
 
     @raise Invalid_argument if [max_message] is negative. *)
 

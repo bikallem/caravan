@@ -68,7 +68,9 @@ let flushed = ref (Cell.Once.make ())
 (* The writer that /keep-writer keeps after its producer returns. *)
 let kept_writer = ref None
 
-(* Set by /stop, as a server stopping while its response is written. *)
+(* Set by /stop (a server that stops while its response is written), and by
+   /ws-stopping, /ws-bare-stopping and the CONNECT to stopping.example (a server
+   that stops while the handler runs). *)
 let stopping = ref false
 
 let handler req =
@@ -78,6 +80,9 @@ let handler req =
         Response.string "not a tunnel"
     | Some "denied.example:443" ->
         Response.string ~status:Status.forbidden "denied"
+    | Some "stopping.example:443" ->
+        stopping := true ;
+        Response.upgrade ~status:Status.ok echo_upgraded
     | _ ->
         Response.upgrade ~status:Status.ok echo_upgraded
   else
@@ -151,6 +156,13 @@ let handler req =
         Response.upgrade
           ~headers:(Headers.of_list [("Upgrade", protocols)])
           echo_upgraded
+    | "/ws-stopping" ->
+        (* The server starts to stop while the handler runs. *)
+        stopping := true ;
+        Response.upgrade ~headers:upgrade_echo echo_upgraded
+    | "/ws-bare-stopping" ->
+        stopping := true ;
+        Response.upgrade echo_upgraded
     | "/ws-read" ->
         ignore (Body.to_string (Request.body req)) ;
         Response.upgrade ~headers:upgrade_echo echo_upgraded
@@ -1517,6 +1529,188 @@ let upgrade_tests =
             Internal Server Error
             [FIN]
             ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: other")
+            |} )
+    ; test "a server that stops opens no new upgrade: 503 (#26)" (fun () ->
+          let ws_stopping ?(headers = []) () =
+            ws
+              ~headers:
+                ([("Upgrade", "echo"); ("Connection", "Upgrade")] @ headers)
+              "/ws-stopping"
+          in
+          expect
+            (String.concat "\n---\n"
+               [ show (ws_stopping () ^ "early bytes")
+               ; show
+                   ( ws_stopping
+                       ~headers:[expect_100; ("Content-Length", "5")]
+                       ()
+                   ^ "hello" )
+               ; show ~config:small_drain
+                   (ws_stopping ~headers:[("Content-Length", "4")] () ^ "abcd")
+               ; show (ws_stopping () ^ get "/")
+               ; show
+                   "CONNECT stopping.example:443 HTTP/1.1\r\n\
+                    Host: stopping.example:443\r\n\
+                    \r\n\
+                    tunnel bytes"
+               ; show
+                   (ws
+                      ~headers:[("Upgrade", "echo"); ("Connection", "Upgrade")]
+                      "/ws-bare-stopping" ) ] )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 503 Service Unavailable\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 20\r\n
+            Connection: close\r\n
+            \r\n
+            Service Unavailable
+            [FIN]
+            ---
+            HTTP/1.1 503 Service Unavailable\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 20\r\n
+            Connection: close\r\n
+            \r\n
+            Service Unavailable
+            [FIN]
+            ---
+            HTTP/1.1 503 Service Unavailable\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 20\r\n
+            Connection: close\r\n
+            \r\n
+            Service Unavailable
+            [FIN]
+            ---
+            HTTP/1.1 503 Service Unavailable\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 20\r\n
+            Connection: close\r\n
+            \r\n
+            Service Unavailable
+            [FIN]
+            ---
+            HTTP/1.1 503 Service Unavailable\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 20\r\n
+            Connection: close\r\n
+            \r\n
+            Service Unavailable
+            [FIN]
+            ---
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Failure("Response.upgrade: 101 without an Upgrade field")
+            |} )
+    ; test "a stop at the 100: 503 after the 100 (#26)" (fun () ->
+          (* The stop starts when the engine writes the 100: the second check,
+             just before the switch, sees it. *)
+          let input =
+            ws
+              ~headers:
+                [ ("Upgrade", "echo")
+                ; ("Connection", "Upgrade")
+                ; expect_100
+                ; ("Content-Length", "5") ]
+              "/ws"
+            ^ "hello"
+          in
+          let out = Buffer.create 256 and stop = ref false in
+          let inner = Flow.of_string input out in
+          let flow =
+            Flow.make ~time:(Flow.time inner) ~read:(Flow.read inner)
+              ~read_now:(Flow.read_now inner)
+              ~write:(fun buf off len ->
+                Flow.write inner buf off len ;
+                if
+                  Bytes.sub_string buf off len = "HTTP/1.1 100 Continue\r\n\r\n"
+                then stop := true )
+              ~readable:(Flow.readable' inner ()) ~shutdown_send:ignore
+              ~close:ignore ~set_read_deadline:ignore ~set_write_deadline:ignore
+              ()
+          in
+          Affect_unix.Unix.main ~domain_count:1 (fun () ->
+              let ctx =
+                { Engine.config=
+                    { Config.default with
+                      date_header= false
+                    ; cancel_on_disconnect= false }
+                ; conn
+                ; stopping= Action.never
+                ; is_stopping= (fun () -> !stop) }
+              in
+              Private.H1_server.serve ctx flow handler ) ;
+          expect (show_crlf (Buffer.contents out))
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 100 Continue\r\n
+            \r\n
+            HTTP/1.1 503 Service Unavailable\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 20\r\n
+            Connection: close\r\n
+            \r\n
+            Service Unavailable
+            |} )
+    ; test "a stop during the drain of the body: 503 (#26)" (fun () ->
+          (* The head comes in one read, the body in the next one, and the stop
+             starts at that read: only the check after the drain sees it. *)
+          let head =
+            ws
+              ~headers:
+                [ ("Upgrade", "echo")
+                ; ("Connection", "Upgrade")
+                ; ("Content-Length", "5") ]
+              "/ws"
+          in
+          let parts = ref [head; "ZZZZZ"] and stop = ref false in
+          let out = Buffer.create 256 in
+          let read buf off len =
+            match !parts with
+            | [] ->
+                0
+            | p :: rest ->
+                if p = "ZZZZZ" then stop := true ;
+                let n = Int.min len (String.length p) in
+                Bytes.blit_string p 0 buf off n ;
+                parts :=
+                  if n = String.length p then rest
+                  else String.sub p n (String.length p - n) :: rest ;
+                n
+          in
+          let flow =
+            Flow.make ~time:Time.mono ~read
+              ~read_now:(fun b o l -> Some (read b o l))
+              ~write:(fun buf off len -> Buffer.add_subbytes out buf off len)
+              ~readable:(Action.always ()) ~shutdown_send:ignore ~close:ignore
+              ~set_read_deadline:ignore ~set_write_deadline:ignore ()
+          in
+          Affect_unix.Unix.main ~domain_count:1 (fun () ->
+              let ctx =
+                { Engine.config=
+                    { Config.default with
+                      date_header= false
+                    ; cancel_on_disconnect= false }
+                ; conn
+                ; stopping= Action.never
+                ; is_stopping= (fun () -> !stop) }
+              in
+              Private.H1_server.serve ctx flow handler ) ;
+          expect (show_crlf (Buffer.contents out))
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 503 Service Unavailable\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 20\r\n
+            Connection: close\r\n
+            \r\n
+            Service Unavailable
             |} )
     ; test "101 hands over the connection, with the bytes already received"
         (fun () ->

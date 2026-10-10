@@ -77,6 +77,16 @@ val upgrade : ?status:Status.t -> ?headers:Headers.t -> (Flow.t -> unit) -> t
     only if a body is still owed. If the rest of the body is known to be larger
     than [Config.max_drain], the client gets a [500] with no [100].
 
+    While the server stops, the engine makes no switch: the client gets a [503]
+    (Service Unavailable) and the connection closes. The engine examines this
+    when the response arrives and again just before it writes the head. A stop
+    can start after this last check, while the head is written or after the
+    switch. Thus [f] must choose {!Conn_info.stopping} with its other actions.
+
+    Thus [f] runs only if the switch happens: on a [503], a [500], or a client
+    that left, it never runs. Put the setup that [f] must release (for example
+    the connection to an upstream of a tunnel) inside [f].
+
     @raise Invalid_argument if [status] is neither [101] nor [2xx]. *)
 
 val status : t -> Status.t

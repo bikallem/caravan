@@ -243,6 +243,10 @@ let serve : Engine.t =
         | Some e ->
             report (Failure ("Response.upgrade: " ^ e)) ;
             fail_500 head
+        (* A server that stops opens no new upgrade or tunnel (#26), and sends
+           no 100 for it. *)
+        | None when ctx.is_stopping () ->
+            fail_503 head
         (* A body known to be too large to drain gets the 500 with no 100: after
            a 100 the client sends it (RFC 9110 §10.1.1). *)
         | None
@@ -257,6 +261,9 @@ let serve : Engine.t =
           (* What follows the request body is the new protocol's. *)
           | () when not (drain body) ->
               fail_500 head
+          (* The stop can start during the 100 or the drain. *)
+          | () when ctx.is_stopping () ->
+              fail_503 head
           | () ->
               (* The writer ignores keep_alive for an upgrade. *)
               ignore
@@ -349,6 +356,15 @@ let serve : Engine.t =
   (* A 500, and the connection ends. *)
   and fail_500 head =
     ignore (write ~keep_alive:(fun () -> false) head (internal_error ())) ;
+    `Linger
+  (* No Retry-After: a server that stops does not know when it comes back. *)
+  and fail_503 head =
+    ignore
+      (write
+         ~keep_alive:(fun () -> false)
+         head
+         (Response.string ~status:Status.service_unavailable
+            "Service Unavailable\n" ) ) ;
     `Linger
   (* Writes [response]; [true] iff it was written in full and the connection can
      stay open, or switch protocols. The head is written, and [committed] set,
