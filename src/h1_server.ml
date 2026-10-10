@@ -53,6 +53,23 @@ let linger (config : Config.t) flow =
     (Time.after (Flow.time flow) config.linger_timeout) ;
   Flow.linger flow ~max:config.max_drain
 
+(* A protocol of an Upgrade field: its name and its version, split at the first
+   '/'. *)
+let protocol p =
+  match String.index_opt p '/' with
+  | Some i ->
+      (String.sub p 0 i, Some (String.sub p (i + 1) (String.length p - i - 1)))
+  | None ->
+      (p, None)
+
+(* RFC 9110 §7.8: the names compare without case. RFC 9110 has no rule for the
+   versions: they must be the same text, and no version matches only no
+   version. *)
+let same_protocol a b =
+  let name, version = protocol a and name', version' = protocol b in
+  String.lowercase_ascii name = String.lowercase_ascii name'
+  && version = version'
+
 (* Why [response], an upgrade, cannot answer the request [head], if it cannot:
    RFC 9110 §7.8, §9.3.6 and §15.2.2. *)
 let upgrade_error (head : H1_parse.head) response =
@@ -63,9 +80,23 @@ let upgrade_error (head : H1_parse.head) response =
         ( Headers.mem "upgrade" head.headers
         && Headers.has_token "connection" "upgrade" head.headers )
     then Some "101 to a request that did not ask for an upgrade"
-    else if not (Headers.mem "upgrade" (Response.headers response)) then
-      Some "101 without an Upgrade field"
-    else None
+    else
+      let offered = Headers.tokens "upgrade" head.headers in
+      match Headers.tokens "upgrade" (Response.headers response) with
+      | [] ->
+          Some "101 without an Upgrade field"
+      | protocols -> (
+        (* RFC 9110 §7.8: no switch to a protocol that the client did not
+           offer. *)
+        match
+          List.find_opt
+            (fun p -> not (List.exists (same_protocol p) offered))
+            protocols
+        with
+        | Some p ->
+            Some ("101 to a protocol that the request did not offer: " ^ p)
+        | None ->
+            None )
   else if not (Method.equal head.meth Method.CONNECT) then
     Some (Format.asprintf "2xx upgrade to a %a request" Method.pp head.meth)
   else None

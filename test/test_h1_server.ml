@@ -130,6 +130,12 @@ let handler req =
         Response.upgrade ~headers:upgrade_echo echo_upgraded
     | "/ws-bare" ->
         Response.upgrade echo_upgraded
+    | "/ws-as" ->
+        (* A 101 to the protocols of the query. *)
+        let protocols = Option.value (Request.query req) ~default:"" in
+        Response.upgrade
+          ~headers:(Headers.of_list [("Upgrade", protocols)])
+          echo_upgraded
     | "/ws-read" ->
         ignore (Body.to_string (Request.body req)) ;
         Response.upgrade ~headers:upgrade_echo echo_upgraded
@@ -1408,6 +1414,66 @@ let upgrade_tests =
             Connection: keep-alive\r\n
             \r\n
             got after
+            |} )
+    ; test "a 101 names only protocols that the request offered (RFC 9110 7.8)"
+        (fun () ->
+          let row (offer, answer) =
+            let headers =
+              List.map (fun o -> ("Upgrade", o)) offer
+              @ [("Connection", "Upgrade")]
+            in
+            let out, errors = serve (ws ~headers ("/ws-as?" ^ answer)) in
+            let status = List.hd (String.split_on_char '\r' out) in
+            Printf.sprintf "%-12s -> %-8s => %s%s"
+              (String.concat " + " offer)
+              answer status
+              (String.concat "" (List.map (fun e -> " ! " ^ e) errors))
+          in
+          expect
+            (String.concat "\n"
+               (List.map row
+                  [ (["echo"], "other")
+                  ; (["ECHO"], "echo")
+                  ; (["echo/2"], "echo")
+                  ; (["echo/2"], "echo/3")
+                  ; (["echo/2"], "echo/2")
+                  ; (["echo"], "echo/2")
+                  ; (["a, b"], "a,b")
+                  ; (["a"], "a,b")
+                  ; (["a"; "b"], "b")
+                  ; (["echo"], "") ] ) )
+          @@ __POS_OF__
+               {|
+            echo         -> other    => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: other")
+            ECHO         -> echo     => HTTP/1.1 101 Switching Protocols
+            echo/2       -> echo     => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: echo")
+            echo/2       -> echo/3   => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: echo/3")
+            echo/2       -> echo/2   => HTTP/1.1 101 Switching Protocols
+            echo         -> echo/2   => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: echo/2")
+            a, b         -> a,b      => HTTP/1.1 101 Switching Protocols
+            a            -> a,b      => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: b")
+            a + b        -> b        => HTTP/1.1 101 Switching Protocols
+            echo         ->          => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 without an Upgrade field")
+            |} )
+    ; test "a 101 to a protocol not offered gets no 100 Continue" (fun () ->
+          expect
+            (show
+               (ws
+                  ~headers:
+                    [ ("Upgrade", "echo")
+                    ; ("Connection", "Upgrade")
+                    ; ("Expect", "100-continue") ]
+                  "/ws-as?other" ) )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: other")
             |} )
     ; test "101 hands over the connection, with the bytes already received"
         (fun () ->

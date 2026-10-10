@@ -26,4 +26,6 @@ val handler : fixtures:bool -> Caravan.Handler.t
     - [/fixture/upgrade-required]: a 426 with [Upgrade: example/1].
     - [/fixture/upgrade]: a 101 to the first protocol that the request offers in
       [Upgrade], and the tunnel ends at once. Without [Upgrade]: 200.
+    - [/fixture/upgrade-other]: a 101 to [other/1], a protocol that no test
+      offers, if the request has [Upgrade]. Else 200. The engine must refuse it.
     - [/fixture/fail]: the handler raises [Failure]. *)
