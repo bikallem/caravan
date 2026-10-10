@@ -967,6 +967,52 @@ let accept_loop_tests =
           Server.wait server ;
           is_true ~msg:"listener closed" (Atomic.get l.closed) ) ]
 
+(* A stop before the supervisor runs. These tests use one domain, whatever
+   TEST_DOMAINS is: there, the calls that Server.start makes do not run before
+   the caller blocks, so an abort right after start cancels the supervisor
+   before it sees the stop. The tests depend on this order of affect: with more
+   domains, the supervisor can end normally, and a cancelled caller of
+   Fun.Async.get then gets its result. *)
+
+let early_stop_tests =
+  let start () =
+    Server.start_with ~config:quiet
+      (module Fake_listener)
+      (Fake_listener.make [Gate Action.never])
+      handler
+  in
+  group "A stop before the supervisor runs"
+    [ (* The supervisor ends with Cancelled: the grace call gets it from the
+         supervisor, and wait gets it too. The two take it as the end. *)
+      test "an abort right after start: wait returns" (fun () ->
+          Affect_unix.Unix.main ~domain_count:1
+          @@ fun () ->
+          let server = start () in
+          Server.abort server ;
+          within_2s (fun () -> Server.wait server) )
+    ; (* wait takes Cancelled from the supervisor as the end, but not the cancel
+         of its own caller. *)
+      test "after that abort, a cancelled caller of wait gets Cancelled"
+        (fun () ->
+          Affect_unix.Unix.main ~domain_count:1
+          @@ fun () ->
+          let server = start () in
+          Server.abort server ;
+          within_2s (fun () -> Server.wait server) ;
+          let w =
+            Fun.Async.call (fun () ->
+                Fun.Async.cancel_current () ;
+                Server.wait server )
+          in
+          (* If this fails on correct code, examine affect first: the test needs
+             a call that does not run before its caller blocks, on one
+             domain. *)
+          raises
+            ~msg:
+              "Cancelled (needs: on one domain, a call of start runs only \
+               after the caller blocks)" Fun.Async.Cancelled (fun () ->
+              get_2s w ) ) ]
+
 (* Stop_signal. Only installing: delivering a signal to the test process could
    kill it, see test_server.ml for that. SIGUSR2 is never sent. *)
 
@@ -1564,6 +1610,7 @@ let () =
        ; race_tests
        ; accept_error_tests
        ; accept_loop_tests
+       ; early_stop_tests
        ; fake_time_tests
        ; stop_signal_tests
        ; date_tests ] )
