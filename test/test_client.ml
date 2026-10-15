@@ -1923,6 +1923,15 @@ let pool_tests =
           is_true ~msg:"new at 6 s" (kind = `New) ;
           equal (list bool) [true; false]
             (List.map (fun f -> !(f.closed)) (made ())) )
+    ; test "a connection of age idle_timeout is stale" (fun () ->
+          let pool, advance, made = fake_pool () in
+          let c, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          Pool.release pool c ~reusable:true ;
+          advance Client_config.default.idle_timeout ;
+          let _, kind = Pool.checkout pool ~host:"a" ~port:80 in
+          is_true ~msg:"new at idle_timeout" (kind = `New) ;
+          equal (list bool) [true; false]
+            (List.map (fun f -> !(f.closed)) (made ())) )
     ; test "max_idle_per_host keeps at most that number" (fun () ->
           let pool, _, made =
             fake_pool

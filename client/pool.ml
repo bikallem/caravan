@@ -110,7 +110,7 @@ let release t (c : Conn.t) ~reusable =
   in
   if not kept then Flow.close c.flow
 
-(* Closes the idle connections that are older than [idle_timeout]. Thus a host
+(* Closes the idle connections whose age is [idle_timeout] or more. Thus a host
    that the client does not use again keeps no socket open. *)
 let reap t =
   let now = Time.now t.config.mono_time and old = ref [] in
