@@ -3,10 +3,18 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    weft = {
+      url = "github:bikallem/weft";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      weft,
+    }:
     let
       systems = [
         "x86_64-linux"
@@ -49,6 +57,9 @@
             });
             ocamlPackages = pkgs.ocaml-ng.ocamlPackages_5_5.overrideScope (
               final: prev: {
+                # Not on opam yet: the package of the weft flake.
+                weft = final.callPackage weft.lib.package { };
+
                 # Not packaged in nixpkgs yet: https://ocaml.org/p/affect/latest
                 affect = final.callPackage (
                   {
@@ -159,8 +170,9 @@
               dune_3_24
               findlib
 
-              # Dependencies
+              # Dependencies (weft here is the flake input, so use ocamlPackages.weft)
               affect
+              ocamlPackages.weft
               http-date
 
               # Test dependencies

@@ -18,7 +18,28 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "weft": "weft"
+      }
+    },
+    "weft": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792031080,
+        "narHash": "sha256-P2x8XjeKwgt8RkaiwhdFfYxfPdKxnordzrarN/u+68g=",
+        "owner": "bikallem",
+        "repo": "weft",
+        "rev": "4cb5868334ec0337bb6bb6fe0434dd0d0edc6f9c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "bikallem",
+        "repo": "weft",
+        "type": "github"
       }
     }
   },
