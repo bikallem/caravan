@@ -1475,9 +1475,119 @@ let with_listener f =
     ~finally:(fun () -> Fun.Async.cancel accepted ; Tcp.Listener.close l)
     (fun () -> f port)
 
+(* The hosts of the numeric tests, with the address that Resolver.numeric must
+   give. *)
+let numeric_table =
+  [ ("127.0.0.1", Some "127.0.0.1")
+  ; ("[127.0.0.1]", Some "127.0.0.1")
+  ; ("0.0.0.0", Some "0.0.0.0")
+  ; ("255.255.255.255", Some "255.255.255.255")
+  ; ("::1", Some "::1")
+  ; ("[::1]", Some "::1")
+  ; ("::", Some "::")
+  ; ("[FE80::a]", Some "FE80::a")
+  ; ("1:2:3:4:5:6:7:8", Some "1:2:3:4:5:6:7:8")
+  ; ("1:2:3:4:5:6:7::", Some "1:2:3:4:5:6:7::")
+  ; ("::ffff:192.0.2.1", Some "::ffff:192.0.2.1")
+  ; ("1:2:3:4:5:6:1.2.3.4", Some "1:2:3:4:5:6:1.2.3.4")
+  ; ("", None)
+  ; ("[]", None)
+  ; ("[::1", None)
+  ; ("::1]", None)
+  ; ("a.example", None)
+  ; ("localhost", None)
+  ; ("256.0.0.1", None)
+  ; ("01.2.3.4", None)
+  ; ("1.2.3", None)
+  ; ("1.2.3.4.5", None)
+  ; ("1.2.3.4 ", None)
+  ; (":::", None)
+  ; (":1", None)
+  ; ("1:", None)
+  ; ("1::2::3", None)
+  ; ("12345::", None)
+  ; ("1:2:3:4:5:6:7", None)
+  ; ("1:2:3:4:5:6:7:8:9", None)
+  ; ("1:2:3:4:5:6:7::8", None)
+  ; ("1.2.3.4::", None)
+  ; ("1:2:3:4:5:6:7:1.2.3.4", None)
+  ; ("fe80::1%eth0", None) ]
+
+(* The numeric check before the pure parser: it calls inet_pton. *)
+let unix_numeric host =
+  let h =
+    if String.starts_with ~prefix:"[" host && String.ends_with ~suffix:"]" host
+    then String.sub host 1 (String.length host - 2)
+    else host
+  in
+  match Unix.inet_addr_of_string h with
+  | a ->
+      Some (Unix.string_of_inet_addr a)
+  | exception Failure _ ->
+      None
+
+(* The address of Resolver.numeric, in the form of Unix.string_of_inet_addr. *)
+let pure_numeric host =
+  Option.map
+    (fun a -> Unix.string_of_inet_addr (Unix.inet_addr_of_string a))
+    (Resolver.numeric host)
+
+(* Hosts near the numeric forms: IPv4, IPv6 with "::" and an IPv4 end, broken
+   parts, and brackets on no side, on one side or on the two sides. Most parts
+   are correct, thus a part of the hosts is numeric. *)
+let numeric_host =
+  let open Gen in
+  let mostly good bad = frequency [(9, of_list good); (1, of_list bad)] in
+  let ipv4 =
+    map (String.concat ".")
+      (list
+         ~size:(frequency [(6, constant 4); (1, int_range 3 5)])
+         (mostly
+            ["0"; "1"; "9"; "10"; "99"; "249"; "255"]
+            ["256"; "300"; "01"; "001"; "1000"; ""; "a"] ) )
+  in
+  let groups n =
+    list ~size:n
+      (mostly ["0"; "1"; "ff"; "FFFF"; "abcd"; "0000"] ["12345"; "g"; ""])
+  in
+  let last = of_list [[]; ["1.2.3.4"]; ["255.255.255.255"]; ["1.2.3"]] in
+  let ipv6 =
+    one_of
+      [ map
+          (fun (gs, l) -> String.concat ":" (gs @ l))
+          (pair (groups (int_range 5 9)) last)
+      ; map
+          (fun (l, sep, r, last) ->
+            String.concat ":" l ^ sep ^ String.concat ":" (r @ last) )
+          (quad
+             (groups (int_range 0 5))
+             (frequency [(6, constant "::"); (1, of_list [":"; ":::"; ""])])
+             (groups (int_range 0 5))
+             last ) ]
+  in
+  let any =
+    string_of ~size:(int_range 0 12)
+      (of_list ['0'; '1'; '9'; 'a'; 'F'; 'g'; ':'; '.'; '['; ']'; '%'; ' '])
+  in
+  with_pp Format.pp_print_string
+    (map
+       (fun ((o, c), h) -> o ^ h ^ c)
+       (pair
+          (of_list [("", ""); ("[", "]"); ("[", ""); ("", "]")])
+          (frequency [(2, ipv4); (3, ipv6); (1, any)]) ) )
+
 let resolver_tests =
   group "Resolver and connect"
-    [ test "a numeric host does not start a thread" (fun () ->
+    [ test "a numeric host is IPv4 or IPv6, with or without brackets" (fun () ->
+          List.iter
+            (fun (host, address) ->
+              equal ~msg:host (option string) address (Resolver.numeric host) )
+            numeric_table )
+    ; prop "numeric accepts the same hosts as inet_addr_of_string" ~count:5000
+        ~examples:(List.map fst numeric_table) numeric_host (fun host ->
+          equal ~msg:host (option string) (unix_numeric host)
+            (pure_numeric host) )
+    ; test "a numeric host does not start a thread" (fun () ->
           main
           @@ fun () ->
           let before = Atomic.get Resolver.threads_started in
