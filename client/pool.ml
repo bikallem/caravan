@@ -4,8 +4,8 @@ open Caravan
 
 (* The idle connections of each (host, port), the newest first, and the
    connections in use. A Mutex protects them, and no critical section suspends
-   the fiber: the connect and the checks of an idle connection happen outside
-   the lock. *)
+   the fiber: the connect, the checks of an idle connection and the clock reads
+   happen outside the lock. *)
 type t =
   { config: Cfg.t
   ; connect: host:string -> port:int -> Flow.t
@@ -46,15 +46,15 @@ let take t key =
 
 (* An idle connection is stale when it is too old, or when its server closed it,
    reset it, or sent bytes that no request asked for. *)
-let too_old t (c : Conn.t) =
+let too_old t ~now (c : Conn.t) =
   match Time.add t.config.mono_time c.released_at t.config.idle_timeout with
   | Some d ->
-      not (Mtime.is_earlier (Time.now t.config.mono_time) ~than:d)
+      not (Mtime.is_earlier now ~than:d)
   | None ->
       false
 
 let stale t c =
-  too_old t c
+  too_old t ~now:(Time.now t.config.mono_time) c
   ||
   match Flow.read_now c.flow (Bytes.create 1) 0 1 with
   | None ->
@@ -92,6 +92,7 @@ let rec checkout ?(reuse = true) t ~host ~port =
       if added then (c, `New) else (Flow.close c.flow ; refuse ())
 
 let release t (c : Conn.t) ~reusable =
+  let now = Time.now t.config.mono_time in
   let kept =
     Mutex.protect t.lock (fun () ->
         Hashtbl.remove t.in_use c.id ;
@@ -101,7 +102,7 @@ let release t (c : Conn.t) ~reusable =
           reusable && (not t.closed)
           && List.length idle < t.config.max_idle_per_host
         then begin
-          c.released_at <- Time.now t.config.mono_time ;
+          c.released_at <- now ;
           Hashtbl.replace t.idle key (c :: idle) ;
           true
         end
@@ -112,11 +113,11 @@ let release t (c : Conn.t) ~reusable =
 (* Closes the idle connections that are older than [idle_timeout]. Thus a host
    that the client does not use again keeps no socket open. *)
 let reap t =
-  let old = ref [] in
+  let now = Time.now t.config.mono_time and old = ref [] in
   Mutex.protect t.lock (fun () ->
       Hashtbl.filter_map_inplace
         (fun _ cs ->
-          let o, keep = List.partition (too_old t) cs in
+          let o, keep = List.partition (too_old t ~now) cs in
           old := o @ !old ;
           if keep = [] then None else Some keep )
         t.idle ) ;

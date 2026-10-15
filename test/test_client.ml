@@ -1896,7 +1896,46 @@ let pool_tests =
           pool := Some (Pool.make ~connect Client_config.default) ;
           raises_match is_invalid_arg (fun () ->
               Pool.checkout (Option.get !pool) ~host:"a" ~port:80 ) ;
-          equal (list bool) [true] (List.map (fun f -> !(f.closed)) !flows) ) ]
+          equal (list bool) [true] (List.map (fun f -> !(f.closed)) !flows) )
+    ; test "the pool reads its clock outside its lock" (fun () ->
+          (* The clock takes the lock of the pool. The stdlib Mutex raises
+             Sys_error if its thread holds the lock at that time. *)
+          let f = Fake_time.make () and pool = ref None in
+          let module Locking_clock = struct
+            type t = Mtime.t
+
+            let now () =
+              Option.iter (fun p -> ignore (Pool.idle_hosts p)) !pool ;
+              Fake_time.mono_now f
+          end in
+          let module No_timer = struct
+            type time = Mtime.t
+
+            let at _ _ = invalid_arg "the pool uses no timer"
+          end in
+          let module Mono_span = struct
+            type time = Mtime.t
+
+            type t = Mtime.Span.t
+
+            let add = Mtime.add_span
+          end in
+          let mono_time =
+            Time.make (module Locking_clock) (module No_timer) (module Mono_span)
+          in
+          let made = fake () in
+          let connect ~host:_ ~port:_ = made.flow in
+          let p = Pool.make ~connect {Client_config.default with mono_time} in
+          pool := Some p ;
+          let c, _ = Pool.checkout p ~host:"a" ~port:80 in
+          Pool.release p c ~reusable:true ;
+          let c, kind = Pool.checkout p ~host:"a" ~port:80 in
+          is_true ~msg:"reused" (kind = `Reused) ;
+          Pool.release p c ~reusable:true ;
+          Fake_time.advance f Mtime.Span.(6 * s) ;
+          Pool.reap p ;
+          equal int 0 (Pool.idle_hosts p) ;
+          is_true ~msg:"the reap closed the connection" !(made.closed) ) ]
 
 (* The pool against a model: one host, a fake clock and fake flows. Each program
    makes its pool first. *)
