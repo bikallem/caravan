@@ -104,7 +104,9 @@ Caravan_client.with_response client
 - [http-date](https://ocaml.org/p/http-date/latest) >= 0.2
 - dune >= 3.20
 - For tests: [windtrap](https://github.com/invariant-hq/windtrap) and
-  ppx_windtrap >= 0.2.0
+  ppx_windtrap >= 0.2.0. The Nix flake uses the fork
+  [bikallem/windtrap](https://github.com/bikallem/windtrap), which has
+  changes after 0.2.0.
 
 ## Development
 
