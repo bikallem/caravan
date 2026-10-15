@@ -25,6 +25,7 @@
    (>= 0.0.0))
   (http-date
    (>= 0.2))
+  (weft :with-test)
   (windtrap
    (and
     :with-test

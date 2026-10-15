@@ -63,3 +63,19 @@
  (name conformance_server)
  (modules conformance_server)
  (libraries caravan conformance_app unix))
+
+; The harness of the simulator. It has no dependency on caravan, because
+; caravan is on affect in M1.
+
+(library
+ (name sim_support)
+ (modules sim_support)
+ (libraries weft weft.sim))
+
+; The tests of the harness. This suite is not in SUITES of the Makefile,
+; because it has no mutant of caravan.
+
+(test
+ (name test_sim_support)
+ (modules test_sim_support)
+ (libraries sim_support windtrap unix))
