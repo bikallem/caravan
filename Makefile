@@ -17,12 +17,12 @@ test:
 # Mutation testing. Each suite runs on one domain: the runner forks for each
 # mutant, and OCaml forbids a fork after a domain starts. The runner tests
 # the mutants of one suite one at a time, and it keeps its verdicts in a file
-# named from the path of the executable. Thus each suite runs as
-# MUTATE_SHARDS copies, each copy for a group of source files, and all the
-# copies run in parallel, MUTATE_JOBS at a time. The copies are beside the
-# suites, because the signal tests start a program from there. They run
-# directly, because dune lets only one build run. Each job keeps its output
-# in _build/_mutate_logs. The target fails if a job gives no result, for
+# named from the path of the executable and the name of the suite. Thus each
+# suite runs as MUTATE_SHARDS copies, each copy for a group of source files,
+# and all the copies run in parallel, MUTATE_JOBS at a time. The copies are
+# beside the suites, because the signal tests start a program from there.
+# They run directly, because dune lets only one build run. Each job keeps its
+# output in _build/_mutate_logs. The target fails if a job gives no result, for
 # example when its dry run fails. The report at the end lists the mutants
 # that no job kills. Options:
 # - MUTATE=websocket/ tests only the mutants of the files under this prefix.

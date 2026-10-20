@@ -3,9 +3,17 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # The fork bikallem/windtrap: it has changes after the release 0.2.0
+    # of invariant-hq, and it has no release. flake.lock pins a commit of
+    # its main branch.
+    windtrap = {
+      url = "github:bikallem/windtrap";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     weft = {
       url = "github:bikallem/weft";
       inputs.nixpkgs.follows = "nixpkgs";
+      inputs.windtrap.follows = "windtrap";
     };
   };
 
@@ -13,6 +21,7 @@
     {
       self,
       nixpkgs,
+      windtrap,
       weft,
     }:
     let
@@ -29,22 +38,6 @@
           system:
           let
             pkgs = nixpkgs.legacyPackages.${system};
-            # The fork bikallem/windtrap at a commit of its main branch. The
-            # fork has changes after the release 0.2.0 of invariant-hq, and it
-            # has no release.
-            windtrapFork = {
-              version = "0.2.0-unstable-2026-10-15";
-              src = pkgs.fetchFromGitHub {
-                owner = "bikallem";
-                repo = "windtrap";
-                rev = "8d5d2a47270bc5fef6ac7633bf30d5612464c5b4";
-                hash = "sha256-WQHAi9WlLyS4xdFWiwbmIzDL1IgVdKmqfwOWhSWd4MQ=";
-              };
-              meta = {
-                homepage = "https://github.com/bikallem/windtrap";
-                license = pkgs.lib.licenses.isc;
-              };
-            };
             # http-date's pinned commit declares (lang dune 3.24), so it is
             # built with this dune and the dev shell uses it too. Other
             # packages keep nixpkgs' dune.
@@ -97,29 +90,10 @@
                   }
                 ) { };
 
-                # nixpkgs ships windtrap 0.1.0 and no ppx_windtrap. The two
-                # packages are built from the same source of the fork.
-                windtrap = final.buildDunePackage {
-                  pname = "windtrap";
-                  inherit (windtrapFork) version src;
-                  minimalOCamlVersion = "5.0";
-                  meta = windtrapFork.meta // {
-                    description = "One library for all your OCaml tests";
-                  };
-                };
-
-                ppx_windtrap = final.buildDunePackage {
-                  pname = "ppx_windtrap";
-                  inherit (windtrapFork) version src;
-                  minimalOCamlVersion = "5.0";
-                  propagatedBuildInputs = [
-                    final.windtrap
-                    final.ppxlib
-                  ];
-                  meta = windtrapFork.meta // {
-                    description = "Inline tests, coverage and mutation testing for windtrap";
-                  };
-                };
+                # nixpkgs ships an older windtrap and no ppx_windtrap. The two
+                # packages of the windtrap flake use the OCaml of this scope.
+                windtrap = final.callPackage windtrap.lib.windtrap { };
+                ppx_windtrap = final.callPackage windtrap.lib.ppx_windtrap { };
 
                 # Not packaged in nixpkgs yet: https://ocaml.org/p/http-date/latest
                 # Pinned to an untagged commit (after v0.2) until v0.3 is
@@ -175,9 +149,10 @@
               ocamlPackages.weft
               http-date
 
-              # Test dependencies
-              windtrap
-              ppx_windtrap
+              # Test dependencies (windtrap here is the flake input, so use
+              # ocamlPackages.windtrap)
+              ocamlPackages.windtrap
+              ocamlPackages.ppx_windtrap
 
               # Dev tools
               ocaml-lsp

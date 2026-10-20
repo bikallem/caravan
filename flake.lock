@@ -19,26 +19,50 @@
     "root": {
       "inputs": {
         "nixpkgs": "nixpkgs",
-        "weft": "weft"
+        "weft": "weft",
+        "windtrap": "windtrap"
       }
     },
     "weft": {
       "inputs": {
         "nixpkgs": [
           "nixpkgs"
+        ],
+        "windtrap": [
+          "windtrap"
         ]
       },
       "locked": {
-        "lastModified": 1792031080,
-        "narHash": "sha256-P2x8XjeKwgt8RkaiwhdFfYxfPdKxnordzrarN/u+68g=",
+        "lastModified": 1792252316,
+        "narHash": "sha256-171BIfN9bzuFImz8Q8f3Xbyb6MXTMifGsEZ0KzUO6+U=",
         "owner": "bikallem",
         "repo": "weft",
-        "rev": "4cb5868334ec0337bb6bb6fe0434dd0d0edc6f9c",
+        "rev": "ae27e3d2882727f3b8e8a9165a17d33294a204c3",
         "type": "github"
       },
       "original": {
         "owner": "bikallem",
         "repo": "weft",
+        "type": "github"
+      }
+    },
+    "windtrap": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792258151,
+        "narHash": "sha256-YqsNQ0durA+2qvZuzhoU+T1DvIP9gHj/h4pNa4nNheQ=",
+        "owner": "bikallem",
+        "repo": "windtrap",
+        "rev": "de08917609100fa04668e0fb6189691ae7840214",
+        "type": "github"
+      },
+      "original": {
+        "owner": "bikallem",
+        "repo": "windtrap",
         "type": "github"
       }
     }

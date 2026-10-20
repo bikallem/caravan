@@ -111,7 +111,8 @@ Caravan_client.with_response client
 ## Development
 
 The repository includes a Nix flake that provides OCaml 5.5, dune,
-affect, http-date, windtrap, ocaml-lsp, utop, ocamlformat and odoc.
+affect, weft, http-date, windtrap, ppx_windtrap, ocaml-lsp, utop,
+ocamlformat and odoc.
 
 With [direnv](https://direnv.net) and
 [nix-direnv](https://github.com/nix-community/nix-direnv) installed,
