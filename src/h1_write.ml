@@ -228,7 +228,7 @@ let () =
   Printexc.register_printer (function
     | Length_mismatch ->
         Some "response body length differs from its Content-Length"
-    | _ ->
+    | (_ [@mutate off "Printexc skips a printer that raises"]) ->
         None )
 
 let body ?(before = ignore) w framing b =

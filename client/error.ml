@@ -32,7 +32,7 @@ let () =
   Printexc.register_printer (function
     | Error e ->
         Some ("Caravan_client.Error: " ^ to_string e)
-    | _ ->
+    | (_ [@mutate off "Printexc skips a printer that raises"]) ->
         None )
 
 let fail e = raise (Error e)

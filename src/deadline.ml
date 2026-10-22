@@ -26,6 +26,7 @@ let earlier a b =
   | None, d | d, None ->
       d
   | Some x, Some y ->
-      if compare x y <= 0 then a else b
+      (* At equal times, [a] and [b] hold the same time. *)
+      if (compare x y <= 0) [@mutate off "the same time"] then a else b
 
 let at = function None -> never | Some d -> Time.at Mono d

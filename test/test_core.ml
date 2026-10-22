@@ -77,8 +77,8 @@ let status_tests =
     ; test "pp" (fun () ->
           expect (Format.asprintf "%a" Status.pp Status.ok)
           @@ __POS_OF__ {|200 OK|} ;
-          expect (Format.asprintf "%a" Status.pp (Status.v 299))
-          @@ __POS_OF__ {|299|} )
+          (* With no reason, no space follows the code. *)
+          equal string "299" (Format.asprintf "%a" Status.pp (Status.v 299)) )
     ; test "registered reason phrases" (fun () ->
           let registered =
             List.filter_map
@@ -238,8 +238,12 @@ let headers_tests =
     ; test "rejects invalid names and values" (fun () ->
           List.iter
             (fun (n, v) ->
-              raises_match is_invalid_arg (fun () ->
-                  Headers.add n v Headers.empty ) )
+              raises_match ~msg:"add" is_invalid_arg (fun () ->
+                  Headers.add n v Headers.empty ) ;
+              raises_match ~msg:"set" is_invalid_arg (fun () ->
+                  Headers.set n v Headers.empty ) ;
+              raises_match ~msg:"of_list" is_invalid_arg (fun () ->
+                  h [("Host", "x"); (n, v)] ) )
             [ ("", "x")
             ; ("Bad Name", "x")
             ; ("Name:", "x")
@@ -1109,8 +1113,10 @@ let response_tests =
             (content_type
                (Response.string ~content_type:"application/json" "{}") ) ;
           let h = Headers.of_list [("Content-Type", "text/html")] in
-          equal (option string) (Some "text/html")
-            (content_type (Response.string ~headers:h "<p>")) ;
+          equal fields
+            [("Content-Type", "text/html")]
+            (Headers.to_list
+               (Response.headers (Response.string ~headers:h "<p>")) ) ;
           equal (option string) (Some "text/csv")
             (content_type
                (Response.string ~headers:h ~content_type:"text/csv" "a,b") ) )

@@ -66,8 +66,8 @@ let buf_reader_tests =
           let read _ _ _ = 0 in
           raises_match is_invalid_arg (fun () ->
               Buf_reader.make ~size:8 ~buffer read ) ;
-          raises_match is_invalid_arg (fun () ->
-              Buf_reader.make ~buffer:Bytes.empty read ) )
+          raises (Invalid_argument "Buf_reader.make: buffer must not be empty")
+            (fun () -> Buf_reader.make ~buffer:Bytes.empty read ) )
     ; test "lines without their CRLF" (fun () ->
           equal (list string)
             ["GET / HTTP/1.1"; "Host: x"; ""]
@@ -1643,8 +1643,8 @@ let buf_writer_tests =
           let write _ _ _ = () in
           raises_match is_invalid_arg (fun () ->
               Buf_writer.make ~size:8 ~buffer write ) ;
-          raises_match is_invalid_arg (fun () ->
-              Buf_writer.make ~buffer:Bytes.empty write ) )
+          raises (Invalid_argument "Buf_writer.make: buffer must not be empty")
+            (fun () -> Buf_writer.make ~buffer:Bytes.empty write ) )
     ; test "writes are buffered until flush" (fun () ->
           let w, calls = recorded () in
           Buf_writer.write_string w "HTTP/1.1 200 OK\r\n" ;
@@ -2195,13 +2195,15 @@ let response_body_tests =
                [ show Chunked quiet_then_data
                ; show (Length 3) (Body.of_string "abc")
                ; show Close_delimited (Body.of_writer ignore)
-               ; show No_body (Body.of_string "ignored") ] )
+               ; show No_body (Body.of_string "ignored")
+               ; show Chunked (Body.of_writer ignore) ] )
           @@ __POS_OF__
                {|
             HEAD;2\r\nab\r\n1\r\nc\r\n0\r\n\r\n [head]
             HEAD;abc [head]
             HEAD; [head]
             HEAD; [head]
+            HEAD;0\r\n\r\n [head]
             |} )
     ; test "trailers that may not follow the content are dropped" (fun () ->
           let b =

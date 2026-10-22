@@ -42,5 +42,5 @@ let () =
   Printexc.register_printer (function
     | E e ->
         Some (Format.asprintf "H1_error.E (%a)" pp e)
-    | _ ->
+    | (_ [@mutate off "Printexc skips a printer that raises"]) ->
         None )

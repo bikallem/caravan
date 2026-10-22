@@ -24,7 +24,10 @@ type t = {config: Config.t; writers: Writers.t; pool: Pool.t}
    make a busy loop. *)
 let reap_interval (config : Config.t) =
   let h = Span.of_ns (Int64.div (Span.to_ns config.idle_timeout) 2L) in
-  if Span.compare h (Span.ms 10) < 0 then Span.ms 10 else h
+  (* At 10 ms, the two branches give 10 ms. *)
+  if (Span.compare h (Span.ms 10) < 0) [@mutate off "the same span"] then
+    Span.ms 10
+  else h
 
 (* The reaper closes the idle connections that are too old. It is a daemon of
    the scope of the writers: [close] cancels it, and the end of the jobs ends

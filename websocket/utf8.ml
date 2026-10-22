@@ -56,12 +56,17 @@ let tail buf i stop next =
 let rec scan buf i stop =
   if i >= stop then ""
   else
-    let c = Char.code (Bytes.unsafe_get buf i) in
+    let c = Char.code (Bytes.unsafe_get buf i) and left = stop - i in
+    (* With exactly 8 bytes left, the loop of one byte gives the result of the
+       step of 8 bytes. With exactly 4 bytes left, [tail] gives the result of
+       the main path. *)
     if c < 0x80 then
-      if i + 8 <= stop && Int64.logand (Bytes.get_int64_le buf i) ascii8 = 0L
+      if
+        (left >= 8) [@mutate off "the same result"]
+        && Int64.logand (Bytes.get_int64_le buf i) ascii8 = 0L
       then scan buf (i + 8) stop
       else scan buf (i + 1) stop
-    else if i + 4 > stop then begin
+    else if (left < 4) [@mutate off "the same result"] then begin
       let next = ref 0 in
       match tail buf i stop next with
       | "" ->

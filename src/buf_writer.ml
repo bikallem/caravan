@@ -49,7 +49,10 @@ let write_bytes w buf off len =
     let off = off + k and len = len - k in
     if len >= size then w.write buf off len
     else begin
-      ensure_buffer w ;
+      (* Here k > 0, thus the buffer held bytes. *)
+      begin[@mutate off "the buffer exists"]
+        ensure_buffer w
+      end ;
       Bytes.blit buf off w.buf 0 len ;
       w.len <- len
     end

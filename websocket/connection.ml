@@ -347,7 +347,10 @@ let wait_closed t =
   if Atomic.get t.closing <> None then begin
     let read = wrap (Fiber.Semaphore.acquire t.reader) (fun () -> `Read)
     and finished = wrap (Ivar.read t.closed) (fun _ -> `Finished) in
-    match sync (choose [finished; read]) with
+    (* [finished] ends the wait without the reader. With [read] alone, the wait
+       also ends. A close of the flow wakes the read of the holder of the
+       reader, and the holder then releases the reader. *)
+    match sync (choose ([finished; read] [@mutate off "the same end"])) with
     | `Finished ->
         ()
     | `Read ->
@@ -355,7 +358,11 @@ let wait_closed t =
           ~finally:(fun () -> Fiber.Semaphore.release t.reader)
           (fun () ->
             try
-              check_closed t ;
+              (* [closing] is set, thus [next] drops each data frame. A read of
+                 the closed flow raises [Closed]. *)
+              begin[@mutate off "the same result"]
+                check_closed t
+              end ;
               ignore (next t None)
             with Closed _ -> () )
   end

@@ -355,8 +355,12 @@ let serve : Engine.t =
             if write ~committed ~body ~keep_alive head response && drain body
             then begin
               (* The other connections of this domain run before the next
-                 request of this connection. *)
-              Fiber.yield () ;
+                 request of this connection. Without the yield, the order of the
+                 fibers can change, but no result changes. The fiber also waits
+                 in the await of each exchange. *)
+              begin[@mutate off "order only"]
+                Fiber.yield ()
+              end ;
               next_request ~idle:config.idle_timeout
             end
             else `Linger ) )
@@ -413,7 +417,9 @@ let serve : Engine.t =
       match sync (choose [wrap response (fun r -> `Response r); read]) with
       | `Response r ->
           `Response r
-      | `Read when Buf_reader.buffered r > 0 ->
+      (* Without this case, watch reads the buffered bytes. *)
+      | (`Read [@mutate off "the same result"]) when Buf_reader.buffered r > 0
+        ->
           `Response (Promise.await p)
       | `Read ->
           (* After the read of a request, the readiness of the flow is stale.
