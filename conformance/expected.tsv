@@ -1,4 +1,4 @@
-# The expected violations of make conformance (plan 6.6). Tab-separated.
+# The expected violations of make conformance. Tab-separated.
 # "*" matches each value. A line that starts with "#" is a comment.
 # kind	rule	url	method	set	verdict	reason
 probe	redirect_after_upgrade_insecure_requests	*	*	2	Breaks specification	no TLS server

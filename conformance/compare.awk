@@ -1,5 +1,5 @@
 # Compares the violations of a make conformance run with the expected
-# violations (plan 6.6):
+# violations (expected.tsv):
 #
 #   awk -f compare.awk expected.tsv violations.tsv
 #

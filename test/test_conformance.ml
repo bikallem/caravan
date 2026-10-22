@@ -425,8 +425,9 @@ let app_tests =
                      (serve_one ~fixtures:false (request "GET" "/fixture/fail")) ) ) )
               .status_line ) ]
 
-(* The DIRECT rules (plan 5.1). Upstream sends each to the base URL and to a
-   random path. *)
+(* The DIRECT rules of upstream: each rule sends its own request over TCP, not
+   through the proxy. Upstream sends each to the base URL and to a random
+   path. *)
 
 let random_path = "/q7w2e9r4t1y6u3i8o5p0a2s7d4f9g1h6"
 
@@ -660,7 +661,8 @@ let direct_tests =
           |} )
     ]
 
-(* The probe matrix (plan 4.3). It is a function, not a lazy value: mutation
+(* The probe matrix: the requests that upstream sends through its proxy, and
+   that the probe rules examine. It is a function, not a lazy value: mutation
    testing starts each mutant from the state of a dry run, and a forced lazy
    value would hide the mutant. *)
 
@@ -1323,7 +1325,7 @@ let probe_tests =
                    (List.map (fun (n, v) -> Printf.sprintf "%S: %S" n v) bad) ) ) )
     ]
 
-(* The multi rules (plan 5.3) compare the final responses of two probes. *)
+(* The multi rules of upstream compare the final responses of two probes. *)
 
 (* [pair_rule ~pairs ~must check] runs [check] on the final responses of each
    pair of probe labels that [applies] selects. Each label in [must] must be the

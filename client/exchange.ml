@@ -198,7 +198,9 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
     | None ->
         false
     | Some (h : H1_parse.response_head) ->
-        (* [closes] is true for HTTP/1.0 (D6). *)
+        (* [closes] is true for each HTTP/1.0 response. The client does not use
+           the keep-alive of HTTP/1.0 (RFC 9112 §9.3), thus the client does not
+           reuse the connection. *)
         (not (closes h))
         && (not (H1_write.request_closes req))
         && !response_framing <> H1_parse.Until_close

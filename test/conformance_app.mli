@@ -1,8 +1,9 @@
-(** The application that the conformance tests serve (plan D1). It obeys the
-    rules that the application controls, so that each violation that the tests
-    find is a violation of caravan. Only some fixtures break a rule on purpose,
-    to show that the engine refuses or repairs the response. It examines the
-    method before the path:
+(** The application that the conformance tests serve. test_conformance and
+    conformance_server (make conformance) use it. It obeys the rules that the
+    application controls, so that each violation that the tests find is a
+    violation of caravan. Only some fixtures break a rule on purpose, to show
+    that the engine refuses or repairs the response. It examines the method
+    before the path:
 
     - An unknown method: 501.
     - CONNECT: a 200 tunnel. The handler sets [Content-Length: 0] and
@@ -18,7 +19,7 @@ val page : string
 
 val handler : fixtures:bool -> Caravan.Handler.t
 (** [handler ~fixtures] is the application. With [fixtures], these paths give
-    responses that the rules must examine (plan 4.3):
+    responses that the rules must examine:
 
     - [/fixture/no-content]: a 204. The handler sets [Content-Length: 5] and
       [Transfer-Encoding: chunked] and gives the body [hello].

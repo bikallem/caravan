@@ -1,4 +1,5 @@
--- The checks of a make conformance run (plan 6.4 and 6.5). Run it with
+-- The checks of a make conformance run: the validity checks, then the query of
+-- the violations. Run it with
 -- psql -X -q -v ON_ERROR_STOP=1 on the result database of the run.
 --
 -- The upstream runner catches each failure and exits 0. Thus the validity
