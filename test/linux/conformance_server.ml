@@ -13,9 +13,7 @@ let () =
         prerr_endline "usage: conformance_server PORT" ;
         exit 2
   in
-  let config =
-    {Config.default with addr= Unix.ADDR_INET (Unix.inet_addr_loopback, port)}
-  in
+  let config = {Config.default with addr= Weft.Net.Tcp ("127.0.0.1", port)} in
   (* make conformance starts the test tool after this line. *)
   let on_start _ = print_endline "listening" in
-  Server.run ~config ~on_start (Conformance_app.handler ~fixtures:false)
+  Caravan_run.run ~config ~on_start (Conformance_app.handler ~fixtures:false)

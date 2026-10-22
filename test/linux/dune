@@ -1,0 +1,61 @@
+; The programs of test/linux run in the OS world of weft. weft.linux builds
+; only on Linux.
+
+; The tests of caravan on the OS: an executable and a rule, not a test stanza,
+; as in weft/test/linux/dune. On another system, dune builds the executable of
+; a test stanza also if its enabled_if is false.
+
+(executable
+ (name test_linux)
+ (enabled_if
+  (= %{system} linux))
+ (modules test_linux)
+ (libraries
+  caravan
+  caravan.client
+  caravan.websocket
+  server_support
+  weft
+  weft.linux
+  weft.posix
+  windtrap
+  http-date
+  unix))
+
+(rule
+ (alias runtest)
+ (enabled_if
+  (= %{system} linux))
+ (deps serve_until_signal.exe)
+ (action
+  (setenv
+   CARAVAN_SERVE_UNTIL_SIGNAL
+   %{dep:serve_until_signal.exe}
+   (run %{exe:test_linux.exe}))))
+
+; The child process of the signal tests of test_linux.
+
+(executable
+ (name serve_until_signal)
+ (enabled_if
+  (= %{system} linux))
+ (modules serve_until_signal)
+ (libraries caravan caravan.run weft))
+
+; The server of make conformance.
+
+(executable
+ (name conformance_server)
+ (enabled_if
+  (= %{system} linux))
+ (modules conformance_server)
+ (libraries caravan caravan.run conformance_app weft))
+
+; The server of make autobahn.
+
+(executable
+ (name autobahn_server)
+ (enabled_if
+  (= %{system} linux))
+ (modules autobahn_server)
+ (libraries caravan caravan.run caravan.websocket weft))

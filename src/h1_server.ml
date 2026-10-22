@@ -1,12 +1,17 @@
-open Affect
+open Weft
 
 let limits (c : Config.t) : H1_parse.limits =
   { max_request_line= c.max_request_line
   ; max_header_bytes= c.max_header_bytes
   ; max_header_count= c.max_header_count }
 
-(* Network failures end a connection; cancellation must go on. *)
-let is_fatal = function Fun.Async.Cancelled -> true | _ -> false
+(* [is_fatal e] is [true] only for a cancel of the fiber ({!Cancel.is_own}). The
+   engine does not report it and raises it again: a weft cancel stays, and the
+   next sync raises it again. A [Fiber.Cancelled] of a scope that the handler
+   cancelled is not fatal: weft gives it as a failure of the handler. A
+   [Promise.Cancelled] is not fatal: a handler can raise it, for example from
+   the await of a child that it cancelled. *)
+let is_fatal = Cancel.is_own
 
 (* The response to a malformed request; the connection closes after it. A client
    that already left makes the write raise Flow.Closed, which ends the
@@ -49,8 +54,7 @@ let expects_continue h = expectation h = `Continue
 (* RFC 9112 §9.6: a connection that the server ends closes in stages, for at
    most [linger_timeout] and [max_drain] bytes. *)
 let linger (config : Config.t) flow =
-  Flow.set_read_deadline flow
-    (Time.after (Flow.time flow) config.linger_timeout) ;
+  Flow.set_read_deadline flow (Deadline.from_now config.linger_timeout) ;
   Flow.linger flow ~max:config.max_drain
 
 (* A protocol of an Upgrade field: its name and its version, split at the first
@@ -116,68 +120,86 @@ let serve : Engine.t =
  fun ctx flow handler ->
   let config = ctx.config in
   let limits = limits config in
-  let time = Flow.time flow in
-  let after span () = Time.after time span in
-  (* Reads get a deadline fixed for a whole request head, and renewed before
-     each read of a body. Each write gets its own. *)
-  let read_deadline = ref (fun () -> None) in
+  (* Each write that waits gets [write_timeout] from the start of its first
+     wait. Thus the engine sets the timeout one time for the connection. *)
+  Flow.set_write_timeout flow (Some config.write_timeout) ;
+  (* The read limits of the phase of the connection: an absolute deadline and a
+     timeout for each read that waits. A head and a drain each get a deadline
+     for all of their reads. Thus a client that sends one byte at a time cannot
+     keep the connection. The deadline is lazy: a phase reads the clock only
+     when it reads the flow. The body of a request has no deadline, and each of
+     its reads has [read_timeout]. *)
+  let body_phase = (Lazy.from_val None, Some config.read_timeout) in
+  let phase = ref body_phase in
+  let new_phase span = phase := (lazy (Deadline.from_now span), None) in
   let r =
     Buf_reader.make ~size:config.buffer_size ~read_now:(Flow.read_now flow)
       (fun buf off len ->
-        Flow.set_read_deadline flow (!read_deadline ()) ;
+        let deadline, timeout = !phase in
+        Flow.set_read_deadline flow (Lazy.force deadline) ;
+        Flow.set_read_timeout flow timeout ;
         Flow.read flow buf off len )
   in
-  (* Discarding a request body the handler left unread gets one deadline for all
-     of it, as lingering does: renewed per read, a client trickling bytes could
-     keep the connection for days. *)
+  (* The engine discards a request body that the handler did not read, within
+     one deadline for all of it, as the linger does. *)
   let drain body =
-    let deadline = after config.read_timeout () in
-    (read_deadline := fun () -> deadline) ;
+    new_phase config.read_timeout ;
     H1_body.drain body ~max:config.max_drain
   in
-  let w =
-    Buf_writer.make ~size:config.buffer_size (fun buf off len ->
-        Flow.set_write_deadline flow (after config.write_timeout ()) ;
-        Flow.write flow buf off len )
-  in
+  let w = Buf_writer.make ~size:config.buffer_size (Flow.write flow) in
   let scheme =
     match Conn_info.scheme ctx.conn with `Http -> "http" | `Https -> "https"
   in
   let report e = config.on_error e (Printexc.get_raw_backtrace ()) in
   let date () =
-    if config.date_header then Some (Date.of_posix (Time.now config.posix_time))
-    else None
+    if config.date_header then Some (Date.of_posix (Time.now Posix)) else None
   in
   let error ?meth e = error_response ?date:(date ()) ?meth w e in
+  (* The exchange of each request is a fiber of this scope. *)
+  Fiber.scope
+  @@ fun s ->
   (* Waits at most [idle] for the next request. A stopping server takes no new
-     request, even one already received. *)
+     request, also one that it received. *)
   let rec next_request ~idle =
     if ctx.is_stopping () then
       if Buf_reader.buffered r > 0 then `Linger else `Close
     else if Buf_reader.buffered r > 0 then exchange ()
-    else wait_for_input (after idle ())
-  (* A wakeup can find nothing to read: readiness can be stale, or a TLS record
-     incomplete. Then the wait goes on, to the same deadline; a blocking read
-     would ignore both it and a stopping server. *)
+    else wait_for_input (Deadline.from_now idle)
+  (* A wake can find nothing to read: the readiness can be stale, or a TLS
+     record incomplete. Then the wait continues, to the same deadline. A read
+     that waits would ignore the deadline and a stopping server. *)
   and wait_for_input deadline =
-    let input = Flow.readable' flow `Input
-    and stop = Action.map (fun () -> `Stop) ctx.stopping in
     match
-      Action.invoke (Action.choose [stop; input; Time.at time deadline `Idle])
+      sync
+        (choose
+           [ wrap (Conn_info.stopping ctx.conn) (fun () -> `Stop)
+           ; wrap (Flow.readable flow) (fun () -> `Input)
+           ; wrap (Deadline.at deadline) (fun () -> `Idle) ] )
     with
-    | `Stop | `Idle ->
+    | `Stop ->
         `Close
     | `Input -> (
       match Buf_reader.fill_now r with
       | `Bytes ->
-          exchange ()
+          input ()
       | `Eof ->
           `Close
       | `Would_block ->
           wait_for_input deadline )
+    (* Input and a passed deadline can be ready at the same time, and weft
+       selects one at random. Thus the engine reads what came: the input
+       wins. *)
+    | `Idle -> (
+      match Buf_reader.fill_now r with
+      | `Bytes ->
+          input ()
+      | `Eof | `Would_block ->
+          `Close )
+  (* The stop and the input can be ready at the same time, and weft selects one
+     at random. A stopping server starts no new exchange. *)
+  and input () = if ctx.is_stopping () then `Linger else exchange ()
   and exchange () =
-    let head_deadline = after config.header_timeout () in
-    (read_deadline := fun () -> head_deadline) ;
+    new_phase config.header_timeout ;
     match H1_parse.request_head limits r with
     | exception Buf_reader.Eof ->
         `Close (* the client left in the middle of a request *)
@@ -196,7 +218,7 @@ let serve : Engine.t =
       | exception H1_error.E e ->
           error ~meth:head.meth e
       | framing, target -> (
-          read_deadline := after config.read_timeout ;
+          phase := body_phase ;
           let committed = ref false in
           let expect_continue =
             if not (expects_continue head) then None
@@ -225,128 +247,188 @@ let serve : Engine.t =
         ?authority:target.authority ~headers:head.headers
         ~body:(H1_body.body body) ~conn:ctx.conn head.meth target.path
     in
-    match await (Fun.Async.call (fun () -> handler req)) body with
-    (* Only the request's own body failing is the client's doing: the same
-       exceptions from the handler's other flows, an upstream, are errors. *)
-    | exception H1_error.E e when H1_body.failed body ->
-        error ~meth:head.meth e
-    | exception Body.Truncated when H1_body.failed body ->
-        `Close (* the client left *)
-    | exception e when not (is_fatal e) ->
-        report e ; fail_500 head
-    | `Disconnected ->
-        `Close
-    | `Response response -> (
-      match Response.kind response with
-      | Response.Upgrade f -> (
-        match upgrade_error head response with
-        | Some e ->
-            report (Failure ("Response.upgrade: " ^ e)) ;
-            fail_500 head
-        (* A server that stops opens no new upgrade or tunnel (#26), and sends
-           no 100 for it. *)
-        | None when ctx.is_stopping () ->
-            fail_503 head
-        (* A body known to be too large to drain gets the 500 with no 100: after
-           a 100 the client sends it (RFC 9110 §10.1.1). *)
-        | None
-          when Option.fold ~none:false
-                 ~some:(fun n -> n > config.max_drain)
-                 (H1_body.unread body) ->
-            fail_500 head
-        | None -> (
-          match continue_before_switch response body with
-          | exception Body.Truncated ->
-              `Close (* the client left *)
-          (* What follows the request body is the new protocol's. *)
-          | () when not (drain body) ->
-              fail_500 head
-          (* The stop can start during the 100 or the drain. *)
-          | () when ctx.is_stopping () ->
-              fail_503 head
-          | () ->
-              (* The writer ignores keep_alive for an upgrade. *)
-              ignore
-                (write ~committed ~body
-                   ~keep_alive:(fun () -> true)
-                   head response ) ;
-              switch f ) )
-      (* RFC 9110 §9.3.6: a 2xx to CONNECT opens a tunnel. *)
-      | Response.Body _
-        when Method.equal head.meth Method.CONNECT
-             && Status.kind (Response.status response) = `Success ->
-          report (Failure "a 2xx response to CONNECT must be a Response.upgrade") ;
-          fail_500 head
-      | Response.Body _ ->
-          (* Decided when the head is written, which a streamed response delays
-             until its first output: it may read the request body first, and get
-             a 100 Continue sent. Whether an unread body can be drained is only
-             known once the response is written. *)
-          let keep_alive () =
-            request_keep_alive head
-            && (not (H1_write.wants_close response))
-            && (not (H1_body.continue_owed body))
-            (* Its framing cannot be trusted any more. *)
-            && (not (H1_body.failed body))
-            && not (ctx.is_stopping ())
-          in
-          if write ~committed ~body ~keep_alive head response && drain body then begin
-            Fun.Async.yield () ;
-            next_request ~idle:config.idle_timeout
-          end
-          else `Linger )
-  (* The handler's response; or [`Disconnected], the exchange cancelled, if the
-     client leaves first. The connection is only watched once the request body
-     was read: until then the handler may be reading it. Bytes that arrive are a
-     pipelined request, kept for later. *)
-  and await exchange body =
-    let response =
-      Action.map (fun r -> `Response r) (Fun.Async.get' exchange)
+    (* [ended] is [true] after the end of the handler, also when it raises. *)
+    let ended = Atomic.make false in
+    let run_handler () =
+      Fun.protect
+        ~finally:(fun () -> Atomic.set ended true)
+        (fun () -> handler req)
     in
-    let read = Action.map (fun () -> `Read) (H1_body.completed body) in
-    (* A wakeup can find nothing to read, as in [wait_for_input]. *)
-    let rec watch () =
-      match
-        Action.invoke (Action.choose [response; Flow.readable' flow `Readable])
-      with
-      | `Response r ->
-          `Response r
-      | `Readable -> (
-        match Buf_reader.fill_now r with
-        | `Bytes ->
-            `Response (Fun.Async.get exchange)
-        | `Would_block ->
-            watch ()
-        | `Eof | (exception Flow.Closed) ->
-            left () )
-    (* Cancelled because the client left, unless we are cancelled too; other
-       failures while it unwound are still errors. A response that came anyway
-       is sent. *)
-    and left () =
-      Fun.Async.cancel exchange ;
-      match Fun.Async.get exchange with
+    match Fiber.fork_promise ~name:"caravan.exchange" s run_handler with
+    | exception Fiber.Scope_closed ->
+        (* The scope of the connection is open, so only a cancel of an outer
+           scope gives it. The connection ends. *)
+        `Close
+    | p -> (
+      match await p body ~ended with
+      (* Only a failure of the body of the request is the fault of the client.
+         The same exceptions from the other flows of the handler, an upstream,
+         are errors. *)
+      | exception H1_error.E e when H1_body.failed body ->
+          error ~meth:head.meth e
+      | exception Body.Truncated when H1_body.failed body ->
+          `Close (* the client left *)
+      (* A cancel of the connection can end the exchange before the connection
+         fiber sees its own cancel. Else the handler raised it: an error. *)
+      | ((exception Promise.Cancelled)
+         [@mutate
+           off
+             "true only on OS domains: the exchange ends with \
+              Promise.Cancelled before the connection fiber reads its cancel"]
+         )
+        when Cancel.is_cancelled () ->
+          `Close
+      | exception (Fiber.Cancelled _ as c) when is_fatal c ->
+          (* The connection is cancelled, and so is the exchange. Wait for its
+             end, so that the engine reports a failure of its cleanup. The
+             cancel gives Promise.Cancelled, or Scope_closed to a fork of the
+             handler. A Fiber.Cancelled is a failure: weft gives it only for a
+             scope that the handler cancelled. *)
+          let bt = Printexc.get_raw_backtrace () in
+          ( match Fiber.shield (fun () -> Promise.await p) with
+          | _ ->
+              ()
+          | exception (Promise.Cancelled | Fiber.Scope_closed) ->
+              ()
+          | exception e ->
+              report e ) ;
+          Printexc.raise_with_backtrace c bt
+      | exception e ->
+          report e ; fail_500 head
+      | `Disconnected ->
+          `Close
+      | `Response response -> (
+        match Response.kind response with
+        | Response.Upgrade f -> (
+          match upgrade_error head response with
+          | Some e ->
+              report (Failure ("Response.upgrade: " ^ e)) ;
+              fail_500 head
+          (* A server that stops opens no new upgrade or tunnel (#26), and sends
+             no 100 for it. *)
+          | None when ctx.is_stopping () ->
+              fail_503 head
+          (* A body too large to drain gets the 500 with no 100: after a 100 the
+             client sends it (RFC 9110 §10.1.1). *)
+          | None
+            when Option.fold ~none:false
+                   ~some:(fun n -> n > config.max_drain)
+                   (H1_body.unread body) ->
+              fail_500 head
+          | None -> (
+            match continue_before_switch response body with
+            | exception Body.Truncated ->
+                `Close (* the client left *)
+            (* What follows the request body is for the new protocol. *)
+            | () when not (drain body) ->
+                fail_500 head
+            (* The stop can start during the 100 or the drain. *)
+            | () when ctx.is_stopping () ->
+                fail_503 head
+            | () ->
+                (* The writer ignores keep_alive for an upgrade. *)
+                ignore
+                  (write ~committed ~body
+                     ~keep_alive:(fun () -> true)
+                     head response ) ;
+                switch f ) )
+        (* RFC 9110 §9.3.6: a 2xx to CONNECT opens a tunnel. *)
+        | Response.Body _
+          when Method.equal head.meth Method.CONNECT
+               && Status.kind (Response.status response) = `Success ->
+            report
+              (Failure "a 2xx response to CONNECT must be a Response.upgrade") ;
+            fail_500 head
+        | Response.Body _ ->
+            (* The engine decides when it writes the head. A streamed response
+               writes it at its first output: before that, it can read the
+               request body and get a 100 Continue sent. The engine knows if it
+               can drain an unread body only after the response. *)
+            let keep_alive () =
+              request_keep_alive head
+              && (not (H1_write.wants_close response))
+              && (not (H1_body.continue_owed body))
+              (* Its framing is not correct any more. *)
+              && (not (H1_body.failed body))
+              && not (ctx.is_stopping ())
+            in
+            if write ~committed ~body ~keep_alive head response && drain body
+            then begin
+              (* The other connections of this domain run before the next
+                 request of this connection. *)
+              Fiber.yield () ;
+              next_request ~idle:config.idle_timeout
+            end
+            else `Linger ) )
+  (* The response of the handler, or [`Disconnected] (the exchange is cancelled)
+     if the client leaves first. The engine watches the connection only after
+     the handler read the request body, because the handler reads the body until
+     then. Bytes that come are a pipelined request: the engine keeps them for
+     later. *)
+  and await p body ~ended =
+    let response = Promise.ready p in
+    let read = wrap (H1_body.completed body) (fun () -> `Read) in
+    (* The engine cancelled the exchange because the client left. A failure of
+       the handler during its cleanup is an error. The engine sends a response
+       that came anyway. *)
+    let left () =
+      Promise.cancel p ;
+      match Promise.await p with
       | r ->
           `Response r
-      | exception Fun.Async.Cancelled
-        when not (Fun.Async.is_current_cancelled ()) ->
+      | exception Promise.Cancelled ->
           `Disconnected
       | exception e when not (is_fatal e) ->
           report e ; `Disconnected
     in
-    if not config.cancel_on_disconnect then `Response (Fun.Async.get exchange)
+    (* A wake can find nothing to read, as in [wait_for_input]. Then the engine
+       syncs the same event again. *)
+    let watch () =
+      let wake =
+        choose
+          [ wrap response (fun r -> `Response r)
+          ; wrap (Flow.readable flow) (fun () -> `Readable) ]
+      in
+      let rec loop () =
+        match sync wake with
+        | `Response r ->
+            `Response r
+        | `Readable -> (
+          match Buf_reader.fill_now r with
+          | `Bytes ->
+              `Response (Promise.await p)
+          | `Would_block ->
+              loop ()
+          | `Eof | (exception Flow.Closed) ->
+              left ()
+          (* A different failure of the read: the engine cannot use the
+             connection either. *)
+          | exception e when not (is_fatal e) ->
+              report e ; left () )
+      in
+      loop ()
+    in
+    if not config.cancel_on_disconnect then `Response (Promise.await p)
     else
-      match Action.invoke (Action.choose [response; read]) with
+      match sync (choose [wrap response (fun r -> `Response r); read]) with
       | `Response r ->
           `Response r
       | `Read when Buf_reader.buffered r > 0 ->
-          `Response (Fun.Async.get exchange)
+          `Response (Promise.await p)
       | `Read ->
-          watch ()
-  (* Hands the connection to [f], with the bytes already received first. The new
-     protocol sets its own deadlines. *)
+          (* After the read of a request, the readiness of the flow is stale.
+             Thus the first watch reads no data. On one domain, the exchange
+             runs in this yield. A handler that ends at once then gives its
+             response with no watch. *)
+          Fiber.yield () ;
+          if Atomic.get ended then `Response (Promise.await p) else watch ()
+  (* Gives the connection to [f], with the bytes that came first. The new
+     protocol sets its own deadlines and timeouts. *)
   and switch f =
     Flow.set_read_deadline flow None ;
     Flow.set_write_deadline flow None ;
+    Flow.set_read_timeout flow None ;
+    Flow.set_write_timeout flow None ;
     ( match f (Flow.prepend (Buf_reader.take_buffered r) flow) with
     | () | (exception (Flow.Closed | Flow.Timeout)) ->
         ()
@@ -366,10 +448,11 @@ let serve : Engine.t =
          (Response.string ~status:Status.service_unavailable
             "Service Unavailable\n" ) ) ;
     `Linger
-  (* Writes [response]; [true] iff it was written in full and the connection can
-     stay open, or switch protocols. The head is written, and [committed] set,
-     just before the body's first output; [keep_alive ()] is asked then. Until
-     that point a failing body can still be answered properly. *)
+  (* Writes [response]. The result is [true] if the engine wrote all of it and
+     the connection can stay open, or switch protocols. The engine writes the
+     head, and sets [committed], just before the first output of the body. It
+     calls [keep_alive ()] then. Until that point, the engine can answer a
+     failure of the body correctly. *)
   and write ?(committed = ref false) ?body ~keep_alive (head : H1_parse.head)
       response =
     let request_failed () = Option.fold ~none:false ~some:H1_body.failed body in
@@ -385,7 +468,7 @@ let serve : Engine.t =
     in
     (* A response cut short after its head. Chunked and Content-Length framings
        show it, but a close-delimited body would look complete after a clean
-       close: reset the connection instead. *)
+       close: reset the connection. *)
     match Response.kind response with
     | Response.Upgrade _ ->
         write_head () ; Buf_writer.flush w ; true
@@ -395,15 +478,20 @@ let serve : Engine.t =
           !kept_alive
       | exception e -> (
           let bt = Printexc.get_raw_backtrace () in
-          (* Cut short after its head, whatever the cause: a failing body, a
-             write timeout, a cancellation. *)
+          (* Cut short after its head, for each cause: a body that fails, a
+             write timeout, a cancel. [Flow.reset] does no sync, so a cancelled
+             fiber can call it. *)
           if !committed && framing = H1_write.Close_delimited then
             Flow.reset flow ;
           match e with
-          | Flow.Closed | Flow.Timeout | Fun.Async.Cancelled ->
+          | Flow.Closed | Flow.Timeout ->
+              Printexc.raise_with_backtrace e bt
+          (* [bt] is taken: [is_fatal] raises inside. A cancel of a different
+             scope is a failure of the producer, as for a handler. *)
+          | Fiber.Cancelled _ when is_fatal e ->
               Printexc.raise_with_backtrace e bt
           (* A request body that the response streams was cut short or is
-             malformed: the client's fault, not the server's. *)
+             malformed: the fault of the client, not of the server. *)
           | Body.Truncated when request_failed () ->
               false
           | H1_error.E e when request_failed () ->

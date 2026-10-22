@@ -1,111 +1,134 @@
 (** HTTP servers.
 
     {[
-    let () = Server.run (fun _req -> Response.string "hello\n")
+    let () = Caravan_run.run (fun _req -> Response.string "hello\n")
     ]}
 
-    {!run} serves until Ctrl-C. For more control, {!start} servers inside
-    [Affect_unix.Unix.main] and stop them with {!shutdown}. *)
+    [Caravan_run.run] serves until Ctrl-C. For more control, {!start} a server
+    in a [Weft.Fiber.scope] and stop it with {!shutdown}. *)
 
 (** The type for running servers. *)
 type t
 
-val start : ?config:Config.t -> ?engine:Engine.t -> Handler.t -> t
-(** [start ~config ~engine handler] listens on [config.addr] (default
-    {!Config.default}) and serves connections with [engine] (default HTTP/1.1),
-    calling [handler] for each request. At most [config.max_connections]
-    connections are served at once.
+val start :
+  ?config:Config.t -> ?engine:Engine.t -> Weft.Fiber.scope -> Handler.t -> t
+(** [start ~config ~engine sw handler] listens on [config.addr] with
+    {!Tcp.Listener} (default {!Config.default}) and serves connections with
+    [engine] (default HTTP/1.1). It calls [handler] for each request. At most
+    [config.max_connections] connections are served at the same time.
 
-    The server runs in an asynchronous function call made by the caller, so the
-    calling function does not return before the server has stopped.
+    The server runs in a new fiber of [sw]. Thus [Fiber.scope] of [sw] returns
+    only after the server stopped: call {!shutdown} or {!abort} before its body
+    returns. A cancel of [sw] stops the server with no grace: the connections
+    get the cancel at once, and {!Conn_info.stopping} becomes ready.
 
-    @raise Unix.Unix_error
-      if the address cannot be bound, for example with [EADDRINUSE]. *)
+    @raise Weft.Net.Error
+      if the address cannot be bound, for example with [In_use].
+    @raise Weft.Fiber.Scope_closed if [sw] ended or is cancelled.
+    @raise Invalid_argument if [config.max_connections] is less than 1. *)
 
-val local_addr : t -> Unix.sockaddr
-(** [local_addr s] is the address [s] listens on, with its actual port when
-    [config.addr] has port [0]. *)
+val local_addr : t -> Weft.Net.addr
+(** [local_addr s] is the address that [s] listens on, with its port when
+    [config.addr] has the port [0]. *)
 
 val shutdown : t -> unit
-(** [shutdown s] stops [s]. It closes the listening socket, so that new clients
-    are refused, and idle connections close. Requests in progress get
-    [config.shutdown_grace] to finish, their responses ending their connections;
-    then they are cancelled. A handler can see the stop with
-    {!Conn_info.stopping}. A response that would switch protocols (an upgrade or
-    a tunnel) gets a [503] in place of the switch (see {!Response.upgrade}).
-    [shutdown] returns at once; see {!wait}. It takes a lock: do not call it
-    from an OCaml signal handler. *)
+(** [shutdown s] stops [s]. It closes the listening socket, and idle connections
+    close. The requests in progress get [config.shutdown_grace] to finish, and
+    their responses end their connections. Then the server cancels them.
+
+    After the close of the listening socket, the OS refuses new clients. On more
+    than one domain, the close can occur a short time after [shutdown] returns.
+    A client that connects in that time gets a reset after its connect.
+
+    A handler can see the stop with {!Conn_info.stopping}. A response that
+    switches protocols (an upgrade or a tunnel) gets a [503] in place of the
+    switch (see {!Response.upgrade}). [shutdown] does not wait (see {!wait}). A
+    second call does nothing. Call it from fiber code, also from a handler of
+    [s].
+
+    @raise Weft.Fiber.Not_in_fiber outside fiber code. *)
 
 val abort : t -> unit
-(** [abort s] is like {!shutdown} but cancels the connections in progress at
-    once, without a grace period. *)
+(** [abort s] is {!shutdown} with no grace: the server cancels the requests in
+    progress at once. *)
 
 val wait : t -> unit
-(** [wait s] waits until [s] has stopped and all its connections are closed.
+(** [wait s] waits until [s] stopped and all its connections closed. It is a
+    cancellation point. A cancel of the scope of the server does not make it
+    raise. Call it from fiber code.
 
-    @raise Unix.Unix_error if accepting connections failed, which stops [s] too.
-*)
-
-(** {1:run Running} *)
-
-val run :
-     ?config:Config.t
-  -> ?engine:Engine.t
-  -> ?domain_count:int
-  -> ?on_start:(t -> unit)
-  -> Handler.t
-  -> unit
-(** [run ~config ~engine ~domain_count ~on_start handler] serves [handler] until
-    the process gets [SIGINT] (Ctrl-C) or [SIGTERM]:
-    + It installs the {!Stop_signal}s and runs [Affect_unix.Unix.main] with
-      [domain_count].
-    + It {!start}s the server and calls [on_start] with it, for example to print
-      its address.
-    + On the first signal it calls {!shutdown}, on a second one {!abort}. A
-      third one ends the process as the signal would, for handlers that ignore
-      cancellation.
-
-    It returns once the server has stopped, the signals {!Stop_signal.release}d.
-    Call it from the main thread, outside [Affect_unix.Unix.main].
-
-    @raise Unix.Unix_error if the address cannot be bound. *)
-
-(**/**)
-
-(** {1:seam Listener seam}
-
-    For tests, not part of the public API. A test gives a fake listener that
-    makes [accept] errors that a real socket cannot make on demand, for example
-    [EMFILE]. *)
-
-(** The listening socket of a server. {!Tcp.Listener} has this signature. *)
-module type LISTENER = sig
-  type t
-
-  val addr : t -> Unix.sockaddr
-
-  val wait_acceptable : t -> 'tag -> 'tag Affect.Action.t
-  (** As {!Tcp.Listener.wait_acceptable}. It can be enabled spuriously. *)
-
-  val try_accept : t -> (Unix.file_descr * Unix.sockaddr) option
-  (** As {!Tcp.Listener.try_accept}. The descriptor must be non-blocking. *)
-
-  val close : t -> unit
-end
+    @raise Weft.Net.Error
+      if the accept of connections failed. This failure also stopped [s]. If no
+      fiber calls [wait], weft reports the failure as a promise that no fiber
+      awaited. An exception of [config.on_error] also goes out of [wait]. Two
+      exceptions from it at the same time go out of [wait] as
+      [Weft.Fiber.Multiple]. *)
 
 val open_connections : t -> int
 (** [open_connections s] is the number of connections that [s] serves at this
     time. *)
 
+val stop_on_signals : t -> unit
+(** [stop_on_signals s] waits for SIGINT and SIGTERM. The first signal calls
+    {!shutdown}. The second signal calls {!abort} and [Weft.Signal.unwatch] for
+    the two signals, then [stop_on_signals] returns. Then a third signal gets
+    its default action, usually the end of the process. This ends a server with
+    a handler that ignores the cancel.
+
+    Two signals in one commit count as the second signal. A third signal in that
+    commit is lost.
+
+    Call it in a daemon fiber, one time for each world. It stops one server. It
+    returns only after the second signal. Thus in a fiber that is not a daemon,
+    the scope stays open after a stop by the first signal. With two calls in one
+    world, each signal goes to one call only. Then the [unwatch] of one call
+    makes the wait of the other call raise [Invalid_argument].
+
+    The world must watch SIGINT and SIGTERM, for example
+    [Weft_linux.run ~signals] or [Weft_sim.run ~signals]. If not, the wait
+    raises [Invalid_argument].
+
+    @raise Weft.Net.Error
+      if the OS gives an error for a signal, for example [ENOMEM] of [signalfd].
+      An error of a wait comes before the next stop of [s]. An error of
+      [Weft.Signal.unwatch] comes after the abort. If the unwatch of SIGINT
+      fails, the world continues to watch the two signals. If the unwatch of
+      SIGTERM fails, it continues to watch SIGTERM. A signal that the world
+      watches does not get its default action. *)
+
+(**/**)
+
+(** {1:seam Listener seam}
+
+    For the tests, not part of the public API. A test gives a fake listener that
+    makes [accept] errors that the simulator cannot make, for example
+    [Other "EPROTO"]. {!Tcp.Listener} has this signature. *)
+
+(** The listening socket of a server. *)
+module type LISTENER = sig
+  type t
+
+  val addr : t -> Weft.Net.addr
+
+  val accept : t -> Weft.Net.t * Weft.Net.addr
+  (** As {!Tcp.Listener.accept}: it waits, it is a cancellation point, and it
+      raises [Weft.Net.Error]. After [close], also for a call that waits at that
+      time, it raises [Weft.Net.Error (Bad_fd, _)]. *)
+
+  val close : t -> unit
+  (** It never blocks, and a second call does nothing. *)
+end
+
 val start_with :
      ?config:Config.t
   -> ?engine:Engine.t
+  -> Weft.Fiber.scope
   -> (module L : LISTENER) -> L.t -> Handler.t -> t
-(** [start_with ~config ~engine (module L) listener handler] is like {!start},
-    but serves the connections of [listener]. It ignores [config.addr] and
+(** [start_with ~config ~engine sw (module L) listener handler] is {!start}, but
+    it serves the connections of [listener]. It ignores [config.addr] and
     [config.backlog]. It closes [listener] when the server stops, or before it
     raises if the server cannot start.
 
     [(module L : LISTENER)] is a module-dependent argument (OCaml 5.5): the type
-    of [listener] is the type [L.t] of the module given. Production code gives
+    of [listener] is the type [L.t] of the module. Production code gives
     [(module Tcp.Listener)]. *)

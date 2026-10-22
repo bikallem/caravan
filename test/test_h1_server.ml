@@ -1,7 +1,9 @@
-(* The HTTP/1.1 engine over in-memory flows: whole connections, golden bytes. *)
+(* The HTTP/1.1 engine over in-memory flows in the simulator of weft: whole
+   connections, golden bytes. Each test runs 1 seed on 1 domain, except a test
+   whose name starts with "race:". *)
 
 open Windtrap
-open Affect
+open Weft
 open Caravan
 
 let show_crlf s =
@@ -17,9 +19,18 @@ let show_crlf s =
   in
   loop 0 ; Buffer.contents b
 
-let loopback port = Unix.ADDR_INET (Unix.inet_addr_loopback, port)
+(* [conn ~scheme ~stopping ()] is the connection of each test. [scheme] is
+   [`Http] and [stopping] is [Weft.never] by default. *)
+let conn ?scheme ?stopping () =
+  Conn_info.make ~id:7
+    ~peer:(Net.Tcp ("127.0.0.1", 50000))
+    ~local:(Net.Tcp ("127.0.0.1", 8080))
+    ?scheme ?stopping ()
 
-let conn = Conn_info.make ~id:7 ~peer:(loopback 50000) ~local:(loopback 8080) ()
+(* [ctx ~scheme ~stopping ~is_stopping config] is the context of an engine. By
+   default the server does not stop. *)
+let ctx ?scheme ?stopping ?(is_stopping = fun () -> false) config =
+  {Engine.config; conn= conn ?scheme ?stopping (); is_stopping}
 
 (* After an upgrade: what the client sends, until it ends. *)
 let echo_upgraded flow =
@@ -40,30 +51,34 @@ let upgrade_echo = Headers.of_list [("Upgrade", "echo")]
 (* How the last slow handler ended: finished or cancelled. *)
 let slow_outcome = ref ""
 
-(* Answers "late" after [span] of real time, having read the request body or
-   not. *)
+(* Filled when a slow handler starts to wait. *)
+let holding = ref (Ivar.create ())
+
+(* Answers "late" after [span] of virtual time. Before the wait, it reads the
+   request body if [read] is [true]. *)
 let slowly ~read ~span req =
   match
     if read then ignore (Body.to_string (Request.body req)) ;
-    Affect_unix.Mtime.wait_for span
+    ignore (Ivar.try_fill !holding ()) ;
+    Time.sleep Mono span
   with
   | () ->
       slow_outcome := "[handler finished]" ;
       Response.string "late"
-  | exception Fun.Async.Cancelled ->
+  | exception (Fiber.Cancelled _ as e) ->
       slow_outcome := "[handler cancelled]" ;
-      raise Fun.Async.Cancelled
+      raise e
 
 (* /slow waits 50 ms: a test that needs the handler to finish uses it. *)
-let slow = Affect_unix.Mtime.Span.(50 * ms)
+let slow = Span.ms 50
 
-(* /hold waits 2 s: a test that needs a cancel uses it. The cancel comes at
-   once, and a missing cancel gives "[handler finished]" after 2 s, not a
-   hang. *)
-let hold = Affect_unix.Mtime.Span.(2 * s)
+(* /hold waits 1 s: a test that needs a cancel uses it. The cancel comes at
+   once. A cancel that does not come gives "[handler finished]" after 1 s,
+   before the guard of 2 s. *)
+let hold = Span.s 1
 
-(* Set by /endless after it flushed its first bytes. *)
-let flushed = ref (Cell.Once.make ())
+(* Filled by /endless after it flushed its first bytes. *)
+let flushed = ref (Ivar.create ())
 
 (* The writer that /keep-writer keeps after its producer returns. *)
 let kept_writer = ref None
@@ -130,8 +145,8 @@ let handler req =
         Response.stream (fun w ->
             Body.Writer.write_string w "first" ;
             Body.Writer.flush w ;
-            ignore (Cell.Once.try_set !flushed ()) ;
-            Affect_unix.Mtime.wait_for Affect_unix.Mtime.Span.(10 * s) )
+            ignore (Ivar.try_fill !flushed ()) ;
+            Time.sleep Mono (Span.s 10) )
     | "/partial" ->
         Response.stream (fun w ->
             Body.Writer.write_string w "partial" ;
@@ -145,7 +160,7 @@ let handler req =
         slowly ~read:true ~span:hold req
     | "/hold-cleanup-fails" -> (
       try slowly ~read:false ~span:hold req
-      with Fun.Async.Cancelled -> failwith "cleanup failed" )
+      with Fiber.Cancelled _ -> failwith "cleanup failed" )
     | "/ws" ->
         Response.upgrade ~headers:upgrade_echo echo_upgraded
     | "/ws-bare" ->
@@ -189,6 +204,37 @@ let handler req =
             Body.Writer.write_string w "b" )
     | "/fail" ->
         failwith "boom"
+    | "/cancelled-child" ->
+        (* The handler cancels a child and awaits it. *)
+        Fiber.scope (fun s ->
+            let child =
+              Fiber.fork_promise s (fun () ->
+                  Time.sleep Mono (Span.s 10) ;
+                  Response.string "child" )
+            in
+            Promise.cancel child ; Promise.await child )
+    | "/cancelled-scope" ->
+        (* The handler cancels a scope of its own. Its Cancelled is not a cancel
+           of the connection. *)
+        Fiber.scope (fun s ->
+            Fiber.cancel s (Failure "inner") ;
+            Fiber.yield () ) ;
+        Response.string "after the scope"
+    | "/stream-cancelled-scope" ->
+        (* The producer cancels a scope of its own before its first output. *)
+        Response.stream (fun _ ->
+            Fiber.scope (fun s ->
+                Fiber.cancel s (Failure "inner") ;
+                Fiber.yield () ) )
+    | "/ws-cancelled-scope" ->
+        Response.upgrade ~headers:upgrade_echo (fun _ ->
+            Fiber.scope (fun s ->
+                Fiber.cancel s (Failure "inner") ;
+                Fiber.yield () ) )
+    | "/ended-scope" ->
+        (* The handler forks into a scope that ended. *)
+        let ended = Fiber.scope Fun.id in
+        Fiber.fork ended ignore ; Response.string "forked"
     | "/short" ->
         Response.stream ~length:5 (fun w -> Body.Writer.write_string w "abc")
     | "/close" ->
@@ -211,36 +257,39 @@ let handler req =
     | _ ->
         Response.string "hello"
 
-(* Serves [input] on one connection. The bytes written, with [[FIN]] where the
-   server half-closed and [[unread n]] if it left input unread, and the errors
-   reported. At the end of [input] the client closes; with [~stall:true] it goes
-   quiet instead (the flow is no longer readable and reads time out), and with
-   [~reset:true] it resets the connection. With [~unwritable:true] every write
-   fails as on a reset connection. With [~false_wakes:n] the flow is first
-   readable [n] times with nothing to read yet, and a read that would block then
-   fails. The flow is on the time line [time] (default: the real one).
+(* [engine ~handler s ctx flow] runs the engine with [handler] on [flow] in a
+   call of the scope [s]. *)
+let engine ?(handler = handler) s ctx flow =
+  Sim_support.call ~name:"engine" s (fun () ->
+      Private.H1_server.serve ctx flow handler )
 
-   With [~drive] or [~cancel_on], the engine runs in a call. [drive] gets the
-   call, for example to advance a fake time. Then, when [cancel_on] is enabled,
-   the call is cancelled, as by a server shutdown. At the end, also on a
-   failure, [serve] cancels the call, so that a failure does not hang. *)
-let serve ?(config = {Config.default with date_header= false}) ?chunk ?time
-    ?drive ?cancel_on ?(stall = false) ?(reset = false) ?(unwritable = false)
-    ?(watch = false) ?(false_wakes = 0) input =
-  let errors = ref [] in
-  (* The input's end looks like a client leaving: only watched for if asked. *)
-  let config =
-    { config with
-      on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
-    ; cancel_on_disconnect= watch }
-  in
-  slow_outcome := "" ;
+(* [span_sum a b] is the span [a] and then [b]. *)
+let span_sum a b = Span.of_ns (Int64.add (Span.to_ns a) (Span.to_ns b))
+
+(* An in-memory connection: the flow of the engine, and [output ()], the bytes
+   that the engine wrote. The bytes have [[FIN]] where the engine half-closed,
+   [[RST]] where it reset, and [[unread n]] if it left input unread. *)
+type memory = {flow: Flow.t; output: unit -> string}
+
+(* [memory input] is a connection whose client sends [input]. At the end of
+   [input] the client closes. With [~stall:true] it stops: the flow is not
+   readable any more, and reads raise [Flow.Timeout]. With [~reset:true] it
+   resets the connection. With [~unwritable:true] each write raises as on a
+   reset connection. With [~false_wakes:n] the flow is first readable [n] times
+   with nothing to read, and a read that waits then fails. With [~ready:iv] the
+   flow is readable and has input only after a fill of [iv]. *)
+let memory ?chunk ?(stall = false) ?(reset = false) ?(unwritable = false)
+    ?(false_wakes = 0) ?ready input =
   let out = Buffer.create 256 and consumed = ref 0 in
   let inner = Flow.of_string ?chunk input out in
   let stalled () = stall && !consumed = String.length input in
+  let before_input () =
+    match ready with Some iv -> Option.is_none (Ivar.peek iv) | None -> false
+  in
   let false_wakes = ref false_wakes in
   let read buf off len =
     if !false_wakes > 0 then failwith "blocking read after a false wakeup" ;
+    if before_input () then failwith "blocking read before the input" ;
     if stalled () then raise Flow.Timeout ;
     if reset && !consumed = String.length input then raise Flow.Closed ;
     let n = Flow.read inner buf off len in
@@ -248,54 +297,173 @@ let serve ?(config = {Config.default with date_header= false}) ?chunk ?time
     n
   in
   let read_now buf off len =
-    if !false_wakes > 0 then (decr false_wakes ; None)
+    if before_input () then None
+    else if !false_wakes > 0 then (decr false_wakes ; None)
     else if stalled () then None
     else Some (read buf off len)
   in
   let readable =
-    Action.guard (fun () ->
-        if !false_wakes = 0 && stalled () then Action.never
-        else Action.always () )
+    match ready with
+    | Some iv ->
+        Ivar.read iv
+    | None ->
+        guard (fun () ->
+            if !false_wakes = 0 && stalled () then never else always () )
   in
   let flow =
     let write buf off len =
       if unwritable then raise Flow.Closed else Flow.write inner buf off len
     in
-    Flow.make
-      ~time:(Option.value time ~default:(Flow.time inner))
-      ~read ~read_now ~write ~readable
+    Flow.make ~read ~read_now ~write ~readable
       ~shutdown_send:(fun () -> Buffer.add_string out "[FIN]")
       ~close:ignore
       ~reset:(fun () -> Buffer.add_string out "[RST]")
       ~set_read_deadline:ignore ~set_write_deadline:ignore ()
   in
-  stopping := false ;
-  Affect_unix.Unix.main ~domain_count:1 (fun () ->
-      let ctx =
-        { Engine.config
-        ; conn
-        ; stopping= Action.never
-        ; is_stopping= (fun () -> !stopping) }
-      in
-      let serve () = Private.H1_server.serve ctx flow handler in
-      if drive = None && cancel_on = None then serve ()
-      else
-        let c = Fun.Async.call serve in
-        Stdlib.Fun.protect
-          ~finally:(fun () -> Fun.Async.cancel c)
-          (fun () ->
-            Option.iter (fun drive -> drive c) drive ;
-            Option.iter Action.invoke cancel_on ) ;
-        try Fun.Async.get c with Fun.Async.Cancelled -> () ) ;
-  let unread = String.length input - !consumed in
-  if unread > 0 then Printf.bprintf out "[unread %d]" unread ;
-  (Buffer.contents out, List.rev !errors)
+  let output () =
+    let unread = String.length input - !consumed in
+    Buffer.contents out
+    ^ if unread > 0 then Printf.sprintf "[unread %d]" unread else ""
+  in
+  {flow; output}
 
-let show ?config ?chunk ?time ?drive ?cancel_on ?stall ?reset ?unwritable ?watch
-    ?false_wakes input =
+(* A fake client socket. As a weft socket, it stays readable after its input
+   until a read with no wait finds nothing. The client sends [parts]: the first
+   part at once, and the next part at each write of the engine. The empty part
+   is the end of the stream. With [~error:e], the first read with no wait that
+   finds no input raises [e], and then the stream ends. A read that waits fails.
+   [empty_reads ()] is the number of reads with no wait that found nothing.
+   [end_stream ()] ends the stream at once. *)
+type fake_socket =
+  { socket: Flow.t
+  ; written: unit -> string
+  ; empty_reads: unit -> int
+  ; end_stream: unit -> unit }
+
+let fake_socket ?error parts =
+  let input = Buffer.create 64 and pos = ref 0 in
+  let eof = ref false and stale = ref false and empty = ref 0 in
+  let error = ref error and wake = ref (Ivar.create ()) in
+  let send part =
+    if part = "" then eof := true else Buffer.add_string input part
+  in
+  let later =
+    ref (match parts with [] -> [] | first :: rest -> send first ; rest)
+  in
+  let wake_reader () =
+    Ivar.fill !wake () ;
+    wake := Ivar.create ()
+  in
+  let send_next () =
+    match !later with
+    | [] ->
+        ()
+    | part :: rest ->
+        later := rest ;
+        send part ;
+        wake_reader ()
+  in
+  let available () = Buffer.length input - !pos in
+  let take buf off len =
+    let n = Int.min len (available ()) in
+    Buffer.blit input !pos buf off n ;
+    pos := !pos + n ;
+    stale := true ;
+    n
+  in
+  let read_now buf off len =
+    if available () > 0 then Some (take buf off len)
+    else
+      match !error with
+      | Some e ->
+          error := None ;
+          eof := true ;
+          raise e
+      | None ->
+          if !eof then Some 0
+          else (
+            incr empty ;
+            stale := false ;
+            None )
+  in
+  let read buf off len =
+    if available () > 0 then take buf off len
+    else if !eof then 0
+    else failwith "a read that waits"
+  in
+  let readable =
+    guard (fun () ->
+        if available () > 0 || !eof || !stale || Option.is_some !error then
+          always ()
+        else Ivar.read !wake )
+  in
+  let out = Buffer.create 256 in
+  let write buf off len =
+    Buffer.add_subbytes out buf off len ;
+    send_next ()
+  in
+  let socket =
+    Flow.make ~read ~read_now ~write ~readable
+      ~shutdown_send:(fun () -> Buffer.add_string out "[FIN]")
+      ~close:ignore ~set_read_deadline:ignore ~set_write_deadline:ignore ()
+  in
+  { socket
+  ; written= (fun () -> Buffer.contents out)
+  ; empty_reads= (fun () -> !empty)
+  ; end_stream= (fun () -> send "" ; wake_reader ()) }
+
+(* [config_for config errors ~watch] is [config] with an [on_error] that adds
+   each error to [errors]. *)
+let config_for config errors ~watch =
+  { config with
+    Config.on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
+  ; cancel_on_disconnect= watch }
+
+(* Serves [input] on one connection of {!memory}. The result is the bytes that
+   the engine wrote, and the errors that it reported.
+
+   The engine runs in [Sim_support.run], thus in auto mode. With
+   [~ends_after:d], it runs in manual mode, and it must end at [d] after the
+   start ([Sim_support.ends_at]). With [~cancel_on:ready], the test cancels the
+   engine when the event [ready ()] is ready, as a stop of the server does.
+   [handler] is {!handler} by default. *)
+let serve ?(config = {Config.default with date_header= false})
+    ?(handler = handler) ?chunk ?ends_after ?cancel_on ?stall ?reset ?unwritable
+    ?(watch = false) ?false_wakes input =
+  let errors = ref [] in
+  (* The end of the input looks like a client that leaves: the engine watches
+     for it only if the test asks. *)
+  let config = config_for config errors ~watch in
+  slow_outcome := "" ;
+  let m = memory ?chunk ?stall ?reset ?unwritable ?false_wakes input in
+  stopping := false ;
+  let ctx = ctx ~is_stopping:(fun () -> !stopping) config in
+  ( match (ends_after, cancel_on) with
+  | Some d, _ ->
+      Sim_support.manual (fun sim ->
+          let t0 = Time.now Mono in
+          Fiber.scope (fun s ->
+              Sim_support.ends_at sim ~t0 d (engine ~handler s ctx m.flow) ) )
+  | None, None ->
+      Sim_support.run (fun _ -> Private.H1_server.serve ctx m.flow handler)
+  | None, Some ready ->
+      Sim_support.run (fun _ ->
+          Fiber.scope (fun s ->
+              let c = engine ~handler s ctx m.flow in
+              sync (ready ()) ;
+              Sim_support.cancel c ;
+              match Sim_support.await c with
+              | () ->
+                  ()
+              | exception Promise.Cancelled ->
+                  () ) ) ) ;
+  (m.output (), List.rev !errors)
+
+let show ?config ?handler ?chunk ?ends_after ?cancel_on ?stall ?reset
+    ?unwritable ?watch ?false_wakes input =
   let out, errors =
-    serve ?config ?chunk ?time ?drive ?cancel_on ?stall ?reset ?unwritable
-      ?watch ?false_wakes input
+    serve ?config ?handler ?chunk ?ends_after ?cancel_on ?stall ?reset
+      ?unwritable ?watch ?false_wakes input
   in
   show_crlf out
   ^ String.concat "" (List.map (fun e -> "\n! " ^ e) errors)
@@ -311,23 +479,6 @@ let post ?(headers = []) path body =
     (String.length body)
     (String.concat "" (List.map (fun (n, v) -> n ^ ": " ^ v ^ "\r\n") headers))
     body
-
-(* The engine on a fake time line *)
-
-module Fake = Fake_time
-
-let ( +: ) = Fake.( +: )
-
-let header_h = Server_support.header_h
-
-let idle_i = Server_support.idle_i
-
-(* The spans of [Server_support], on the fake time line [f]. *)
-let fake_config = Server_support.fake_config
-
-let get_2s = Server_support.get_2s
-
-let ends_at = Server_support.ends_at
 
 let connection_tests =
   group "H1_server connections"
@@ -437,6 +588,21 @@ let connection_tests =
         Content-Length: 74\r\n
         \r\n
         GET http a.example /info?q=1 HTTP/1.1 #7 127.0.0.1:50000 -> 127.0.0.1:8080
+        |} )
+    ; test "a connection with TLS gives the https scheme" (fun () ->
+          let m = memory (get "/info") in
+          let ctx =
+            ctx ~scheme:`Https {Config.default with date_header= false}
+          in
+          Sim_support.run (fun _ -> Private.H1_server.serve ctx m.flow handler) ;
+          expect (show_crlf (m.output ()))
+          @@ __POS_OF__
+               {|
+        HTTP/1.1 200 OK\r\n
+        Content-Type: text/plain; charset=utf-8\r\n
+        Content-Length: 71\r\n
+        \r\n
+        GET https a.example /info HTTP/1.1 #7 127.0.0.1:50000 -> 127.0.0.1:8080
         |} )
     ; test "HTTP/1.0 closes unless kept alive" (fun () ->
           expect
@@ -783,9 +949,10 @@ let connection_tests =
     ; test
         "a close-delimited body cut short by cancellation resets the connection"
         (fun () ->
-          flushed := Cell.Once.make () ;
+          flushed := Ivar.create () ;
           expect
-            (show ~cancel_on:(Cell.Once.get' !flushed)
+            (show
+               ~cancel_on:(fun () -> Ivar.read !flushed)
                (get ~v:"HTTP/1.0" "/endless") )
           @@ __POS_OF__
                {|
@@ -897,41 +1064,32 @@ let connection_tests =
     ; test "a stopping server ends an idle connection without reading"
         (fun () ->
           let flow =
-            Flow.make ~time:Time.mono
+            Flow.make
               ~read:(fun _ _ _ -> failwith "read while stopping")
               ~read_now:(fun _ _ _ -> failwith "read while stopping")
               ~write:(fun _ _ _ -> ())
-              ~readable:Action.never ~shutdown_send:ignore ~close:ignore
+              ~readable:never ~shutdown_send:ignore ~close:ignore
               ~set_read_deadline:ignore ~set_write_deadline:ignore ()
           in
-          Affect_unix.Unix.main ~domain_count:1 (fun () ->
-              let ctx =
-                { Engine.config= Config.default
-                ; conn
-                ; stopping= Action.always ()
-                ; is_stopping= (fun () -> true) }
-              in
-              Private.H1_server.serve ctx flow handler ) )
+          let ctx =
+            ctx ~stopping:(always ())
+              ~is_stopping:(fun () -> true)
+              Config.default
+          in
+          Sim_support.run (fun _ -> Private.H1_server.serve ctx flow handler) )
     ; test "an error response to a client that left is dropped" (fun () ->
           let input =
             Flow.of_string "GET / HTTP/1.1\r\n\r\n" (Buffer.create 0)
           in
           let flow =
-            Flow.make ~time:(Flow.time input) ~read:(Flow.read input)
-              ~read_now:(Flow.read_now input)
+            Flow.make ~read:(Flow.read input) ~read_now:(Flow.read_now input)
               ~write:(fun _ _ _ -> raise Flow.Closed)
-              ~readable:(Flow.readable' input ()) ~shutdown_send:ignore
+              ~readable:(Flow.readable input) ~shutdown_send:ignore
               ~close:ignore ~set_read_deadline:ignore ~set_write_deadline:ignore
               ()
           in
-          Affect_unix.Unix.main ~domain_count:1 (fun () ->
-              let ctx =
-                { Engine.config= Config.default
-                ; conn
-                ; stopping= Action.never
-                ; is_stopping= (fun () -> false) }
-              in
-              Private.H1_server.serve ctx flow handler ) )
+          Sim_support.run (fun _ ->
+              Private.H1_server.serve (ctx Config.default) flow handler ) )
     ; test "a failing handler gets 500 and is reported" (fun () ->
           expect (show (get "/fail" ^ get "/"))
           @@ __POS_OF__
@@ -1124,21 +1282,15 @@ let timeout_tests =
             |} )
     ; test "a new connection that sends nothing is closed" (fun () ->
           (* The first wait for a request has the header timeout. *)
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
           expect
-            (show ~config:(fake_config f) ~time:(Fake.mono f) ~stall:true
-               ~drive:(ends_at f ~since:m ~t0 header_h)
-               "" )
+            (show ~config:Server_support.timed_config ~stall:true
+               ~ends_after:Server_support.header_h "" )
           @@ __POS_OF__ {||} )
     ; test "an idle connection is closed" (fun () ->
           (* The close is not a linger: no [FIN]. *)
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
           expect
-            (show ~config:(fake_config f) ~time:(Fake.mono f) ~stall:true
-               ~drive:(ends_at f ~since:m ~t0 idle_i)
-               (get "/") )
+            (show ~config:Server_support.timed_config ~stall:true
+               ~ends_after:Server_support.idle_i (get "/") )
           @@ __POS_OF__
                {|
             HTTP/1.1 200 OK\r\n
@@ -1160,27 +1312,24 @@ let timeout_tests =
             hello
             |} )
     ; test "a wakeup without input leaves the timeout running" (fun () ->
-          (* The flow is readable only when the test sets [wake], and then it
-             has nothing to read. A wakeup 1 s after the start must keep the
+          (* The flow is readable only when the test fills [wake], and then it
+             has nothing to read. A wake 1 s after the start must keep the
              deadline of the first wait. *)
-          let f = Fake.make () in
-          let woken = Atomic.make 0 and pending = Atomic.make false in
-          let wake = ref (Cell.Once.make ()) in
+          let woken = ref 0 and pending = ref false in
+          let wake = ref (Ivar.create ()) in
           let readable =
-            Action.guard (fun () ->
-                if Atomic.get pending then Action.always ()
-                else Cell.Once.get' !wake )
+            guard (fun () -> if !pending then always () else Ivar.read !wake)
           in
           let read_now _ _ _ =
-            if Atomic.get pending then begin
-              Atomic.incr woken ;
-              wake := Cell.Once.make () ;
-              Atomic.set pending false
+            if !pending then begin
+              incr woken ;
+              wake := Ivar.create () ;
+              pending := false
             end ;
             None
           in
           let flow =
-            Flow.make ~time:(Fake.mono f)
+            Flow.make
               ~read:(fun _ _ _ -> failwith "blocking read")
               ~read_now
               ~write:(fun _ _ _ -> ())
@@ -1189,62 +1338,46 @@ let timeout_tests =
               ~close:ignore ~set_read_deadline:ignore ~set_write_deadline:ignore
               ()
           in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          Affect_unix.Unix.main ~domain_count:1 (fun () ->
-              let ctx =
-                { Engine.config= fake_config f
-                ; conn
-                ; stopping= Action.never
-                ; is_stopping= (fun () -> false) }
-              in
-              let c =
-                Fun.Async.call (fun () ->
-                    Private.H1_server.serve ctx flow handler )
-              in
-              Stdlib.Fun.protect ~finally:(fun () -> Fun.Async.cancel c)
-              @@ fun () ->
-              Fake.wait_mono_timer f ~since:m (t0 +: header_h) ;
-              Fake.advance f Affect_unix.Mtime.Span.s ;
-              let m2 = Fake.mark f in
-              Atomic.set pending true ;
-              ignore (Cell.Once.try_set !wake ()) ;
-              (* The engine woke, found nothing, and waits again: for the old
-                 deadline, not for a new one 1 s later. *)
-              Fake.wait_mono_timer f ~since:m2 (t0 +: header_h) ;
-              equal int ~msg:"wakeups" 1 (Atomic.get woken) ;
-              Fake.advance f Affect_unix.Mtime.Span.(header_h - s - ns) ;
-              is_false ~msg:"ended 1 ns before" (Fake.ends_within_50ms c) ;
-              Fake.advance f Affect_unix.Mtime.Span.ns ;
-              get_2s c ) )
+          Sim_support.manual
+          @@ fun sim ->
+          let t0 = Time.now Mono in
+          Fiber.scope
+          @@ fun s ->
+          let c = engine s (ctx Server_support.timed_config) flow in
+          Sim_support.advance sim (Span.s 1) ;
+          pending := true ;
+          Ivar.fill !wake () ;
+          (* The engine woke, found nothing, and waits again: for the old
+             deadline, not for a new one 1 s later. *)
+          is_false ~msg:"the engine waits" (Sim_support.ended sim c) ;
+          equal int ~msg:"wakeups" 1 !woken ;
+          Sim_support.ends_at sim ~t0 Server_support.header_h c )
     ; test "a wakeup without input does not hold up a stopping server"
         (fun () ->
           (* The server stops when the flow finds nothing to read. *)
-          let woken = ref false and stop = Cell.Once.make () in
+          let woken = ref false and stop = Ivar.create () in
           let flow =
-            Flow.make ~time:Time.mono
+            Flow.make
               ~read:(fun _ _ _ -> failwith "blocking read")
               ~read_now:(fun _ _ _ ->
                 woken := true ;
-                ignore (Cell.Once.try_set stop ()) ;
+                ignore (Ivar.try_fill stop ()) ;
                 None )
               ~write:(fun _ _ _ -> ())
-              ~readable:
-                (Action.guard (fun () ->
-                     if !woken then Action.never else Action.always () ) )
+              ~readable:(guard (fun () -> if !woken then never else always ()))
               ~shutdown_send:ignore ~close:ignore ~set_read_deadline:ignore
               ~set_write_deadline:ignore ()
           in
-          Affect_unix.Unix.main ~domain_count:1 (fun () ->
-              let ctx =
-                { Engine.config=
-                    { Config.default with
-                      header_timeout= Affect_unix.Mtime.Span.(60 * s) }
-                ; conn
-                ; stopping= Cell.Once.get' stop
-                ; is_stopping= (fun () -> false) }
-              in
-              Server_support.within_2s (fun () ->
-                  Private.H1_server.serve ctx flow handler ) ) ;
+          let ctx =
+            ctx ~stopping:(Ivar.read stop)
+              {Config.default with header_timeout= Span.s 60}
+          in
+          Sim_support.manual (fun sim ->
+              Fiber.scope (fun s ->
+                  let c = engine s ctx flow in
+                  is_true ~msg:"the engine ends at once"
+                    (Sim_support.ended sim c) ;
+                  Sim_support.await c ) ) ;
           is_true ~msg:"woken" !woken ) ]
 
 let upgrade_tests =
@@ -1408,6 +1541,24 @@ let upgrade_tests =
                "CONNECT x.example:443 HTTP/1.1\r\n\
                 Host: x.example:443\r\n\
                 Expect: 100-continue\r\n\
+                \r\n\
+                after" )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 200 OK\r\n
+            \r\n
+            got after
+            |} )
+    ; test "Expect 100-continue, CONNECT with Content-Length: 0: 200, no 100"
+        (fun () ->
+          (* The body is complete at once, so the drain reads nothing and sends
+             no 100. *)
+          expect
+            (show
+               "CONNECT x.example:443 HTTP/1.1\r\n\
+                Host: x.example:443\r\n\
+                Expect: 100-continue\r\n\
+                Content-Length: 0\r\n\
                 \r\n\
                 after" )
           @@ __POS_OF__
@@ -1624,28 +1775,24 @@ let upgrade_tests =
           let out = Buffer.create 256 and stop = ref false in
           let inner = Flow.of_string input out in
           let flow =
-            Flow.make ~time:(Flow.time inner) ~read:(Flow.read inner)
-              ~read_now:(Flow.read_now inner)
+            Flow.make ~read:(Flow.read inner) ~read_now:(Flow.read_now inner)
               ~write:(fun buf off len ->
                 Flow.write inner buf off len ;
                 if
                   Bytes.sub_string buf off len = "HTTP/1.1 100 Continue\r\n\r\n"
                 then stop := true )
-              ~readable:(Flow.readable' inner ()) ~shutdown_send:ignore
+              ~readable:(Flow.readable inner) ~shutdown_send:ignore
               ~close:ignore ~set_read_deadline:ignore ~set_write_deadline:ignore
               ()
           in
-          Affect_unix.Unix.main ~domain_count:1 (fun () ->
-              let ctx =
-                { Engine.config=
-                    { Config.default with
-                      date_header= false
-                    ; cancel_on_disconnect= false }
-                ; conn
-                ; stopping= Action.never
-                ; is_stopping= (fun () -> !stop) }
-              in
-              Private.H1_server.serve ctx flow handler ) ;
+          let ctx =
+            ctx
+              ~is_stopping:(fun () -> !stop)
+              { Config.default with
+                date_header= false
+              ; cancel_on_disconnect= false }
+          in
+          Sim_support.run (fun _ -> Private.H1_server.serve ctx flow handler) ;
           expect (show_crlf (Buffer.contents out))
           @@ __POS_OF__
                {|
@@ -1685,23 +1832,20 @@ let upgrade_tests =
                 n
           in
           let flow =
-            Flow.make ~time:Time.mono ~read
+            Flow.make ~read
               ~read_now:(fun b o l -> Some (read b o l))
               ~write:(fun buf off len -> Buffer.add_subbytes out buf off len)
-              ~readable:(Action.always ()) ~shutdown_send:ignore ~close:ignore
+              ~readable:(always ()) ~shutdown_send:ignore ~close:ignore
               ~set_read_deadline:ignore ~set_write_deadline:ignore ()
           in
-          Affect_unix.Unix.main ~domain_count:1 (fun () ->
-              let ctx =
-                { Engine.config=
-                    { Config.default with
-                      date_header= false
-                    ; cancel_on_disconnect= false }
-                ; conn
-                ; stopping= Action.never
-                ; is_stopping= (fun () -> !stop) }
-              in
-              Private.H1_server.serve ctx flow handler ) ;
+          let ctx =
+            ctx
+              ~is_stopping:(fun () -> !stop)
+              { Config.default with
+                date_header= false
+              ; cancel_on_disconnect= false }
+          in
+          Sim_support.run (fun _ -> Private.H1_server.serve ctx flow handler) ;
           expect (show_crlf (Buffer.contents out))
           @@ __POS_OF__
                {|
@@ -1891,7 +2035,50 @@ let upgrade_tests =
 
             ! Failure("ws")
             |} )
-    ]
+    ; test "an upgrade gets a flow with no deadline and no timeout" (fun () ->
+          (* The flow records if each of its four limits has a value. Each one
+             has a value at the start. The flow gives at most 8 bytes for each
+             read. Thus the engine reads the head with a deadline. When the
+             handler reads the body, the engine reads it with a timeout. *)
+          let limits_at_upgrade ~read input =
+            let m = memory ~chunk:8 input in
+            let limits = Array.make 4 true in
+            let set i v = limits.(i) <- Option.is_some v in
+            let flow =
+              Flow.make ~read:(Flow.read m.flow)
+                ~read_now:(Flow.read_now m.flow) ~write:(Flow.write m.flow)
+                ~readable:(Flow.readable m.flow)
+                ~shutdown_send:(fun () -> Flow.shutdown_send m.flow)
+                ~close:ignore ~set_read_deadline:(set 0)
+                ~set_write_deadline:(set 1) ~set_read_timeout:(set 2)
+                ~set_write_timeout:(set 3) ()
+            in
+            let seen = ref [] in
+            let handler req =
+              if read then ignore (Body.to_string (Request.body req)) ;
+              Response.upgrade ~headers:upgrade_echo (fun _ ->
+                  seen := Array.to_list limits )
+            in
+            Sim_support.run (fun _ ->
+                Private.H1_server.serve (ctx Config.default) flow handler ) ;
+            !seen
+          in
+          let none = [false; false; false; false] in
+          equal
+            (list (list bool))
+            ~msg:
+              "a value for the read deadline, the write deadline, the read \
+               timeout and the write timeout"
+            [none; none]
+            [ limits_at_upgrade ~read:false (ws "/ws")
+            ; limits_at_upgrade ~read:true
+                ( ws
+                    ~headers:
+                      [ ("Upgrade", "echo")
+                      ; ("Connection", "Upgrade")
+                      ; ("Content-Length", "20") ]
+                    "/ws"
+                ^ String.make 20 'x' ) ] ) ]
 
 let disconnect_tests =
   group "H1_server client disconnects"
@@ -1912,9 +2099,7 @@ let disconnect_tests =
     ; test "a failing handler is still answered while the connection is watched"
         (fun () ->
           let config =
-            { Config.default with
-              date_header= false
-            ; idle_timeout= Affect_unix.Mtime.Span.(10 * ms) }
+            {Config.default with date_header= false; idle_timeout= Span.ms 10}
           in
           expect (show ~watch:true ~stall:true ~config (get "/fail"))
           @@ __POS_OF__
@@ -1931,13 +2116,11 @@ let disconnect_tests =
     ; test "a request arriving during the handler is not a disconnect"
         (fun () ->
           (* After the two responses, the connection is idle. *)
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
           let first = get "/slow" in
           expect
-            (show ~watch:true ~stall:true ~config:(fake_config f)
-               ~time:(Fake.mono f) ~chunk:(String.length first)
-               ~drive:(ends_at f ~since:m ~t0 idle_i)
+            (show ~watch:true ~stall:true ~config:Server_support.timed_config
+               ~chunk:(String.length first)
+               ~ends_after:(span_sum slow Server_support.idle_i)
                (first ^ get "/") )
           @@ __POS_OF__
                {|
@@ -1977,12 +2160,43 @@ let disconnect_tests =
         (fun () ->
           expect (show ~watch:true (post "/read-hold" "hello"))
           @@ __POS_OF__ {| [handler cancelled] |} )
+    ; test "race: on one domain, a fast handler costs no read with no data"
+        (fun () ->
+          (* Two keep-alive requests, each after the response to the one before.
+             After a request the socket stays readable with no data. A handler
+             that ends at once, also with a failure, gives its response before
+             the engine watches the connection. If the engine watches, weft can
+             select the stale readiness. *)
+          let expected =
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Length: 5\r\n\
+             \r\n\
+             helloHTTP/1.1 500 Internal Server Error\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Length: 22\r\n\
+             Connection: close\r\n\
+             \r\n\
+             Internal Server Error\n\
+             [FIN]"
+          in
+          Sim_support.race ~domains:1 (fun _ ->
+              let c = fake_socket [get "/"; get "/fail"; ""]
+              and errors = ref [] in
+              let config =
+                config_for
+                  {Config.default with date_header= false}
+                  errors ~watch:true
+              in
+              Private.H1_server.serve (ctx config) c.socket handler ;
+              equal (list string) ~msg:"errors" ["Failure(\"boom\")"] !errors ;
+              equal int ~msg:"reads with no data" 0 (c.empty_reads ()) ;
+              equal string ~msg:"the responses" expected (c.written ()) ) )
     ; test "a wakeup without input while the handler runs is not a disconnect"
         (fun () ->
           (* Once the request is read the client is quiet: the flow is readable
              once more with nothing to read, and a read would block, which
              fails. *)
-          let f = Fake.make () in
           let input = get "/slow" and out = Buffer.create 64 in
           let pos = ref 0 and woken = ref false in
           let quiet () = !pos = String.length input in
@@ -2000,33 +2214,25 @@ let disconnect_tests =
             else Some (read buf off len)
           in
           let flow =
-            Flow.make ~time:(Fake.mono f) ~read ~read_now
+            Flow.make ~read ~read_now
               ~write:(fun b off len -> Buffer.add_subbytes out b off len)
               ~readable:
-                (Action.guard (fun () ->
-                     if quiet () && !woken then Action.never
-                     else Action.always () ) )
+                (guard (fun () ->
+                     if quiet () && !woken then never else always () ) )
               ~shutdown_send:ignore ~close:ignore ~set_read_deadline:ignore
               ~set_write_deadline:ignore ()
           in
           slow_outcome := "" ;
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          Affect_unix.Unix.main ~domain_count:1 (fun () ->
-              let ctx =
-                { Engine.config=
-                    {(fake_config f) with cancel_on_disconnect= true}
-                ; conn
-                ; stopping= Action.never
-                ; is_stopping= (fun () -> false) }
-              in
-              let c =
-                Fun.Async.call (fun () ->
-                    Private.H1_server.serve ctx flow handler )
-              in
+          let ctx =
+            ctx {Server_support.timed_config with cancel_on_disconnect= true}
+          in
+          Sim_support.manual (fun sim ->
+              let t0 = Time.now Mono in
               (* After the response, the connection is idle. *)
-              Stdlib.Fun.protect
-                ~finally:(fun () -> Fun.Async.cancel c)
-                (fun () -> ends_at f ~since:m ~t0 idle_i c) ) ;
+              Fiber.scope (fun s ->
+                  Sim_support.ends_at sim ~t0
+                    (span_sum slow Server_support.idle_i)
+                    (engine s ctx flow) ) ) ;
           is_true ~msg:"woken" !woken ;
           expect (show_crlf (Buffer.contents out) ^ "\n" ^ !slow_outcome)
           @@ __POS_OF__
@@ -2117,11 +2323,578 @@ let smuggling_tests =
           (* The default handler would answer /smuggled with "hello". *)
           is_true ~msg:out (not (contains out "hello")) ) ]
 
+(* The response of the default handler. *)
+let hello =
+  "HTTP/1.1 200 OK\r\n\
+   Content-Type: text/plain; charset=utf-8\r\n\
+   Content-Length: 5\r\n\
+   \r\n\
+   hello"
+
+(* The orders that weft can select at random: input and a stop, input and a
+   passed deadline, input and a cancel. *)
+let race_tests =
+  let config errors =
+    config_for {Config.default with date_header= false} errors ~watch:false
+  in
+  group "H1_server races"
+    [ test "race: a stop that comes with input starts no new exchange" (fun () ->
+          (* The stop and the input are ready at the same wait. The engine reads
+             the request and lingers, or it closes with no read. *)
+          let input = get "/" in
+          let paths = ref [] in
+          (* The check of the two paths needs more than one seed. Thus the seed
+             count is fixed, also when CARAVAN_RACE_SEEDS has a value. *)
+          Sim_support.race ~seeds:100 (fun _ ->
+              let m = memory input and errors = ref [] in
+              let checks = ref 0 in
+              (* [false] at the first check, before the wait. *)
+              let is_stopping () = incr checks ; !checks > 1 in
+              Private.H1_server.serve
+                (ctx ~stopping:(always ()) ~is_stopping (config errors))
+                m.flow handler ;
+              let out = m.output () in
+              let stop_path =
+                Printf.sprintf "[unread %d]" (String.length input)
+              in
+              if not (List.mem out ["[FIN]"; stop_path]) then
+                failf "the engine wrote %S" out ;
+              equal (list string) ~msg:"errors" [] !errors ;
+              if not (List.mem out !paths) then paths := out :: !paths ) ;
+          (* A replay of one seed takes one path only. *)
+          if Option.is_none (Sys.getenv_opt "CARAVAN_SEED") then
+            equal int ~msg:"the two paths occur over the seeds" 2
+              (List.length !paths) )
+    ; test
+        "race: input and a passed idle deadline at the same time: the request \
+         is served" (fun () ->
+          Sim_support.race (fun _ ->
+              let m = memory (get "/") and errors = ref [] in
+              let config = {(config errors) with header_timeout= Span.zero} in
+              Private.H1_server.serve (ctx config) m.flow handler ;
+              equal string ~msg:"the response" hello (m.output ()) ;
+              equal (list string) ~msg:"errors" [] !errors ) )
+    ; test "a cancel right after the input is ready reports no error" (fun () ->
+          (* The fill of [input] commits the wait of the engine. The cancel
+             comes before the engine continues. The engine then reads the
+             request with no wait, and the fork of the exchange gives
+             Scope_closed. *)
+          let input = Ivar.create () in
+          let m = memory ~ready:input (get "/") and errors = ref [] in
+          Sim_support.run (fun sim ->
+              Fiber.scope (fun s ->
+                  let c = engine s (ctx (config errors)) m.flow in
+                  is_false ~msg:"the engine waits for input"
+                    (Sim_support.ended sim c) ;
+                  Ivar.fill input () ;
+                  Sim_support.cancel c ;
+                  (* As the server, which forks each connection with
+                     fork_isolated. *)
+                  match Sim_support.await c with
+                  | () | (exception Promise.Cancelled) ->
+                      ()
+                  | exception e ->
+                      errors := Printexc.to_string e :: !errors ) ) ;
+          equal (list string) ~msg:"errors" [] !errors ;
+          equal string ~msg:"no response" "" (m.output ()) ) ]
+
+(* The exceptions of a handler that the engine must not take for a cancel of the
+   connection. *)
+let handler_error_tests =
+  group "H1_server handler errors"
+    [ test "a handler that raises Promise.Cancelled is reported" (fun () ->
+          expect (show (get "/cancelled-child"))
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Weft__Promise.Cancelled
+            |} )
+    ; test "a handler that raises Scope_closed is reported" (fun () ->
+          expect (show (get "/ended-scope"))
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Weft__Sched.Scope_closed
+            |} )
+    ; test "a handler that raises the Cancelled of its own scope is reported"
+        (fun () ->
+          expect (show (get "/cancelled-scope"))
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Weft__Sched.Cancelled(_)
+            |} )
+    ; test
+        "a response producer that raises the Cancelled of its own scope is \
+         reported" (fun () ->
+          expect (show (get "/stream-cancelled-scope"))
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Weft__Sched.Cancelled(_)
+            |} )
+    ; test "an upgrade that raises the Cancelled of its own scope is reported"
+        (fun () ->
+          expect
+            (show
+               (get
+                  ~headers:[("Upgrade", "echo"); ("Connection", "Upgrade")]
+                  "/ws-cancelled-scope" ) )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 101 Switching Protocols\r\n
+            Upgrade: echo\r\n
+            Connection: Upgrade\r\n
+            \r\n
+
+            ! Weft__Sched.Cancelled(_)
+            |} )
+    ; test "a handler that forks after the cancel of its connection: no error"
+        (fun () ->
+          (* The wait of the handler ends, then the cancel comes before the
+             handler continues. Its fork then gives Scope_closed. *)
+          let started = Ivar.create () and go = Ivar.create () in
+          let handler _ =
+            Ivar.fill started () ;
+            sync (Ivar.read go) ;
+            Fiber.scope (fun s -> Fiber.fork s ignore) ;
+            Response.string "forked"
+          in
+          expect
+            (show ~handler
+               ~cancel_on:(fun () ->
+                 wrap (Ivar.read started) (fun () -> Ivar.fill go ()) )
+               (get "/") )
+          @@ __POS_OF__ {| |} )
+    ; test
+        "race: a handler that raises the Cancelled of its own scope at the \
+         cancel of its connection is reported" (fun () ->
+          (* The handler fails, and the test cancels the connection at the same
+             time. The handler records if its context was cancelled when it
+             raised: then weft gives Promise.Cancelled, a cancel. If not, its
+             Cancelled is a failure, and the engine reports it one time: in the
+             shield, or with a 500. *)
+          Sim_support.race (fun _ ->
+              let started = Ivar.create () and go = Ivar.create () in
+              let failed = ref false in
+              let handler _ =
+                Ivar.fill started () ;
+                sync (Ivar.read go) ;
+                ( try
+                    Fiber.scope (fun s ->
+                        Fiber.cancel s (Failure "inner") ;
+                        sync (always ()) )
+                  with e ->
+                    failed := not (Private.Cancel.is_cancelled ()) ;
+                    raise e ) ;
+                Response.string "after the scope"
+              in
+              let m = memory (get "/") and errors = ref [] in
+              let config =
+                config_for
+                  {Config.default with date_header= false}
+                  errors ~watch:false
+              in
+              Fiber.scope (fun s ->
+                  let c = engine ~handler s (ctx config) m.flow in
+                  sync (Ivar.read started) ;
+                  Ivar.fill go () ;
+                  Fiber.yield () ;
+                  Sim_support.cancel c ;
+                  match Sim_support.await c with
+                  | () | (exception Promise.Cancelled) ->
+                      () ) ;
+              let reported =
+                if !failed then ["Weft__Sched.Cancelled(_)"] else []
+              in
+              equal (list string) ~msg:"errors" reported !errors ;
+              if not !failed then
+                equal string ~msg:"no response" "" (m.output ()) ) )
+    ; test
+        "a handler that raises the Cancelled of its own scope after its client \
+         left is reported" (fun () ->
+          (* The client leaves while the handler waits. Then the handler fails
+             before the engine reads the end of the stream. [left] cancels the
+             exchange after the failure: it gets the Cancelled of the handler, a
+             failure. *)
+          let c = fake_socket [get "/"] and errors = ref [] in
+          let config =
+            config_for
+              {Config.default with date_header= false}
+              errors ~watch:true
+          in
+          let started = Ivar.create () and go = Ivar.create () in
+          let failed = ref false in
+          let handler _ =
+            Ivar.fill started () ;
+            sync (Ivar.read go) ;
+            ( try
+                Fiber.scope (fun s ->
+                    Fiber.cancel s (Failure "inner") ;
+                    sync (always ()) )
+              with e ->
+                failed := not (Private.Cancel.is_cancelled ()) ;
+                raise e ) ;
+            Response.string "after the scope"
+          in
+          Sim_support.run (fun _ ->
+              Fiber.scope (fun s ->
+                  let e = engine ~handler s (ctx config) c.socket in
+                  sync (Ivar.read started) ;
+                  (* The engine waits in its watch after these yields. *)
+                  for _ = 1 to 5 do
+                    Fiber.yield ()
+                  done ;
+                  (* The order of the two fills is important. With this order,
+                     the handler fails, then the engine reads the end of the
+                     stream. With the other order, the cancel comes first. *)
+                  c.end_stream () ;
+                  Ivar.fill go () ;
+                  Sim_support.await e ) ) ;
+          is_true ~msg:"the handler failed" !failed ;
+          equal (list string) ~msg:"errors" ["Weft__Sched.Cancelled(_)"] !errors ;
+          equal string ~msg:"no response" "" (c.written ()) )
+    ; test "a read error while the handler runs is reported, and cancels it"
+        (fun () ->
+          (* After the request, the read with no wait of the watch raises a
+             network error that is not a close. The engine cannot use the
+             connection: it ends at once. *)
+          let error = Net.Error (Net.Other "ETIMEDOUT", "read") in
+          let c = fake_socket ~error [get "/hold"] and errors = ref [] in
+          let config =
+            config_for
+              {Config.default with date_header= false}
+              errors ~watch:true
+          in
+          slow_outcome := "" ;
+          let waited =
+            Sim_support.run (fun _ ->
+                let t0 = Time.now Mono in
+                Private.H1_server.serve (ctx config) c.socket handler ;
+                Span.to_ns (Time.diff Mono (Time.now Mono) t0) )
+          in
+          equal int64 ~msg:"the wait of the engine" 0L waited ;
+          equal string ~msg:"no response" "" (c.written ()) ;
+          equal (list string) ~msg:"errors" [Printexc.to_string error] !errors ;
+          equal string ~msg:"the handler" "[handler cancelled]" !slow_outcome )
+    ; test "a handler that fails after its connection is cancelled is reported"
+        (fun () ->
+          (* The cancel comes when the handler waits, and the client does not
+             leave. *)
+          holding := Ivar.create () ;
+          expect
+            (show
+               ~cancel_on:(fun () -> Ivar.read !holding)
+               (get "/hold-cleanup-fails") )
+          @@ __POS_OF__
+               {|
+            ! Failure("cleanup failed")
+            [handler cancelled]
+            |} )
+    ; test "a cancel of the connection while the handler runs reports no error"
+        (fun () ->
+          holding := Ivar.create () ;
+          expect (show ~cancel_on:(fun () -> Ivar.read !holding) (get "/hold"))
+          @@ __POS_OF__ {| [handler cancelled] |} )
+    ; test "a cancel of an upgraded connection reports no error" (fun () ->
+          let started = Ivar.create () in
+          let handler _ =
+            Response.upgrade ~headers:upgrade_echo (fun _ ->
+                Ivar.fill started () ;
+                Time.sleep Mono (Span.s 10) )
+          in
+          expect
+            (show ~handler
+               ~cancel_on:(fun () -> Ivar.read started)
+               (get
+                  ~headers:[("Upgrade", "echo"); ("Connection", "Upgrade")]
+                  "/" ) )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 101 Switching Protocols\r\n
+            Upgrade: echo\r\n
+            Connection: Upgrade\r\n
+            \r\n
+            |} )
+    ]
+
+(* The engine on a Tcp flow: the deadlines and the timeouts of each phase, and a
+   failed body. H is the header timeout, R is the read timeout, I is the idle
+   timeout, W is the write timeout and L is the linger timeout. H is
+   Server_support.header_h. The test sets R, I, W and L, so that H and R are
+   less than I. *)
+let tcp_tests =
+  let read_r = Span.s 4 and write_w = Span.s 6 and linger_l = Span.s 7 in
+  let config =
+    { Server_support.timed_config with
+      read_timeout= read_r
+    ; idle_timeout= Span.s 10
+    ; write_timeout= write_w
+    ; linger_timeout= linger_l }
+  in
+  let ignored =
+    "HTTP/1.1 200 OK\r\n\
+     Content-Type: text/plain; charset=utf-8\r\n\
+     Content-Length: 7\r\n\
+     \r\n\
+     ignored"
+  in
+  let request_timeout =
+    "HTTP/1.1 408 Request Timeout\r\n\
+     Content-Type: text/plain; charset=utf-8\r\n\
+     Content-Length: 16\r\n\
+     Connection: close\r\n\
+     \r\n\
+     Request Timeout\n"
+  in
+  (* [on_tcp ~handler sim f] runs the engine with [handler] on the server side
+     of a Tcp pair, in a call [c]. It runs [f s client c] on the client side.
+     Then the client closes, and the engine must end with no error. *)
+  let on_tcp ?(handler = handler) sim f =
+    Server_support.with_flows sim
+    @@ fun ~server ~client ->
+    let errors = ref [] in
+    let ctx = ctx (config_for config errors ~watch:true) in
+    Fiber.scope (fun s ->
+        let c = engine ~handler s ctx server in
+        f s client c ; Flow.close client ; Sim_support.await c ) ;
+    equal (list string) ~msg:"errors" [] !errors
+  in
+  let response client expected =
+    equal string ~msg:"the response" expected
+      (Server_support.read_exactly client (String.length expected))
+  in
+  group "H1_server on Tcp"
+    [ test "a head that comes one byte at a time gets 408 at the header timeout"
+        (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          on_tcp sim
+          @@ fun s client _ ->
+          let t0 = Time.now Mono in
+          let head = get "/" in
+          let writer =
+            Sim_support.call ~name:"client" s (fun () ->
+                String.iter
+                  (fun c ->
+                    Flow.write_string client (String.make 1 c) ;
+                    Time.sleep Mono (Span.s 1) )
+                  head )
+          in
+          let reader =
+            Sim_support.call ~name:"reader" s (fun () ->
+                response client request_timeout )
+          in
+          Sim_support.ends_at sim ~t0 Server_support.header_h reader ;
+          Sim_support.cancel writer )
+    ; test "the second head of a connection gets its own header timeout"
+        (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          on_tcp sim
+          @@ fun _ client _ ->
+          (* Each head comes in two parts, 1 s apart. *)
+          let request () =
+            Flow.write_string client "GET / HTTP/1.1\r\n" ;
+            Sim_support.advance sim (Span.s 1) ;
+            Flow.write_string client "Host: a.example\r\n\r\n" ;
+            response client hello
+          in
+          request () ;
+          (* More than H, less than I. *)
+          Sim_support.advance sim (Span.s 5) ;
+          request () )
+    ; test "the second drain of a connection gets its own drain deadline"
+        (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          on_tcp sim
+          @@ fun _ client _ ->
+          (* The handler does not read the body. The second half of the body
+             comes 1 s after the response, in the drain. *)
+          let request () =
+            Flow.write_string client
+              "POST /ignore HTTP/1.1\r\n\
+               Host: a.example\r\n\
+               Content-Length: 10\r\n\
+               \r\n\
+               01234" ;
+            response client ignored ;
+            Sim_support.advance sim (Span.s 1) ;
+            Flow.write_string client "56789"
+          in
+          request () ;
+          (* More than R, less than I. *)
+          Sim_support.advance sim (Span.s 5) ;
+          request () ;
+          Flow.write_string client (get "/") ;
+          response client hello )
+    ; test "a response that the client does not read ends at the write timeout"
+        (fun () ->
+          (* The write of the response waits from its start: the client does not
+             read. *)
+          let handler _ =
+            Response.string (String.make Server_support.big 'x')
+          in
+          Sim_support.manual
+          @@ fun sim ->
+          on_tcp ~handler sim
+          @@ fun _ client c ->
+          let t0 = Time.now Mono in
+          Flow.write_string client (get "/") ;
+          Sim_support.ends_at sim ~t0 write_w c )
+    ; test "a request body that stops gets 408 at the read timeout" (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          on_tcp sim
+          @@ fun s client _ ->
+          let t0 = Time.now Mono in
+          Flow.write_string client
+            "POST /echo HTTP/1.1\r\n\
+             Host: a.example\r\n\
+             Content-Length: 10\r\n\
+             \r\n\
+             01234" ;
+          let reader =
+            Sim_support.call ~name:"reader" s (fun () ->
+                response client request_timeout )
+          in
+          Sim_support.ends_at sim ~t0 read_r reader )
+    ; test "each read of a request body gets the read timeout" (fun () ->
+          (* The body has no deadline. Its bytes come 3 s apart, less than R,
+             and all of them take more than R. *)
+          Sim_support.manual
+          @@ fun sim ->
+          on_tcp sim
+          @@ fun _ client _ ->
+          Flow.write_string client
+            "POST /echo HTTP/1.1\r\n\
+             Host: a.example\r\n\
+             Content-Length: 4\r\n\
+             \r\n" ;
+          String.iter
+            (fun c ->
+              Sim_support.advance sim (Span.s 3) ;
+              Flow.write_string client (String.make 1 c) )
+            "abcd" ;
+          response client
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Length: 4\r\n\
+             \r\n\
+             abcd" )
+    ; test "a drain that comes one byte at a time ends at the drain deadline"
+        (fun () ->
+          (* The handler does not read the body. The engine drains it, and the
+             client sends one byte each second. At the drain deadline the engine
+             lingers: the client reads the end of the stream. *)
+          Sim_support.manual
+          @@ fun sim ->
+          on_tcp sim
+          @@ fun s client _ ->
+          let t0 = Time.now Mono in
+          Flow.write_string client
+            "POST /ignore HTTP/1.1\r\n\
+             Host: a.example\r\n\
+             Content-Length: 10\r\n\
+             \r\n" ;
+          response client ignored ;
+          let writer =
+            Sim_support.call ~name:"client" s (fun () ->
+                for _ = 1 to 10 do
+                  Time.sleep Mono (Span.s 1) ;
+                  Flow.write_string client "x"
+                done )
+          in
+          let reader =
+            Sim_support.call ~name:"reader" s (fun () ->
+                Flow.read client (Bytes.create 1) 0 1 )
+          in
+          equal int ~msg:"the end of the stream" 0
+            (Sim_support.ends_at sim ~t0 read_r reader) ;
+          Sim_support.cancel writer )
+    ; test "a linger ends at the linger timeout" (fun () ->
+          (* A request with no Host gets 400, then the engine lingers. The
+             client sends nothing more and does not close. *)
+          Sim_support.manual
+          @@ fun sim ->
+          on_tcp sim
+          @@ fun _ client c ->
+          let t0 = Time.now Mono in
+          Flow.write_string client "GET / HTTP/1.1\r\n\r\n" ;
+          Sim_support.ends_at sim ~t0 linger_l c )
+    ; test "an upgrade after a cancelled read of the body gets 500" (fun () ->
+          (* A child of the handler reads the body and waits for the rest. The
+             handler cancels the child, so the body failed with the cancel of a
+             different fiber. The engine must not read the body again for the
+             upgrade. *)
+          let handler req =
+            Fiber.scope (fun s ->
+                let child =
+                  Fiber.fork_promise s (fun () ->
+                      Body.to_string (Request.body req) )
+                in
+                Fiber.yield () ;
+                Promise.cancel child ;
+                match Promise.await child with
+                | _ ->
+                    ()
+                | exception Promise.Cancelled ->
+                    () ) ;
+            Response.upgrade ~headers:upgrade_echo echo_upgraded
+          in
+          Sim_support.manual
+          @@ fun sim ->
+          on_tcp ~handler sim
+          @@ fun _ client _ ->
+          Flow.write_string client
+            "GET /ws HTTP/1.1\r\n\
+             Host: a.example\r\n\
+             Upgrade: echo\r\n\
+             Connection: Upgrade\r\n\
+             Content-Length: 5\r\n\
+             \r\n\
+             ab" ;
+          response client
+            "HTTP/1.1 500 Internal Server Error\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Length: 22\r\n\
+             Connection: close\r\n\
+             \r\n\
+             Internal Server Error\n" ) ]
+
 let () =
   exit
-    (run "h1_server"
+    (Windtrap.run "h1_server"
        [ connection_tests
        ; timeout_tests
        ; upgrade_tests
        ; disconnect_tests
-       ; smuggling_tests ] )
+       ; smuggling_tests
+       ; race_tests
+       ; handler_error_tests
+       ; tcp_tests ] )

@@ -1,15 +1,20 @@
 (* A stateful test of HTTP/1.1 connections: generated programs of pipelined
    requests and response reads on several connections, against a model of what
-   the server must answer (RFC 9112, RFC 9110). *)
+   the server must answer (RFC 9112, RFC 9110).
+
+   Each program runs in its own run of the simulator, with a new server on
+   [loopback]: a property draws the program with [Stateful.program], and
+   [Stateful.execute] runs it inside the run. Thus each program gets a new
+   world, and a shrink candidate runs again from no state. *)
 
 open Windtrap
-open Affect
+open Weft
 open Caravan
 open Server_support
 
 (* Request kinds. Chunked bodies are HTTP/1.1 only. /ignore also gets a body
    larger than the server's buffer, so that some of it is still unread in the
-   kernel when the server drains it or closes over it. *)
+   socket when the server drains it or closes over it. *)
 let large = String.make 40_000 'x'
 
 let kinds =
@@ -35,6 +40,21 @@ let kinds =
             [None; Some "close"; Some "keep-alive"] )
         ["/hello"; "/echo"; "/empty"; "/close"; "/stream"; "/ignore"] )
     [false; true]
+
+(* [pp_kind] prints a kind in one line. A long body prints as its length. *)
+let pp_kind ppf k =
+  Format.fprintf ppf "%s %s %s%s%s" k.meth k.path
+    (if k.v10 then "1.0" else "1.1")
+    (match k.conn with None -> "" | Some c -> " conn:" ^ c)
+    ( match k.body with
+    | No_body ->
+        ""
+    | Length s when String.length s > 16 ->
+        Printf.sprintf " len:%d" (String.length s)
+    | Length s ->
+        Printf.sprintf " len:%S" s
+    | Chunked s ->
+        Printf.sprintf " chunked:%S" s )
 
 (* What the server must answer to [k], and whether it then closes. *)
 let expected k =
@@ -63,7 +83,7 @@ let expected k =
   let closes = closes_by_request || closes_by_response in
   (summary code (if head then "" else body) closes, closes)
 
-(* Requests that make the server close over a body still unread in the kernel
+(* Requests that make the server close over a body still unread in the socket
    are rare among the kinds, so they get a share of their own. *)
 let kind_gen =
   let closes_over_unread k = k.body = Length large && snd (expected k) in
@@ -110,11 +130,12 @@ module Model = struct
   let can_close m = not m.closed
 end
 
-(* A real connection, with the kinds sent but not yet answered, to parse HEAD
-   responses. *)
+(* A connection of the simulator, with the kinds sent but not yet answered, to
+   parse HEAD responses. *)
 module System = struct
   type t = {flow: Flow.t; reader: Buf_reader.t; sent: kind Queue.t}
 
+  (* The server of the program that runs at this time. *)
   let server = ref None
 
   let connect () =
@@ -135,24 +156,53 @@ module System = struct
   let close c = Flow.close c.flow
 end
 
+(* The commands come from [Stateful] of windtrap, so that [Stateful.program] and
+   [Stateful.execute] take them. The flat [command] of windtrap gives an
+   abstract type that these two functions do not take. [Private] has no
+   stability guarantee. The flake pins windtrap: after an update of windtrap, do
+   a check of this test. *)
+module Stateful = Windtrap.Private.Stateful
+
+(* The calls of each command in the system, for the check "never called" of
+   [stateful] of windtrap. The release of a connection calls [System.close] but
+   not the system function of the command "close". *)
+let names = ["connect"; "send"; "receive"; "close"]
+
+let calls = List.map (fun name -> (name, Atomic.make 0)) names
+
+let counted name f =
+  let n = List.assoc name calls in
+  fun x -> Atomic.incr n ; f x
+
+let counted2 name f =
+  let n = List.assoc name calls in
+  fun x y -> Atomic.incr n ; f x y
+
 let conn =
-  abstract "c"
+  Stateful.abstract "c"
     ~pp:(fun ppf (m : Model.t) ->
       Format.fprintf ppf "owed %d%s" (List.length m.owed)
         (if m.closing then ", closing" else "") )
     ~release:System.close
 
 let commands =
-  [ command "connect" (Gen.unit @-> makes conn) Model.connect System.connect
+  let open Stateful in
+  [ command "connect"
+      (Gen.unit @-> makes conn)
+      Model.connect
+      (counted "connect" System.connect)
   ; command "send" ~pre:Model.can_send
       (conn ^-> kind_gen @-> returns unit)
-      Model.send System.send
+      Model.send
+      (counted2 "send" System.send)
   ; command "receive" ~pre:Model.can_receive
       (conn ^-> returns string)
-      Model.receive System.receive
+      Model.receive
+      (counted "receive" System.receive)
   ; command "close" ~pre:Model.can_close
       (conn ^-> returns unit)
-      Model.close System.close ]
+      Model.close
+      (counted "close" System.close) ]
 
 (* 300 programs by default. The mutation check runs this test again for each
    mutant, and each program opens many connections: it sets a lower count with
@@ -161,18 +211,40 @@ let count =
   Option.value ~default:300
     (Option.bind (Sys.getenv_opt "CARAVAN_STATEFUL_COUNT") int_of_string_opt)
 
+(* [execute p] runs the program [p] in a new run of the simulator, against a new
+   server. At the end, the server aborts and [with_server] waits for it. In a
+   program that passes, the virtual time does not move. The guard is longer than
+   the timeouts of [Config.default] (30 s at most). Thus a program that waits
+   for a timeout of the server fails in the model with its table, and not at the
+   guard. *)
+let execute p =
+  Sim_support.run ~guard:(Span.s 600)
+  @@ fun _ ->
+  with_server
+  @@ fun server ->
+  System.server := Some server ;
+  Fun.protect
+    ~finally:(fun () -> System.server := None)
+    (fun () -> Stateful.execute p)
+
+(* A property over the programs. It keeps these parts of [stateful] of windtrap:
+   the tags "prop" and "stateful", a failure that prints the record of the run
+   of the program with [summary] as its one-line form, and the check "never
+   called" of each command (with [calls]). [stateful] itself runs each program
+   in the fiber of the test, thus it cannot give each program a new run. *)
 let stateful_tests =
   group "HTTP/1.1 connections"
-    [stateful ~count ~steps:25 "behave like the model" commands]
+    [ test ~tags:["prop"; "stateful"] "behave like the model" (fun () ->
+          Windtrap.Private.Run.property ~count ~summary:Stateful.summary
+            ~prints_run:true
+            (Stateful.program ~steps:25 commands)
+            execute ;
+          match List.filter (fun (_, n) -> Atomic.get n = 0) calls with
+          | [] ->
+              ()
+          | never ->
+              failf "never called: %s (over %d passing programs)"
+                (String.concat ", " (List.map fst never))
+                count ) ]
 
-let () =
-  let code =
-    Affect_unix.Unix.main ~domain_count:1
-    @@ fun () ->
-    let server = Server.start ~config handler in
-    System.server := Some server ;
-    Fun.protect
-      ~finally:(fun () -> Server.shutdown server ; Server.wait server)
-      (fun () -> run "server-stateful" [stateful_tests])
-  in
-  exit code
+let () = exit (Windtrap.run "server-stateful" [stateful_tests])

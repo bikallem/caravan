@@ -1,4 +1,6 @@
+open Weft
 open Caravan
+module Cancel = Caravan.Private.Cancel
 
 let guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -58,44 +60,52 @@ let is_key key =
 
 (* Runs [f] on the connection. If [f] ends, we close the connection. If [f]
    raises, we close with 1011 and give the exception to the server. If the
-   server cancels us, we do not close. A [Cancelled] from a different call, for
-   example a child of [f], is an exception of [f]. A [Closed] is not an
-   exception of [f] only if our connection closes: else it comes from a
-   different connection. When [stopping] is enabled, we close with 1001 (RFC
-   6455 §7.4.1: an endpoint that goes away). *)
-let run ?(stopping = Affect.Action.never) ?protocol ?max_message ?close_timeout
+   server cancels us, we do not close. A [Closed] is not an exception of [f]
+   only if our connection closes: else it comes from a different connection.
+   When [stopping] is ready, we close with 1001 (RFC 6455 §7.4.1: an endpoint
+   that goes away).
+
+   The watch of [stopping] is a daemon of a local scope: the scope cancels it
+   when [f] and the close end. A fork into the new scope raises [Scope_closed]
+   if a scope of the caller is cancelled. Then the caller gets its cancel, and
+   [f] does not run.
+
+   A [Fiber.Cancelled] goes out of [run] only for a cancel of the caller. A
+   [Fiber.Cancelled] of a different scope, for example of a scope inside [f], is
+   an exception of [f], and the server gets it as a [Failure]. A
+   [Promise.Cancelled] from a promise of [f] is an exception of [f]. *)
+let run ?(stopping = Weft.never) ?protocol ?max_message ?close_timeout
     ?write_timeout ?read_timeout ?idle_timeout f flow =
-  let open Affect in
   let c =
     Connection.make ?protocol ?max_message ?close_timeout ?write_timeout
       ?read_timeout ?idle_timeout flow
   in
-  let watch =
-    Fun.Async.call (fun () ->
-        Action.invoke stopping ;
-        Connection.close ~code:1001 ~reason:"server shutdown" c )
-  in
-  (* If the stop started a closing handshake, [close] waits for its end and
-     sends no second Close frame. Thus the end of [f] does not stop the
-     handshake. The connection call waits for the end of [watch]. *)
-  let finish ?code () = Connection.close ?code c ; Fun.Async.cancel watch in
+  Fiber.scope
+  @@ fun s ->
+  ( try
+      Fiber.fork_daemon ~name:"caravan.websocket.stop" s (fun () ->
+          Weft.sync stopping ;
+          Connection.close ~code:1001 ~reason:"server shutdown" c )
+    with Fiber.Scope_closed -> Cancel.scope_closed () ) ;
   match f c with
   | () ->
-      finish ()
+      (* If the stop started a closing handshake, [close] waits for its end and
+         sends no second Close frame. Thus the end of [f] does not stop the
+         handshake. *)
+      Connection.close c
   | exception Closed _ when Connection.is_closing c ->
-      finish ()
-  | exception (Fun.Async.Cancelled as e) when Fun.Async.is_current_cancelled ()
-    ->
-      (* The cancel goes to [watch] too. *)
-      Printexc.raise_with_backtrace e (Printexc.get_raw_backtrace ())
+      Connection.close c
   | exception e ->
+      (* [Cancel.is_own] raises inside: take the backtrace first. *)
       let bt = Printexc.get_raw_backtrace () in
-      finish ~code:1011 () ;
-      (* The server does not report a Cancelled, thus we give a Failure. *)
+      if Cancel.is_own e then Printexc.raise_with_backtrace e bt ;
+      Connection.close ~code:1011 c ;
       let e =
         match e with
-        | Fun.Async.Cancelled ->
-            Failure "Caravan_websocket: a call of the handler was cancelled"
+        | Fiber.Cancelled _ ->
+            Failure
+              "Caravan_websocket: the handler raised the Cancelled of a \
+               different scope"
         | e ->
             e
       in

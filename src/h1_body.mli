@@ -1,5 +1,6 @@
 (* Internal. HTTP/1.1 request bodies (RFC 9112 §6, §7), read from the
-   connection's buffered reader. *)
+   connection's buffered reader. The reads of a body run in a weft fiber. [make]
+   needs no fiber. *)
 
 val fixed : Buf_reader.t -> int -> Body.t
 (** [fixed r n] is the body of exactly [n] bytes read from [r], as declared by
@@ -57,9 +58,9 @@ val make :
 val body : t -> Body.t
 (** [body t] is the body for the handler. *)
 
-val completed : t -> unit Affect.Action.t
-(** [completed t] is enabled once the handler has read the body to its end, at
-    once if there is none. *)
+val completed : t -> unit Weft.event
+(** [completed t] is ready after the handler read the body to its end, at once
+    if there is none. *)
 
 val is_complete : t -> bool
 (** [is_complete t] is [true] iff the body was read to its end, or there is

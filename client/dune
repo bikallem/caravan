@@ -1,7 +1,7 @@
 (library
  (name caravan_client)
  (public_name caravan.client)
- (libraries caravan affect affect.unix unix threads.posix)
+ (libraries caravan weft)
  (instrumentation
   (backend ppx_windtrap.mutate))
  (instrumentation

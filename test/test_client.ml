@@ -1,16 +1,15 @@
+(* The tests of caravan.client on the simulator of weft. Each test runs in
+   Sim_support: 1 seed and 1 domain, except a test whose name starts with
+   "race:" (100 seeds on 4 domains). A test that checks a time runs in manual
+   mode. The servers listen on 127.0.0.1, a numeric host, so that the client
+   needs no DNS answer. *)
+
 open Windtrap
-open Affect
+open Weft
 open Caravan
 open Caravan.Private
 open Caravan_client.Private
-module Mtime = Affect_unix.Mtime
 module Client_config = Caravan_client.Config
-
-let ms n = Mtime.Span.(n * ms)
-
-let within_2s = Server_support.within_2s
-
-let eventually = Server_support.eventually
 
 let server_limits = H1_server.limits Config.default
 
@@ -38,23 +37,66 @@ let error_text f =
   | exception e ->
       Printexc.to_string e
 
+(* An Ivar as a signal of one event. *)
+let fill iv = ignore (Ivar.try_fill iv ())
+
+let wait iv = sync (Ivar.read iv)
+
+let is_set iv = Option.is_some (Ivar.peek iv)
+
+(* [check_settled sim ~msg p] lets the program run until it is quiescent, with
+   no move of the time, then makes sure that [p ()] is true. *)
+let check_settled sim ~msg p =
+  Weft_sim.settle sim ;
+  is_true ~msg (p ())
+
+(* The bytes that the client sent on a fake flow are not in a socket. *)
+let net_eio = Net.Error (Other "EIO", "write")
+
 (* One connection: [server] is the flow of a scripted server, [run] sends a
    request on the other end. The release records [reusable], and closes a
-   connection that is not reusable, as the pool does. *)
+   connection that is not reusable, as the pool does. The scripted servers and
+   the callers are calls of [scope]. *)
 type t =
-  { server: Flow.t
+  { sim: Weft_sim.t
+  ; scope: Fiber.scope
+  ; server: Flow.t
   ; run: ?config:Client_config.t -> Request.t -> Response.t
   ; releases: unit -> bool list
   ; writers: Writers.t }
 
-let with_conn f =
-  Server_support.with_flows
-  @@ fun server client ->
-  let writers = Writers.make () in
-  Stdlib.Fun.protect ~finally:(fun () ->
-      Writers.stop writers ; Writers.wait writers )
+(* [with_client_flow sim f] gives [f ~scope ~server ~writers ~conn ~taken] a
+   client connection [conn] over a socket pair of [sim], and a scope with the
+   writers of the client. [write real] replaces the write of the client flow:
+   [real] is the flow of the socket. [on_write_timeout] gets each write timeout
+   that the client sets. [taken] counts the bytes that the client took. At the
+   end, the writers stop, and the two flows close. *)
+let with_client_flow ?write ?on_write_timeout sim f =
+  Sim_support.with_pair sim
+  @@ fun a b ->
+  let real = Tcp.flow a and server = Tcp.flow b in
+  let counted =
+    Server_support.counted
+      ?write:(Option.map (fun w -> w real) write)
+      ?on_write_timeout real
+  in
+  let client = counted.flow in
+  Fiber.scope
+  @@ fun scope ->
+  let writers = Writers.make scope in
+  Fun.protect ~finally:(fun () ->
+      Writers.stop writers ;
+      Writers.wait writers ;
+      Flow.close server ;
+      Flow.close client )
   @@ fun () ->
-  let conn = Conn.make ~host:"a.example" ~port:80 client in
+  let conn = Conn.make ~host:"a" ~port:80 client in
+  f ~scope ~server ~writers ~conn ~taken:counted.read_bytes
+
+(* [conn_in sim f] gives [f] a connection of [with_client_flow]. *)
+let conn_in sim f =
+  with_client_flow sim
+  @@ fun ~scope ~server ~writers ~conn ~taken:_ ->
   let releases = ref [] in
   let on_release (c : Conn.t) ~reusable =
     releases := reusable :: !releases ;
@@ -63,15 +105,17 @@ let with_conn f =
   let run ?(config = Client_config.default) r =
     Exchange.run config writers conn ~on_release r
   in
-  f {server; run; releases= (fun () -> List.rev !releases); writers}
+  f {sim; scope; server; run; releases= (fun () -> List.rev !releases); writers}
 
-(* The scripted server, in a child call: [script r] gets a reader on the server
+let with_conn f = Sim_support.run @@ fun sim -> conn_in sim f
+
+(* The scripted server, in a call: [script r] gets a reader on the server
    flow. *)
 let serve t script =
-  Fun.Async.call (fun () -> script (Buf_reader.of_flow t.server))
+  Sim_support.call ~name:"server" t.scope (fun () ->
+      script (Buf_reader.of_flow t.server) )
 
-(* The end of the scripted server, with a guard. *)
-let await s = within_2s (fun () -> Fun.Async.get s)
+let await = Sim_support.await
 
 let read_head r = H1_parse.request_head server_limits r
 
@@ -84,9 +128,15 @@ let read_request r =
   in
   (h, Body.to_string b)
 
+(* Reads the body of a request with the head [h]. *)
+let read_body r h =
+  Body.to_string
+    (H1_body.body
+       (H1_body.make ~limits:server_limits r (H1_parse.request_framing h)) )
+
 let respond t s = Flow.write_string t.server s
 
-(* A body that writes chunks of 64 KiB until a write raises. Then it sets
+(* A body that writes chunks of 64 KiB until a write raises. Then it fills
    [raised] and raises again. *)
 let endless raised =
   let chunk = String.make 65536 'x' in
@@ -96,76 +146,91 @@ let endless raised =
           Body.Writer.write_string w chunk ;
           Body.Writer.flush w
         done
-      with e ->
-        Cell.Once.try_set raised () ;
-        raise e )
+      with e -> fill raised ; raise e )
 
-(* [f] with a client flow on the time line [time], over a socket pair, whose
-   writes raise [error] after [break ()]. [failed] is set at the first such
-   write. [on_write_deadline] gets each write deadline that the client sets, and
-   [on_release] each release of the connection. *)
-let with_breakable ?time ?(on_write_deadline = ignore)
-    ?(on_release = fun _ ~reusable:_ -> ()) ?(failed = Cell.Once.make ()) error
-    f =
-  Affect_unix.Unix.main ~domain_count:Server_support.domain_count
-  @@ fun () ->
-  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
-  Unix.set_nonblock a ;
-  Unix.set_nonblock b ;
-  let real = Tcp.flow ?time a and server = Tcp.flow b in
+(* [f ~scope ~server ~run ~break ~failed] with a client flow over a socket pair
+   of [sim], whose writes raise [error] after [break ()]. [failed] is filled at
+   the first such write. [on_write_timeout] gets each write timeout that the
+   client sets, and [on_release] each release of the connection. *)
+let with_breakable ?on_write_timeout ?(on_release = fun _ ~reusable:_ -> ())
+    ?(failed = Ivar.create ()) error sim f =
   let broken = Atomic.make false in
-  let write buf off len =
-    if Atomic.get broken then (
-      Cell.Once.try_set failed () ;
-      raise error )
+  let write real buf off len =
+    if Atomic.get broken then (fill failed ; raise error)
     else Flow.write real buf off len
   in
-  let client = (Server_support.counted ~write ~on_write_deadline real).flow in
-  let writers = Writers.make () in
-  Stdlib.Fun.protect ~finally:(fun () ->
-      Writers.stop writers ;
-      Writers.wait writers ;
-      Flow.close server ;
-      Flow.close client )
-  @@ fun () ->
-  let conn = Conn.make ~host:"a" ~port:80 client in
+  with_client_flow ~write ?on_write_timeout sim
+  @@ fun ~scope ~server ~writers ~conn ~taken:_ ->
   let run config r = Exchange.run config writers conn ~on_release r in
-  f ~server ~run ~break:(fun () -> Atomic.set broken true) ~failed
+  f ~scope ~server ~run ~break:(fun () -> Atomic.set broken true) ~failed
 
-(* [f ~server ~writers ~conn ~taken] with a client connection over a socket
-   pair. After a write sends its bytes, it waits for [release] if [hold] is true
-   for all the bytes sent at that time. [taken] counts the bytes that the client
-   took. *)
-let with_held_writes ~hold ~release f =
-  Affect_unix.Unix.main ~domain_count:Server_support.domain_count
-  @@ fun () ->
-  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
-  Unix.set_nonblock a ;
-  Unix.set_nonblock b ;
-  let real = Tcp.flow a and server = Tcp.flow b in
+(* [f ~scope ~server ~writers ~conn ~taken] with a client connection over a
+   socket pair of [sim]. After a write sends its bytes, it waits for [release]
+   if [hold] is true for all the bytes sent at that time. A cancel of that wait
+   fills [write_cancelled]. [taken] counts the bytes that the client took. *)
+let with_held_writes ?(write_cancelled = Ivar.create ()) ~hold ~release sim f =
   let sent = Buffer.create 64 in
-  let write buf off len =
+  let write real buf off len =
     Flow.write real buf off len ;
     Buffer.add_subbytes sent buf off len ;
-    if hold (Buffer.contents sent) then Cell.Once.get release
+    if hold (Buffer.contents sent) then (
+      try wait release
+      with Fiber.Cancelled _ as e -> fill write_cancelled ; raise e )
   in
-  let counted = Server_support.counted ~write real in
-  let client = counted.flow and taken = counted.read_bytes in
-  let writers = Writers.make () in
-  Stdlib.Fun.protect ~finally:(fun () ->
-      Cell.Once.try_set release () ;
-      Writers.stop writers ;
-      Writers.wait writers ;
-      Flow.close server ;
-      Flow.close client )
-  @@ fun () ->
-  let conn = Conn.make ~host:"a" ~port:80 client in
-  f ~server ~writers ~conn ~taken
+  with_client_flow ~write sim
+  @@ fun ~scope ~server ~writers ~conn ~taken ->
+  (* The held writes end before the writers stop. *)
+  Fun.protect ~finally:(fun () -> fill release)
+  @@ fun () -> f ~scope ~server ~writers ~conn ~taken
 
-(* Waits until a cancel, which raises [Cancelled]. On a failure, the stop of the
-   writers at the end of [with_conn] gives the cancel: the test does not
-   hang. *)
-let wait_for_cancel () : unit = Cell.Once.get (Cell.Once.make ())
+(* An exchange on [conn] that records its releases in [releases]. *)
+let exchange ?(config = Client_config.default) writers conn releases r =
+  Exchange.run config writers conn
+    ~on_release:(fun _ ~reusable -> releases := reusable :: !releases)
+    r
+
+(* A source of the 3 bytes "abc". [closes] counts its closes. *)
+let abc_source ?(closes = Atomic.make 0) ?(close = ignore) () =
+  let sent = ref false in
+  Body.of_source ~length:3
+    ~close:(fun () -> Atomic.incr closes ; close ())
+    (fun buf off _ ->
+      if !sent then 0
+      else (
+        Bytes.blit_string "abc" 0 buf off 3 ;
+        sent := true ;
+        3 ) )
+
+(* A request body that writes "abc", waits for [go], then raises [Failure
+   "x"]. *)
+let failing_after go =
+  Body.of_writer (fun w ->
+      Body.Writer.write_string w "abc" ;
+      Body.Writer.flush w ;
+      wait go ;
+      failwith "x" )
+
+(* [none_counted flow] is [flow], and a count of the calls of [read_now] that
+   gave [None]. A reader makes such a call before each wait, and at each wake
+   with no byte. *)
+let none_counted flow =
+  let nones = Atomic.make 0 in
+  let read_now buf off len =
+    let r = Flow.read_now flow buf off len in
+    if Option.is_none r then Atomic.incr nones ;
+    r
+  in
+  ( Flow.make ~read:(Flow.read flow) ~read_now ~write:(Flow.write flow)
+      ~readable:(Flow.readable flow)
+      ~shutdown_send:(fun () -> Flow.shutdown_send flow)
+      ~close:(fun () -> Flow.close flow)
+      ~reset:(fun () -> Flow.reset flow)
+      ~set_read_deadline:(Flow.set_read_deadline flow)
+      ~set_write_deadline:(Flow.set_write_deadline flow)
+      ~set_read_timeout:(Flow.set_read_timeout flow)
+      ~set_write_timeout:(Flow.set_write_timeout flow)
+      ()
+  , nones )
 
 let exchange_tests =
   group "Exchange"
@@ -290,13 +355,13 @@ let exchange_tests =
           equal string
             "Caravan_client.Error: bad response: 400 Bad Request (more than 10 \
              interim responses)"
-            (within_2s (fun () -> error_text (fun () -> t.run (req "/")))) ;
+            (error_text (fun () -> t.run (req "/"))) ;
           await s )
     ; test "a 413 with Connection: close stops the upload, and its body arrives"
         (fun () ->
           with_conn
           @@ fun t ->
-          let raised = Cell.Once.make () in
+          let raised = Ivar.create () in
           let s =
             serve t (fun r ->
                 ignore (read_head r) ;
@@ -306,12 +371,12 @@ let exchange_tests =
                    Connection: close\r\n\
                    Content-Length: 9\r\n\
                    \r\n" ;
-                within_2s (fun () -> Cell.Once.get raised) ;
+                wait raised ;
                 respond t "too large" )
           in
           let resp = t.run (req ~meth:Method.POST ~body:(endless raised) "/") in
           equal int 413 (status resp) ;
-          within_2s (fun () -> Cell.Once.get raised) ;
+          wait raised ;
           equal string "too large" (Body.to_string (body resp)) ;
           await s ;
           equal (list bool) [false] (t.releases ()) )
@@ -357,11 +422,8 @@ let exchange_tests =
                 in
                 go 0 )
           in
-          let got =
-            Server_support.within_2s (fun () ->
-                let resp = t.run (req ~meth:Method.POST ~body:upload "/") in
-                Body.to_string (body resp) )
-          in
+          let resp = t.run (req ~meth:Method.POST ~body:upload "/") in
+          let got = Body.to_string (body resp) in
           is_true ~msg:"the echo is equal" (got = data) ;
           await s )
     ; test "the end of the input before the head gives Closed" (fun () ->
@@ -374,7 +436,7 @@ let exchange_tests =
           in
           equal string
             "Caravan_client.Error: the connection closed before the response"
-            (within_2s (fun () -> error_text (fun () -> t.run (req "/")))) ;
+            (error_text (fun () -> t.run (req "/"))) ;
           await s )
     ; test "the end of the input after a part of a head gives Bad_response"
         (fun () ->
@@ -387,9 +449,7 @@ let exchange_tests =
                   respond t part ;
                   Flow.close t.server )
             in
-            let e =
-              within_2s (fun () -> error_text (fun () -> t.run (req "/")))
-            in
+            let e = error_text (fun () -> t.run (req "/")) in
             await s ; e
           in
           equal string
@@ -410,7 +470,7 @@ let exchange_tests =
           in
           equal string
             "Caravan_client.Error: the connection closed before the response"
-            (within_2s (fun () -> error_text (fun () -> t.run (req "/")))) ;
+            (error_text (fun () -> t.run (req "/"))) ;
           await s )
     ; test "a cancel of the caller closes the connection" (fun () ->
           with_conn
@@ -420,19 +480,19 @@ let exchange_tests =
                 ignore (read_request r) ;
                 respond t "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab" ;
                 (* The end of the stream comes when the client closes. *)
-                within_2s (fun () -> ignore (Buf_reader.peek_eof r)) )
+                ignore (Buf_reader.peek_eof r) )
           in
-          let reading = Cell.Once.make () in
+          let reading = Ivar.create () in
           let caller =
-            Fun.Async.call (fun () ->
+            Sim_support.call ~name:"caller" t.scope (fun () ->
                 let b = body (t.run (req "/")) in
                 ignore (Body.read b (Bytes.create 8) 0 8) ;
-                Cell.Once.try_set reading () ;
+                fill reading ;
                 Body.to_string b )
           in
-          within_2s (fun () -> Cell.Once.get reading) ;
-          Fun.Async.cancel caller ;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get caller) ;
+          wait reading ;
+          Sim_support.cancel caller ;
+          raises Promise.Cancelled (fun () -> await caller) ;
           equal (list bool) [false] (t.releases ()) ;
           await s )
     ; test "a 101 gives Unsupported" (fun () ->
@@ -446,7 +506,7 @@ let exchange_tests =
                    Upgrade: x\r\n\
                    Connection: upgrade\r\n\
                    \r\n" ;
-                within_2s (fun () -> ignore (Buf_reader.peek_eof r)) )
+                ignore (Buf_reader.peek_eof r) )
           in
           equal string "Caravan_client.Error: unsupported: protocol switch"
             (error_text (fun () -> t.run (req "/"))) ;
@@ -465,19 +525,17 @@ let exchange_tests =
                 failwith "x" )
           in
           let config =
-            {Client_config.default with response_timeout= ms 10_000}
+            {Client_config.default with response_timeout= Span.s 10}
           in
           equal string "Failure(\"x\")"
-            (within_2s (fun () ->
-                 error_text (fun () ->
-                     t.run ~config (req ~meth:Method.POST ~body:failing "/") ) )
-            ) ;
+            (error_text (fun () ->
+                 t.run ~config (req ~meth:Method.POST ~body:failing "/") ) ) ;
           equal (list bool) [false] (t.releases ()) ;
           await s )
     ; test "a 431 during a large request head, and its body arrives" (fun () ->
           with_conn
           @@ fun t ->
-          let returned = Cell.Once.make () in
+          let returned = Ivar.create () in
           let s =
             serve t (fun _ ->
                 ignore (Flow.read t.server (Bytes.create 1024) 0 1024) ;
@@ -486,14 +544,14 @@ let exchange_tests =
                    Connection: close\r\n\
                    Content-Length: 7\r\n\
                    \r\n" ;
-                within_2s (fun () -> Cell.Once.get returned) ;
+                wait returned ;
                 respond t "too big" )
           in
           let resp =
             t.run
               (req ~headers:[("X-Big", String.make (8 * 1024 * 1024) 'b')] "/")
           in
-          Cell.Once.try_set returned () ;
+          fill returned ;
           equal int 431 (status resp) ;
           equal string "too big" (Body.to_string (body resp)) ;
           await s ;
@@ -568,30 +626,25 @@ let exchange_tests =
               serve t (fun r ->
                   let h = read_head r in
                   respond t response ;
-                  ignore
-                    (Body.to_string
-                       (H1_body.body
-                          (H1_body.make ~limits:server_limits r
-                             (H1_parse.request_framing h) ) ) ) )
+                  ignore (read_body r h) )
             in
-            let go = Cell.Once.make () in
+            let go = Ivar.create () in
             (* The producer waits for the caller. *)
             let waiting =
               Body.of_writer (fun w ->
                   Body.Writer.write_string w "abc" ;
                   Body.Writer.flush w ;
-                  Cell.Once.get go ;
+                  wait go ;
                   Body.Writer.write_string w "def" )
             in
             let got =
-              within_2s (fun () ->
-                  Body.to_string
-                    (body (t.run (req ~meth:Method.POST ~body:waiting "/"))) )
+              Body.to_string
+                (body (t.run (req ~meth:Method.POST ~body:waiting "/")))
             in
             (* The connection goes back only after the producer. *)
             equal (list bool) [] (t.releases ()) ;
-            Cell.Once.try_set go () ;
-            eventually ~msg:"released after the producer" (fun () ->
+            fill go ;
+            check_settled t.sim ~msg:"released after the producer" (fun () ->
                 t.releases () = [true] ) ;
             await s ;
             got
@@ -611,20 +664,19 @@ let exchange_tests =
                 respond t "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" ;
                 ignore (Buf_reader.peek_eof r) )
           in
-          let go = Cell.Once.make () in
+          let go = Ivar.create () in
           let failing =
             Body.of_writer (fun w ->
                 Body.Writer.write_string w "abc" ;
                 Body.Writer.flush w ;
-                Cell.Once.get go ;
+                wait go ;
                 failwith "late" )
           in
           equal string "ok"
-            (within_2s (fun () ->
-                 Body.to_string
-                   (body (t.run (req ~meth:Method.POST ~body:failing "/"))) ) ) ;
-          Cell.Once.try_set go () ;
-          eventually ~msg:"released, not reusable" (fun () ->
+            (Body.to_string
+               (body (t.run (req ~meth:Method.POST ~body:failing "/"))) ) ;
+          fill go ;
+          check_settled t.sim ~msg:"released, not reusable" (fun () ->
               t.releases () = [false] ) ;
           await s )
     ; test "a body of length 0 with a producer does not make the response wait"
@@ -635,28 +687,22 @@ let exchange_tests =
             serve t (fun r ->
                 let h = read_head r in
                 respond t "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" ;
-                ignore
-                  (Body.to_string
-                     (H1_body.body
-                        (H1_body.make ~limits:server_limits r
-                           (H1_parse.request_framing h) ) ) ) )
+                ignore (read_body r h) )
           in
-          let go = Cell.Once.make () in
+          let go = Ivar.create () in
           (* Content-Length: 0, but the producer runs and waits for the
              caller. *)
           let waiting =
-            Body.of_writer ~length:0 (fun w ->
-                Body.Writer.flush w ; Cell.Once.get go )
+            Body.of_writer ~length:0 (fun w -> Body.Writer.flush w ; wait go)
           in
           let st =
-            Stdlib.Fun.protect
-              ~finally:(fun () -> Cell.Once.try_set go ())
+            Fun.protect
+              ~finally:(fun () -> fill go)
               (fun () ->
-                within_2s (fun () ->
-                    status (t.run (req ~meth:Method.POST ~body:waiting "/")) ) )
+                status (t.run (req ~meth:Method.POST ~body:waiting "/")) )
           in
           equal int 200 st ;
-          eventually ~msg:"released after the producer" (fun () ->
+          check_settled t.sim ~msg:"released after the producer" (fun () ->
               t.releases () = [true] ) ;
           await s )
     ; test
@@ -664,39 +710,34 @@ let exchange_tests =
         (fun () ->
           (* The write of the head waits for [hold] after it sends its bytes:
              the read that ends the response body waits for the last write. *)
-          let hold = Cell.Once.make () in
-          with_held_writes ~hold:(fun _ -> true) ~release:hold
-          @@ fun ~server ~writers ~conn ~taken:_ ->
+          let hold = Ivar.create () in
+          Sim_support.run
+          @@ fun sim ->
+          with_held_writes ~hold:(fun _ -> true) ~release:hold sim
+          @@ fun ~scope ~server ~writers ~conn ~taken:_ ->
           let releases = ref [] in
           let r = Buf_reader.of_flow server in
           let s =
-            Fun.Async.call (fun () ->
+            Sim_support.call ~name:"server" scope (fun () ->
                 ignore (read_request r) ;
                 Flow.write_string server
                   "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" )
           in
-          let read_ok = Cell.Once.make () in
+          let read_ok = Ivar.create () in
           let caller =
-            Fun.Async.call (fun () ->
-                let b =
-                  body
-                    (Exchange.run Client_config.default writers conn
-                       ~on_release:(fun _ ~reusable ->
-                         releases := reusable :: !releases )
-                       (req "/") )
-                in
+            Sim_support.call ~name:"caller" scope (fun () ->
+                let b = body (exchange writers conn releases (req "/")) in
                 let buf = Bytes.create 2 in
                 let n = Body.read b buf 0 2 in
-                Cell.Once.try_set read_ok (Bytes.sub_string buf 0 n) ;
+                ignore (Ivar.try_fill read_ok (Bytes.sub_string buf 0 n)) ;
                 (* The end of the body: the release waits for the write. *)
                 Body.read b buf 0 2 )
           in
-          equal string "ok" (within_2s (fun () -> Cell.Once.get read_ok)) ;
-          Fun.Async.cancel caller ;
-          within_2s (fun () ->
-              raises Fun.Async.Cancelled (fun () -> Fun.Async.get caller) ) ;
+          equal string "ok" (sync (Ivar.read read_ok)) ;
+          Sim_support.cancel caller ;
+          raises Promise.Cancelled (fun () -> await caller) ;
           equal (list bool) [false] !releases ;
-          within_2s (fun () -> Fun.Async.get s) )
+          await s )
     ; test "the head goes before the producer runs" (fun () ->
           (* A chunked body, and a body of known length. *)
           let case length =
@@ -706,29 +747,24 @@ let exchange_tests =
               serve t (fun r ->
                   let h = read_head r in
                   respond t "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" ;
-                  ignore
-                    (Body.to_string
-                       (H1_body.body
-                          (H1_body.make ~limits:server_limits r
-                             (H1_parse.request_framing h) ) ) ) )
+                  ignore (read_body r h) )
             in
-            let go = Cell.Once.make () in
+            let go = Ivar.create () in
             (* The producer waits for the response before its first write. *)
             let waiting =
               Body.of_writer ?length (fun w ->
-                  Cell.Once.get go ;
+                  wait go ;
                   Body.Writer.write_string w "abc" )
             in
             let got =
-              Stdlib.Fun.protect
-                ~finally:(fun () -> Cell.Once.try_set go ())
+              Fun.protect
+                ~finally:(fun () -> fill go)
                 (fun () ->
-                  within_2s (fun () ->
-                      Body.to_string
-                        (body (t.run (req ~meth:Method.POST ~body:waiting "/"))) ) )
+                  Body.to_string
+                    (body (t.run (req ~meth:Method.POST ~body:waiting "/"))) )
             in
             equal string "ok" got ;
-            eventually ~msg:"released after the producer" (fun () ->
+            check_settled t.sim ~msg:"released after the producer" (fun () ->
                 t.releases () = [true] ) ;
             await s
           in
@@ -737,7 +773,7 @@ let exchange_tests =
         (fun () ->
           with_conn
           @@ fun t ->
-          let closes = Atomic.make 0 in
+          let closes = Atomic.make 0 and closing = Ivar.create () in
           let s =
             serve t (fun r ->
                 ignore (read_head r) ;
@@ -748,50 +784,42 @@ let exchange_tests =
                    \r\n" ;
                 (* Only the cancel at the response head ends the read of the
                    source. Then the source closes. *)
-                eventually ~msg:"the source closed" (fun () ->
-                    Atomic.get closes = 1 ) ;
+                wait closing ;
                 respond t "nope" )
           in
           (* The read waits for a cancel. The close waits too, thus it gets the
              cancel of the job. *)
           let source =
             Body.of_source ~length:3
-              ~close:(fun () -> Atomic.incr closes ; wait_for_cancel ())
-              (fun _ _ _ -> wait_for_cancel () ; 0)
+              ~close:(fun () -> Atomic.incr closes ; fill closing ; sync never)
+              (fun _ _ _ -> sync never)
           in
-          let resp =
-            within_2s (fun () -> t.run (req ~meth:Method.POST ~body:source "/"))
-          in
+          let resp = t.run (req ~meth:Method.POST ~body:source "/") in
           equal int 413 (status resp) ;
-          equal string "nope" (within_2s (fun () -> Body.to_string (body resp))) ;
+          equal string "nope" (Body.to_string (body resp)) ;
           equal (list bool) [false] (t.releases ()) ;
           equal int 1 (Atomic.get closes) ;
           await s )
     ; test "the body closes when the writers stopped before the job" (fun () ->
-          Affect_unix.Unix.main ~domain_count:Server_support.domain_count
-          @@ fun () ->
-          let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
-          Unix.set_nonblock a ;
-          Unix.set_nonblock b ;
-          let client = Tcp.flow a and server = Tcp.flow b in
-          Stdlib.Fun.protect ~finally:(fun () ->
-              Flow.close server ; Flow.close client )
-          @@ fun () ->
-          let writers = Writers.make () in
+          Sim_support.run
+          @@ fun sim ->
+          Server_support.with_flows sim
+          @@ fun ~server:_ ~client ->
+          Fiber.scope
+          @@ fun scope ->
+          let writers = Writers.make scope in
           Writers.stop writers ;
           Writers.wait writers ;
           let conn = Conn.make ~host:"a" ~port:80 client
-          and releases = ref [] in
-          let closes = Atomic.make 0 in
+          and releases = ref []
+          and closes = Atomic.make 0 in
           let source =
             Body.of_source ~length:3
               ~close:(fun () -> Atomic.incr closes)
               (fun _ _ _ -> 0)
           in
           raises_match is_invalid_arg (fun () ->
-              Exchange.run Client_config.default writers conn
-                ~on_release:(fun _ ~reusable ->
-                  releases := reusable :: !releases )
+              exchange writers conn releases
                 (req ~meth:Method.POST ~body:source "/") ) ;
           equal (list bool) [false] !releases ;
           equal int 1 (Atomic.get closes) )
@@ -815,8 +843,7 @@ let exchange_tests =
                     3 ) )
             in
             raises expected (fun () ->
-                within_2s (fun () ->
-                    ignore (t.run (req ~meth:Method.POST ~body:source "/")) ) ) ;
+                ignore (t.run (req ~meth:Method.POST ~body:source "/")) ) ;
             equal (list bool) [false] (t.releases ()) ;
             Flow.close t.server ;
             await s
@@ -832,45 +859,34 @@ let exchange_tests =
          the client" (fun () ->
           with_conn
           @@ fun t ->
-          let in_close = Cell.Once.make ()
-          and close_cancelled = Cell.Once.make () in
+          let in_close = Ivar.create () and close_cancelled = Ivar.create () in
           (* The server answers while the close waits. It sends the body only
              after the close got its cancel: only the cancel at the response
              head ends the close. *)
           let s =
             serve t (fun r ->
                 ignore (read_head r) ;
-                within_2s (fun () -> Cell.Once.get in_close) ;
+                wait in_close ;
                 respond t
                   "HTTP/1.1 413 Too Large\r\n\
                    Connection: close\r\n\
                    Content-Length: 4\r\n\
                    \r\n" ;
-                within_2s (fun () -> Cell.Once.get close_cancelled) ;
+                wait close_cancelled ;
                 respond t "nope" )
           in
-          let closes = Atomic.make 0 and sent = ref false in
+          let closes = Atomic.make 0 in
           let source =
-            Body.of_source ~length:3
+            abc_source ~closes
               ~close:(fun () ->
-                Atomic.incr closes ;
-                Cell.Once.try_set in_close () ;
-                try wait_for_cancel ()
-                with Fun.Async.Cancelled as e ->
-                  Cell.Once.try_set close_cancelled () ;
-                  raise e )
-              (fun buf off _ ->
-                if !sent then 0
-                else (
-                  Bytes.blit_string "abc" 0 buf off 3 ;
-                  sent := true ;
-                  3 ) )
+                fill in_close ;
+                try sync never
+                with Fiber.Cancelled _ as e -> fill close_cancelled ; raise e )
+              ()
           in
-          let resp =
-            within_2s (fun () -> t.run (req ~meth:Method.POST ~body:source "/"))
-          in
+          let resp = t.run (req ~meth:Method.POST ~body:source "/") in
           equal int 413 (status resp) ;
-          equal string "nope" (within_2s (fun () -> Body.to_string (body resp))) ;
+          equal string "nope" (Body.to_string (body resp)) ;
           equal (list bool) [false] (t.releases ()) ;
           equal int 1 (Atomic.get closes) ;
           await s )
@@ -886,30 +902,28 @@ let exchange_tests =
           case
             (fun () -> failwith "close")
             (function Failure s -> s = "close" | _ -> false) ;
-          (* A Cancelled of a different call: the caller is not cancelled. *)
+          (* A Cancelled of a different scope: the caller is not cancelled. *)
           case
-            (fun () -> raise Fun.Async.Cancelled)
+            (fun () -> raise (Fiber.Cancelled Exit))
             (function Failure _ -> true | _ -> false) )
     ; test
         "a cancel during the close of a request with no body keeps the \
          connection" (fun () ->
           with_conn
           @@ fun t ->
-          let in_close = Cell.Once.make () in
+          let in_close = Ivar.create () in
           let source =
             Body.of_source ~length:0
-              ~close:(fun () ->
-                Cell.Once.try_set in_close () ;
-                Cell.Once.get (Cell.Once.make ()) )
+              ~close:(fun () -> fill in_close ; sync never)
               (fun _ _ _ -> 0)
           in
           let caller =
-            Fun.Async.call (fun () -> ignore (t.run (req ~body:source "/")))
+            Sim_support.call ~name:"caller" t.scope (fun () ->
+                ignore (t.run (req ~body:source "/")) )
           in
-          within_2s (fun () -> Cell.Once.get in_close) ;
-          Fun.Async.cancel caller ;
-          within_2s (fun () ->
-              raises Fun.Async.Cancelled (fun () -> Fun.Async.get caller) ) ;
+          wait in_close ;
+          Sim_support.cancel caller ;
+          raises Promise.Cancelled (fun () -> await caller) ;
           equal (list bool) [true] (t.releases ()) )
     ; test "the close of a request with no body runs in the caller" (fun () ->
           with_conn
@@ -922,19 +936,19 @@ let exchange_tests =
           let closer = ref [] in
           let source =
             Body.of_source ~length:0
-              ~close:(fun () -> closer := Fun.Async.Call.current () :: !closer)
+              ~close:(fun () -> closer := Fiber.self () :: !closer)
               (fun _ _ _ -> 0)
           in
           let caller =
-            Fun.Async.call (fun () ->
+            Sim_support.call ~name:"caller" t.scope (fun () ->
                 let st = status (t.run (req ~body:source "/")) in
-                (st, Fun.Async.Call.current ()) )
+                (st, Fiber.self ()) )
           in
-          let st, me = within_2s (fun () -> Fun.Async.get caller) in
+          let st, me = await caller in
           equal int 200 st ;
           ( match !closer with
           | [c] ->
-              is_true ~msg:"the caller closed" (Fun.Async.Call.equal c me)
+              is_true ~msg:"the caller closed" (Fiber.Id.equal c me)
           | l ->
               fail (Printf.sprintf "%d closes" (List.length l)) ) ;
           await s )
@@ -947,28 +961,18 @@ let exchange_tests =
                 ignore (read_request r) ;
                 respond t "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" )
           in
-          let go = Cell.Once.make () and sent = ref false in
+          let go = Ivar.create () in
           (* The close of the source waits for the caller. *)
-          let source =
-            Body.of_source ~length:3
-              ~close:(fun () -> Cell.Once.get go)
-              (fun buf off _ ->
-                if !sent then 0
-                else (
-                  Bytes.blit_string "abc" 0 buf off 3 ;
-                  sent := true ;
-                  3 ) )
-          in
+          let source = abc_source ~close:(fun () -> wait go) () in
           let got =
-            Stdlib.Fun.protect
-              ~finally:(fun () -> Cell.Once.try_set go ())
+            Fun.protect
+              ~finally:(fun () -> fill go)
               (fun () ->
-                within_2s (fun () ->
-                    Body.to_string
-                      (body (t.run (req ~meth:Method.POST ~body:source "/"))) ) )
+                Body.to_string
+                  (body (t.run (req ~meth:Method.POST ~body:source "/"))) )
           in
           equal string "ok" got ;
-          eventually ~msg:"released after the close" (fun () ->
+          check_settled t.sim ~msg:"released after the close" (fun () ->
               t.releases () = [true] ) ;
           await s )
     ; test "a cancel during the release inside run closes the connection"
@@ -976,34 +980,31 @@ let exchange_tests =
           (* The write of the head waits for [hold] after it sends its bytes.
              The response has no body, thus run itself waits for the last
              write. *)
-          let hold = Cell.Once.make () in
+          let hold = Ivar.create () in
           let head = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" in
-          with_held_writes ~hold:(fun _ -> true) ~release:hold
-          @@ fun ~server ~writers ~conn ~taken ->
+          Sim_support.run
+          @@ fun sim ->
+          with_held_writes ~hold:(fun _ -> true) ~release:hold sim
+          @@ fun ~scope ~server ~writers ~conn ~taken ->
           let releases = ref [] in
           let r = Buf_reader.of_flow server in
           let s =
-            Fun.Async.call (fun () ->
+            Sim_support.call ~name:"server" scope (fun () ->
                 ignore (read_request r) ;
                 Flow.write_string server head )
           in
           let caller =
-            Fun.Async.call (fun () ->
-                Exchange.run Client_config.default writers conn
-                  ~on_release:(fun _ ~reusable ->
-                    releases := reusable :: !releases )
-                  (req "/") )
+            Sim_support.call ~name:"caller" scope (fun () ->
+                exchange writers conn releases (req "/") )
           in
           (* After the client took the whole head, nothing waits or checks for a
              cancel before the wait for the write. *)
-          eventually ~msg:"the client took the head" (fun () ->
+          check_settled sim ~msg:"the client took the head" (fun () ->
               Atomic.get taken >= String.length head ) ;
-          Fun.Async.cancel caller ;
-          within_2s (fun () ->
-              raises Fun.Async.Cancelled (fun () ->
-                  ignore (Fun.Async.get caller) ) ) ;
+          Sim_support.cancel caller ;
+          raises Promise.Cancelled (fun () -> ignore (await caller)) ;
           equal (list bool) [false] !releases ;
-          within_2s (fun () -> Fun.Async.get s) )
+          await s )
     ; test "a user source of the request body gets its close" (fun () ->
           with_conn
           @@ fun t ->
@@ -1012,22 +1013,13 @@ let exchange_tests =
                 ignore (read_request r) ;
                 respond t "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" )
           in
-          let closes = Atomic.make 0 and sent = ref false in
-          let source =
-            Body.of_source ~length:3
-              ~close:(fun () -> Atomic.incr closes)
-              (fun buf off _ ->
-                if !sent then 0
-                else (
-                  Bytes.blit_string "abc" 0 buf off 3 ;
-                  sent := true ;
-                  3 ) )
-          in
+          let closes = Atomic.make 0 in
           equal int 200
-            (status (t.run (req ~meth:Method.POST ~body:source "/"))) ;
+            (status
+               (t.run (req ~meth:Method.POST ~body:(abc_source ~closes ()) "/")) ) ;
           await s ;
-          eventually ~msg:"closed one time" (fun () -> Atomic.get closes = 1) ;
-          equal int 1 (Atomic.get closes) )
+          check_settled t.sim ~msg:"closed one time" (fun () ->
+              Atomic.get closes = 1 ) )
     ; test "a producer that closes its own response releases the connection"
         (fun () ->
           with_conn
@@ -1038,23 +1030,22 @@ let exchange_tests =
                 respond t "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n" )
           in
           let resp = ref None
-          and ready = Cell.Once.make ()
-          and seen = Cell.Once.make () in
+          and ready = Ivar.create ()
+          and seen = Ivar.create () in
           let producer =
             Body.of_writer (fun w ->
                 Body.Writer.write_string w "abc" ;
                 Body.Writer.flush w ;
-                Cell.Once.get ready ;
+                wait ready ;
                 match Body.close (body (Option.get !resp)) with
                 | () ->
-                    Cell.Once.try_set seen "no error"
+                    ignore (Ivar.try_fill seen "no error")
                 | exception Invalid_argument _ ->
-                    Cell.Once.try_set seen "Invalid_argument" )
+                    ignore (Ivar.try_fill seen "Invalid_argument") )
           in
           resp := Some (t.run (req ~meth:Method.POST ~body:producer "/")) ;
-          Cell.Once.try_set ready () ;
-          equal string "Invalid_argument"
-            (within_2s (fun () -> Cell.Once.get seen)) ;
+          fill ready ;
+          equal string "Invalid_argument" (sync (Ivar.read seen)) ;
           equal (list bool) [false] (t.releases ()) ;
           await s )
     ; test "which ends of the writer stop a read" (fun () ->
@@ -1078,11 +1069,10 @@ let exchange_tests =
             ; show `Body (Failure "x")
             ; show `Body H1_write.Length_mismatch
             ; show `Head Flow.Timeout
-            ; show `Head Fun.Async.Cancelled
-            ; show `Head
-                (Exchange.Net (Unix.Unix_error (Unix.ETIMEDOUT, "write", "")))
+            ; show `Head (Fiber.Cancelled Exit)
+            ; show `Head (Exchange.Net (Net.Error (Other "ETIMEDOUT", "write")))
             ] )
-    ; test "a producer that raises Cancelled of a different call gives Failure"
+    ; test "a producer that raises Cancelled of a different scope gives Failure"
         (fun () ->
           with_conn
           @@ fun t ->
@@ -1093,36 +1083,73 @@ let exchange_tests =
             Body.of_writer (fun w ->
                 Body.Writer.write_string w "abc" ;
                 Body.Writer.flush w ;
-                let other =
-                  Fun.Async.call (fun () -> Mtime.wait_for (ms 10_000))
-                in
-                Fun.Async.cancel other ; Fun.Async.get other )
+                Fiber.scope (fun s -> Fiber.cancel s Exit ; sync never) )
           in
           equal string
             "Failure(\"Caravan_client: the request body producer raised \
              Cancelled\")"
-            (within_2s (fun () ->
-                 error_text (fun () ->
-                     t.run (req ~meth:Method.POST ~body:failing "/") ) ) ) ;
+            (error_text (fun () ->
+                 t.run (req ~meth:Method.POST ~body:failing "/") ) ) ;
           await s )
+    ; test "the end of the upload wakes the reader of the head one or two times"
+        (fun () ->
+          (* The writer fills [sent], then its result, with no wait between. The
+             reader of the head makes one read with no byte before its wait, and
+             one at each wake. It wakes at [sent] and at the end of the writer,
+             or only at the end of the writer: 2 or 3 reads with no byte. A turn
+             on a ready event gives more. The response comes 10 ms later. The
+             seed selects the event of the first wake, thus 20 requests. On 4
+             domains, a stale readiness can give one more wake. Thus the test
+             runs on one domain, where 100 seeds give 2 or 3. *)
+          Sim_support.run
+          @@ fun sim ->
+          with_client_flow sim
+          @@ fun ~scope ~server ~writers ~conn ~taken:_ ->
+          let flow, nones = none_counted conn.flow in
+          let conn = Conn.make ~host:"a" ~port:80 flow and releases = ref [] in
+          let r = Buf_reader.of_flow server in
+          let s =
+            Sim_support.call ~name:"server" scope (fun () ->
+                for _ = 1 to 20 do
+                  ignore (read_request r) ;
+                  Time.sleep Mono (Span.ms 10) ;
+                  Flow.write_string server
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+                done )
+          in
+          let counts =
+            List.init 20 (fun _ ->
+                let before = Atomic.get nones in
+                let resp = exchange writers conn releases (req "/") in
+                equal string "ok" (Body.to_string (body resp)) ;
+                Atomic.get nones - before )
+          in
+          await s ;
+          let text = String.concat " " (List.map string_of_int counts) in
+          is_true
+            ~msg:("no turn on a ready event: " ^ text)
+            (List.for_all (fun n -> n = 2 || n = 3) counts) ;
+          is_true ~msg:("a wake at sent: " ^ text) (List.mem 3 counts) )
     ; test "a write error of the network lets the response body arrive"
         (fun () ->
           List.iter
             (fun error ->
-              with_breakable error
-              @@ fun ~server ~run ~break ~failed ->
-              let go = Cell.Once.make () in
+              Sim_support.run
+              @@ fun sim ->
+              with_breakable error sim
+              @@ fun ~scope ~server ~run ~break ~failed ->
+              let go = Ivar.create () in
               let producer =
                 Body.of_writer (fun w ->
                     Body.Writer.write_string w "abc" ;
                     Body.Writer.flush w ;
-                    Cell.Once.get go ;
+                    wait go ;
                     Body.Writer.write_string w "def" ;
                     Body.Writer.flush w )
               in
               let r = Buf_reader.of_flow server in
               let s =
-                Fun.Async.call (fun () ->
+                Sim_support.call ~name:"server" scope (fun () ->
                     ignore (read_head r) ;
                     Flow.write_string server
                       "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab" )
@@ -1131,17 +1158,17 @@ let exchange_tests =
                 run Client_config.default
                   (Request.make ~authority:"a" ~body:producer Method.POST "/")
               in
-              within_2s (fun () -> Fun.Async.get s) ;
+              await s ;
               let b = body resp in
               let buf = Bytes.create 2 in
               equal string "ab" (Bytes.sub_string buf 0 (Body.read b buf 0 2)) ;
               (* The write error comes first, then the rest of the body. *)
               break () ;
-              Cell.Once.try_set go () ;
-              within_2s (fun () -> Cell.Once.get failed) ;
+              fill go ;
+              wait failed ;
               Flow.write_string server "cd" ;
-              equal string "cd" (within_2s (fun () -> Body.to_string b)) )
-            [Flow.Closed; Unix.Unix_error (Unix.EIO, "write", "")] )
+              equal string "cd" (Body.to_string b) )
+            [Flow.Closed; net_eio] )
     ; test "a full response before the end of the last write releases at once"
         (fun () ->
           (* The last write sends its bytes, then waits for [release]: the
@@ -1152,35 +1179,35 @@ let exchange_tests =
           let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" in
           List.iter
             (fun (meth, request_body, last) ->
-              let release = Cell.Once.make () in
-              with_held_writes ~hold:last ~release
-              @@ fun ~server ~writers ~conn ~taken ->
+              let release = Ivar.create () in
+              Sim_support.run
+              @@ fun sim ->
+              with_held_writes ~hold:last ~release sim
+              @@ fun ~scope ~server ~writers ~conn ~taken ->
               let releases = ref [] in
               let r = Buf_reader.of_flow server in
               let s =
-                Fun.Async.call (fun () ->
+                Sim_support.call ~name:"server" scope (fun () ->
                     (* The whole request, then the response. *)
                     ignore (read_request r) ;
                     Flow.write_string server response )
               in
               let c =
-                Fun.Async.call (fun () ->
+                Sim_support.call ~name:"caller" scope (fun () ->
                     Body.to_string
                       (body
-                         (Exchange.run Client_config.default writers conn
-                            ~on_release:(fun _ ~reusable ->
-                              releases := reusable :: !releases )
+                         (exchange writers conn releases
                             (req ~meth ~body:(request_body ()) "/") ) ) )
               in
-              eventually ~msg:"the client took the response" (fun () ->
+              check_settled sim ~msg:"the client took the response" (fun () ->
                   Atomic.get taken >= String.length response ) ;
               (* Only [release] can end the last write. *)
               is_false ~msg:"no end before the last write returns"
-                (Fake_time.ends_within_50ms c) ;
-              Cell.Once.try_set release () ;
-              equal string "ok" (within_2s (fun () -> Fun.Async.get c)) ;
+                (Sim_support.ended sim c) ;
+              fill release ;
+              equal string "ok" (await c) ;
               equal (list bool) [true] !releases ;
-              within_2s (fun () -> Fun.Async.get s) )
+              await s )
             [ ( Method.GET
               , (fun () -> Body.empty)
               , fun sent -> String.ends_with ~suffix:"\r\n\r\n" sent )
@@ -1202,25 +1229,25 @@ let exchange_tests =
                 Body.Writer.flush w ;
                 raise Flow.Closed )
           in
-          let config = {Client_config.default with response_timeout= ms 200} in
+          let config =
+            {Client_config.default with response_timeout= Span.ms 200}
+          in
           equal string "Caravan__Flow.Closed"
-            (within_2s (fun () ->
-                 error_text (fun () ->
-                     t.run ~config (req ~meth:Method.POST ~body:failing "/") ) )
-            ) ;
+            (error_text (fun () ->
+                 t.run ~config (req ~meth:Method.POST ~body:failing "/") ) ) ;
           await s )
     ; test "Body.close before the end stops the upload" (fun () ->
           with_conn
           @@ fun t ->
-          let raised = Cell.Once.make () in
+          let raised = Ivar.create () in
           let s =
             serve t (fun r ->
                 ignore (read_head r) ;
                 respond t "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n" )
           in
           let resp = t.run (req ~meth:Method.POST ~body:(endless raised) "/") in
-          within_2s (fun () -> Body.close (body resp)) ;
-          within_2s (fun () -> Cell.Once.get raised) ;
+          Body.close (body resp) ;
+          wait raised ;
           equal (list bool) [false] (t.releases ()) ;
           await s )
     ; test "a Body.close after the end does nothing" (fun () ->
@@ -1240,7 +1267,7 @@ let exchange_tests =
     ; test "a bad head from a peer that does not read" (fun () ->
           with_conn
           @@ fun t ->
-          let raised = Cell.Once.make () in
+          let raised = Ivar.create () in
           let s =
             serve t (fun r ->
                 ignore (read_head r) ;
@@ -1249,11 +1276,9 @@ let exchange_tests =
           equal string
             "Caravan_client.Error: bad response: 400 Bad Request (invalid \
              status code \"2x0\")"
-            (within_2s (fun () ->
-                 error_text (fun () ->
-                     t.run (req ~meth:Method.POST ~body:(endless raised) "/") ) )
-            ) ;
-          within_2s (fun () -> Cell.Once.get raised) ;
+            (error_text (fun () ->
+                 t.run (req ~meth:Method.POST ~body:(endless raised) "/") ) ) ;
+          wait raised ;
           equal (list bool) [false] (t.releases ()) ;
           await s )
     ; test "a wrong length gives Invalid_argument" (fun () ->
@@ -1270,9 +1295,8 @@ let exchange_tests =
           equal string
             "Invalid_argument(\"Caravan_client: the request body length \
              differs from its Content-Length\")"
-            (within_2s (fun () ->
-                 error_text (fun () ->
-                     t.run (req ~meth:Method.POST ~body:short "/") ) ) ) ;
+            (error_text (fun () ->
+                 t.run (req ~meth:Method.POST ~body:short "/") ) ) ;
           await s )
     ; test "a transfer coding other than chunked gives Unsupported" (fun () ->
           with_conn
@@ -1290,7 +1314,7 @@ let exchange_tests =
     ; test "Body.close raises the exception of the producer" (fun () ->
           with_conn
           @@ fun t ->
-          let go = Cell.Once.make () and raised = Cell.Once.make () in
+          let go = Ivar.create () and raised = Ivar.create () in
           let s =
             serve t (fun r ->
                 ignore (read_head r) ;
@@ -1300,13 +1324,13 @@ let exchange_tests =
             Body.of_writer (fun w ->
                 Body.Writer.write_string w "abc" ;
                 Body.Writer.flush w ;
-                Cell.Once.get go ;
-                Cell.Once.try_set raised () ;
+                wait go ;
+                fill raised ;
                 failwith "x" )
           in
           let resp = t.run (req ~meth:Method.POST ~body:failing "/") in
-          Cell.Once.try_set go () ;
-          within_2s (fun () -> Cell.Once.get raised) ;
+          fill go ;
+          wait raised ;
           equal string "Failure(\"x\")"
             (error_text (fun () -> Body.close (body resp))) ;
           equal (list bool) [false] (t.releases ()) ;
@@ -1314,7 +1338,7 @@ let exchange_tests =
     ; test "the writer is not a child of the caller" (fun () ->
           with_conn
           @@ fun t ->
-          let gate = Cell.Once.make () in
+          let gate = Ivar.create () in
           let s =
             serve t (fun r ->
                 let h = read_head r in
@@ -1343,238 +1367,299 @@ let exchange_tests =
                 for i = 1 to 4 do
                   Body.Writer.write_string w (Printf.sprintf "part %d;" i) ;
                   Body.Writer.flush w ;
-                  Cell.Once.get gate
+                  wait gate
                 done )
           in
           let f =
-            Fun.Async.call (fun () ->
+            Sim_support.call ~name:"caller" t.scope (fun () ->
                 t.run (req ~meth:Method.POST ~body:four "/") )
           in
           (* F ends before the upload: the writer belongs to the client. *)
           let resp =
-            match within_2s (fun () -> Fun.Async.get f) with
-            | r ->
-                Cell.Once.try_set gate () ; r
-            | exception e ->
-                Cell.Once.try_set gate () ; raise e
+            Fun.protect ~finally:(fun () -> fill gate) (fun () -> await f)
           in
           equal string "part 1;part 2;part 3;part 4;"
             (Body.to_string (body resp)) ;
           await s )
-    ; test "a stopped writer supervisor refuses a job" (fun () ->
+    ; test "race: a stop right after the start of the writers is no failure"
+        (fun () ->
+          (* The daemon of the writers can see the cancel of [stop] before its
+             wait for [stopping]. Its scope then raises Cancelled Stopped. The
+             daemon ends with no failure of [s]. *)
+          Sim_support.race
+          @@ fun _ ->
+          (* Few orders of the domains give that case: 50 tries for each
+             seed. *)
+          for _ = 1 to 50 do
+            Fiber.scope
+            @@ fun s ->
+            let writers = Writers.make s in
+            Writers.stop writers ; Writers.wait writers
+          done )
+    ; test "stopped writers refuse a job" (fun () ->
           with_conn
           @@ fun t ->
           Writers.stop t.writers ;
           equal string
             "Invalid_argument(\"Caravan_client: the client is closed\")"
-            (within_2s (fun () -> error_text (fun () -> t.run (req "/")))) ;
+            (error_text (fun () -> t.run (req "/"))) ;
           equal (list bool) [false] (t.releases ()) )
-    ; test "a cancel during an offer that does not synchronize" (fun () ->
-          Server_support.with_flows
-          @@ fun _ client ->
-          (* A supervisor that never takes a job. *)
-          let writers =
-            { Writers.jobs= Port.make ()
-            ; stopping= Cell.Once.make ()
-            ; supervisor= Fun.Async.call ignore }
-          in
-          let conn = Conn.make ~host:"a.example" ~port:80 client in
-          let releases = ref [] in
-          let on_release _ ~reusable = releases := reusable :: !releases in
-          (* A GET with no body on the wire: the caller closes the body just
-             before the offer, and nothing waits between the two. *)
-          let started = Cell.Once.make () in
-          let empty =
-            Body.of_source ~length:0
-              ~close:(fun () -> Cell.Once.try_set started ())
+    ; test "writers whose scope ended refuse a job" (fun () ->
+          (* The end of the scope cancels the daemon of the writers, and
+             [stopping] stays empty: the fork into the scope of the writers
+             gives Scope_closed. *)
+          Sim_support.run
+          @@ fun sim ->
+          Server_support.with_flows sim
+          @@ fun ~server:_ ~client ->
+          let writers = Fiber.scope (fun s -> Writers.make s) in
+          let conn = Conn.make ~host:"a" ~port:80 client
+          and releases = ref []
+          and closes = Atomic.make 0 in
+          let source =
+            Body.of_source ~length:3
+              ~close:(fun () -> Atomic.incr closes)
               (fun _ _ _ -> 0)
           in
-          let f =
-            Fun.Async.call (fun () ->
-                Exchange.run Client_config.default writers conn ~on_release
-                  (req ~body:empty "/") )
+          equal string
+            "Invalid_argument(\"Caravan_client: the client is closed\")"
+            (error_text (fun () ->
+                 exchange writers conn releases
+                   (req ~meth:Method.POST ~body:source "/") ) ) ;
+          equal (list bool) [false] !releases ;
+          equal int 1 (Atomic.get closes) )
+    ; test "a job cancelled before its first step gives Job_cancelled"
+        (fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          Fiber.scope
+          @@ fun s ->
+          let writers = Writers.make s in
+          let closes = Atomic.make 0 in
+          let j =
+            Writers.job (fun () ->
+                Fun.protect
+                  ~finally:(fun () -> Atomic.incr closes)
+                  (fun () -> Fiber.yield ()) )
           in
-          (* On a failure, the stop ends an offer that ignores the cancel: the
-             test does not hang. *)
-          Stdlib.Fun.protect ~finally:(fun () ->
-              Cell.Once.try_set writers.stopping () )
-          @@ fun () ->
-          within_2s (fun () -> Cell.Once.get started) ;
-          Fun.Async.cancel f ;
-          within_2s (fun () ->
-              raises Fun.Async.Cancelled (fun () -> Fun.Async.get f) ) ;
-          equal (list bool) [false] !releases ) ]
+          (* No switch between the two calls: the job did not start. *)
+          Writers.start writers j ;
+          Writers.cancel j ;
+          ( match Writers.await ~cancel:false j with
+          | Error (Writers.Job_cancelled, _) ->
+              ()
+          | Ok () ->
+              fail "the job ended with Ok"
+          | Error (e, _) ->
+              fail (Printexc.to_string e) ) ;
+          equal int ~msg:"the body ran one time" 1 (Atomic.get closes) ;
+          Writers.stop writers ;
+          Writers.wait writers )
+    ; test "a deferred release after the close of the client closes the flow"
+        (fun () ->
+          with_conn
+          @@ fun t ->
+          let s =
+            serve t (fun r ->
+                ignore (read_head r) ;
+                respond t "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" )
+          in
+          let go = Ivar.create () in
+          (* The producer ignores the cancel until [go]. Its next write then
+             raises the cancel of its job. *)
+          let late =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "abc" ;
+                Body.Writer.flush w ;
+                Fiber.shield (fun () -> wait go) ;
+                Body.Writer.write_string w "def" ;
+                Body.Writer.flush w )
+          in
+          (* The response ends first: the release waits for the producer. *)
+          equal string "ok"
+            (Body.to_string
+               (body (t.run (req ~meth:Method.POST ~body:late "/"))) ) ;
+          await s ;
+          equal (list bool) [] (t.releases ()) ;
+          let fds = Weft_sim.open_fds t.sim in
+          Writers.stop t.writers ;
+          fill go ;
+          check_settled t.sim ~msg:"released, not reusable" (fun () ->
+              t.releases () = [false] ) ;
+          equal int ~msg:"the client socket closed" (fds - 1)
+            (Weft_sim.open_fds t.sim) )
+    ; test "a malformed chunk gives Bad_response" (fun () ->
+          with_conn
+          @@ fun t ->
+          let s =
+            serve t (fun r ->
+                ignore (read_request r) ;
+                respond t
+                  "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n" )
+          in
+          let resp = t.run (req "/") in
+          await s ;
+          equal string
+            "Caravan_client.Error: bad response: 400 Bad Request (invalid \
+             chunk size)"
+            (error_text (fun () -> Body.to_string (body resp))) )
+    ; test "a bad request raises before the exchange" (fun () ->
+          with_conn
+          @@ fun t ->
+          raises_match is_invalid_arg (fun () -> t.run (req "/a#b")) ;
+          equal (list bool) [true] (t.releases ()) ;
+          Weft_sim.settle t.sim ;
+          is_true ~msg:"no byte for the server"
+            (Flow.read_now t.server (Bytes.create 1) 0 1 = None) )
+    ; test "a cancelled reader stops also when the input is ready" (fun () ->
+          (* All the body is in the socket of the client: no read waits. The
+             reader takes the bytes of its buffer, then its next read raises the
+             cancel. *)
+          with_conn
+          @@ fun t ->
+          let n = 60000 in
+          let s =
+            serve t (fun r ->
+                ignore (read_request r) ;
+                respond t
+                  (Printf.sprintf
+                     "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" n
+                     (String.make n 'x') ) )
+          in
+          let b = body (t.run (req "/")) in
+          await s ;
+          Weft_sim.settle t.sim ;
+          ignore (Body.read b (Bytes.create 1) 0 1) ;
+          let got = ref 0 in
+          raises_match
+            (function Fiber.Cancelled Exit -> true | _ -> false)
+            (fun () ->
+              Fiber.scope (fun s ->
+                  Fiber.cancel s Exit ;
+                  let buf = Bytes.create 1024 in
+                  while true do
+                    got := !got + Body.read b buf 0 1024
+                  done ) ) ;
+          is_true
+            ~msg:(Printf.sprintf "%d bytes after the cancel" !got)
+            (!got < Conn.buffer_size) ;
+          equal (list bool) [false] (t.releases ()) )
+    ; test "a cancel during the wait for the last writes stops the writer first"
+        (fun () ->
+          let hold = Ivar.create () and write_cancelled = Ivar.create () in
+          Sim_support.run
+          @@ fun sim ->
+          with_held_writes ~write_cancelled
+            ~hold:(fun _ -> true)
+            ~release:hold sim
+          @@ fun ~scope ~server ~writers ~conn ~taken:_ ->
+          let releases = ref [] in
+          let r = Buf_reader.of_flow server in
+          let s =
+            Sim_support.call ~name:"server" scope (fun () ->
+                ignore (read_request r) ;
+                Flow.write_string server
+                  "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" )
+          in
+          let caller =
+            Sim_support.call ~name:"caller" scope (fun () ->
+                Body.to_string (body (exchange writers conn releases (req "/"))) )
+          in
+          await s ;
+          is_false ~msg:"the read waits for the last write"
+            (Sim_support.ended sim caller) ;
+          Sim_support.cancel caller ;
+          raises Promise.Cancelled (fun () -> ignore (await caller)) ;
+          (* The release waits for the end of the writer. *)
+          is_true ~msg:"the writer got the cancel" (is_set write_cancelled) ;
+          equal (list bool) [false] !releases )
+    ; test
+        "the read that ends the body raises the error of the producer one time"
+        (fun () ->
+          with_conn
+          @@ fun t ->
+          let s =
+            serve t (fun r ->
+                ignore (read_head r) ;
+                respond t "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" ;
+                ignore (Buf_reader.peek_eof r) )
+          in
+          let go = Ivar.create () in
+          let b =
+            body (t.run (req ~meth:Method.POST ~body:(failing_after go) "/"))
+          in
+          (* The producer fails before the read: the response and the input are
+             there, so the reads do not wait. *)
+          fill go ;
+          Weft_sim.settle t.sim ;
+          equal string "Failure(\"x\")" (error_text (fun () -> Body.to_string b)) ;
+          equal string "no error" (error_text (fun () -> Body.close b)) ;
+          equal (list bool) [false] (t.releases ()) ;
+          await s )
+    ; test "an error of the producer during a body read comes out of the read"
+        (fun () ->
+          with_conn
+          @@ fun t ->
+          let s =
+            serve t (fun r ->
+                ignore (read_head r) ;
+                respond t "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab" ;
+                ignore (Buf_reader.peek_eof r) )
+          in
+          let go = Ivar.create () in
+          let b =
+            body (t.run (req ~meth:Method.POST ~body:(failing_after go) "/"))
+          in
+          equal int 2 (Body.read b (Bytes.create 8) 0 8) ;
+          let reader =
+            Sim_support.call ~name:"reader" t.scope (fun () ->
+                let read = error_text (fun () -> Body.to_string b) in
+                (read, error_text (fun () -> Body.close b)) )
+          in
+          is_false ~msg:"the read waits" (Sim_support.ended t.sim reader) ;
+          fill go ;
+          equal (pair string string)
+            ("Failure(\"x\")", "no error")
+            (await reader) ;
+          equal (list bool) [false] (t.releases ()) ;
+          await s )
+    ; test "a refused job gives the refusal, not the error of the close"
+        (fun () ->
+          Sim_support.run
+          @@ fun sim ->
+          Server_support.with_flows sim
+          @@ fun ~server:_ ~client ->
+          let writers = Fiber.scope (fun s -> Writers.make s) in
+          let conn = Conn.make ~host:"a" ~port:80 client
+          and releases = ref [] in
+          let source =
+            Body.of_source ~length:3
+              ~close:(fun () -> failwith "close")
+              (fun _ _ _ -> 0)
+          in
+          raises_match is_invalid_arg (fun () ->
+              exchange writers conn releases
+                (req ~meth:Method.POST ~body:source "/") ) ) ]
 
 (* Resolver and connect *)
 
-let inet a port = Unix.ADDR_INET (Unix.inet_addr_of_string a, port)
+(* The name of the hosts of the lookup tests. *)
+let lookup_host = "a.example"
 
-let show_addr = function
-  | Unix.ADDR_INET (a, p) ->
-      Printf.sprintf "%s:%d" (Unix.string_of_inet_addr a) p
-  | Unix.ADDR_UNIX s ->
-      s
-
-(* A getaddrinfo stub that gives [addrs], after [delay] seconds in its thread,
-   and sets [ended] at its end. *)
-let stub ?(delay = 0.) ?(ended = Atomic.make false) addrs _ _ _ =
-  Unix.sleepf delay ;
-  Atomic.set ended true ;
-  List.map
-    (fun a ->
-      { Unix.ai_family= Unix.PF_INET
-      ; ai_socktype= Unix.SOCK_STREAM
-      ; ai_protocol= 0
-      ; ai_addr= a
-      ; ai_canonname= "" } )
-    addrs
-
-(* The targets of the open file descriptors, for example "pipe:[123]". *)
-let fd_targets () =
-  List.filter_map
-    (fun fd ->
-      try Some (Unix.readlink ("/proc/self/fd/" ^ fd))
-      with Unix.Unix_error _ -> None )
-    (Array.to_list (Sys.readdir "/proc/self/fd"))
-
-(* The targets of the open file descriptors that are not in [before]. The thread
-   of an earlier test can close its pipe late: thus a test does not count all
-   the file descriptors. *)
-let new_fds before =
-  List.filter (fun t -> not (List.mem t before)) (fd_targets ())
-
-(* [f port] with a port that refuses connections: a socket that is bound but
-   does not listen. The socket keeps the port, thus a different process cannot
-   take it during [f]. *)
-let with_refused_port f =
-  let s = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-  Stdlib.Fun.protect ~finally:(fun () -> Unix.close s)
+(* [with_listener addr f] runs [f] with a listener on [addr] that accepts
+   connections and closes them. The listener closes at the end. *)
+let with_listener addr f =
+  let l = Tcp.Listener.listen addr in
+  Fun.protect ~finally:(fun () -> Tcp.Listener.close l)
   @@ fun () ->
-  Unix.bind s Server_support.loopback ;
-  match Unix.getsockname s with
-  | Unix.ADDR_INET (_, p) ->
-      f p
-  | _ ->
-      fail "no port"
-
-let main f = Affect_unix.Unix.main ~domain_count:Server_support.domain_count f
-
-(* [f port] with a listener on [port] that accepts one connection. The accept
-   stops at the end, also when [f] raises. *)
-let with_listener f =
-  let l = Tcp.Listener.listen Server_support.loopback in
-  let port =
-    match Tcp.Listener.addr l with Unix.ADDR_INET (_, p) -> p | _ -> 0
-  in
-  let accepted =
-    Fun.Async.call (fun () ->
-        let fd, _ = Tcp.Listener.accept l in
-        Unix.close fd )
-  in
-  Stdlib.Fun.protect
-    ~finally:(fun () -> Fun.Async.cancel accepted ; Tcp.Listener.close l)
-    (fun () -> f port)
-
-(* The hosts of the numeric tests, with the address that Resolver.numeric must
-   give. *)
-let numeric_table =
-  [ ("127.0.0.1", Some "127.0.0.1")
-  ; ("[127.0.0.1]", Some "127.0.0.1")
-  ; ("0.0.0.0", Some "0.0.0.0")
-  ; ("255.255.255.255", Some "255.255.255.255")
-  ; ("::1", Some "::1")
-  ; ("[::1]", Some "::1")
-  ; ("::", Some "::")
-  ; ("[FE80::a]", Some "FE80::a")
-  ; ("1:2:3:4:5:6:7:8", Some "1:2:3:4:5:6:7:8")
-  ; ("1:2:3:4:5:6:7::", Some "1:2:3:4:5:6:7::")
-  ; ("::ffff:192.0.2.1", Some "::ffff:192.0.2.1")
-  ; ("1:2:3:4:5:6:1.2.3.4", Some "1:2:3:4:5:6:1.2.3.4")
-  ; ("", None)
-  ; ("[]", None)
-  ; ("[::1", None)
-  ; ("::1]", None)
-  ; ("a.example", None)
-  ; ("localhost", None)
-  ; ("256.0.0.1", None)
-  ; ("01.2.3.4", None)
-  ; ("1.2.3", None)
-  ; ("1.2.3.4.5", None)
-  ; ("1.2.3.4 ", None)
-  ; (":::", None)
-  ; (":1", None)
-  ; ("1:", None)
-  ; ("1::2::3", None)
-  ; ("12345::", None)
-  ; ("1:2:3:4:5:6:7", None)
-  ; ("1:2:3:4:5:6:7:8:9", None)
-  ; ("1:2:3:4:5:6:7::8", None)
-  ; ("1.2.3.4::", None)
-  ; ("1:2:3:4:5:6:7:1.2.3.4", None)
-  ; ("fe80::1%eth0", None) ]
-
-(* The numeric check before the pure parser: it calls inet_pton. *)
-let unix_numeric host =
-  let h =
-    if String.starts_with ~prefix:"[" host && String.ends_with ~suffix:"]" host
-    then String.sub host 1 (String.length host - 2)
-    else host
-  in
-  match Unix.inet_addr_of_string h with
-  | a ->
-      Some (Unix.string_of_inet_addr a)
-  | exception Failure _ ->
-      None
-
-(* The address of Resolver.numeric, in the form of Unix.string_of_inet_addr. *)
-let pure_numeric host =
-  Option.map
-    (fun a -> Unix.string_of_inet_addr (Unix.inet_addr_of_string a))
-    (Resolver.numeric host)
-
-(* Hosts near the numeric forms: IPv4, IPv6 with "::" and an IPv4 end, broken
-   parts, and brackets on no side, on one side or on the two sides. Most parts
-   are correct, thus a part of the hosts is numeric. *)
-let numeric_host =
-  let open Gen in
-  let mostly good bad = frequency [(9, of_list good); (1, of_list bad)] in
-  let ipv4 =
-    map (String.concat ".")
-      (list
-         ~size:(frequency [(6, constant 4); (1, int_range 3 5)])
-         (mostly
-            ["0"; "1"; "9"; "10"; "99"; "249"; "255"]
-            ["256"; "300"; "01"; "001"; "1000"; ""; "a"] ) )
-  in
-  let groups n =
-    list ~size:n
-      (mostly ["0"; "1"; "ff"; "FFFF"; "abcd"; "0000"] ["12345"; "g"; ""])
-  in
-  let last = of_list [[]; ["1.2.3.4"]; ["255.255.255.255"]; ["1.2.3"]] in
-  let ipv6 =
-    one_of
-      [ map
-          (fun (gs, l) -> String.concat ":" (gs @ l))
-          (pair (groups (int_range 5 9)) last)
-      ; map
-          (fun (l, sep, r, last) ->
-            String.concat ":" l ^ sep ^ String.concat ":" (r @ last) )
-          (quad
-             (groups (int_range 0 5))
-             (frequency [(6, constant "::"); (1, of_list [":"; ":::"; ""])])
-             (groups (int_range 0 5))
-             last ) ]
-  in
-  let any =
-    string_of ~size:(int_range 0 12)
-      (of_list ['0'; '1'; '9'; 'a'; 'F'; 'g'; ':'; '.'; '['; ']'; '%'; ' '])
-  in
-  with_pp Format.pp_print_string
-    (map
-       (fun ((o, c), h) -> o ^ h ^ c)
-       (pair
-          (of_list [("", ""); ("[", "]"); ("[", ""); ("", "]")])
-          (frequency [(2, ipv4); (3, ipv6); (1, any)]) ) )
+  Fiber.scope
+  @@ fun s ->
+  Fiber.fork_daemon ~name:"acceptor" s (fun () ->
+      while true do
+        let c, _ = Tcp.Listener.accept l in
+        Net.close c
+      done ) ;
+  f ()
 
 let resolver_tests =
   group "Resolver and connect"
@@ -1582,192 +1667,120 @@ let resolver_tests =
           List.iter
             (fun (host, address) ->
               equal ~msg:host (option string) address (Resolver.numeric host) )
-            numeric_table )
-    ; prop "numeric accepts the same hosts as inet_addr_of_string" ~count:5000
-        ~examples:(List.map fst numeric_table) numeric_host (fun host ->
-          equal ~msg:host (option string) (unix_numeric host)
-            (pure_numeric host) )
-    ; test "a numeric host does not start a thread" (fun () ->
-          main
-          @@ fun () ->
-          let before = Atomic.get Resolver.threads_started in
-          equal (list string) ["127.0.0.1:80"]
-            (List.map show_addr
-               (Resolver.resolve ~host:"127.0.0.1" ~port:80 ()) ) ;
-          equal (list string) ["::1:443"]
-            (List.map show_addr (Resolver.resolve ~host:"[::1]" ~port:443 ())) ;
-          equal int before (Atomic.get Resolver.threads_started) )
-    ; test "a host name uses a thread" (fun () ->
-          main
-          @@ fun () ->
-          let before = Atomic.get Resolver.threads_started in
-          equal (list string) ["127.0.0.1:8080"]
-            (List.map show_addr
-               (Resolver.resolve
-                  ~getaddrinfo:(stub [inet "127.0.0.1" 8080])
-                  ~host:"a.example" ~port:8080 () ) ) ;
-          equal int (before + 1) (Atomic.get Resolver.threads_started) )
+            Numeric_hosts.table )
+    ; test "a numeric host needs no lookup" (fun () ->
+          (* The simulator has no name: a lookup gives No_entry. *)
+          Sim_support.run
+          @@ fun _ ->
+          equal (list string) ["127.0.0.1"] (Resolver.resolve "127.0.0.1") ;
+          equal (list string) ["::1"] (Resolver.resolve "[::1]") )
+    ; test "a host name uses Dns" (fun () ->
+          Sim_support.run
+          @@ fun sim ->
+          Weft_sim.set_dns sim lookup_host (Addresses ["10.0.0.1"; "10.0.0.2"]) ;
+          equal (list string) ["10.0.0.1"; "10.0.0.2"]
+            (Resolver.resolve lookup_host) )
     ; test "a broken IPv6 host is not numeric" (fun () ->
-          main
-          @@ fun () ->
-          let before = Atomic.get Resolver.threads_started in
-          equal (list string) ["127.0.0.1:80"]
-            (List.map show_addr
-               (Resolver.resolve
-                  ~getaddrinfo:(stub [inet "127.0.0.1" 80])
-                  ~host:"[::1" ~port:80 () ) ) ;
-          equal int (before + 1) (Atomic.get Resolver.threads_started) )
-    ; test "the read end of the pipe stays open until the thread ends"
-        (fun () ->
-          main
-          @@ fun () ->
-          let before = fd_targets ()
-          and go = Atomic.make false
-          and ended = Atomic.make false in
-          let held _ _ _ =
-            while not (Atomic.get go) do
-              Unix.sleepf 0.005
-            done ;
-            Atomic.set ended true ;
-            []
-          in
-          Stdlib.Fun.protect ~finally:(fun () -> Atomic.set go true)
-          @@ fun () ->
-          let c =
-            Fun.Async.call (fun () ->
-                Resolver.resolve ~getaddrinfo:held ~host:"a.example" ~port:80 () )
-          in
-          (* The thread of a different test can close its pipe at this time:
-             count only the ends of the new pipe. *)
-          let new_pipe () =
-            List.filter (String.starts_with ~prefix:"pipe:") (new_fds before)
-          in
-          eventually ~msg:"the pipe is open" (fun () ->
-              List.length (new_pipe ()) = 2 ) ;
-          let pipe = List.hd (new_pipe ()) in
-          let ends () =
-            List.length (List.filter (String.equal pipe) (fd_targets ()))
-          in
-          Fun.Async.cancel c ;
-          within_2s (fun () ->
-              raises Fun.Async.Cancelled (fun () -> Fun.Async.get c) ) ;
-          (* The thread still owns the read end: it writes to it later. *)
-          equal int 2 (ends ()) ;
-          Atomic.set go true ;
-          eventually ~msg:"the thread ended" (fun () -> Atomic.get ended) ;
-          eventually ~msg:"no fd leaked" (fun () -> ends () = 0) )
+          Sim_support.run
+          @@ fun sim ->
+          Weft_sim.set_dns sim "[::1" (Addresses ["127.0.0.1"]) ;
+          equal (list string) ["127.0.0.1"] (Resolver.resolve "[::1") )
     ; test "no address gives Error (Connect _)" (fun () ->
-          main
-          @@ fun () ->
+          Sim_support.run
+          @@ fun _ ->
           equal string
             "Caravan_client.Error: cannot connect: no address for a.example"
-            (error_text (fun () ->
-                 Resolver.resolve ~getaddrinfo:(stub []) ~host:"a.example"
-                   ~port:80 () ) ) )
-    ; test "other fibers run during a lookup" (fun () ->
-          (* One domain: a lookup in the fiber stops the ticker. *)
-          Affect_unix.Unix.main ~domain_count:1
-          @@ fun () ->
-          let ticks = Atomic.make 0 and stop = Atomic.make false in
-          let ticker =
-            Fun.Async.call (fun () ->
-                while not (Atomic.get stop) do
-                  Mtime.wait_for (ms 10) ;
-                  Atomic.incr ticks
-                done )
-          in
-          (* The lookup waits until the ticker ran 3 times, or at most 2 s. *)
-          let waiting host port opts =
-            let until = Unix.gettimeofday () +. 2. in
-            while Atomic.get ticks < 3 && Unix.gettimeofday () < until do
-              Unix.sleepf 0.005
-            done ;
-            stub [inet "127.0.0.1" 80] host port opts
-          in
-          ignore
-            (Resolver.resolve ~getaddrinfo:waiting ~host:"a.example" ~port:80 ()) ;
-          let n = Atomic.get ticks in
-          Atomic.set stop true ;
-          Fun.Async.get ticker ;
-          is_true ~msg:(Printf.sprintf "%d ticks" n) (n >= 3) )
+            (error_text (fun () -> Resolver.resolve lookup_host)) )
     ; test "connect tries the next address" (fun () ->
-          main
+          Sim_support.run
+          @@ fun sim ->
+          Weft_sim.set_dns sim lookup_host (Addresses ["10.0.0.9"; "10.0.0.1"]) ;
+          with_listener (Net.Tcp ("10.0.0.1", 80))
           @@ fun () ->
-          with_listener
-          @@ fun port ->
-          with_refused_port
-          @@ fun closed ->
           Flow.close
-            (Connect.connect
-               ~getaddrinfo:
-                 (stub [inet "127.0.0.1" closed; inet "127.0.0.1" port])
-               Client_config.default ~host:"a.example" ~port ) )
+            (Connect.connect Client_config.default ~host:lookup_host ~port:80) )
     ; test "all addresses refused gives Error (Connect _)" (fun () ->
-          main
-          @@ fun () ->
-          with_refused_port
-          @@ fun p1 ->
-          with_refused_port
-          @@ fun p2 ->
+          Sim_support.run
+          @@ fun sim ->
+          Weft_sim.set_dns sim lookup_host (Addresses ["10.0.0.8"; "10.0.0.9"]) ;
           equal string
             "Caravan_client.Error: cannot connect: Connection refused"
             (error_text (fun () ->
-                 Connect.connect
-                   ~getaddrinfo:
-                     (stub [inet "127.0.0.1" p1; inet "127.0.0.1" p2])
-                   Client_config.default ~host:"a.example" ~port:80 ) ) )
-    ; test "lookups leak no file descriptor" (fun () ->
-          main
-          @@ fun () ->
-          let before = fd_targets () in
-          for _ = 1 to 20 do
-            ignore
-              (Resolver.resolve
-                 ~getaddrinfo:(stub [inet "127.0.0.1" 80])
-                 ~host:"a.example" ~port:80 () )
-          done ;
-          eventually ~msg:"no fd leaked" (fun () -> new_fds before = []) )
+                 Connect.connect Client_config.default ~host:lookup_host
+                   ~port:80 ) ) )
     ; test "a cancel during the connect stops it" (fun () ->
-          main
-          @@ fun () ->
-          let before = fd_targets ()
-          and go = Atomic.make false
-          and started = Atomic.make false
-          and ended = Atomic.make false in
-          (* The thread of the lookup ends only when [go] is set. *)
-          let held _ _ _ =
-            Atomic.set started true ;
-            while not (Atomic.get go) do
-              Unix.sleepf 0.005
-            done ;
-            Atomic.set ended true ;
-            []
-          in
-          Stdlib.Fun.protect ~finally:(fun () -> Atomic.set go true)
-          @@ fun () ->
+          (* In manual mode the time does not move: only the cancel can end the
+             wait for the lookup. *)
+          Sim_support.manual
+          @@ fun sim ->
+          Weft_sim.set_dns sim lookup_host No_answer ;
+          let fds = Weft_sim.open_fds sim in
+          Fiber.scope
+          @@ fun s ->
           let c =
-            Fun.Async.call (fun () ->
-                Connect.connect ~getaddrinfo:held Client_config.default
-                  ~host:"a.example" ~port:80 )
+            Sim_support.call ~name:"connect" s (fun () ->
+                Connect.connect Client_config.default ~host:lookup_host ~port:80 )
           in
-          eventually ~msg:"the lookup started" (fun () -> Atomic.get started) ;
-          Fun.Async.cancel c ;
-          within_2s (fun () ->
-              raises Fun.Async.Cancelled (fun () -> Fun.Async.get c) ) ;
-          Atomic.set go true ;
-          eventually ~msg:"the thread ended" (fun () -> Atomic.get ended) ;
-          eventually ~msg:"no fd leaked" (fun () -> new_fds before = []) )
-    ; test "localhost reaches a server on 127.0.0.1" (fun () ->
-          main
-          @@ fun () ->
-          with_listener
-          @@ fun port ->
-          Flow.close
-            (Connect.connect Client_config.default ~host:"localhost" ~port) ) ]
+          is_false ~msg:"the lookup waits" (Sim_support.ended sim c) ;
+          Sim_support.cancel c ;
+          raises Promise.Cancelled (fun () -> ignore (await c)) ;
+          equal int ~msg:"open fds" fds (Weft_sim.open_fds sim) )
+    ; test "duplicate addresses connect one time" (fun () ->
+          Sim_support.run
+          @@ fun sim ->
+          Weft_sim.set_dns sim lookup_host (Addresses ["10.0.0.9"; "10.0.0.9"]) ;
+          equal (list string) ["10.0.0.9"] (Resolver.resolve lookup_host) )
+    ; test "race: a connect at its deadline leaks no socket" (fun () ->
+          (* The latency and the jitter put the end of the connect near its
+             deadline: before it, at it or after it. The seed selects the delay.
+             Over 10 seeds or more, the two results occur. A run with a smaller
+             number of seeds (CARAVAN_SEED, or a small CARAVAN_RACE_SEEDS) does
+             not do this check. *)
+          let config = {Client_config.default with connect_timeout= Span.s 3} in
+          let seeds = Atomic.make 0
+          and flows = Atomic.make 0
+          and timeouts = Atomic.make 0 in
+          Sim_support.race ~guard:(Span.s 10) (fun sim ->
+              Atomic.incr seeds ;
+              Weft_sim.set_latency sim (Span.ms 2500) ;
+              Weft_sim.net_faults sim {Weft_sim.no_faults with jitter= Span.s 1} ;
+              let fds = Weft_sim.open_fds sim in
+              with_listener (Net.Tcp ("10.0.0.1", 80))
+              @@ fun () ->
+              ( match Connect.connect config ~host:"10.0.0.1" ~port:80 with
+              | flow ->
+                  Flow.close flow ; Atomic.incr flows
+              | exception Caravan_client.Error (Timeout `Connect) ->
+                  Atomic.incr timeouts ) ;
+              Weft_sim.settle sim ;
+              equal int ~msg:"only the listener is open" (fds + 1)
+                (Weft_sim.open_fds sim) ) ;
+          if Atomic.get seeds >= 10 then
+            is_true
+              ~msg:
+                (Printf.sprintf "%d flows and %d timeouts" (Atomic.get flows)
+                   (Atomic.get timeouts) )
+              (Atomic.get flows > 0 && Atomic.get timeouts > 0) )
+    ; test "a connect with no free fd gives Error (Connect _)" (fun () ->
+          Sim_support.run
+          @@ fun sim ->
+          Weft_sim.set_fd_limit sim (Some (Weft_sim.open_fds sim)) ;
+          equal string
+            "Caravan_client.Error: cannot connect: no resources (EMFILE)"
+            (error_text (fun () ->
+                 Connect.connect Client_config.default ~host:"10.0.0.1" ~port:80 )
+            ) )
+    ; test "a lookup error gives Error (Connect _) with its text" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          equal string
+            "Caravan_client.Error: cannot connect: EINVAL: a NUL byte in a \
+             string"
+            (error_text (fun () -> Resolver.resolve "a\000b")) ) ]
 
 (* Pool *)
 
-(* A request through a pool, as the client will make it. *)
+(* A request through a pool, as the client makes it. *)
 let pooled pool writers ?(config = Client_config.default) ~port r =
   let c, _ = Pool.checkout pool ~host:"127.0.0.1" ~port in
   Exchange.run config writers c
@@ -1775,28 +1788,22 @@ let pooled pool writers ?(config = Client_config.default) ~port r =
     r
 
 let server_port server =
-  match Server.local_addr server with Unix.ADDR_INET (_, p) -> p | _ -> 0
+  match Server.local_addr server with Net.Tcp (_, p) -> p | Net.Unix _ -> 0
 
 (* A server whose handler gives the id of the connection. *)
 let id_handler req =
   Response.string (string_of_int (Conn_info.id (Option.get (Request.conn req))))
 
-(* [f pool writers port] against a caravan server. With [fake], the server is on
-   that fake time line, and its config is [Server_support.fake_config fake] if
-   [config] is not given. *)
-let with_pool ?config ?fake ?engine ?(handler = id_handler) f =
-  let with_server f =
-    match fake with
-    | None ->
-        Server_support.with_server ?config ?engine ~handler f
-    | Some fake ->
-        Server_support.with_fake_time_server fake ?config ?engine ~handler f
-  in
-  with_server
+(* [f pool writers port] against a caravan server, in the body of a run. *)
+let with_pool ?config ?(client_config = Client_config.default) ?engine
+    ?(handler = id_handler) f =
+  Server_support.with_server ?config ?engine ~handler
   @@ fun server ->
-  let writers = Writers.make () in
-  let pool = Pool.make Client_config.default in
-  Stdlib.Fun.protect ~finally:(fun () ->
+  Fiber.scope
+  @@ fun s ->
+  let writers = Writers.make s in
+  let pool = Pool.make client_config in
+  Fun.protect ~finally:(fun () ->
       Pool.close pool ; Writers.stop writers ; Writers.wait writers )
   @@ fun () -> f pool writers (server_port server)
 
@@ -1804,47 +1811,52 @@ let get_id pool writers ~port ?(meth = Method.GET) () =
   Body.to_string
     (body (pooled pool writers ~port (req ~meth ~body:Body.empty "/id")))
 
-(* A flow for the fake connects: it records its close, and its server can close
+(* A flow for the fake connects: it counts its closes, and its server can close
    it. *)
-type fake = {closed: bool ref; server_closed: bool ref; flow: Flow.t}
+type fake = {closes: int Atomic.t; server_closed: bool Atomic.t; flow: Flow.t}
 
 let fake () =
-  let closed = ref false and server_closed = ref false in
+  let closes = Atomic.make 0 and server_closed = Atomic.make false in
   let flow =
-    Flow.make ~time:Time.mono
+    Flow.make
       ~read:(fun _ _ _ -> 0)
-      ~read_now:(fun _ _ _ -> if !server_closed then Some 0 else None)
+      ~read_now:(fun _ _ _ -> if Atomic.get server_closed then Some 0 else None)
       ~write:(fun _ _ _ -> ())
-      ~readable:Action.never ~shutdown_send:ignore
-      ~close:(fun () -> closed := true)
+      ~readable:never ~shutdown_send:ignore
+      ~close:(fun () -> Atomic.incr closes)
       ~set_read_deadline:ignore ~set_write_deadline:ignore ()
   in
-  {closed; server_closed; flow}
+  {closes; server_closed; flow}
 
-(* A pool on a fake time line, with fake connects. *)
+let is_closed f = Atomic.get f.closes > 0
+
+(* A pool with fake connects. [made ()] gives the fake flows in the order of the
+   connects. *)
 let fake_pool ?(config = Client_config.default) () =
-  let f = Fake_time.make () and made = ref [] in
+  let made = ref [] in
   let connect ~host:_ ~port:_ =
     let f = fake () in
     made := f :: !made ;
     f.flow
   in
-  let pool = Pool.make ~connect {config with mono_time= Fake_time.mono f} in
-  (pool, Fake_time.advance f, fun () -> List.rev !made)
+  let pool = Pool.make ~connect config in
+  (pool, fun () -> List.rev !made)
 
 let pool_tests =
   group "Pool"
     [ test
         "a request body that ends after the response, then the next exchange \
          on the connection" (fun () ->
+          Sim_support.run
+          @@ fun sim ->
           with_pool ~handler:Server_support.handler
           @@ fun pool writers port ->
-          let go_on = Cell.Once.make () in
+          let go_on = Ivar.create () in
           let late_body =
             Body.of_writer (fun w ->
                 Body.Writer.write_string w (String.make 3000 'a') ;
                 Body.Writer.flush w ;
-                Cell.Once.get go_on ;
+                wait go_on ;
                 Body.Writer.write_string w (String.make 3000 'b') )
           in
           (* /ignore answers before it reads the body. *)
@@ -1855,8 +1867,8 @@ let pool_tests =
                      (req ~meth:Method.POST ~body:late_body "/ignore") ) ) ) ;
           equal int ~msg:"the writer keeps the connection" 0
             (Pool.idle_hosts pool) ;
-          Cell.Once.try_set go_on () ;
-          eventually ~msg:"the connection is back in the pool" (fun () ->
+          fill go_on ;
+          check_settled sim ~msg:"the connection is back in the pool" (fun () ->
               Pool.idle_hosts pool = 1 ) ;
           let sent = String.init 9000 (fun i -> Char.chr (97 + (i mod 26))) in
           let c, tag = Pool.checkout pool ~host:"127.0.0.1" ~port in
@@ -1868,6 +1880,8 @@ let pool_tests =
           in
           equal string sent (Body.to_string (body resp)) )
     ; test "two requests in sequence use one connection" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
           with_pool
           @@ fun pool writers port ->
           let a = get_id pool writers ~port () in
@@ -1876,6 +1890,8 @@ let pool_tests =
     ; test "requests in sequence always use one connection" (fun () ->
           (* The release of a request without a body never waits for the writer
              at a different time: each next request finds the connection. *)
+          Sim_support.run
+          @@ fun _ ->
           with_pool
           @@ fun pool writers port ->
           let ids = List.init 1000 (fun _ -> get_id pool writers ~port ()) in
@@ -1884,56 +1900,63 @@ let pool_tests =
           (* The handler waits until [gate] opens: the second request of a round
              opens it. Thus the two requests are in the server at the same
              time. *)
-          let arrived = Atomic.make 0
-          and gate = Atomic.make (Cell.Once.make ()) in
+          let arrived = Atomic.make 0 and gate = Atomic.make (Ivar.create ()) in
           let handler req =
             let g = Atomic.get gate in
-            if Atomic.fetch_and_add arrived 1 = 1 then Cell.Once.try_set g () ;
-            ignore
-              (Action.invoke
-                 (Action.choose
-                    [ Action.map ignore (Cell.Once.get' g)
-                    ; Mtime.wait_for' (ms 2000) () ] ) ) ;
+            if Atomic.fetch_and_add arrived 1 = 1 then fill g ;
+            sync (choose [Ivar.read g; Time.after Mono (Span.s 1)]) ;
             id_handler req
           in
+          Sim_support.run
+          @@ fun _ ->
           with_pool ~handler
           @@ fun pool writers port ->
           (* One idle connection first, with an open gate. *)
-          let opened = Cell.Once.make () in
-          Cell.Once.try_set opened () ;
+          let opened = Ivar.create () in
+          fill opened ;
           Atomic.set gate opened ;
           ignore (get_id pool writers ~port ()) ;
           Atomic.set arrived 0 ;
-          Atomic.set gate (Cell.Once.make ()) ;
-          let a = Fun.Async.call (fun () -> get_id pool writers ~port ()) in
-          let b = Fun.Async.call (fun () -> get_id pool writers ~port ()) in
-          let a = within_2s (fun () -> Fun.Async.get a)
-          and b = within_2s (fun () -> Fun.Async.get b) in
+          Atomic.set gate (Ivar.create ()) ;
+          Fiber.scope
+          @@ fun s ->
+          let a = Sim_support.call s (fun () -> get_id pool writers ~port ()) in
+          let b = Sim_support.call s (fun () -> get_id pool writers ~port ()) in
+          let a = await a and b = await b in
           is_true ~msg:(a ^ " and " ^ b) (a <> b) )
     ; test "an idle connection older than idle_timeout is closed" (fun () ->
-          let pool, advance, made = fake_pool () in
+          Sim_support.manual
+          @@ fun sim ->
+          let pool, made = fake_pool () in
+          let idle = Client_config.default.idle_timeout in
           let c, _ = Pool.checkout pool ~host:"a" ~port:80 in
           Pool.release pool c ~reusable:true ;
-          advance Mtime.Span.(4 * s) ;
+          Sim_support.advance sim (Span.s 4) ;
           let c', kind = Pool.checkout pool ~host:"A" ~port:80 in
           is_true ~msg:"reused at 4 s" (kind = `Reused && c'.Conn.id = c.Conn.id) ;
           Pool.release pool c' ~reusable:true ;
-          advance Mtime.Span.(6 * s) ;
-          let _, kind = Pool.checkout pool ~host:"a" ~port:80 in
-          is_true ~msg:"new at 6 s" (kind = `New) ;
-          equal (list bool) [true; false]
-            (List.map (fun f -> !(f.closed)) (made ())) )
-    ; test "a connection of age idle_timeout is stale" (fun () ->
-          let pool, advance, made = fake_pool () in
-          let c, _ = Pool.checkout pool ~host:"a" ~port:80 in
-          Pool.release pool c ~reusable:true ;
-          advance Client_config.default.idle_timeout ;
+          Sim_support.advance sim (Span.of_ns (Int64.pred (Span.to_ns idle))) ;
+          let c', kind = Pool.checkout pool ~host:"a" ~port:80 in
+          is_true ~msg:"reused at idle_timeout - 1 ns" (kind = `Reused) ;
+          Pool.release pool c' ~reusable:true ;
+          Sim_support.advance sim idle ;
           let _, kind = Pool.checkout pool ~host:"a" ~port:80 in
           is_true ~msg:"new at idle_timeout" (kind = `New) ;
-          equal (list bool) [true; false]
-            (List.map (fun f -> !(f.closed)) (made ())) )
+          equal (list bool) [true; false] (List.map is_closed (made ())) )
+    ; test "a connection of age idle_timeout is stale" (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          let pool, made = fake_pool () in
+          let c, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          Pool.release pool c ~reusable:true ;
+          Sim_support.advance sim Client_config.default.idle_timeout ;
+          let _, kind = Pool.checkout pool ~host:"a" ~port:80 in
+          is_true ~msg:"new at idle_timeout" (kind = `New) ;
+          equal (list bool) [true; false] (List.map is_closed (made ())) )
     ; test "max_idle_per_host keeps at most that number" (fun () ->
-          let pool, _, made =
+          Sim_support.run
+          @@ fun _ ->
+          let pool, made =
             fake_pool
               ~config:{Client_config.default with max_idle_per_host= 2}
               ()
@@ -1942,8 +1965,7 @@ let pool_tests =
             List.init 3 (fun _ -> fst (Pool.checkout pool ~host:"a" ~port:80))
           in
           List.iter (fun c -> Pool.release pool c ~reusable:true) cs ;
-          equal (list bool) [false; false; true]
-            (List.map (fun f -> !(f.closed)) (made ())) ;
+          equal (list bool) [false; false; true] (List.map is_closed (made ())) ;
           let kinds =
             List.init 3 (fun _ -> snd (Pool.checkout pool ~host:"a" ~port:80))
           in
@@ -1951,60 +1973,67 @@ let pool_tests =
             (List.map (fun k -> k = `Reused) kinds) ;
           equal int 4 (List.length (made ())) )
     ; test "close closes idle and used connections" (fun () ->
-          let pool, _, made = fake_pool () in
+          Sim_support.run
+          @@ fun _ ->
+          let pool, made = fake_pool () in
           let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
           let _b, _ = Pool.checkout pool ~host:"a" ~port:80 in
           Pool.release pool a ~reusable:true ;
           Pool.close pool ;
-          equal (list bool) [true; true]
-            (List.map (fun f -> !(f.closed)) (made ())) ;
+          equal (list bool) [true; true] (List.map is_closed (made ())) ;
           raises_match is_invalid_arg (fun () ->
               Pool.checkout pool ~host:"a" ~port:80 ) )
     ; test "reap closes the idle connections that are too old" (fun () ->
-          let pool, advance, made = fake_pool () in
+          Sim_support.manual
+          @@ fun sim ->
+          let pool, made = fake_pool () in
           let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
           let b, _ = Pool.checkout pool ~host:"b" ~port:80 in
           Pool.release pool a ~reusable:true ;
-          advance Mtime.Span.(3 * s) ;
+          Sim_support.advance sim (Span.s 3) ;
           Pool.release pool b ~reusable:true ;
-          advance Mtime.Span.(3 * s) ;
+          Sim_support.advance sim (Span.s 3) ;
           Pool.reap pool ;
-          equal (list bool) [true; false]
-            (List.map (fun f -> !(f.closed)) (made ())) )
+          equal (list bool) [true; false] (List.map is_closed (made ())) )
     ; test "the timer runs each half of idle_timeout, and each 10 ms or more"
         (fun () ->
           let interval t =
-            Mtime.Span.to_float_ns
-              (Caravan_client.Private.reap_interval
-                 {Client_config.default with idle_timeout= t} )
-            /. 1e6
+            Int64.to_int
+              (Span.to_ns
+                 (Caravan_client.Private.reap_interval
+                    {Client_config.default with idle_timeout= t} ) )
+            / 1_000_000
           in
-          equal
-            (list (float 0.001))
-            [50.; 10.; 10.; 2500.]
-            [ interval (ms 100)
-            ; interval (ms 0)
-            ; interval (ms 20)
-            ; interval (ms 5000) ] )
+          equal (list int) [50; 10; 10; 2500]
+            [ interval (Span.ms 100)
+            ; interval (Span.ms 0)
+            ; interval (Span.ms 20)
+            ; interval (Span.ms 5000) ] )
     ; test "the pool keeps no empty list of a host" (fun () ->
-          let pool, advance, _ = fake_pool () in
+          Sim_support.manual
+          @@ fun sim ->
+          let pool, _ = fake_pool () in
           let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
           Pool.release pool a ~reusable:true ;
           equal int 1 (Pool.idle_hosts pool) ;
           let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
           equal int 0 (Pool.idle_hosts pool) ;
           Pool.release pool a ~reusable:true ;
-          advance Mtime.Span.(6 * s) ;
+          Sim_support.advance sim (Span.s 6) ;
           Pool.reap pool ;
           equal int 0 (Pool.idle_hosts pool) )
     ; test "a new connection after close is refused without a connect"
         (fun () ->
-          let pool, _, made = fake_pool () in
+          Sim_support.run
+          @@ fun _ ->
+          let pool, made = fake_pool () in
           Pool.close pool ;
           raises_match is_invalid_arg (fun () ->
               Pool.checkout ~reuse:false pool ~host:"a" ~port:80 ) ;
           equal int 0 (List.length (made ())) )
     ; test "a connect during close is closed" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
           let pool = ref None and flows = ref [] in
           let connect ~host:_ ~port:_ =
             let f = fake () in
@@ -2015,59 +2044,119 @@ let pool_tests =
           pool := Some (Pool.make ~connect Client_config.default) ;
           raises_match is_invalid_arg (fun () ->
               Pool.checkout (Option.get !pool) ~host:"a" ~port:80 ) ;
-          equal (list bool) [true] (List.map (fun f -> !(f.closed)) !flows) )
-    ; test "the pool reads its clock outside its lock" (fun () ->
-          (* The clock takes the lock of the pool. The stdlib Mutex raises
-             Sys_error if its thread holds the lock at that time. *)
-          let f = Fake_time.make () and pool = ref None in
-          let module Locking_clock = struct
-            type t = Mtime.t
-
-            let now () =
-              Option.iter (fun p -> ignore (Pool.idle_hosts p)) !pool ;
-              Fake_time.mono_now f
-          end in
-          let module No_timer = struct
-            type time = Mtime.t
-
-            let at _ _ = invalid_arg "the pool uses no timer"
-          end in
-          let module Mono_span = struct
-            type time = Mtime.t
-
-            type t = Mtime.Span.t
-
-            let add = Mtime.add_span
-          end in
-          let mono_time =
-            Time.make (module Locking_clock) (module No_timer) (module Mono_span)
+          equal (list bool) [true] (List.map is_closed !flows) )
+    ; test "race: checkout, release and reap on 4 domains" (fun () ->
+          (* 8 fibers on 4 domains use the pool at the same time. A sleep
+             between the checkout and the release lets the other fibers run. The
+             short idle timeout makes some connections stale and lets the reaper
+             close some. *)
+          let config =
+            { Client_config.default with
+              max_idle_per_host= 2
+            ; idle_timeout= Span.ms 3 }
           in
-          let made = fake () in
-          let connect ~host:_ ~port:_ = made.flow in
-          let p = Pool.make ~connect {Client_config.default with mono_time} in
-          pool := Some p ;
-          let c, _ = Pool.checkout p ~host:"a" ~port:80 in
-          Pool.release p c ~reusable:true ;
-          let c, kind = Pool.checkout p ~host:"a" ~port:80 in
+          Sim_support.race
+          @@ fun _ ->
+          let made = Atomic.make [] in
+          let rec add x =
+            let l = Atomic.get made in
+            if not (Atomic.compare_and_set made l (x :: l)) then add x
+          in
+          let connect ~host ~port:_ =
+            let f = fake () in
+            add (host, f) ;
+            f.flow
+          in
+          let pool = Pool.make ~connect config in
+          let worker i () =
+            for step = 1 to 20 do
+              let host = if (i + step) mod 2 = 0 then "a" else "b" in
+              let c, _ = Pool.checkout pool ~host ~port:80 in
+              Time.sleep Mono (Span.ms (((i * 7) + (step * 3)) mod 5)) ;
+              Pool.release pool c ~reusable:((i + step) mod 3 <> 0) ;
+              if step mod 5 = 0 then Pool.reap pool
+            done
+          in
+          Fiber.scope (fun s ->
+              List.iter await
+                (List.init 8 (fun i ->
+                     Sim_support.call ~name:"worker" s (worker i) ) ) ) ;
+          (* All connections went back: the open ones are idle. *)
+          List.iter
+            (fun host ->
+              let idle =
+                List.length
+                  (List.filter
+                     (fun (h, f) -> h = host && not (is_closed f))
+                     (Atomic.get made) )
+              in
+              is_true
+                ~msg:(Printf.sprintf "%d idle connections of %s" idle host)
+                (idle <= config.max_idle_per_host) )
+            ["a"; "b"] ;
+          Pool.close pool ;
+          List.iter
+            (fun (_, f) ->
+              equal int ~msg:"closes of a flow" 1 (Atomic.get f.closes) )
+            (Atomic.get made) )
+    ; test "a stale connection leaves the connections in use" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          let pool, made = fake_pool () in
+          let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          Pool.release pool a ~reusable:true ;
+          Atomic.set (List.hd (made ())).server_closed true ;
+          let _, kind = Pool.checkout pool ~host:"a" ~port:80 in
+          is_true ~msg:"a new connection" (kind = `New) ;
+          equal int ~msg:"in use" 1 (Pool.in_use pool) )
+    ; test "a release leaves the connections in use" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          let pool, _ = fake_pool () in
+          let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          let b, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          equal int 2 (Pool.in_use pool) ;
+          Pool.release pool a ~reusable:true ;
+          Pool.release pool b ~reusable:false ;
+          equal int 0 (Pool.in_use pool) )
+    ; test "close empties the pool" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          let pool, _ = fake_pool () in
+          let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          let _b, _ = Pool.checkout pool ~host:"b" ~port:80 in
+          Pool.release pool a ~reusable:true ;
+          Pool.close pool ;
+          equal (pair int int) ~msg:"idle hosts, in use" (0, 0)
+            (Pool.idle_hosts pool, Pool.in_use pool) )
+    ; test "close closes a reused connection in use" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          let pool, made = fake_pool () in
+          let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          Pool.release pool a ~reusable:true ;
+          let _, kind = Pool.checkout pool ~host:"a" ~port:80 in
           is_true ~msg:"reused" (kind = `Reused) ;
-          Pool.release p c ~reusable:true ;
-          Fake_time.advance f Mtime.Span.(6 * s) ;
-          Pool.reap p ;
-          equal int 0 (Pool.idle_hosts p) ;
-          is_true ~msg:"the reap closed the connection" !(made.closed) ) ]
+          Pool.close pool ;
+          equal (list bool) [true] (List.map is_closed (made ())) ) ]
 
-(* The pool against a model: one host, a fake clock and fake flows. Each program
-   makes its pool first. *)
+(* The pool against a model: one host, the clock of the world and fake flows.
+   Each program runs in its own run of the simulator in manual mode, and makes
+   its pools first. *)
 module Pool_model = struct
-  type pool =
-    {mutable clock: int; mutable connects: int; mutable idle: conn list}
+  (* The time in ms. All the pools of a program share the clock of the world.
+     The model only compares two times of one run, so the clock never goes back
+     to 0. *)
+  let clock = ref 0
+
+  type pool = {mutable connects: int; mutable idle: conn list}
 
   and conn =
     { pool: pool
     ; mutable state: [`Used | `Idle of int | `Closed]
     ; mutable server_closed: bool }
 
-  let make () = {clock= 0; connects= 0; idle= []}
+  let make () = {connects= 0; idle= []}
 
   (* Idle for less than 5 s, and not closed by its server. *)
   let rec checkout p =
@@ -2075,7 +2164,7 @@ module Pool_model = struct
     | c :: rest -> (
         p.idle <- rest ;
         match c.state with
-        | `Idle t when p.clock - t < 5000 && not c.server_closed ->
+        | `Idle t when !clock - t < 5000 && not c.server_closed ->
             c.state <- `Used ;
             c
         | _ ->
@@ -2088,11 +2177,11 @@ module Pool_model = struct
   let release c reusable =
     let p = c.pool in
     if reusable && List.length p.idle < 2 then (
-      c.state <- `Idle p.clock ;
+      c.state <- `Idle !clock ;
       p.idle <- c :: p.idle )
     else c.state <- `Closed
 
-  let advance p ms = p.clock <- p.clock + ms
+  let advance _ ms = clock := !clock + ms
 
   let server_close c = c.server_closed <- true
 
@@ -2106,18 +2195,15 @@ module Pool_model = struct
 end
 
 module Pool_system = struct
-  type pool =
-    { pool: Pool.t
-    ; time: Fake_time.t
-    ; fakes: (int, fake) Hashtbl.t
-    ; connects: int ref }
+  (* The simulator of the program that runs. *)
+  let sim : Weft_sim.t option ref = ref None
+
+  type pool = {pool: Pool.t; fakes: (int, fake) Hashtbl.t; connects: int ref}
 
   let owners : (int, pool) Hashtbl.t = Hashtbl.create 64
 
   let make () =
-    let time = Fake_time.make ()
-    and fakes = Hashtbl.create 8
-    and connects = ref 0 in
+    let fakes = Hashtbl.create 8 and connects = ref 0 in
     let connect ~host:_ ~port:_ =
       incr connects ;
       let f = fake () in
@@ -2126,12 +2212,9 @@ module Pool_system = struct
       f.flow
     in
     let config =
-      { Client_config.default with
-        max_idle_per_host= 2
-      ; idle_timeout= Mtime.Span.(5 * s)
-      ; mono_time= Fake_time.mono time }
+      {Client_config.default with max_idle_per_host= 2; idle_timeout= Span.s 5}
     in
-    {pool= Pool.make ~connect config; time; fakes; connects}
+    {pool= Pool.make ~connect config; fakes; connects}
 
   let checkout p =
     let c, _ = Pool.checkout p.pool ~host:"a" ~port:80 in
@@ -2141,18 +2224,24 @@ module Pool_system = struct
   let release (c : Conn.t) reusable =
     Pool.release (Hashtbl.find owners c.id).pool c ~reusable
 
-  let advance p n = Fake_time.advance p.time Mtime.Span.(n * ms)
+  let advance _ n = Sim_support.advance (Option.get !sim) (Span.ms n)
 
   let fake_of (c : Conn.t) = Hashtbl.find (Hashtbl.find owners c.id).fakes c.id
 
-  let server_close c = (fake_of c).server_closed := true
+  let server_close c = Atomic.set (fake_of c).server_closed true
 
-  let is_closed c = !((fake_of c).closed)
+  let is_closed c = is_closed (fake_of c)
 
   let connects p = !(p.connects)
 end
 
-let pool_stateful =
+(* The commands come from [Stateful] of windtrap, so that [Stateful.program] and
+   [Stateful.execute] take them (as in test_server_stateful.ml). [Private] has
+   no stability guarantee. The flake pins windtrap. *)
+module Stateful = Windtrap.Private.Stateful
+
+let pool_commands =
+  let open Stateful in
   let pool =
     abstract "p"
       ~pp:(fun ppf _ -> Format.pp_print_string ppf "pool")
@@ -2171,47 +2260,61 @@ let pool_stateful =
               "closed" ) )
       ~release:ignore
   in
-  let commands =
-    [ command "pool" (Gen.unit @-> makes pool) Pool_model.make Pool_system.make
-    ; command "checkout"
-        (pool ^-> makes conn)
-        Pool_model.checkout Pool_system.checkout
-    ; command "release"
-        ~pre:(fun c _ -> Pool_model.used c)
-        (conn ^-> Gen.bool @-> returns unit)
-        Pool_model.release Pool_system.release
-    ; command "advance"
-        (pool ^-> Gen.int_range 0 3000 @-> returns unit)
-        Pool_model.advance Pool_system.advance
-    ; command "server closes" ~pre:Pool_model.is_idle
-        (conn ^-> returns unit)
-        Pool_model.server_close Pool_system.server_close
-    ; command "is closed"
-        (conn ^-> returns bool)
-        Pool_model.is_closed Pool_system.is_closed
-    ; command "connects"
-        (pool ^-> returns int)
-        Pool_model.connects Pool_system.connects ]
-  in
+  [ command "pool" (Gen.unit @-> makes pool) Pool_model.make Pool_system.make
+  ; command "checkout"
+      (pool ^-> makes conn)
+      Pool_model.checkout Pool_system.checkout
+  ; command "release"
+      ~pre:(fun c _ -> Pool_model.used c)
+      (conn ^-> Gen.bool @-> returns unit)
+      Pool_model.release Pool_system.release
+  ; command "advance"
+      (pool ^-> Gen.int_range 0 3000 @-> returns unit)
+      Pool_model.advance Pool_system.advance
+  ; command "server closes" ~pre:Pool_model.is_idle
+      (conn ^-> returns unit)
+      Pool_model.server_close Pool_system.server_close
+  ; command "is closed"
+      (conn ^-> returns bool)
+      Pool_model.is_closed Pool_system.is_closed
+  ; command "connects"
+      (pool ^-> returns int)
+      Pool_model.connects Pool_system.connects ]
+
+(* [execute_pool p] runs the program [p] in a new run of the simulator in manual
+   mode. The command "advance" moves the time of that run. *)
+let execute_pool p =
+  Sim_support.manual
+  @@ fun sim ->
+  Pool_system.sim := Some sim ;
+  Fun.protect
+    ~finally:(fun () -> Pool_system.sim := None)
+    (fun () -> Stateful.execute p)
+
+let pool_stateful =
   group "Pool model"
-    [stateful ~count:300 ~steps:30 "the pool behaves like a model" commands]
+    [ test ~tags:["prop"; "stateful"] "the pool behaves like a model" (fun () ->
+          Windtrap.Private.Run.property ~count:300 ~summary:Stateful.summary
+            ~prints_run:true
+            (Stateful.program ~steps:30 pool_commands)
+            execute_pool ) ]
 
 (* The public API *)
 
 module C = Caravan_client
 
-let name = function
-  | Fun.Async.Cancelled ->
+let exn_name = function
+  | Fiber.Cancelled _ ->
       "Cancelled"
   | e ->
       Printexc.to_string e
 
+(* The Ivar that lets the second half of /two-part go. *)
+let two_part_go = ref (Ivar.create ())
+
 (* The handler of the tests: "/id" gives the id of the connection, "/conn" the
    Connection field and the id, and the others go to the handler of
    Server_support. *)
-(* The cell that lets the second half of /two-part go. *)
-let two_part_go = ref (Cell.Once.make ())
-
 let api_handler req =
   match Request.path_only req with
   | "/id" ->
@@ -2224,7 +2327,7 @@ let api_handler req =
           Body.Writer.write_string w
             (String.concat "" (List.init 50 (fun _ -> c))) ;
           Body.Writer.flush w ;
-          Cell.Once.get go ;
+          wait go ;
           Body.Writer.write_string w (String.make 50 'z') )
   | "/long-head" ->
       Response.string
@@ -2246,19 +2349,17 @@ let api_handler req =
 
 let big_config = {Server_support.config with max_body= None}
 
-(* The result of [f], or a failure after 5 s. A whole client run gets this
-   guard: a bug in its close gives a failure, not a hang. *)
-let within_5s f = Server_support.within Mtime.Span.(5 * s) f
+let url_of server = Printf.sprintf "http://127.0.0.1:%d" (server_port server)
 
-(* [f client url] against a caravan server. *)
-let with_client ?(config = big_config) ?client_config f =
+(* [client_in f] calls [f client url] in [C.run], against a caravan server. Call
+   it in the body of a run. *)
+let client_in ?(config = big_config) ?client_config f =
   Server_support.with_server ~config ~handler:api_handler
   @@ fun server ->
-  within_5s
-  @@ fun () ->
-  C.run ?config:client_config
-  @@ fun client ->
-  f client (Printf.sprintf "http://127.0.0.1:%d" (server_port server))
+  C.run ?config:client_config @@ fun client -> f client (url_of server)
+
+let with_client ?config ?client_config f =
+  Sim_support.run @@ fun _ -> client_in ?config ?client_config f
 
 let text resp = Body.to_string (C.body resp)
 
@@ -2272,45 +2373,91 @@ let at_port port ?(meth = Method.GET) ?(headers = []) ?body path =
     ~authority:(Printf.sprintf "127.0.0.1:%d" port)
     ~headers:(Headers.of_list headers) ?body meth path
 
-(* A listener whose connections follow [scripts], one script for each
-   connection, in order. [f client port accepted] runs with a client of
-   [config]. *)
-let with_scripts ?config scripts f =
-  main
-  @@ fun () ->
+(* A port with no listener: a connect gives Refused in the simulator. *)
+let refused_port = 9
+
+(* [scripts_in ~config scripts f] runs [f client port accepted] in [C.run] with
+   a client of [config]. A listener on [port] runs [scripts] on its connections,
+   one script for each connection, in order. [accepted] counts the connections.
+   After [C.run], the scope waits for the scripts: the end of [C.run] closes the
+   connections of the client. Call it in the body of a run. *)
+let scripts_in ?config scripts f =
   let l = Tcp.Listener.listen Server_support.loopback in
   let port =
-    match Tcp.Listener.addr l with Unix.ADDR_INET (_, p) -> p | _ -> 0
+    match Tcp.Listener.addr l with Net.Tcp (_, p) -> p | Net.Unix _ -> 0
   in
   let accepted = Atomic.make 0 in
-  let acceptor =
-    Fun.Async.call (fun () ->
-        List.iter
-          (fun script ->
-            let fd, _ = Tcp.Listener.accept l in
-            Atomic.incr accepted ;
-            let flow = Tcp.flow fd in
-            ignore
-              (Fun.Async.call (fun () ->
-                   Stdlib.Fun.protect
-                     ~finally:(fun () -> Flow.close flow)
-                     (fun () ->
-                       try script flow (Buf_reader.of_flow flow) with _ -> () ) )
-              ) )
-          scripts )
+  Fun.protect ~finally:(fun () -> Tcp.Listener.close l)
+  @@ fun () ->
+  Fiber.scope
+  @@ fun s ->
+  Fiber.fork_daemon ~name:"acceptor" s (fun () ->
+      List.iter
+        (fun script ->
+          let c, _ = Tcp.Listener.accept l in
+          let flow = Tcp.flow c in
+          Atomic.incr accepted ;
+          Fiber.fork ~name:"script" s (fun () ->
+              Fun.protect
+                ~finally:(fun () -> Flow.close flow)
+                (fun () ->
+                  try script flow (Buf_reader.of_flow flow) with _ -> () ) ) )
+        scripts ) ;
+  C.run ?config (fun client -> f client port accepted)
+
+let with_scripts ?config scripts f =
+  Sim_support.run @@ fun _ -> scripts_in ?config scripts f
+
+(* A server that answers at once, does not read the body, and waits for the end
+   of the connection. *)
+let answer_at_once flow r =
+  ignore (read_head r) ;
+  Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n" ;
+  ignore (Buf_reader.peek_eof r)
+
+(* A request body that writes 3 bytes, then waits until [release] is filled. A
+   cancel fills [cancelled], then calls [on_cancel]. *)
+let held_body ?(on_cancel = ignore) ~release ~cancelled () =
+  Body.of_writer (fun w ->
+      Body.Writer.write_string w "abc" ;
+      Body.Writer.flush w ;
+      try wait release with e -> fill cancelled ; on_cancel () ; raise e )
+
+(* [grace_after_raise ~cancel] runs [C.run] with an [f] that makes a request,
+   then raises [Failure "f"]. The request body waits for [release]. In the grace
+   of [run], the test cancels [run] if [cancel], else it fills [release]. [run]
+   must give the exception of [f]. The result tells if the body got a cancel. *)
+let grace_after_raise ~cancel =
+  Sim_support.run
+  @@ fun sim ->
+  let release = Ivar.create ()
+  and cancelled = Ivar.create ()
+  and raised = Ivar.create () in
+  Fiber.scope
+  @@ fun s ->
+  let r =
+    Sim_support.call ~name:"run" s (fun () ->
+        scripts_in [answer_at_once]
+        @@ fun client port _ ->
+        ignore
+          (C.request client
+             (at_port port ~meth:Method.POST
+                ~body:(held_body ~release ~cancelled ())
+                "/" ) ) ;
+        fill raised ;
+        failwith "f" )
   in
-  Stdlib.Fun.protect
-    ~finally:(fun () -> Fun.Async.cancel acceptor ; Tcp.Listener.close l)
-    (fun () ->
-      within_5s (fun () -> C.run ?config (fun client -> f client port accepted)) )
+  wait raised ;
+  is_false ~msg:"run waits for the body" (Sim_support.ended sim r) ;
+  if cancel then Sim_support.cancel r else fill release ;
+  raises (Failure "f") (fun () -> await r) ;
+  is_set cancelled
 
 let api_tests =
   group "Caravan_client"
     [ test "the body closes when request raises before the exchange" (fun () ->
-          main
-          @@ fun () ->
-          with_refused_port
-          @@ fun port ->
+          Sim_support.run
+          @@ fun _ ->
           C.run
           @@ fun client ->
           let case name r =
@@ -2327,7 +2474,7 @@ let api_tests =
                 () ) ;
             equal ~msg:name int 1 (Atomic.get closes)
           in
-          let authority = Printf.sprintf "127.0.0.1:%d" port in
+          let authority = Printf.sprintf "127.0.0.1:%d" refused_port in
           case "refused" (fun body ->
               Request.make ~authority ~body Method.POST "/" ) ;
           case "https" (fun body ->
@@ -2387,7 +2534,7 @@ let api_tests =
           with_client
           @@ fun client url ->
           let port = port_of url in
-          let go_on = Cell.Once.make () in
+          let go_on = Ivar.create () in
           let x = String.make 100 'x'
           and y = String.make 100 'y'
           and z = String.make 100 'z' in
@@ -2397,7 +2544,7 @@ let api_tests =
             (* Not flushed: these bytes wait in the write buffer while the
                response comes in. *)
             Body.Writer.write_string w y ;
-            Cell.Once.get go_on ;
+            wait go_on ;
             Body.Writer.write_string w z
           in
           (* /echo sends its head with the first bytes of the echo. *)
@@ -2406,7 +2553,7 @@ let api_tests =
               (at_port port ~meth:Method.POST ~body:(Body.of_writer produce)
                  "/echo" )
           in
-          Cell.Once.try_set go_on () ;
+          fill go_on ;
           equal string (x ^ y ^ z) (text resp) )
     ; test "two exchanges hold request bytes in their buffers at the same time"
         (fun () ->
@@ -2415,13 +2562,15 @@ let api_tests =
           with_client
           @@ fun client url ->
           let port = port_of url in
+          Fiber.scope
+          @@ fun s ->
           let echo c ~waiting ~go_on =
-            Fun.Async.call (fun () ->
+            Sim_support.call ~name:"echo" s (fun () ->
                 let first = String.make 50 c and second = String.make 50 'z' in
                 let produce w =
                   Body.Writer.write_string w first ;
-                  Cell.Once.try_set waiting () ;
-                  Cell.Once.get go_on ;
+                  fill waiting ;
+                  wait go_on ;
                   Body.Writer.write_string w second
                 in
                 text
@@ -2429,29 +2578,25 @@ let api_tests =
                      (at_port port ~meth:Method.POST
                         ~body:(Body.of_writer produce) "/echo" ) ) )
           in
-          let wa = Cell.Once.make () and wb = Cell.Once.make () in
-          let go_on = Cell.Once.make () in
+          let wa = Ivar.create () and wb = Ivar.create () in
+          let go_on = Ivar.create () in
           let a = echo 'a' ~waiting:wa ~go_on in
-          within_2s (fun () -> Cell.Once.get wa) ;
+          wait wa ;
           let b = echo 'b' ~waiting:wb ~go_on in
-          within_2s (fun () -> Cell.Once.get wb) ;
-          Cell.Once.try_set go_on () ;
-          equal string
-            (String.make 50 'a' ^ String.make 50 'z')
-            (Fun.Async.get a) ;
-          equal string
-            (String.make 50 'b' ^ String.make 50 'z')
-            (Fun.Async.get b) )
+          wait wb ;
+          fill go_on ;
+          equal string (String.make 50 'a' ^ String.make 50 'z') (await a) ;
+          equal string (String.make 50 'b' ^ String.make 50 'z') (await b) )
     ; test "two responses wait half read in their buffers at the same time"
         (fun () ->
           (* Each response is half read when the other one comes in. A read
              buffer that two connections share mixes the two responses. *)
           with_client
           @@ fun client url ->
-          two_part_go := Cell.Once.make () ;
+          two_part_go := Ivar.create () ;
           let a = C.get client (url ^ "/two-part?a") in
           let b = C.get client (url ^ "/two-part?b") in
-          Cell.Once.try_set !two_part_go () ;
+          fill !two_part_go ;
           equal string (String.make 50 'a' ^ String.make 50 'z') (text a) ;
           equal string (String.make 50 'b' ^ String.make 50 'z') (text b) )
     ; test "a response head larger than the read buffer" (fun () ->
@@ -2473,8 +2618,10 @@ let api_tests =
           with_client
           @@ fun client url ->
           let port = port_of url in
+          Fiber.scope
+          @@ fun s ->
           let echo c =
-            Fun.Async.call (fun () ->
+            Sim_support.call ~name:"echo" s (fun () ->
                 let sent = String.make 6000 c in
                 let got =
                   text
@@ -2482,20 +2629,19 @@ let api_tests =
                        (at_port port ~meth:Method.POST
                           ~body:
                             (Body.of_writer (fun w ->
-                                 String.iter
-                                   (fun ch ->
+                                 String.iteri
+                                   (fun i ch ->
                                      Body.Writer.write_string w
                                        (String.make 1 ch) ;
-                                     if Random.int 500 = 0 then (
-                                       Body.Writer.flush w ; Fun.Async.yield ()
-                                       ) )
+                                     if i mod 500 = 0 then (
+                                       Body.Writer.flush w ; Fiber.yield () ) )
                                    sent ) )
                           "/echo" ) )
                 in
                 equal string sent got )
           in
           let a = echo 'a' and b = echo 'b' in
-          Fun.Async.get a ; Fun.Async.get b )
+          await a ; await b )
     ; test "sequential exchanges with large heads and bodies" (fun () ->
           with_client
           @@ fun client url ->
@@ -2518,10 +2664,7 @@ let api_tests =
           let id0 = get_text client (url ^ "/id") in
           equal string "hello" (get_text client (url ^ "/hello")) ;
           let head =
-            C.request client
-              (at_port
-                 (int_of_string (List.nth (String.split_on_char ':' url) 2))
-                 ~meth:Method.HEAD "/hello" )
+            C.request client (at_port (port_of url) ~meth:Method.HEAD "/hello")
           in
           equal int 200 (status head) ;
           equal string "" (text head) ;
@@ -2532,9 +2675,6 @@ let api_tests =
     ; test "an upload of unknown length goes chunked, and comes back" (fun () ->
           with_client
           @@ fun client url ->
-          let port =
-            int_of_string (List.nth (String.split_on_char ':' url) 2)
-          in
           let b =
             Body.of_writer (fun w ->
                 List.iter (Body.Writer.write_string w) ["one;"; "two;"; "three"] )
@@ -2542,13 +2682,10 @@ let api_tests =
           equal string "one;two;three"
             (text
                (C.request client
-                  (at_port port ~meth:Method.POST ~body:b "/echo") ) ) )
+                  (at_port (port_of url) ~meth:Method.POST ~body:b "/echo") ) ) )
     ; test "8 MiB echoed while it uploads" (fun () ->
           with_client
           @@ fun client url ->
-          let port =
-            int_of_string (List.nth (String.split_on_char ':' url) 2)
-          in
           let data =
             String.init (8 * 1024 * 1024) (fun i -> Char.chr (i land 0xff))
           in
@@ -2565,10 +2702,9 @@ let api_tests =
                 go 0 )
           in
           let got =
-            within_2s (fun () ->
-                text
-                  (C.request client
-                     (at_port port ~meth:Method.POST ~body:b "/echo") ) )
+            text
+              (C.request client
+                 (at_port (port_of url) ~meth:Method.POST ~body:b "/echo") )
           in
           is_true ~msg:"the echo is equal" (got = data) )
     ; test "a stale connection is retried for a GET" (fun () ->
@@ -2586,8 +2722,7 @@ let api_tests =
           with_scripts [first; second]
           @@ fun client port accepted ->
           equal string "a" (text (C.request client (at_port port "/"))) ;
-          equal string "b"
-            (within_2s (fun () -> text (C.request client (at_port port "/")))) ;
+          equal string "b" (text (C.request client (at_port port "/"))) ;
           equal int 2 (Atomic.get accepted) )
     ; test "a stale connection is retried for a PUT with an empty body"
         (fun () ->
@@ -2605,11 +2740,9 @@ let api_tests =
           @@ fun client port accepted ->
           equal string "a" (text (C.request client (at_port port "/"))) ;
           equal string "b"
-            (within_2s (fun () ->
-                 text
-                   (C.request client
-                      (at_port port ~meth:Method.PUT ~body:(Body.of_string "")
-                         "/" ) ) ) ) ;
+            (text
+               (C.request client
+                  (at_port port ~meth:Method.PUT ~body:(Body.of_string "") "/") ) ) ;
           equal int 2 (Atomic.get accepted) )
     ; test "a new connection that closes is not retried" (fun () ->
           let closes _ r = ignore (read_head r) in
@@ -2617,8 +2750,7 @@ let api_tests =
           @@ fun client port accepted ->
           equal string
             "Caravan_client.Error: the connection closed before the response"
-            (within_2s (fun () ->
-                 error_text (fun () -> C.request client (at_port port "/")) ) ) ;
+            (error_text (fun () -> C.request client (at_port port "/"))) ;
           equal int 1 (Atomic.get accepted) )
     ; test "a stale connection is not retried for a POST" (fun () ->
           let first flow r =
@@ -2632,11 +2764,9 @@ let api_tests =
           equal string "a" (text (C.request client (at_port port "/"))) ;
           equal string
             "Caravan_client.Error: the connection closed before the response"
-            (within_2s (fun () ->
-                 error_text (fun () ->
-                     C.request client
-                       (at_port port ~meth:Method.POST ~body:Body.empty "/") ) )
-            ) ;
+            (error_text (fun () ->
+                 C.request client
+                   (at_port port ~meth:Method.POST ~body:Body.empty "/") ) ) ;
           equal int 1 (Atomic.get accepted) )
     ; test "a stale connection is not retried for a PUT with a body" (fun () ->
           let first flow r =
@@ -2650,28 +2780,27 @@ let api_tests =
           equal string "a" (text (C.request client (at_port port "/"))) ;
           equal string
             "Caravan_client.Error: the connection closed before the response"
-            (within_2s (fun () ->
-                 error_text (fun () ->
-                     C.request client
-                       (at_port port ~meth:Method.PUT
-                          ~body:(Body.of_string "abc") "/" ) ) ) ) ;
+            (error_text (fun () ->
+                 C.request client
+                   (at_port port ~meth:Method.PUT ~body:(Body.of_string "abc")
+                      "/" ) ) ) ;
           equal int 1 (Atomic.get accepted) )
     ; test "with_response closes an unread body" (fun () ->
-          let eof = Cell.Once.make () in
+          let eof = Ivar.create () in
           let script flow r =
             ignore (read_request r) ;
             Flow.write_string flow
               "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nabc" ;
             ignore (Buf_reader.peek_eof r) ;
-            Cell.Once.try_set eof ()
+            fill eof
           in
           with_scripts [script]
           @@ fun client port _ ->
-          within_2s (fun () -> C.with_response client (at_port port "/") ignore) ;
+          C.with_response client (at_port port "/") ignore ;
           (* The client closes the connection of the unread body. *)
-          within_2s (fun () -> Cell.Once.get eof) )
+          wait eof )
     ; test "with_response gives the exception of f" (fun () ->
-          let go = Cell.Once.make () and raised = Cell.Once.make () in
+          let go = Ivar.create () and raised = Ivar.create () in
           let script flow r =
             ignore (read_head r) ;
             Flow.write_string flow
@@ -2684,19 +2813,15 @@ let api_tests =
             Body.of_writer (fun w ->
                 Body.Writer.write_string w "abc" ;
                 Body.Writer.flush w ;
-                Cell.Once.get go ;
-                Cell.Once.try_set raised () ;
+                wait go ;
+                fill raised ;
                 failwith "p" )
           in
           equal string "Failure(\"f\")"
-            (within_2s (fun () ->
-                 error_text (fun () ->
-                     C.with_response client
-                       (at_port port ~meth:Method.POST ~body:failing "/")
-                       (fun _ ->
-                         Cell.Once.try_set go () ;
-                         Cell.Once.get raised ;
-                         failwith "f" ) ) ) ) )
+            (error_text (fun () ->
+                 C.with_response client
+                   (at_port port ~meth:Method.POST ~body:failing "/") (fun _ ->
+                     fill go ; wait raised ; failwith "f" ) ) ) )
     ; test "close stops a request body at once" (fun () ->
           let script flow r =
             ignore (read_head r) ;
@@ -2706,14 +2831,14 @@ let api_tests =
           in
           with_scripts [script]
           @@ fun client port _ ->
-          let seen = Cell.Once.make () in
+          let seen = Ivar.create () in
           let waiting =
             Body.of_writer (fun w ->
                 Body.Writer.write_string w "abc" ;
                 Body.Writer.flush w ;
-                try Cell.Once.get (Cell.Once.make ())
+                try sync never
                 with e ->
-                  Cell.Once.try_set seen (name e) ;
+                  ignore (Ivar.try_fill seen (exn_name e)) ;
                   raise e )
           in
           equal int 200
@@ -2721,19 +2846,15 @@ let api_tests =
                (C.request client
                   (at_port port ~meth:Method.POST ~body:waiting "/") ) ) ;
           C.close client ;
-          equal string "Cancelled" (within_2s (fun () -> Cell.Once.get seen)) )
+          equal string "Cancelled" (sync (Ivar.read seen)) )
     ; test "a bad path raises before a connect" (fun () ->
-          main
-          @@ fun () ->
-          with_refused_port
-          @@ fun port ->
-          within_5s
-          @@ fun () ->
+          Sim_support.run
+          @@ fun _ ->
           C.run
           @@ fun client ->
           (* A connect to this port gives Error (Connect _). *)
           equal string "Invalid_argument"
-            ( match C.request client (at_port port "/a#b") with
+            ( match C.request client (at_port refused_port "/a#b") with
             | _ ->
                 "no error"
             | exception Invalid_argument _ ->
@@ -2741,27 +2862,20 @@ let api_tests =
             | exception e ->
                 Printexc.to_string e ) )
     ; test "request after close raises Invalid_argument" (fun () ->
-          main
-          @@ fun () ->
-          within_2s
-          @@ fun () ->
+          Sim_support.run
+          @@ fun _ ->
           C.run
           @@ fun client ->
           C.close client ;
           raises_match is_invalid_arg (fun () ->
-              C.request client (at_port 9 "/") ) )
+              C.request client (at_port refused_port "/") ) )
     ; test "a proxy handler streams an upload to an upstream echo" (fun () ->
-          main
-          @@ fun () ->
-          let upstream =
-            Server.start ~config:big_config Server_support.handler
-          in
-          Stdlib.Fun.protect ~finally:(fun () ->
-              Server.shutdown upstream ; Server.wait upstream )
-          @@ fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          Server_support.with_server ~config:big_config
+            ~handler:Server_support.handler
+          @@ fun upstream ->
           let up = Printf.sprintf "127.0.0.1:%d" (server_port upstream) in
-          within_5s
-          @@ fun () ->
           C.run
           @@ fun client ->
           let forward req =
@@ -2773,14 +2887,10 @@ let api_tests =
             Response.make ~status:(Response.status resp)
               ~headers:(Response.headers resp) (C.body resp)
           in
-          let proxy = Server.start ~config:big_config forward in
-          let ok = ref false in
-          Stdlib.Fun.protect ~finally:(fun () ->
-              if !ok then (Server.shutdown proxy ; Server.wait proxy)
-              else Server.abort proxy )
-          @@ fun () ->
+          Server_support.with_server ~config:big_config ~handler:forward
+          @@ fun proxy ->
           let flow = Tcp.connect (Server.local_addr proxy) in
-          Stdlib.Fun.protect ~finally:(fun () -> Flow.close flow)
+          Fun.protect ~finally:(fun () -> Flow.close flow)
           @@ fun () ->
           Flow.write_string flow
             "POST /echo HTTP/1.1\r\n\
@@ -2794,9 +2904,7 @@ let api_tests =
                  (String.make n (Char.chr (65 + k))) )
           in
           send 0 ;
-          let h =
-            within_2s (fun () -> H1_parse.response_head server_limits r)
-          in
+          let h = H1_parse.response_head server_limits r in
           equal int 200 (Status.code h.status) ;
           let b = H1_body.chunked ~limits:server_limits r in
           let read_n () =
@@ -2809,66 +2917,69 @@ let api_tests =
           (* Chunk k goes only after the echo of chunk k - 1 came. *)
           for k = 0 to 15 do
             if k > 0 then send k ;
-            equal string (String.make n (Char.chr (65 + k))) (within_2s read_n)
+            equal string (String.make n (Char.chr (65 + k))) (read_n ())
           done ;
           Flow.write_string flow "0\r\n\r\n" ;
-          equal string "" (within_2s (fun () -> Body.to_string b)) ;
-          ok := true )
+          equal string "" (Body.to_string b) )
     ; test "a cancel of the caller during the head wait stops the writer"
         (fun () ->
-          let eof = Cell.Once.make () in
+          let eof = Ivar.create () in
           let script _ r =
             ignore (read_head r) ;
             ignore (Buf_reader.peek_eof r) ;
-            Cell.Once.try_set eof ()
+            fill eof
           in
           with_scripts [script]
           @@ fun client port _ ->
-          let wrote = Cell.Once.make () and seen = Cell.Once.make () in
+          let wrote = Ivar.create () and seen = Ivar.create () in
           let waiting =
             Body.of_writer (fun w ->
                 Body.Writer.write_string w "abc" ;
                 Body.Writer.flush w ;
-                Cell.Once.try_set wrote () ;
-                try Cell.Once.get (Cell.Once.make ())
+                fill wrote ;
+                try sync never
                 with e ->
-                  Cell.Once.try_set seen (name e) ;
+                  ignore (Ivar.try_fill seen (exn_name e)) ;
                   raise e )
           in
+          Fiber.scope
+          @@ fun s ->
           let caller =
-            Fun.Async.call (fun () ->
+            Sim_support.call ~name:"caller" s (fun () ->
                 C.request client
                   (at_port port ~meth:Method.POST ~body:waiting "/") )
           in
-          within_2s (fun () -> Cell.Once.get wrote) ;
-          Fun.Async.cancel caller ;
-          equal string "Cancelled" (within_2s (fun () -> Cell.Once.get seen)) ;
-          within_2s (fun () -> Cell.Once.get eof) ;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get caller) )
+          wait wrote ;
+          Sim_support.cancel caller ;
+          equal string "Cancelled" (sync (Ivar.read seen)) ;
+          wait eof ;
+          raises Promise.Cancelled (fun () -> ignore (await caller)) )
     ; test "a cancel of the caller during the body closes the connection"
         (fun () ->
-          let eof = Cell.Once.make () in
+          let eof = Ivar.create () in
           let script flow r =
             ignore (read_request r) ;
             Flow.write_string flow
               "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nab" ;
             ignore (Buf_reader.peek_eof r) ;
-            Cell.Once.try_set eof ()
+            fill eof
           in
           with_scripts [script]
           @@ fun client port _ ->
-          let reading = Cell.Once.make () in
+          let reading = Ivar.create () in
+          Fiber.scope
+          @@ fun s ->
           let caller =
-            Fun.Async.call (fun () ->
+            Sim_support.call ~name:"caller" s (fun () ->
                 let b = C.body (C.request client (at_port port "/")) in
                 ignore (Body.read b (Bytes.create 8) 0 8) ;
-                Cell.Once.try_set reading () ;
+                fill reading ;
                 Body.to_string b )
           in
-          within_2s (fun () -> Cell.Once.get reading) ;
-          Fun.Async.cancel caller ;
-          within_2s (fun () -> Cell.Once.get eof) ;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get caller) )
+          wait reading ;
+          Sim_support.cancel caller ;
+          wait eof ;
+          raises Promise.Cancelled (fun () -> ignore (await caller)) )
     ; test "get parses URLs" (fun () ->
           let show url =
             match C.Private.parse_url url with
@@ -2899,7 +3010,9 @@ let api_tests =
                   ; "http://a:1/"
                   ; "http://a:65535/"
                   ; "http://a:65536/"
-                  ; "http://a:+80/" ] ) )
+                  ; "http://a:+80/"
+                  ; "http://a:9/"
+                  ; "http://[::1/" ] ) )
           @@ __POS_OF__
                {|
             http://a.example => a.example /
@@ -2920,6 +3033,8 @@ let api_tests =
             http://a:65535/ => a:65535 /
             http://a:65536/ => Invalid_argument
             http://a:+80/ => Invalid_argument
+            http://a:9/ => a:9 /
+            http://[::1/ => Invalid_argument
             |} )
     ; test "the client and the server under load" (fun () ->
           let client_config =
@@ -2928,12 +3043,12 @@ let api_tests =
           with_client ~client_config
           @@ fun client url ->
           let ids =
-            List.concat
-              (Fun.Async.get_all
-                 (List.init 20 (fun _ ->
-                      Fun.Async.call (fun () ->
-                          List.init 25 (fun _ -> get_text client (url ^ "/id")) ) )
-                 ) )
+            Fiber.scope (fun s ->
+                List.concat_map await
+                  (List.init 20 (fun _ ->
+                       Sim_support.call ~name:"loader" s (fun () ->
+                           List.init 25 (fun _ -> get_text client (url ^ "/id")) ) )
+                  ) )
           in
           equal int 500 (List.length ids) ;
           let distinct = List.sort_uniq compare ids in
@@ -2945,414 +3060,451 @@ let api_tests =
          connection" (fun () ->
           with_client
           @@ fun client url ->
-          let port =
-            int_of_string (List.nth (String.split_on_char ':' url) 2)
-          in
           let first =
             text
               (C.request client
-                 (at_port port ~headers:[("Connection", "close")] "/conn") )
+                 (at_port (port_of url)
+                    ~headers:[("Connection", "close")]
+                    "/conn" ) )
           in
           let id1 = List.nth (String.split_on_char ' ' first) 1 in
           equal string "close" (List.hd (String.split_on_char ' ' first)) ;
           let id2 = get_text client (url ^ "/id") in
-          is_true ~msg:(id1 ^ " then " ^ id2) (id1 <> id2) ) ]
+          is_true ~msg:(id1 ^ " then " ^ id2) (id1 <> id2) )
+    ; test "race: the client and the server under load" (fun () ->
+          Sim_support.race
+          @@ fun _ ->
+          client_in
+          @@ fun client url ->
+          let ids =
+            Fiber.scope (fun s ->
+                List.concat_map await
+                  (List.init 4 (fun _ ->
+                       Sim_support.call ~name:"loader" s (fun () ->
+                           List.init 5 (fun _ -> get_text client (url ^ "/id")) ) )
+                  ) )
+          in
+          equal int 20 (List.length ids) ;
+          let distinct = List.sort_uniq compare ids in
+          is_true
+            ~msg:(Printf.sprintf "%d connections" (List.length distinct))
+            (List.length distinct <= 4) )
+    ; test "a client that is not closed ends with its scope" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          Server_support.with_server ~handler:api_handler
+          @@ fun server ->
+          let got =
+            Fiber.scope (fun s ->
+                let client = C.make s in
+                get_text client (url_of server ^ "/hello") )
+          in
+          equal string "hello" got )
+    ; test "the end of the scope closes the idle connections" (fun () ->
+          Sim_support.run
+          @@ fun sim ->
+          Server_support.with_server ~handler:api_handler
+          @@ fun server ->
+          let fds = Weft_sim.open_fds sim in
+          Fiber.scope (fun s ->
+              let client = C.make s in
+              equal string "hello" (get_text client (url_of server ^ "/hello")) ) ;
+          check_settled sim ~msg:"only the listener is open" (fun () ->
+              Weft_sim.open_fds sim = fds ) )
+    ; test "run in a cancelled fiber raises Cancelled" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          let called = ref false in
+          raises_match
+            (function Fiber.Cancelled Exit -> true | _ -> false)
+            (fun () ->
+              Fiber.scope (fun s ->
+                  Fiber.cancel s Exit ;
+                  C.run (fun _ -> called := true) ) ) ;
+          is_false ~msg:"f ran" !called )
+    ; test
+        "race: a request after a cancel of the caller of run raises Cancelled"
+        (fun () ->
+          (* The cancel of [s] reaches the scope of the writers of the client.
+             The next request does no sync before its checkout and the start of
+             its writer. On a different domain, the daemon of the writers can
+             close the pool first. *)
+          Sim_support.race
+          @@ fun _ ->
+          Server_support.with_server ~handler:api_handler
+          @@ fun server ->
+          let url = url_of server ^ "/hello" and second = ref "no request" in
+          ( match
+              Fiber.scope (fun s ->
+                  C.run (fun client ->
+                      equal string "hello" (get_text client url) ;
+                      Fiber.cancel s Exit ;
+                      second :=
+                        match C.get client url with
+                        | _ ->
+                            "a response"
+                        | exception e ->
+                            exn_name e ) )
+            with
+          | () ->
+              fail "run returned"
+          | exception Fiber.Cancelled Exit ->
+              () ) ;
+          equal string "Cancelled" !second )
+    ; test "with_response closes the body when f raises" (fun () ->
+          let eof = Ivar.create () in
+          let script flow r =
+            ignore (read_request r) ;
+            Flow.write_string flow
+              "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nabc" ;
+            ignore (Buf_reader.peek_eof r) ;
+            fill eof
+          in
+          with_scripts [script]
+          @@ fun client port _ ->
+          raises (Failure "f") (fun () ->
+              C.with_response client (at_port port "/") (fun _ -> failwith "f") ) ;
+          (* The client closes the connection of the unread body. *)
+          wait eof )
+    ; test "a close during the head wait on a reused connection gives Closed"
+        (fun () ->
+          (* The connection closes, and the client is closed: no retry. *)
+          let script flow r =
+            ignore (read_request r) ;
+            Flow.write_string flow
+              "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na" ;
+            ignore (read_request r) ;
+            ignore (Buf_reader.peek_eof r)
+          in
+          Sim_support.run
+          @@ fun sim ->
+          scripts_in [script]
+          @@ fun client port _ ->
+          equal string "a" (text (C.request client (at_port port "/"))) ;
+          Fiber.scope
+          @@ fun s ->
+          let second =
+            Sim_support.call ~name:"second" s (fun () ->
+                error_text (fun () -> C.request client (at_port port "/")) )
+          in
+          is_false ~msg:"the head wait" (Sim_support.ended sim second) ;
+          C.close client ;
+          equal string
+            "Caravan_client.Error: the connection closed before the response"
+            (await second) )
+    ; test "run gives the grace to the bodies also when f raises" (fun () ->
+          is_false ~msg:"the body got no cancel"
+            (grace_after_raise ~cancel:false) )
+    ; test "a cancel in the grace after f raised gives the exception of f"
+        (fun () ->
+          is_true ~msg:"the body got the cancel"
+            (grace_after_raise ~cancel:true) )
+    ; test "the body of an upgrade response is empty" (fun () ->
+          equal string ""
+            (Body.to_string
+               (C.body (Response.upgrade ~status:Status.ok (fun _ -> ()))) ) )
+    ; test
+        "a request that raises before the exchange gives its error, not the \
+         error of the close" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          C.run
+          @@ fun client ->
+          let body =
+            Body.of_source ~length:3
+              ~close:(fun () -> failwith "close")
+              (fun _ _ _ -> 0)
+          in
+          raises_match is_invalid_arg (fun () ->
+              C.request client (Request.make ~body Method.POST "/") ) ) ]
 
-(* The client on a fake time line *)
+(* The client and exact time. Each test runs in manual mode. *)
 
-module Fake = Fake_time
+let ( +: ) = Sim_support.( +: )
 
-let ( +: ) = Fake.( +: )
+(* [d] minus 1 ns. *)
+let minus_ns d = Span.of_ns (Int64.pred (Span.to_ns d))
 
-(* The spans of the fake time tests. A test advances only to deadlines that it
-   proved with [Fake.wait_mono_timer]. *)
-let connect_c = Mtime.Span.(3 * s)
+(* The spans of the client in these tests. Server_support has different spans,
+   with other names. *)
+let client_connect = Span.s 3
 
-let response_r = Mtime.Span.(5 * s)
+let client_response = Span.s 5
 
-let read_d = Mtime.Span.(7 * s)
+let client_read = Span.s 7
 
-let write_w = Mtime.Span.(11 * s)
+let client_write = Span.s 11
 
-let idle_i = Mtime.Span.(13 * s)
+let client_idle = Span.s 13
 
-let grace_g = Mtime.Span.(17 * s)
+let client_grace = Span.s 17
 
-(* The spans on the real time line. The exchange tests put only the flow on the
-   fake time line: thus an exchange that uses [mono_time] fails. *)
-let fake_spans =
+let timed =
   { Client_config.default with
-    connect_timeout= connect_c
-  ; response_timeout= response_r
-  ; read_timeout= read_d
-  ; write_timeout= write_w
-  ; idle_timeout= idle_i
-  ; close_grace= grace_g }
+    connect_timeout= client_connect
+  ; response_timeout= client_response
+  ; read_timeout= client_read
+  ; write_timeout= client_write
+  ; idle_timeout= client_idle
+  ; close_grace= client_grace }
 
-let fake_client_config f = {fake_spans with mono_time= Fake.mono f}
-
-(* [test] with an exchange in a child call: [exchange run] runs [run] on the
-   client flow of [with_breakable], on the fake time line [f]. The call gives
-   the result of [exchange], or the text of its error. With [~broken:true], each
-   write of the client raises EIO. [failed], [on_write_deadline] and
-   [on_release] go to [with_breakable]. *)
-let with_fake_exchange ?(broken = false) ?failed ?on_write_deadline ?on_release
-    f ~exchange test =
-  with_breakable ~time:(Fake.mono f) ?on_write_deadline ?on_release ?failed
-    (Unix.Unix_error (Unix.EIO, "write", ""))
-  @@ fun ~server ~run ~break ~failed:_ ->
+(* [test ~sim ~server ~t0 c] with an exchange in a call: [exchange run] runs
+   [run] on the client flow of [with_breakable], with the spans of [timed]. The
+   call gives the result of [exchange], or the text of its error. With
+   [~broken:true], each write of the client raises EIO. [failed],
+   [on_write_timeout] and [on_release] go to [with_breakable]. *)
+let with_timed_exchange ?(broken = false) ?failed ?on_write_timeout ?on_release
+    ~exchange test =
+  Sim_support.manual
+  @@ fun sim ->
+  with_breakable ?on_write_timeout ?on_release ?failed net_eio sim
+  @@ fun ~scope ~server ~run ~break ~failed:_ ->
   if broken then break () ;
-  let t0 = Fake.mono_now f and m = Fake.mark f in
+  let t0 = Time.now Mono in
   let c =
-    Fun.Async.call (fun () ->
-        match exchange (fun r -> run fake_spans r) with
+    Sim_support.call ~name:"exchange" scope (fun () ->
+        match exchange (fun r -> run timed r) with
         | v ->
             v
         | exception Caravan_client.Error e ->
             Printexc.to_string (Caravan_client.Error e) )
   in
-  Stdlib.Fun.protect ~finally:(fun () -> Fun.Async.cancel c)
-  @@ fun () -> test ~server ~t0 ~since:m c
+  test ~sim ~server ~t0 c
 
-let set_within_50ms cell = Fake.within_50ms (Cell.Once.get' cell)
-
-(* [f port] with a server on [port] that runs [script] on one connection. *)
-let with_script_server script f =
-  let l = Tcp.Listener.listen Server_support.loopback in
-  let port =
-    match Tcp.Listener.addr l with Unix.ADDR_INET (_, p) -> p | _ -> 0
-  in
-  let server =
-    Fun.Async.call (fun () ->
-        let fd, _ = Tcp.Listener.accept l in
-        let flow = Tcp.flow fd in
-        Stdlib.Fun.protect
-          ~finally:(fun () -> Flow.close flow)
-          (fun () -> try script flow (Buf_reader.of_flow flow) with _ -> ()) )
-  in
-  Stdlib.Fun.protect
-    ~finally:(fun () -> Fun.Async.cancel server ; Tcp.Listener.close l)
-    (fun () -> f port)
-
-(* A server that answers at once, does not read the body, and waits for the end
-   of the connection. *)
-let answer_at_once flow r =
-  ignore (read_head r) ;
-  Flow.write_string flow "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n" ;
-  ignore (Buf_reader.peek_eof r)
-
-(* A request body that writes 3 bytes, then waits until [release] is set. A
-   cancel sets [cancelled], then calls [on_cancel]. *)
-let held_body ?(on_cancel = ignore) ~release ~cancelled () =
-  Body.of_writer (fun w ->
-      Body.Writer.write_string w "abc" ;
-      Body.Writer.flush w ;
-      try Cell.Once.get release
-      with e ->
-        Cell.Once.try_set cancelled () ;
-        on_cancel () ;
-        raise e )
-
-let fake_time_tests =
-  group "Client on a fake time line"
+let timed_tests =
+  group "Client and exact time"
     [ test "a lookup that does not end gives a connect timeout at the deadline"
         (fun () ->
-          main
-          @@ fun () ->
-          let f = Fake.make ()
-          and go = Atomic.make false
-          and thread_ended = Atomic.make false in
-          (* The thread of the lookup ends only when [go] is set. *)
-          let held _ _ _ =
-            while not (Atomic.get go) do
-              Unix.sleepf 0.005
-            done ;
-            Atomic.set thread_ended true ;
-            []
-          in
-          Stdlib.Fun.protect ~finally:(fun () -> Atomic.set go true)
-          @@ fun () ->
-          let t0 = Fake.mono_now f
-          and m = Fake.mark f
-          and ended = Cell.Once.make () in
+          Sim_support.manual
+          @@ fun sim ->
+          Weft_sim.set_dns sim lookup_host No_answer ;
+          let t0 = Time.now Mono in
+          Fiber.scope
+          @@ fun s ->
           let c =
-            Fun.Async.call (fun () ->
-                Stdlib.Fun.protect
-                  ~finally:(fun () -> Cell.Once.try_set ended ())
-                  (fun () ->
-                    error_text (fun () ->
-                        Connect.connect ~getaddrinfo:held (fake_client_config f)
-                          ~host:"a.example" ~port:80 ) ) )
+            Sim_support.call ~name:"connect" s (fun () ->
+                error_text (fun () ->
+                    Connect.connect timed ~host:lookup_host ~port:80 ) )
           in
-          Stdlib.Fun.protect ~finally:(fun () -> Fun.Async.cancel c)
-          @@ fun () ->
-          Fake.wait_mono_timer f ~since:m (t0 +: connect_c) ;
-          (* Only an advance can end the connect. *)
-          Fake.advance f Mtime.Span.(connect_c - ns) ;
-          is_false ~msg:"no end 1 ns before the deadline"
-            (set_within_50ms ended) ;
-          Fake.advance f Mtime.Span.ns ;
           equal string "Caravan_client.Error: connect timeout"
-            (within_2s (fun () -> Fun.Async.get c)) ;
-          (* The lookup stopped at the deadline, but its thread runs until
-             getaddrinfo returns. *)
-          Atomic.set go true ;
-          eventually ~msg:"the thread ended" (fun () -> Atomic.get thread_ended) )
-    ; test "a connect gives a flow on the time line of the config" (fun () ->
-          main
-          @@ fun () ->
-          with_listener
-          @@ fun port ->
-          let f = Fake.make () in
-          let flow =
-            Connect.connect (fake_client_config f) ~host:"127.0.0.1" ~port
+            (Sim_support.ends_at sim ~t0 client_connect c) )
+    ; test "a close grace that overflows the clock does not cancel the bodies"
+        (fun () ->
+          (* The grace is the largest span. After 1 s, the end of the grace is
+             out of the range of the Mono clock: the grace never ends. The body
+             ends 1 h after the end of [f]. *)
+          let config =
+            {Client_config.default with close_grace= Span.of_ns Int64.max_int}
           in
-          Stdlib.Fun.protect ~finally:(fun () -> Flow.close flow)
-          @@ fun () ->
-          is_true ~msg:"the time line of the flow"
-            (Flow.time flow == Fake.mono f) )
-    ; test "the timer that closes idle connections is on the config's time line"
-        (fun () ->
-          main
-          @@ fun () ->
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          C.run ~config:(fake_client_config f) (fun _ ->
-              (* Each half of [idle_timeout]. *)
-              Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.(6500 * ms)) ) )
-    ; test "a close grace of 2^63 ns or more does not cancel the bodies"
-        (fun () ->
-          (* 2^63 ns + 1 s: affect ends a wait of 2^63 ns or more at once. *)
-          let grace = Mtime.Span.(add (of_uint64_ns Int64.min_int) s) in
-          main
-          @@ fun () ->
-          with_script_server answer_at_once
-          @@ fun port ->
-          let release = Cell.Once.make ()
-          and cancelled = Cell.Once.make ()
-          and returned = Cell.Once.make () in
-          let config = {Client_config.default with close_grace= grace} in
+          Sim_support.manual
+          @@ fun sim ->
+          Sim_support.advance sim (Span.s 1) ;
+          let late flow r =
+            ignore (read_head r) ;
+            Flow.write_string flow
+              "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" ;
+            ignore (Buf_reader.peek_eof r)
+          in
+          let returned = Ivar.create () and t_end = ref (Time.now Mono) in
+          Fiber.scope
+          @@ fun s ->
           let r =
-            Fun.Async.call (fun () ->
-                C.run ~config (fun client ->
-                    ignore
-                      (C.request client
-                         (at_port port ~meth:Method.POST
-                            ~body:(held_body ~release ~cancelled ())
-                            "/" ) ) ;
-                    Cell.Once.try_set returned () ) )
+            Sim_support.call ~name:"run" s (fun () ->
+                scripts_in ~config [late]
+                @@ fun client port _ ->
+                let slow =
+                  Body.of_writer (fun w ->
+                      Body.Writer.write_string w "abc" ;
+                      Body.Writer.flush w ;
+                      Time.sleep Mono (Span.s 3600) )
+                in
+                ignore
+                  (C.request client
+                     (at_port port ~meth:Method.POST ~body:slow "/") ) ;
+                t_end := Time.now Mono ;
+                fill returned )
           in
-          Stdlib.Fun.protect ~finally:(fun () ->
-              Cell.Once.try_set release () ;
-              Fun.Async.cancel r )
-          @@ fun () ->
-          within_2s (fun () -> Cell.Once.get returned) ;
-          is_false ~msg:"no cancel within 50 ms" (set_within_50ms cancelled) ;
-          Cell.Once.try_set release () ;
-          within_2s (fun () -> Fun.Async.get r) )
+          wait returned ;
+          Sim_support.ends_at sim ~t0:!t_end (Span.s 3600) r )
     ; test "a response 1 ns before the response timeout is taken" (fun () ->
-          let f = Fake.make () in
-          with_fake_exchange f ~exchange:(fun run ->
+          with_timed_exchange ~exchange:(fun run ->
               Printf.sprintf "status %d" (status (run (req "/"))) )
-          @@ fun ~server ~t0 ~since c ->
-          ignore (within_2s (fun () -> read_head (Buf_reader.of_flow server))) ;
+          @@ fun ~sim ~server ~t0 c ->
+          ignore (read_head (Buf_reader.of_flow server)) ;
           (* The deadline starts at the end of the request. *)
-          Fake.wait_mono_timer f ~since (t0 +: response_r) ;
-          Fake.advance f Mtime.Span.(response_r - ns) ;
+          Sim_support.advance_to sim (t0 +: minus_ns client_response) ;
           Flow.write_string server
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" ;
-          equal string "status 200" (within_2s (fun () -> Fun.Async.get c)) )
+          equal string "status 200" (await c) )
     ; test "no response at the response timeout gives Timeout `Response"
         (fun () ->
-          let f = Fake.make () in
-          with_fake_exchange f ~exchange:(fun run ->
+          with_timed_exchange ~exchange:(fun run ->
               Printf.sprintf "status %d" (status (run (req "/"))) )
-          @@ fun ~server ~t0 ~since c ->
-          ignore (within_2s (fun () -> read_head (Buf_reader.of_flow server))) ;
-          Fake.wait_mono_timer f ~since (t0 +: response_r) ;
-          Fake.advance f response_r ;
+          @@ fun ~sim ~server ~t0 c ->
+          ignore (read_head (Buf_reader.of_flow server)) ;
           equal string "Caravan_client.Error: response timeout"
-            (within_2s (fun () -> Fun.Async.get c)) )
+            (Sim_support.ends_at sim ~t0 client_response c) )
     ; test "a body read that waits until the read timeout gives Timeout `Read"
         (fun () ->
-          let f = Fake.make () and releases = ref [] in
+          let releases = ref [] in
           let on_release _ ~reusable = releases := reusable :: !releases in
-          with_fake_exchange ~on_release f ~exchange:(fun run ->
+          with_timed_exchange ~on_release ~exchange:(fun run ->
               let b = body (run (req "/")) in
               let n = Body.read b (Bytes.create 8) 0 8 in
               Printf.sprintf "%d bytes, then %s" n
                 (error_text (fun () -> Body.to_string b)) )
-          @@ fun ~server ~t0 ~since c ->
-          ignore (within_2s (fun () -> read_head (Buf_reader.of_flow server))) ;
+          @@ fun ~sim ~server ~t0 c ->
+          ignore (read_head (Buf_reader.of_flow server)) ;
           (* The head and the first 2 bytes in one write: the first read gives
-             the 2 bytes, and the next read waits from t0. *)
+             the 2 bytes, and the next read waits from t0. A byte 1 ns before
+             its read timeout ends that read, and the next read waits from that
+             time. *)
           Flow.write_string server
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab" ;
-          Fake.wait_mono_timer f ~since (t0 +: read_d) ;
-          Fake.advance f Mtime.Span.(read_d - ns) ;
-          let m = Fake.mark f in
+          let t1 = t0 +: minus_ns client_read in
+          Sim_support.advance_to sim t1 ;
           Flow.write_string server "c" ;
-          let t1 = t0 +: Mtime.Span.(read_d - ns) in
-          Fake.wait_mono_timer f ~since:m (t1 +: read_d) ;
-          Fake.advance f read_d ;
           equal string "2 bytes, then Caravan_client.Error: read timeout"
-            (within_2s (fun () -> Fun.Async.get c)) ;
+            (Sim_support.ends_at sim ~t0:t1 client_read c) ;
           (* The rest of the body did not come: the connection closes. *)
           equal (list bool) [false] !releases )
     ; test "a write that waits until the write timeout gives Timeout `Write"
         (fun () ->
-          let f = Fake.make () and raised = Cell.Once.make () in
-          with_fake_exchange f ~exchange:(fun run ->
+          let raised = Ivar.create () in
+          with_timed_exchange ~exchange:(fun run ->
               Printf.sprintf "status %d"
                 (status
                    (run (req ~meth:Method.POST ~body:(endless raised) "/")) ) )
-          @@ fun ~server:_ ~t0 ~since c ->
-          (* The server never reads: only an advance can wake the write that
-             waits. A drain of the server wakes the write more than once, and
-             then the test cannot prove which wait is the last. *)
-          Fake.wait_mono_timer f ~since (t0 +: write_w) ;
-          Fake.advance f Mtime.Span.(write_w - ns) ;
-          is_false ~msg:"no write error 1 ns before the write timeout"
-            (set_within_50ms raised) ;
-          Fake.advance f Mtime.Span.ns ;
+          @@ fun ~sim ~server:_ ~t0 c ->
+          (* The server never reads: the first write that waits starts at t0. *)
           equal string "Caravan_client.Error: write timeout"
-            (within_2s (fun () -> Fun.Async.get c)) ;
-          within_2s (fun () -> Cell.Once.get raised) )
+            (Sim_support.ends_at sim ~t0 client_write c) ;
+          is_true ~msg:"the producer got the error" (is_set raised) )
+    ; test "a second blocked write gets a new write timeout" (fun () ->
+          (* Two writes of 100 KiB each. The window of the simulator is 64 KiB.
+             The first write waits from t0. At t0 + 10 s the server reads 64
+             KiB: the first write ends, and the second write waits from that
+             time. *)
+          let part = String.make (100 * 1024) 'x' in
+          let two_parts =
+            Body.of_writer
+              ~length:(2 * String.length part)
+              (fun w ->
+                Body.Writer.write_string w part ;
+                Body.Writer.flush w ;
+                Body.Writer.write_string w part ;
+                Body.Writer.flush w )
+          in
+          with_timed_exchange ~exchange:(fun run ->
+              Printf.sprintf "status %d"
+                (status (run (req ~meth:Method.POST ~body:two_parts "/"))) )
+          @@ fun ~sim ~server ~t0 c ->
+          let t1 = t0 +: Span.s 10 in
+          Sim_support.advance_to sim t1 ;
+          ignore (Server_support.read_exactly server (64 * 1024)) ;
+          equal string "Caravan_client.Error: write timeout"
+            (Sim_support.ends_at sim ~t0:t1 client_write c) )
+    ; test "a wake by the end of the writer keeps the read deadline" (fun () ->
+          (* The read of the body waits from t0. At t0 + 3 s the writer ends:
+             the read wakes, and waits again with the same deadline. *)
+          let gate = Ivar.create () in
+          let gated =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "abc" ;
+                Body.Writer.flush w ;
+                wait gate )
+          in
+          with_timed_exchange ~exchange:(fun run ->
+              let b = body (run (req ~meth:Method.POST ~body:gated "/")) in
+              let n = Body.read b (Bytes.create 8) 0 8 in
+              Printf.sprintf "%d bytes, then %s" n
+                (error_text (fun () -> Body.to_string b)) )
+          @@ fun ~sim ~server ~t0 c ->
+          ignore (read_head (Buf_reader.of_flow server)) ;
+          Flow.write_string server
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab" ;
+          Sim_support.advance_to sim (t0 +: Span.s 3) ;
+          fill gate ;
+          equal string "2 bytes, then Caravan_client.Error: read timeout"
+            (Sim_support.ends_at sim ~t0 client_read c) )
     ; test
         "a write error before the end of the request starts the response \
          deadline" (fun () ->
           (* A GET with no body on the wire, and a POST with a source. *)
           List.iter
             (fun (meth, length) ->
-              let f = Fake.make ()
-              and failed = Cell.Once.make ()
-              and closes = Atomic.make 0 in
+              let failed = Ivar.create () and closes = Atomic.make 0 in
               let source =
                 Body.of_source ~length
                   ~close:(fun () -> Atomic.incr closes)
                   (fun _ _ _ -> 0)
               in
-              with_fake_exchange ~broken:true ~failed f ~exchange:(fun run ->
+              with_timed_exchange ~broken:true ~failed ~exchange:(fun run ->
                   Printf.sprintf "status %d"
                     (status (run (req ~meth ~body:source "/"))) )
-              @@ fun ~server:_ ~t0 ~since c ->
+              @@ fun ~sim ~server:_ ~t0 c ->
               (* The write of the head fails. The writer ends with the error
                  before [sent]: the reader stamps the end of the request. *)
-              Fake.wait_mono_timer f ~since (t0 +: response_r) ;
-              Fake.advance f response_r ;
               equal string "Caravan_client.Error: response timeout"
-                (within_2s (fun () -> Fun.Async.get c)) ;
-              is_true ~msg:"the write failed" (Cell.Once.is_set failed) ;
+                (Sim_support.ends_at sim ~t0 client_response c) ;
+              is_true ~msg:"the write failed" (is_set failed) ;
               equal int 1 (Atomic.get closes) )
             [(Method.GET, 0); (Method.POST, 3)] )
-    ; test "each write gets a new write deadline" (fun () ->
-          let f = Fake.make () and gate = Cell.Once.make () in
-          let lock = Mutex.create () and deadlines = ref [] in
-          let on_write_deadline d =
-            Mutex.protect lock (fun () -> deadlines := d :: !deadlines)
-          in
-          let has ~msg d =
-            eventually ~msg (fun () ->
-                Mutex.protect lock (fun () -> List.mem (Some d) !deadlines) )
-          in
-          (* The head goes before the producer runs. The producer writes after
-             [gate]. *)
-          let late =
-            Body.of_writer (fun w ->
-                Cell.Once.get gate ;
-                Body.Writer.write_string w "b" ;
-                Body.Writer.flush w )
-          in
-          with_fake_exchange ~on_write_deadline f ~exchange:(fun run ->
-              Printf.sprintf "status %d"
-                (status (run (req ~meth:Method.POST ~body:late "/"))) )
-          @@ fun ~server:_ ~t0 ~since:_ _ ->
-          (* No write waits: the deadlines make no timer. *)
-          has ~msg:"the deadline of the head" (t0 +: write_w) ;
-          Fake.advance f Mtime.Span.(5 * s) ;
-          Cell.Once.try_set gate () ;
-          has ~msg:"the deadline of the body"
-            (t0 +: Mtime.Span.(5 * s) +: write_w) )
-    ; test "run cancels the bodies at the close grace of the config's time line"
-        (fun () ->
-          main
-          @@ fun () ->
-          with_script_server answer_at_once
-          @@ fun port ->
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let release = Cell.Once.make ()
-          and cancelled = Cell.Once.make ()
-          and late = Cell.Once.make ()
-          and returned = Cell.Once.make ()
-          and run_returned = Cell.Once.make () in
+    ; test "run cancels the bodies at the close grace" (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          let release = Ivar.create ()
+          and cancelled = Ivar.create ()
+          and late = Ivar.create ()
+          and returned = Ivar.create () in
           (* After its cancel, the body waits for [late]. *)
-          let on_cancel () =
-            Fun.Async.mask_cancellation (fun () -> Cell.Once.get late)
-          in
+          let on_cancel () = Fiber.shield (fun () -> wait late) in
+          let t_end = ref (Time.now Mono) in
+          Fiber.scope
+          @@ fun s ->
           let r =
-            Fun.Async.call (fun () ->
-                C.run ~config:(fake_client_config f) (fun client ->
-                    ignore
-                      (C.request client
-                         (at_port port ~meth:Method.POST
-                            ~body:(held_body ~on_cancel ~release ~cancelled ())
-                            "/" ) ) ;
-                    Cell.Once.try_set returned () ) ;
-                Cell.Once.try_set run_returned () )
+            Sim_support.call ~name:"run" s (fun () ->
+                scripts_in ~config:timed [answer_at_once]
+                @@ fun client port _ ->
+                ignore
+                  (C.request client
+                     (at_port port ~meth:Method.POST
+                        ~body:(held_body ~on_cancel ~release ~cancelled ())
+                        "/" ) ) ;
+                t_end := Time.now Mono ;
+                fill returned )
           in
-          Stdlib.Fun.protect ~finally:(fun () ->
-              Cell.Once.try_set late () ;
-              Cell.Once.try_set release () ;
-              Fun.Async.cancel r ;
-              Fake.advance f Mtime.Span.day )
-          @@ fun () ->
-          within_2s (fun () -> Cell.Once.get returned) ;
-          (* The timer of the reaper is at t0 + 6.5 s, and then at t0 + 23.5 s -
-             1 ns: not at the grace. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: grace_g) ;
-          Fake.advance f Mtime.Span.(grace_g - ns) ;
-          (* Only an advance can end the grace. *)
-          is_false ~msg:"no cancel 1 ns before the grace"
-            (set_within_50ms cancelled) ;
-          Fake.advance f Mtime.Span.ns ;
-          within_2s (fun () -> Cell.Once.get cancelled) ;
+          wait returned ;
+          Sim_support.holds_from sim ~t0:!t_end client_grace ~what:"the cancel"
+            (fun () -> is_set cancelled ) ;
           (* Only [late] can end the body: run returns after it. *)
           is_false ~msg:"run waits for the cancelled body"
-            (set_within_50ms run_returned) ;
-          Cell.Once.try_set late () ;
-          within_2s (fun () -> Fun.Async.get r) )
+            (Sim_support.ended sim r) ;
+          fill late ;
+          await r )
     ; test "run waits for a request body that goes after its response"
         (fun () ->
-          main
-          @@ fun () ->
-          let received = Cell.Once.make () in
+          Sim_support.manual
+          @@ fun sim ->
+          let received = Ivar.create () in
           (* The server answers at once, then reads the whole body. *)
           let script flow r =
             let h = read_head r in
             Flow.write_string flow
               "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" ;
-            Cell.Once.try_set received
-              (error_text (fun () ->
-                   Body.to_string
-                     (H1_body.body
-                        (H1_body.make ~limits:server_limits r
-                           (H1_parse.request_framing h) ) ) ) )
+            ignore
+              (Ivar.try_fill received (error_text (fun () -> read_body r h)))
           in
-          with_script_server script
-          @@ fun port ->
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
           let got = ref ""
-          and gate = Cell.Once.make ()
-          and returned = Cell.Once.make () in
+          and gate = Ivar.create ()
+          and returned = Ivar.create () in
           (* The rest of the body goes after the response, when the test opens
              [gate]. *)
           let late =
             Body.of_writer (fun w ->
                 Body.Writer.write_string w "part1;" ;
                 Body.Writer.flush w ;
-                Cell.Once.get gate ;
+                wait gate ;
                 List.iter
                   (fun part ->
                     Body.Writer.write_string w part ;
@@ -3360,121 +3512,115 @@ let fake_time_tests =
                   ["part2;"; "part3"] ;
                 got := "part1;part2;part3" )
           in
+          let t0 = Time.now Mono in
+          Fiber.scope
+          @@ fun s ->
           let r =
-            Fun.Async.call (fun () ->
-                C.run ~config:(fake_client_config f) (fun client ->
-                    equal int 200
-                      (status
-                         (C.request client
-                            (at_port port ~meth:Method.POST ~body:late "/") ) ) ;
-                    Cell.Once.try_set returned () ) )
+            Sim_support.call ~name:"run" s (fun () ->
+                scripts_in ~config:timed [script]
+                @@ fun client port _ ->
+                equal int 200
+                  (status
+                     (C.request client
+                        (at_port port ~meth:Method.POST ~body:late "/") ) ) ;
+                fill returned )
           in
-          Stdlib.Fun.protect ~finally:(fun () ->
-              Cell.Once.try_set gate () ;
-              Fun.Async.cancel r ;
-              Fake.advance f Mtime.Span.day )
-          @@ fun () ->
-          within_2s (fun () -> Cell.Once.get returned) ;
-          (* The timer of the grace proves that run waits for the body. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: grace_g) ;
-          Cell.Once.try_set gate () ;
-          within_2s (fun () -> Fun.Async.get r) ;
+          wait returned ;
+          is_false ~msg:"run waits for the body" (Sim_support.ended sim r) ;
+          fill gate ;
+          await r ;
           (* [run] returned after the producer ended, not after a cancel. *)
+          equal Server_support.span ~msg:"no time passed" Span.zero
+            (Time.diff Mono (Time.now Mono) t0) ;
           equal string "part1;part2;part3" !got ;
-          equal string "no error" (within_2s (fun () -> Cell.Once.get received)) )
+          equal string "no error" (sync (Ivar.read received)) )
     ; test "the response deadline starts at the end of the upload" (fun () ->
-          let f = Fake.make () and gate = Cell.Once.make () in
+          let gate = Ivar.create () in
           let gated =
             Body.of_writer (fun w ->
                 Body.Writer.write_string w "abc" ;
                 Body.Writer.flush w ;
-                Cell.Once.get gate ;
+                wait gate ;
                 Body.Writer.write_string w "def" ;
                 Body.Writer.flush w )
           in
-          with_fake_exchange f ~exchange:(fun run ->
+          with_timed_exchange ~exchange:(fun run ->
               Printf.sprintf "status %d"
                 (status (run (req ~meth:Method.POST ~body:gated "/"))) )
-          @@ fun ~server ~t0 ~since:_ c ->
-          Stdlib.Fun.protect ~finally:(fun () -> Cell.Once.try_set gate ())
+          @@ fun ~sim ~server ~t0 c ->
+          Fun.protect ~finally:(fun () -> fill gate)
           @@ fun () ->
           (* The server reads the head first: the time of the head is not the
              start of the deadline. *)
-          ignore (within_2s (fun () -> read_head (Buf_reader.of_flow server))) ;
-          Fake.advance f Mtime.Span.(5 * s) ;
-          let m = Fake.mark f in
-          Cell.Once.try_set gate () ;
-          let t1 = t0 +: Mtime.Span.(5 * s) in
-          Fake.wait_mono_timer f ~since:m (t1 +: response_r) ;
-          Fake.advance f Mtime.Span.(response_r - ns) ;
+          ignore (read_head (Buf_reader.of_flow server)) ;
+          let t1 = t0 +: Span.s 5 in
+          Sim_support.advance_to sim t1 ;
+          fill gate ;
+          Sim_support.advance_to sim (t1 +: minus_ns client_response) ;
           Flow.write_string server
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" ;
-          equal string "status 200" (within_2s (fun () -> Fun.Async.get c)) )
+          equal string "status 200" (await c) )
     ; test "a response head that comes slowly gives Timeout `Response"
         (fun () ->
-          let f = Fake.make () in
-          with_fake_exchange f ~exchange:(fun run ->
+          with_timed_exchange ~exchange:(fun run ->
               Printf.sprintf "status %d" (status (run (req "/"))) )
-          @@ fun ~server ~t0 ~since c ->
-          ignore (within_2s (fun () -> read_head (Buf_reader.of_flow server))) ;
-          Fake.wait_mono_timer f ~since (t0 +: response_r) ;
+          @@ fun ~sim ~server ~t0 c ->
+          ignore (read_head (Buf_reader.of_flow server)) ;
+          (* The reader takes each part, and waits again until the same
+             deadline. *)
           List.iter
             (fun part ->
-              Fake.advance f Mtime.Span.s ;
-              let m = Fake.mark f in
-              Flow.write_string server part ;
-              (* The reader took the part, and waits again until the same
-                 deadline. *)
-              Fake.wait_mono_timer f ~since:m (t0 +: response_r) )
+              Sim_support.advance sim (Span.s 1) ;
+              Flow.write_string server part )
             ["H"; "TTP/1.1 2"] ;
-          Fake.advance f Mtime.Span.(3 * s) ;
           equal string "Caravan_client.Error: response timeout"
-            (within_2s (fun () -> Fun.Async.get c)) )
+            (Sim_support.ends_at sim ~t0 client_response c) )
     ; test "an idle connection that the server closed is not used" (fun () ->
-          (* Only the server is on the fake time line. *)
-          let f = Fake.make () and closed = Cell.Once.make () in
+          Sim_support.manual
+          @@ fun sim ->
+          let closed = Ivar.create () in
           let engine ctx flow handler =
             H1_server.serve ctx flow handler ;
             Flow.close flow ;
-            Cell.Once.try_set closed ()
+            fill closed
           in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          with_pool ~fake:f ~engine
+          (* The idle timeout of the client is longer than the one of the
+             server. *)
+          with_pool ~config:Server_support.timed_config ~client_config:timed
+            ~engine
           @@ fun pool writers port ->
           let a = get_id pool writers ~port () in
           (* After the response, the server waits for the next request until its
              idle timeout. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: Server_support.idle_i) ;
-          Fake.advance f Server_support.idle_i ;
-          within_2s (fun () -> Cell.Once.get closed) ;
+          Sim_support.advance sim Server_support.idle_i ;
+          is_true ~msg:"the server closed" (is_set closed) ;
           (* A POST, which the client never retries. *)
           let b = get_id pool writers ~port ~meth:Method.POST () in
           is_true ~msg:(a ^ " then " ^ b) (a <> b) )
-    ; test "the timer closes an idle connection" (fun () ->
-          let eof = Cell.Once.make () in
+    ; test
+        "the reaper closes an idle connection at the first tick after \
+         idle_timeout" (fun () ->
+          (* [run] makes the reaper at t0. It ticks each 6.5 s, half of
+             [client_idle]. The release occurs at t0 + 1 s, thus the connection
+             is young at the second tick (t0 + 13 s). *)
+          Sim_support.manual
+          @@ fun sim ->
+          let eof = Ivar.create () in
           let script flow r =
             ignore (read_request r) ;
             Flow.write_string flow
               "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na" ;
             ignore (Buf_reader.peek_eof r) ;
-            Cell.Once.try_set eof ()
+            fill eof
           in
-          let f = Fake.make () and half = Mtime.Span.(6500 * ms) in
-          (* [run] makes the timer of the reaper before [f] runs. *)
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          with_scripts ~config:(fake_client_config f) [script]
+          let t0 = Time.now Mono in
+          scripts_in ~config:timed [script]
           @@ fun client port _ ->
+          Sim_support.advance sim (Span.s 1) ;
           equal string "a" (text (C.request client (at_port port "/"))) ;
-          (* No request uses the host again: only the reaper closes it. It runs
-             each half of [idle_timeout]. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: half) ;
-          let m = Fake.mark f in
-          Fake.advance f half ;
-          (* The reaper kept the young connection, and waits again. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: idle_i) ;
-          is_false ~msg:"open at t0 + 6.5 s" (set_within_50ms eof) ;
-          Fake.advance f half ;
-          within_2s (fun () -> Cell.Once.get eof) )
+          (* No request uses the host again: only the reaper closes it. *)
+          Sim_support.holds_from sim ~t0 (Span.ms 19500)
+            ~what:"the end of the stream" (fun () -> is_set eof ) )
     ; test "a request during the grace of run raises before a connect"
         (fun () ->
           let script flow r =
@@ -3483,48 +3629,50 @@ let fake_time_tests =
               "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" ;
             ignore (Buf_reader.peek_eof r)
           in
-          let f = Fake.make () and late = Cell.Once.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          with_scripts ~config:(fake_client_config f) [script; script]
-            (fun client port accepted ->
-              let go = Cell.Once.make () in
-              let waiting =
-                Body.of_writer (fun w ->
-                    Body.Writer.write_string w "abc" ;
-                    Body.Writer.flush w ;
-                    Cell.Once.get go )
-              in
-              equal int 200
-                (status
-                   (C.request client
-                      (at_port port ~meth:Method.POST ~body:waiting "/") ) ) ;
-              (* A child fiber makes a request after f returns, during the
-                 grace, then lets the first body end. *)
-              ignore
-                (Fun.Async.call (fun () ->
-                     Stdlib.Fun.protect ~finally:(fun () ->
-                         Cell.Once.try_set go () )
-                     @@ fun () ->
-                     Cell.Once.try_set late
-                       ( match
-                           (* The timer of the grace: run is in its grace. *)
-                           Fake.wait_mono_timer f ~since:m (t0 +: grace_g) ;
-                           C.request client (at_port port "/")
-                         with
-                       | _ ->
-                           "no error"
-                       | exception Invalid_argument _ ->
-                           (* A connect, if any, has time to arrive. *)
-                           Mtime.wait_for (ms 100) ;
-                           Printf.sprintf "Invalid_argument, %d accepted"
-                             (Atomic.get accepted)
-                       | exception e ->
-                           Printexc.to_string e ) ) ) ) ;
-          equal string "Invalid_argument, 1 accepted" (Cell.Once.get late) )
+          Sim_support.manual
+          @@ fun sim ->
+          Fiber.scope
+          @@ fun outer ->
+          let returned = Ivar.create () in
+          let late =
+            scripts_in ~config:timed [script; script]
+            @@ fun client port accepted ->
+            let go = Ivar.create () in
+            let waiting =
+              Body.of_writer (fun w ->
+                  Body.Writer.write_string w "abc" ;
+                  Body.Writer.flush w ;
+                  wait go )
+            in
+            equal int 200
+              (status
+                 (C.request client
+                    (at_port port ~meth:Method.POST ~body:waiting "/") ) ) ;
+            (* A fiber of the outer scope makes a request after f returns,
+               during the grace, then lets the first body end. On 1 domain, run
+               starts its grace before that fiber runs. *)
+            let late =
+              Sim_support.call ~name:"late" outer (fun () ->
+                  wait returned ;
+                  Fun.protect ~finally:(fun () -> fill go)
+                  @@ fun () ->
+                  match C.request client (at_port port "/") with
+                  | _ ->
+                      "no error"
+                  | exception Invalid_argument _ ->
+                      (* A connect, if any, has time to arrive. *)
+                      Weft_sim.settle sim ;
+                      Printf.sprintf "Invalid_argument, %d accepted"
+                        (Atomic.get accepted)
+                  | exception e ->
+                      Printexc.to_string e )
+            in
+            fill returned ; late
+          in
+          equal string "Invalid_argument, 1 accepted" (await late) )
     ; test "a stale connection is not retried during the grace of run"
         (fun () ->
-          let f = Fake.make () and second_head = Cell.Once.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
+          let second_head = Ivar.create () and stopped = Ivar.create () in
           (* Connection 1 keeps the grace open: its request body goes after the
              response. *)
           let first flow r =
@@ -3539,51 +3687,56 @@ let fake_time_tests =
             Flow.write_string flow
               "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb" ;
             ignore (read_head r) ;
-            Cell.Once.try_set second_head () ;
-            (* The timer of the grace: run set the stop. *)
-            Fake.wait_mono_timer f ~since:m (t0 +: grace_g)
+            fill second_head ;
+            wait stopped
           (* Only a retry connects a third time. *)
           and third flow r =
             ignore (read_request r) ;
             Flow.write_string flow
               "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nc"
           in
-          let late = Cell.Once.make () in
-          with_scripts ~config:(fake_client_config f) [first; second; third]
-            (fun client port accepted ->
-              let go = Cell.Once.make () in
-              let waiting =
-                Body.of_writer (fun w ->
-                    Body.Writer.write_string w "abc" ;
-                    Body.Writer.flush w ;
-                    Cell.Once.get go )
-              in
-              equal int 200
-                (status
-                   (C.request client
-                      (at_port port ~meth:Method.POST ~body:waiting "/") ) ) ;
-              (* Connection 1 is in use: this GET makes connection 2. *)
-              equal string "b" (text (C.request client (at_port port "/"))) ;
-              ignore
-                (Fun.Async.call (fun () ->
-                     Stdlib.Fun.protect ~finally:(fun () ->
-                         Cell.Once.try_set go () )
-                     @@ fun () ->
-                     let result =
-                       error_text (fun () ->
-                           text (C.request client (at_port port "/")) )
-                     in
-                     (* A connect, if any, has time to arrive. *)
-                     Mtime.wait_for (ms 100) ;
-                     Cell.Once.try_set late
-                       (Printf.sprintf "%s, %d accepted" result
-                          (Atomic.get accepted) ) ) ) ;
-              (* The GET goes on connection 2 before f returns. *)
-              within_2s (fun () -> Cell.Once.get second_head) ) ;
+          Sim_support.manual
+          @@ fun sim ->
+          Fiber.scope
+          @@ fun outer ->
+          let late =
+            scripts_in ~config:timed [first; second; third]
+            @@ fun client port accepted ->
+            let go = Ivar.create () in
+            let waiting =
+              Body.of_writer (fun w ->
+                  Body.Writer.write_string w "abc" ;
+                  Body.Writer.flush w ;
+                  wait go )
+            in
+            equal int 200
+              (status
+                 (C.request client
+                    (at_port port ~meth:Method.POST ~body:waiting "/") ) ) ;
+            (* Connection 1 is in use: this GET makes connection 2. *)
+            equal string "b" (text (C.request client (at_port port "/"))) ;
+            let late =
+              Sim_support.call ~name:"late" outer (fun () ->
+                  Fun.protect ~finally:(fun () -> fill go)
+                  @@ fun () ->
+                  let result =
+                    error_text (fun () ->
+                        text (C.request client (at_port port "/")) )
+                  in
+                  (* A connect, if any, has time to arrive. *)
+                  Weft_sim.settle sim ;
+                  Printf.sprintf "%s, %d accepted" result (Atomic.get accepted) )
+            in
+            (* The GET goes on connection 2 before f returns. After f, run
+               starts its grace before the server closes connection 2. *)
+            wait second_head ;
+            Fiber.fork outer (fun () -> fill stopped) ;
+            late
+          in
           equal string
             "Caravan_client.Error: the connection closed before the response, \
              2 accepted"
-            (Cell.Once.get late) )
+            (await late) )
     ; test "a cancel during the grace of run raises Cancelled" (fun () ->
           let script flow r =
             ignore (read_head r) ;
@@ -3591,47 +3744,39 @@ let fake_time_tests =
               "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" ;
             ignore (Buf_reader.peek_eof r)
           in
-          main
-          @@ fun () ->
-          with_script_server script
-          @@ fun port ->
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let stop = Cell.Once.make () and returned = Cell.Once.make () in
-          let waiting =
-            Body.of_writer (fun w ->
-                Body.Writer.write_string w "abc" ;
-                Body.Writer.flush w ;
-                Cell.Once.get stop )
-          in
+          Sim_support.manual
+          @@ fun sim ->
+          let cancelled = Ivar.create () and returned = Ivar.create () in
+          let release = Ivar.create () in
+          let t0 = Time.now Mono in
+          Fiber.scope
+          @@ fun s ->
           let caller =
-            Fun.Async.call (fun () ->
-                C.run ~config:(fake_client_config f) (fun client ->
-                    ignore
-                      (C.request client
-                         (at_port port ~meth:Method.POST ~body:waiting "/") ) ;
-                    Cell.Once.try_set returned () ) )
+            Sim_support.call ~name:"run" s (fun () ->
+                scripts_in ~config:timed [script]
+                @@ fun client port _ ->
+                ignore
+                  (C.request client
+                     (at_port port ~meth:Method.POST
+                        ~body:(held_body ~release ~cancelled ())
+                        "/" ) ) ;
+                fill returned )
           in
-          (* The body ends at the end of the test in all cases: a bug that waits
-             for it gives a failure, not a hang. *)
-          Stdlib.Fun.protect ~finally:(fun () ->
-              Cell.Once.try_set stop () ;
-              Fun.Async.cancel caller ;
-              Fake.advance f Mtime.Span.day )
-          @@ fun () ->
-          within_2s (fun () -> Cell.Once.get returned) ;
-          (* The timer of the grace: run waits in its grace. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: grace_g) ;
-          Fun.Async.cancel caller ;
-          within_2s (fun () ->
-              raises Fun.Async.Cancelled (fun () -> Fun.Async.get caller) ) ) ]
+          wait returned ;
+          (* run waits in its grace. *)
+          is_false ~msg:"run is in its grace" (Sim_support.ended sim caller) ;
+          Sim_support.cancel caller ;
+          raises Promise.Cancelled (fun () -> await caller) ;
+          is_true ~msg:"the body got the cancel" (is_set cancelled) ;
+          equal Server_support.span ~msg:"at once" Span.zero
+            (Time.diff Mono (Time.now Mono) t0) ) ]
 
 let () =
   exit
-    (run "client"
+    (Windtrap.run "client"
        [ exchange_tests
        ; resolver_tests
        ; pool_tests
        ; pool_stateful
        ; api_tests
-       ; fake_time_tests ] )
+       ; timed_tests ] )

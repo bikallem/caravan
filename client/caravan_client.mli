@@ -1,7 +1,7 @@
 (** An HTTP/1.1 client for caravan servers and programs.
 
     {[
-    Affect_unix.Unix.main
+    Weft_linux.run
     @@ fun () ->
     Caravan_client.run
     @@ fun client ->
@@ -20,26 +20,30 @@
     Version 1 sends HTTP/1.1 over TCP to [http] URLs only. It has no TLS, no
     proxy support, no redirects, no cookies and no content codings.
 
+    Code that uses the client runs in a weft fiber.
+
     Limits:
-    - A system thread does each DNS lookup. A lookup cannot stop before
-      [getaddrinfo] returns. With 2 or more domains, [Affect_unix.Unix.main]
-      waits for a lookup thread that runs at its end.
-    - The client uses [Fun.Async.mask_cancellation]. In affect, a mask does not
-      nest: a call of the client inside a masked region of the caller ends the
-      mask of the caller. *)
+    - Weft does each DNS lookup on the name pool of the world. The pool does 8
+      lookups at a time, and the other lookups wait in a queue. A cancel or the
+      connect timeout ends the wait at once. The lookup continues in its thread
+      until getaddrinfo returns. [Weft_linux.run] does not wait for such a
+      lookup at its end, because a lookup holds no fd. *)
 
 module Config : sig
+  (** All the time limits are on the [Mono] clock of the world. *)
   type t = Config.t =
-    { connect_timeout: Affect_unix.Mtime.Span.t
+    { connect_timeout: Weft.Span.t
           (** The time limit of the lookup and all the connects. *)
-    ; response_timeout: Affect_unix.Mtime.Span.t
+    ; response_timeout: Weft.Span.t
           (** The time limit from the end of the request to the end of the
               response head. *)
-    ; read_timeout: Affect_unix.Mtime.Span.t
-          (** The time limit of each read of the body. *)
-    ; write_timeout: Affect_unix.Mtime.Span.t
-          (** The time limit of each write. *)
-    ; idle_timeout: Affect_unix.Mtime.Span.t
+    ; read_timeout: Weft.Span.t
+          (** The time limit of each read of the body that waits, from the start
+              of its first wait. *)
+    ; write_timeout: Weft.Span.t
+          (** The time limit of each write of the request that waits, from the
+              start of its first wait. A write of many bytes is one write. *)
+    ; idle_timeout: Weft.Span.t
           (** The time that an idle connection stays in the pool. A timer of the
               client closes older idle connections each half of this time, but
               not more often than each 10 ms. A checkout does not take one. *)
@@ -48,22 +52,15 @@ module Config : sig
     ; max_status_line: int  (** The size limit of the status line. *)
     ; max_header_bytes: int  (** The size limit of the response fields. *)
     ; max_header_count: int  (** The limit of the number of response fields. *)
-    ; close_grace: Affect_unix.Mtime.Span.t
+    ; close_grace: Weft.Span.t
           (** The time that {!run} gives to the request bodies that still go at
               its end, before it cancels them. A grace of about 292 years or
-              more never ends. *)
-    ; mono_time: Caravan.Time.mono
-          (** The monotonic time line of the client: the time line of its
-              connections and their deadlines, the connect timeout, the age of
-              the idle connections, the timer that closes them and the close
-              grace. Its clock must be monotonic. Tests give a fake time line.
-              An exchange computes its deadlines with {!Caravan.Flow.time} of
-              its connection. *) }
+              more never ends. *) }
 
   val default : t
-  (** [default] has the limits 10 s (connect), 30 s (response, read, write), 5 s
-      (idle), 8 idle connections, 8 KiB, 64 KiB, 200 fields, 5 s (close grace)
-      and {!Caravan.Time.mono}. *)
+  (** [default] has the time limits 10 s (connect), 30 s (response, read,
+      write), 5 s (idle) and 5 s (close grace). It keeps 8 idle connections for
+      each host and port. Its size limits are 8 KiB, 64 KiB and 200 fields. *)
 end
 
 (** The type for errors. *)
@@ -83,16 +80,21 @@ exception Error of error
 (** The type for clients. *)
 type t
 
-val make : ?config:Config.t -> unit -> t
-(** [make ~config ()] is a client. It must run inside the affect runtime. It
-    starts two fibers, children of the fiber that calls [make]: one writes the
-    request bodies, and a timer closes old idle connections. Thus the fiber that
-    calls [make] returns only after {!close}. Use {!run} if possible.
+val make : ?config:Config.t -> Weft.Fiber.scope -> t
+(** [make ~config sw] is a client in the scope [sw]. It forks one daemon fiber
+    in [sw]. That fiber runs the scope of the client: the writers of request
+    bodies and the timer that closes old idle connections. {!close} ends it.
 
-    Make one client for a program, outside the handlers of a server, for example
-    with {!run} around [Server.start]. Do not make it in [on_start] of
-    [Server.run]: nothing then closes it, and [Server.run] does not return. A
-    client is for one [Affect_unix.Unix.main] only. *)
+    If all the other fibers of [sw] end first, [sw] cancels the daemon. Then the
+    client closes as with {!close}: request bodies that still go stop with no
+    grace. [make] waits until the daemon starts, so it is a cancellation point.
+    A client is for one weft run only. Use {!run} if possible.
+
+    Make one client for a program, outside the handlers of a server. A program
+    that runs a server and a client makes the two in one [Fiber.scope] inside
+    [Weft_linux.run]. [Caravan_run.run] gives no scope to [on_start].
+
+    @raise Weft.Fiber.Scope_closed if [sw] ended or is cancelled. *)
 
 val run : ?config:Config.t -> (t -> 'a) -> 'a
 (** [run ~config f] makes a client, calls [f] with it, and closes it, also when
@@ -100,18 +102,26 @@ val run : ?config:Config.t -> (t -> 'a) -> 'a
     its response ended first. [run] waits for such bodies for at most
     [config.close_grace], then cancels them and returns. During this time, a new
     {!request} raises [Invalid_argument] before a connect (a request that starts
-    at the same time as the grace can connect first), and no retry occurs. A
-    cancel of the caller ends the wait at once, and [run] then raises
-    [Cancelled]. *)
+    at the same time as the grace can connect first), and no retry occurs. [run]
+    makes its own scope. A cancel of the caller ends the grace at once, and
+    [run] then raises [Weft.Fiber.Cancelled].
+
+    @raise Weft.Fiber.Cancelled
+      if the caller is cancelled, also before the client starts. *)
 
 val close : t -> unit
 (** [close t] closes [t] at once: its connections close, and the writers of
     request bodies stop. A request body that still goes, for example after its
-    response ended, stops without an error to the caller, and the server gets a
-    truncated body. {!run} gives such bodies a grace time first. A request in
-    progress gets [Error Closed], [Error Truncated], [Error (Bad_response _)]
-    for a part of a head, or [Invalid_argument]. A later {!request} raises
-    [Invalid_argument]. *)
+    response ended, stops without an error to the caller. The server then gets a
+    truncated body. {!run} gives such bodies a grace time first.
+
+    A request in progress gets [Error Closed], [Error Truncated],
+    [Error (Bad_response _)] for a part of a head, or [Invalid_argument]. A
+    later {!request} raises [Invalid_argument]. A cancelled caller gets
+    [Weft.Fiber.Cancelled].
+
+    [close] does no sync, so a cancelled fiber can call it. Call it from fiber
+    code. *)
 
 val request : t -> Caravan.Request.t -> Caravan.Response.t
 (** [request t req] sends [req] and gives the response when its head comes:
@@ -155,8 +165,14 @@ val request : t -> Caravan.Request.t -> Caravan.Response.t
       connection: nothing went. If the caller is cancelled at a different time,
       the request body continues until the response body closes (or, after a
       deferred release, until its producer ends), or until the client closes.
-    - If the producer or the close of the request body raises [Cancelled] of a
-      different call, the caller gets [Failure]: the caller is not cancelled.
+    - The producer or the close of the request body can raise
+      [Weft.Fiber.Cancelled] of a different scope. Then the caller gets
+      [Failure], because the caller is not cancelled.
+    - A cancelled caller gets [Weft.Fiber.Cancelled] in place of the
+      [Invalid_argument] of a closed client. This is also true if the client
+      closes at the same time, for example at a cancel of the caller of {!run}.
+      A bad request, for example a request with no authority, gives
+      [Invalid_argument] also to a cancelled caller.
 
     @raise Error for the errors of the network and of the server.
     @raise Invalid_argument
@@ -196,5 +212,5 @@ module Private : sig
 
   val parse_url : string -> string * string
 
-  val reap_interval : Config.t -> Affect_unix.Mtime.Span.t
+  val reap_interval : Config.t -> Weft.Span.t
 end

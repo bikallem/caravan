@@ -1,13 +1,12 @@
 type t =
   { id: int
-  ; peer: Unix.sockaddr
-  ; local: Unix.sockaddr
+  ; peer: Weft.Net.addr
+  ; local: Weft.Net.addr
   ; scheme: [`Http | `Https]
   ; alpn: string option
-  ; stopping: unit Affect.Action.t }
+  ; stopping: unit Weft.event }
 
-let make ~id ~peer ~local ?(scheme = `Http) ?alpn
-    ?(stopping = Affect.Action.never) () =
+let make ~id ~peer ~local ?(scheme = `Http) ?alpn ?(stopping = Weft.never) () =
   {id; peer; local; scheme; alpn; stopping}
 
 let id c = c.id
@@ -23,12 +22,11 @@ let alpn c = c.alpn
 let stopping c = c.stopping
 
 let pp_addr ppf = function
-  | Unix.ADDR_UNIX path ->
+  | Weft.Net.Unix path ->
       Format.pp_print_string ppf path
-  | Unix.ADDR_INET (a, port) ->
-      let a = Unix.string_of_inet_addr a in
-      if String.contains a ':' then Format.fprintf ppf "[%s]:%d" a port
-      else Format.fprintf ppf "%s:%d" a port
+  | Weft.Net.Tcp (host, port) ->
+      if String.contains host ':' then Format.fprintf ppf "[%s]:%d" host port
+      else Format.fprintf ppf "%s:%d" host port
 
 let pp ppf c =
   Format.fprintf ppf "#%d %a -> %a" c.id pp_addr c.peer pp_addr c.local

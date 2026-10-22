@@ -13,7 +13,7 @@ depends: [
   "ocaml" {>= "5.5.0"}
   "affect" {>= "0.0.0"}
   "http-date" {>= "0.2"}
-  "weft" {with-test}
+  "weft"
   "windtrap" {with-test & >= "0.2.0"}
   "ppx_windtrap" {with-test & >= "0.2.0"}
   "odoc" {with-doc}

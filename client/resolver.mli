@@ -1,23 +1,14 @@
-(* Internal. Host names to addresses, without a block of the domain. *)
-
-val threads_started : int Atomic.t
-(* The number of lookup threads, for tests. *)
+(* Internal. Host names to addresses. *)
 
 val numeric : string -> string option
 (* [numeric host] is the address of a numeric host as text: IPv4 in dotted
    decimal, or IPv6, with or without brackets. Else it gives [None]. It accepts
    the same texts as inet_pton, and it does no lookup. *)
 
-val resolve :
-     ?getaddrinfo:
-       (string -> string -> Unix.getaddrinfo_option list -> Unix.addr_info list)
-  -> host:string
-  -> port:int
-  -> unit
-  -> Unix.sockaddr list
-(* [resolve ~host ~port ()] are the addresses of [host]. A numeric host (see
-   {!numeric}) gives its address at once. Else a system thread calls
-   [getaddrinfo]. At most 16 fibers wait for a lookup at the same time. A lookup
-   cannot stop before getaddrinfo returns: with 2 or more domains,
-   Affect_unix.Unix.main waits for a lookup thread that runs at its end. @raise
-   Error.Error (Connect _) if the host has no address. *)
+val resolve : string -> string list
+(* [resolve host] gives the addresses of [host] as text, in the order of the
+   lookup, each one time. A numeric host (see {!numeric}) gives its address at
+   once. Else Weft.Dns.resolve does the lookup on the name pool of the world. It
+   is a cancellation point: a cancel ends the wait at once, but the lookup
+   continues in its thread until getaddrinfo returns. @raise Error.Error
+   (Connect _) if the host has no address, or if the lookup fails. *)

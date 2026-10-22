@@ -1,63 +1,71 @@
-(** TCP connections as {!Flow.t} values, and listening sockets.
+(** TCP and Unix stream connections as {!Flow.t} values, and listening sockets.
 
-    All waiting is cooperative, through affect: a blocked read, write, connect
-    or accept suspends only the asynchronous function that makes it. *)
+    All waits are weft events. A read, a write, a connect or an accept that
+    waits suspends only its fiber. *)
 
-val flow : ?time:Time.mono -> Unix.file_descr -> Flow.t
-(** [flow ~time fd] is the flow of the connected, non-blocking socket [fd]:
-    - Its deadlines are on the time line [time] (default: {!Time.mono}).
-    - Reads and writes wait cooperatively when the socket is not ready, and
-      raise {!Flow.Timeout} if the flow's deadline passes first.
-    - A reset or broken connection raises {!Flow.Closed}.
-    - Each read and write first checks whether the calling asynchronous function
-      is cancelled, and raises {!Affect.Fun.Async.Cancelled} if so: a socket
-      that is always ready would otherwise never notice.
-    - {!Flow.shutdown_send} half-closes the socket and {!Flow.close} closes it.
-      A read or a write that waits in a different fiber then raises
-      {!Flow.Closed}. The socket closes when no read or write uses it, thus a
-      fiber cannot use the socket of a different connection. *)
+val flow : Weft.Net.t -> Flow.t
+(** [flow s] is the flow of the connected socket [s]. The flow owns [s]:
+    {!Flow.close} closes it.
+    - Reads and writes wait for the socket when it is not ready. A read or a
+      write that waits raises {!Flow.Timeout} at the earlier of the deadline of
+      the flow ({!Flow.set_read_deadline}) and the deadline of the call. The
+      deadline of the call is the time of its first wait plus the timeout of the
+      flow ({!Flow.set_read_timeout}). The deadlines are on the [Mono] line of
+      [Weft.Time].
+    - A reset or a broken connection raises {!Flow.Closed}. Other errors of the
+      socket raise [Weft.Net.Error].
+    - Each read and write is first a cancellation point: if the fiber is
+      cancelled, it raises [Weft.Fiber.Cancelled]. Without this, a read of a
+      socket that is always ready never sees the cancel, because a weft read
+      with data does not sync.
+    - {!Flow.shutdown_send} ends the send side, and {!Flow.close} closes the
+      socket. A read or a write that waits in another fiber then raises
+      {!Flow.Closed}. weft closes the fd only when no operation uses it.
 
-val connect : ?time:Time.mono -> Unix.sockaddr -> Flow.t
-(** [connect ~time addr] connects to [addr] and is the connection's flow. Its
-    deadlines are on the time line [time] (default: {!Time.mono}).
+    The functions of the flow need a weft fiber. *)
 
-    @raise Unix.Unix_error
-      if the connection fails, for example with [ECONNREFUSED]. *)
+val connect : Weft.Net.addr -> Flow.t
+(** [connect addr] connects to [addr] and gives the flow of the connection. A
+    TCP connection has [TCP_NODELAY]. The connect has no deadline: put
+    [Weft.Fiber.with_timeout] around it. On each exception, also a cancel, no
+    socket stays open.
+
+    @raise Weft.Net.Error if the connect gives an error, for example [Refused].
+*)
 
 (** Listening sockets. *)
 module Listener : sig
   (** The type for listening sockets. *)
   type t
 
-  val listen : ?backlog:int -> Unix.sockaddr -> t
-  (** [listen ~backlog addr] binds a socket to [addr], with [SO_REUSEADDR], and
-      listens on it with a queue of [backlog] connections (default 1024). Bind
-      to port [0] to get a free port, see {!addr}.
+  val listen : ?backlog:int -> Weft.Net.addr -> t
+  (** [listen ~backlog addr] listens on [addr], with a queue of [backlog]
+      connections (default 1024). A TCP listener has [SO_REUSEADDR]. Listen on
+      port [0] to get a free port, see {!addr}.
 
-      @raise Unix.Unix_error if the address cannot be bound. *)
+      @raise Weft.Net.Error if the address cannot be used, for example [In_use].
+  *)
 
-  val addr : t -> Unix.sockaddr
-  (** [addr l] is the address [l] is bound to, with its actual port. *)
+  val addr : t -> Weft.Net.addr
+  (** [addr l] is the address of [l], with its port. It is the value at the
+      listen, so it stays the same after {!close}. *)
 
-  val accept : t -> Unix.file_descr * Unix.sockaddr
-  (** [accept l] waits for a connection on [l] and is its socket, made
-      non-blocking and close-on-exec, with [TCP_NODELAY] on inet sockets, and
-      the peer's address. *)
+  val accept : t -> Weft.Net.t * Weft.Net.addr
+  (** [accept l] waits for a connection on [l], and gives its socket and the
+      address of the client. The socket of a TCP connection has [TCP_NODELAY].
+      The wait is a cancellation point. The caller owns the socket. No sync
+      occurs between the accept of the socket and the return, so a cancel cannot
+      lose the socket. Take the ownership with no sync between, for example with
+      a [Fun.protect] at once.
 
-  val try_accept : t -> (Unix.file_descr * Unix.sockaddr) option
-  (** [try_accept l] is like {!accept} but does not wait: it is [None] if no
-      connection is pending, or if the one accepted could not be set up, in
-      which case it is closed.
-
-      @raise Unix.Unix_error
-        as accept(2) does, which includes errors of the pending connection that
-        callers should retry on. *)
-
-  val wait_acceptable : t -> 'tag -> 'tag Affect.Action.t
-  (** [wait_acceptable l tag] is an action enabled with [tag] when {!accept}
-      would probably not wait. It can be enabled spuriously: follow it with
-      {!try_accept}. *)
+      @raise Weft.Net.Error
+        with [Bad_fd] if [l] is closed, also by another fiber during the wait.
+        It raises [No_resources _] if the process has no free fd (the connection
+        stays in the queue, see [Accept_error]), and the other errors of
+        accept(2). *)
 
   val close : t -> unit
-  (** [close l] stops listening. *)
+  (** [close l] stops the listen. A waiting {!accept} raises
+      [Weft.Net.Error (Bad_fd, _)]. The connections in the queue get a reset. A
+      second close does nothing. It never waits. *)
 end

@@ -352,30 +352,36 @@ module Date = Private.Date
 
 let http_date = Testable.structural ~pp:Http_date.pp
 
-let max_time = 253402300799 (* 9999-12-31T23:59:59Z *)
+(* The last whole second of [Clock.posix]: Fri, 11 Apr 2262 23:47:16 GMT. *)
+let max_time = 9223372036
+
+let posix t = Weft.Time.posix_of_unix_s t
+
+(* The date of the POSIX time [t], in seconds. *)
+let date_of t = Date.of_utc (Weft.Time.to_utc (posix t))
+
+let enc t = Http_date.encode (date_of t)
 
 let date_tests =
   group "Date"
     [ test "known dates" (fun () ->
-          let enc t = Http_date.encode (Date.of_unix_time t) in
           expect (enc 0.) @@ __POS_OF__ {|Thu, 01 Jan 1970 00:00:00 GMT|} ;
           expect (enc 784111777.)
           @@ __POS_OF__ {|Sun, 06 Nov 1994 08:49:37 GMT|} ;
           expect (enc 951782400.)
           @@ __POS_OF__ {|Tue, 29 Feb 2000 00:00:00 GMT|} ;
           expect (enc (Float.of_int max_time))
-          @@ __POS_OF__ {|Fri, 31 Dec 9999 23:59:59 GMT|} )
+          @@ __POS_OF__ {|Fri, 11 Apr 2262 23:47:16 GMT|} ;
+          (* In the first second of the range of [Clock.posix]. *)
+          expect (enc (-9223372036.5))
+          @@ __POS_OF__ {|Tue, 21 Sep 1677 00:12:43 GMT|} )
     ; test "fractions of a second are dropped" (fun () ->
-          equal http_date
-            (Date.of_unix_time 784111777.)
-            (Date.of_unix_time 784111777.9) )
+          equal http_date (date_of 784111777.) (date_of 784111777.9) )
     ; prop "encoding decodes to the same date" (Gen.int_range 0 max_time)
         (fun t ->
-          let d = Date.of_unix_time (Float.of_int t) in
+          let d = date_of (Float.of_int t) in
           equal http_date d (Http_date.decode (Http_date.encode d)) )
     ; test "of_posix caches one string per second" (fun () ->
-          let enc t = Http_date.encode (Date.of_unix_time t) in
-          let posix t = Option.get (Affect_unix.Ptime.of_float_s t) in
           let a = Date.of_posix (posix 1000.) in
           let b = Date.of_posix (posix 1000.5) in
           equal string (enc 1000.) a ;
@@ -383,7 +389,6 @@ let date_tests =
           equal string (enc 1001.) (Date.of_posix (posix 1001.)) ;
           equal string (enc 1000.) (Date.of_posix (posix 1000.)) )
     ; test "of_posix drops the fraction of a time before 1970" (fun () ->
-          let posix t = Option.get (Affect_unix.Ptime.of_float_s t) in
           equal string "Thu, 01 Jan 1970 00:00:00 GMT"
             (Date.of_posix (posix 0.5)) ;
           equal string "Wed, 31 Dec 1969 23:59:59 GMT"
@@ -392,36 +397,72 @@ let date_tests =
             (Date.of_posix (posix (-1.))) )
     ; test "of_posix drops a fraction near 1 s" (fun () ->
           (* 100 ns before midnight: a float rounds it up to the next second. *)
-          let p =
-            Affect_unix.Ptime.(
-              Option.get (of_span (Span.v (20500, 86_399_999_999_900_000L))) )
+          let second =
+            Weft.Time.of_utc
+              { year= 2026
+              ; month= 2
+              ; day= 16
+              ; hour= 23
+              ; minute= 59
+              ; second= 59
+              ; weekday= 0 }
           in
-          equal string "Mon, 16 Feb 2026 23:59:59 GMT" (Date.of_posix p) ) ]
+          let p =
+            Weft.Time.add Posix (Option.get second) (Weft.Span.ns 999_999_900)
+          in
+          equal string "Mon, 16 Feb 2026 23:59:59 GMT"
+            (Date.of_posix (Option.get p)) ) ]
 
 (* Flow *)
 
-(* Reads [flow] to the end, [size] bytes at a time. *)
-let read_all ?(size = 4096) flow =
-  let buf = Bytes.create size and out = Buffer.create 64 in
-  let rec loop () =
-    match Flow.read flow buf 0 size with
-    | 0 ->
-        Buffer.contents out
-    | n ->
-        Buffer.add_subbytes out buf 0 n ;
-        loop ()
-  in
-  loop ()
+let read_all = Server_support.read_all
 
-let in_main f = Affect_unix.Unix.main ~domain_count:1 f
+(* [readable_before_20ms flow] is [true] if [readable flow] is ready before 20
+   ms of virtual time. *)
+let readable_before_20ms flow =
+  Weft.(
+    sync
+      (choose
+         [ wrap (Flow.readable flow) (fun () -> true)
+         ; wrap (Time.after Mono (Span.ms 20)) (fun () -> false) ] ) )
 
-let readable_within_20ms flow =
-  in_main
-  @@ fun () ->
-  Affect.Action.invoke
-    (Affect.Action.choose
-       [ Flow.readable' flow true
-       ; Affect_unix.Mtime.wait_for' Affect_unix.Mtime.Span.(20 * ms) false ] )
+(* A flow for the tests of [Flow]. Each function that the test does not give
+   does nothing: a read gives 0 (the end of the stream), and [readable] is ready
+   at once. *)
+let fake_flow ?(read = fun _ _ _ -> 0) ?(read_now = fun _ _ _ -> Some 0)
+    ?(write = fun _ _ _ -> ()) ?(readable = Weft.always ())
+    ?(shutdown_send = ignore) ?(close = ignore) ?reset ?set_read_timeout
+    ?set_write_timeout () =
+  Flow.make ~read ~read_now ~write ~readable ~shutdown_send ~close ?reset
+    ~set_read_deadline:ignore ~set_write_deadline:ignore ?set_read_timeout
+    ?set_write_timeout ()
+
+(* [timeout_text name d] is the log line of a set of the timeout [name] to
+   [d]. *)
+let timeout_text name = function
+  | None ->
+      name ^ " none"
+  | Some d ->
+      Format.asprintf "%s %a" name Weft.Span.pp d
+
+(* A fake flow that logs its timeouts, its shutdown and its reads in [log]. If
+   [read_error] has a value, a read raises it. If not, a read gives at most 2
+   bytes of [input] and removes them from [input]. *)
+let logged_flow ?(input = ref "") ?read_error log =
+  let note s = log := s :: !log in
+  fake_flow
+    ~read:(fun buf off len ->
+      Option.iter raise read_error ;
+      let n = Int.min (Int.min len 2) (String.length !input) in
+      Bytes.blit_string !input 0 buf off n ;
+      input := String.sub !input n (String.length !input - n) ;
+      note (Printf.sprintf "read %d" n) ;
+      n )
+    ~read_now:(fun _ _ _ -> None)
+    ~shutdown_send:(fun () -> note "shutdown")
+    ~set_read_timeout:(fun d -> note (timeout_text "rt" d))
+    ~set_write_timeout:(fun d -> note (timeout_text "wt" d))
+    ()
 
 let flow_tests =
   group "Flow"
@@ -459,12 +500,10 @@ let flow_tests =
             [Some 2; Some 1; Some 0]
             (List.init 3 (fun _ -> Flow.read_now f buf 0 4)) ;
           let nothing =
-            Flow.make ~time:Time.mono
+            fake_flow
               ~read:(fun _ _ _ -> failwith "blocking read")
               ~read_now:(fun _ _ _ -> None)
-              ~write:(fun _ _ _ -> ())
-              ~readable:Affect.Action.never ~shutdown_send:ignore ~close:ignore
-              ~set_read_deadline:ignore ~set_write_deadline:ignore ()
+              ~readable:Weft.never ()
           in
           let p = Flow.prepend "x" nothing in
           equal
@@ -482,13 +521,7 @@ let flow_tests =
         (fun () ->
           let log = ref [] in
           let flow ?reset () =
-            Flow.make ~time:Time.mono
-              ~read:(fun _ _ _ -> 0)
-              ~read_now:(fun _ _ _ -> Some 0)
-              ~write:(fun _ _ _ -> ())
-              ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
-              ~close:(fun () -> log := "close" :: !log)
-              ?reset ~set_read_deadline:ignore ~set_write_deadline:ignore ()
+            fake_flow ~close:(fun () -> log := "close" :: !log) ?reset ()
           in
           let f = flow ~reset:(fun () -> log := "reset" :: !log) () in
           Flow.reset f ;
@@ -502,73 +535,66 @@ let flow_tests =
     ; test "linger sends the end of the stream, then discards at most max bytes"
         (fun () ->
           let log = ref [] and input = ref "abcdef" in
-          let flow ?read_error () =
-            Flow.make ~time:Time.mono
-              ~read:(fun buf off len ->
-                Option.iter raise read_error ;
-                let n = Int.min (Int.min len 2) (String.length !input) in
-                Bytes.blit_string !input 0 buf off n ;
-                input := String.sub !input n (String.length !input - n) ;
-                log := Printf.sprintf "read %d" n :: !log ;
-                n )
-              ~read_now:(fun _ _ _ -> None)
-              ~write:(fun _ _ _ -> ())
-              ~readable:(Affect.Action.always ())
-              ~shutdown_send:(fun () -> log := "shutdown" :: !log)
-              ~close:ignore ~set_read_deadline:ignore ~set_write_deadline:ignore
-              ()
-          in
+          let flow ?read_error () = logged_flow ~input ?read_error log in
           Flow.linger (flow ()) ~max:3 ;
-          equal (list string) ["shutdown"; "read 2"; "read 1"] (List.rev !log) ;
+          equal (list string)
+            ["rt none"; "shutdown"; "read 2"; "read 1"]
+            (List.rev !log) ;
           equal string "def" !input ;
           log := [] ;
           Flow.linger (flow ()) ~max:100 ;
           equal (list string) ~msg:"until the end of the stream"
-            ["shutdown"; "read 2"; "read 1"; "read 0"]
+            ["rt none"; "shutdown"; "read 2"; "read 1"; "read 0"]
             (List.rev !log) ;
           List.iter
             (fun e -> Flow.linger (flow ~read_error:e ()) ~max:100)
             [Flow.Timeout; Flow.Closed] ;
-          raises Affect.Fun.Async.Cancelled (fun () ->
+          raises (Weft.Fiber.Cancelled Exit) (fun () ->
               Flow.linger
-                (flow ~read_error:Affect.Fun.Async.Cancelled ())
+                (flow ~read_error:(Weft.Fiber.Cancelled Exit) ())
                 ~max:100 ) ;
           let f = flow () in
           Flow.close f ;
           log := [] ;
           Flow.linger f ~max:100 ;
-          equal (list string) ~msg:"a closed flow" [] !log )
+          equal (list string) ~msg:"a closed flow: no shutdown and no read"
+            ["rt none"] !log )
     ; test "close is idempotent and later use raises Closed" (fun () ->
           let closes = ref 0 in
-          let flow =
-            Flow.make ~time:Time.mono
-              ~read:(fun _ _ _ -> 0)
-              ~read_now:(fun _ _ _ -> Some 0)
-              ~write:(fun _ _ _ -> ())
-              ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
-              ~close:(fun () -> incr closes)
-              ~set_read_deadline:ignore ~set_write_deadline:ignore ()
-          in
+          let flow = fake_flow ~close:(fun () -> incr closes) () in
           Flow.close flow ;
           Flow.close flow ;
           equal int 1 !closes ;
           raises Flow.Closed (fun () -> Flow.read flow (Bytes.create 1) 0 1) ;
           raises Flow.Closed (fun () -> Flow.write_string flow "x") )
+    ; test "write rejects an invalid range before the write of the flow"
+        (fun () ->
+          let writes = ref 0 in
+          let flow = fake_flow ~write:(fun _ _ _ -> incr writes) () in
+          let buf = Bytes.create 4 in
+          List.iter
+            (fun (off, len) ->
+              raises_match is_invalid_arg (fun () ->
+                  Flow.write flow buf off len ) )
+            [(-1, 2); (0, 5); (3, 2); (2, -1)] ;
+          equal int ~msg:"no write of the flow" 0 !writes )
     ; test "make delegates to its functions" (fun () ->
           let log = ref [] in
           let note s = log := s :: !log in
           let flow =
-            Flow.make ~time:Time.mono
+            Flow.make
               ~read:(fun buf off _ -> note "read" ; Bytes.set buf off 'a' ; 1)
               ~read_now:(fun _ _ _ -> note "read_now" ; None)
               ~write:(fun _ _ len -> note (Printf.sprintf "write %d" len))
-              ~readable:(Affect.Action.always ())
+              ~readable:(Weft.always ())
               ~shutdown_send:(fun () -> note "shutdown")
               ~close:(fun () -> note "close")
               ~set_read_deadline:(fun d ->
                 note (if d = None then "rd none" else "rd") )
               ~set_write_deadline:(fun d ->
                 note (if d = None then "wd none" else "wd") )
+              ~set_read_timeout:(fun d -> note (timeout_text "rt" d))
+              ~set_write_timeout:(fun d -> note (timeout_text "wt" d))
               ()
           in
           equal int 1 (Flow.read flow (Bytes.create 1) 0 1) ;
@@ -578,6 +604,10 @@ let flow_tests =
           Flow.shutdown_send flow ;
           Flow.set_read_deadline flow None ;
           Flow.set_write_deadline flow None ;
+          Flow.set_read_timeout flow (Some (Weft.Span.s 5)) ;
+          Flow.set_write_timeout flow (Some (Weft.Span.ms 7)) ;
+          Flow.set_read_timeout flow None ;
+          Flow.set_write_timeout flow None ;
           Flow.close flow ;
           equal (list string)
             [ "read"
@@ -586,6 +616,10 @@ let flow_tests =
             ; "shutdown"
             ; "rd none"
             ; "wd none"
+            ; "rt 5000000000ns"
+            ; "wt 7000000ns"
+            ; "rt none"
+            ; "wt none"
             ; "close" ]
             (List.rev !log) )
     ; test "prepend reads its bytes first" (fun () ->
@@ -602,39 +636,43 @@ let flow_tests =
     ; test "prepend passes shutdown and close to the flow" (fun () ->
           let log = ref [] in
           let flow =
-            Flow.make ~time:Time.mono
-              ~read:(fun _ _ _ -> 0)
-              ~read_now:(fun _ _ _ -> Some 0)
-              ~write:(fun _ _ _ -> ())
-              ~readable:(Affect.Action.always ())
+            fake_flow
               ~shutdown_send:(fun () -> log := "shutdown" :: !log)
               ~close:(fun () -> log := "close" :: !log)
-              ~set_read_deadline:ignore ~set_write_deadline:ignore ()
+              ()
           in
           let p = Flow.prepend "x" flow in
           Flow.shutdown_send p ;
           Flow.close p ;
           equal (list string) ["shutdown"; "close"] (List.rev !log) ;
           let f = Flow.of_string "" (Buffer.create 0) in
-          Flow.set_read_deadline f (Some (Affect_unix.Mtime.now ())) ;
+          let now = Sim_support.run (fun _ -> Weft.Time.now Mono) in
+          Flow.set_read_deadline f (Some now) ;
           Flow.set_write_deadline f None ;
           Flow.shutdown_send f ;
           equal int 0 (Flow.read f (Bytes.create 1) 0 1) )
+    ; test "prepend gives the timeouts to the flow" (fun () ->
+          let log = ref [] in
+          let p = Flow.prepend "x" (logged_flow log) in
+          Flow.set_read_timeout p (Some (Weft.Span.s 1)) ;
+          Flow.set_write_timeout p (Some (Weft.Span.s 2)) ;
+          equal (list string)
+            ["rt 1000000000ns"; "wt 2000000000ns"]
+            (List.rev !log) )
     ; test "prepend is readable while its bytes remain" (fun () ->
-          let never =
-            Flow.make ~time:Time.mono
-              ~read:(fun _ _ _ -> 0)
-              ~read_now:(fun _ _ _ -> Some 0)
-              ~write:(fun _ _ _ -> ())
-              ~readable:Affect.Action.never ~shutdown_send:ignore ~close:ignore
-              ~set_read_deadline:ignore ~set_write_deadline:ignore ()
-          in
-          let flow = Flow.prepend "a" never in
-          is_true ~msg:"readable before the prefix is read"
-            (readable_within_20ms flow) ;
+          let flow = Flow.prepend "a" (fake_flow ~readable:Weft.never ()) in
+          Sim_support.manual
+          @@ fun sim ->
+          Weft.Fiber.scope
+          @@ fun s ->
+          let c = Sim_support.call s (fun () -> readable_before_20ms flow) in
+          is_true ~msg:"ready at once before the prefix is read"
+            (Sim_support.ended sim c && Sim_support.await c) ;
           equal int 1 (Flow.read flow (Bytes.create 4) 0 4) ;
-          is_true ~msg:"waits on the underlying flow after"
-            (not (readable_within_20ms flow)) )
+          let t0 = Weft.(Time.now Mono) in
+          let c = Sim_support.call s (fun () -> readable_before_20ms flow) in
+          equal bool ~msg:"waits for the inner flow after" false
+            (Sim_support.ends_at sim ~t0 (Weft.Span.ms 20) c) )
     ; prop "reads return the input however it is split"
         Gen.(
           pair
@@ -649,6 +687,96 @@ let flow_tests =
                  (Buffer.create 0) )
           in
           equal string input (read_all ~size flow) ) ]
+
+(* Deadline *)
+
+module Deadline = Private.Deadline
+
+(* [same a b] is [true] iff the two deadlines are the same time, or are both
+   [None]. It does not use [Deadline.equal], which a test examines. *)
+let same a b =
+  match (a, b) with
+  | None, None ->
+      true
+  | Some a, Some b ->
+      Weft.(Span.equal (Time.diff Mono a b) Span.zero)
+  | _ ->
+      false
+
+(* The printer runs in the fiber of the test. It gives a time as its distance
+   from the time now. *)
+let deadline =
+  Testable.make
+    ~pp:(fun ppf -> function
+      | None ->
+          Format.pp_print_string ppf "None"
+      | Some d ->
+          Format.fprintf ppf "Some (now + %a)" Weft.Span.pp
+            Weft.(Time.diff Mono d (Time.now Mono)) )
+    ~equal:same
+
+let deadline_tests =
+  let open Weft in
+  let open Sim_support in
+  group "Deadline"
+    [ test "from_now is the time now plus the span" (fun () ->
+          manual
+          @@ fun sim ->
+          advance sim (Span.s 3) ;
+          let t0 = Time.now Mono in
+          equal deadline (Some (t0 +: Span.s 5)) (Deadline.from_now (Span.s 5)) ;
+          equal deadline ~msg:"an overflow is no deadline" None
+            (Deadline.from_now (Span.of_ns Int64.max_int)) )
+    ; test "has_passed is true from the deadline on" (fun () ->
+          manual
+          @@ fun sim ->
+          let t0 = Time.now Mono in
+          let d = Some (t0 +: Span.s 1) in
+          holds_from sim ~t0 (Span.s 1) ~what:"has_passed" (fun () ->
+              Deadline.has_passed d ) ;
+          advance sim (Span.s 1) ;
+          is_true ~msg:"after the deadline" (Deadline.has_passed d) ;
+          is_false ~msg:"no deadline" (Deadline.has_passed None) )
+    ; test "equal compares the times" (fun () ->
+          manual
+          @@ fun _ ->
+          let t0 = Time.now Mono in
+          let t1 = t0 +: Span.ns 1 in
+          is_true (Deadline.equal None None) ;
+          is_true (Deadline.equal (Some t1) (Some (t0 +: Span.ns 1))) ;
+          is_false (Deadline.equal (Some t0) (Some t1)) ;
+          is_false (Deadline.equal (Some t1) (Some t0)) ;
+          is_false (Deadline.equal None (Some t0)) ;
+          is_false (Deadline.equal (Some t0) None) )
+    ; test "earlier gives the earlier time, and None is the latest" (fun () ->
+          manual
+          @@ fun _ ->
+          let t0 = Time.now Mono in
+          let t1 = t0 +: Span.ns 1 in
+          equal deadline (Some t0) (Deadline.earlier (Some t0) (Some t1)) ;
+          equal deadline (Some t0) (Deadline.earlier (Some t1) (Some t0)) ;
+          equal deadline (Some t1) (Deadline.earlier None (Some t1)) ;
+          equal deadline (Some t1) (Deadline.earlier (Some t1) None) ;
+          equal deadline None (Deadline.earlier None None) )
+    ; test "at is ready at its deadline, and never for None" (fun () ->
+          manual
+          @@ fun sim ->
+          let t0 = Time.now Mono in
+          Fiber.scope
+          @@ fun s ->
+          let c =
+            call s (fun () -> sync (Deadline.at (Some (t0 +: Span.s 2))))
+          in
+          ends_at sim ~t0 (Span.s 2) c ;
+          let t0 = Time.now Mono in
+          let c =
+            call s (fun () ->
+                sync
+                  (choose
+                     [ wrap (Deadline.at None) (fun () -> "at None")
+                     ; wrap (Time.after Mono (Span.s 10)) (fun () -> "10 s") ] ) )
+          in
+          equal string "10 s" (ends_at sim ~t0 (Span.s 10) c) ) ]
 
 (* Body *)
 
@@ -855,7 +983,7 @@ let body_tests =
 
 (* Conn_info, Request, Response, Handler *)
 
-let loopback port = Unix.ADDR_INET (Unix.inet_addr_loopback, port)
+let loopback port = Weft.Net.Tcp ("127.0.0.1", port)
 
 let conn_info_tests =
   group "Conn_info"
@@ -873,27 +1001,27 @@ let conn_info_tests =
           @@ __POS_OF__ {|#7 127.0.0.1:51000 -> 127.0.0.1:8080|} ;
           let c6 =
             Conn_info.make ~id:1
-              ~peer:(Unix.ADDR_INET (Unix.inet6_addr_loopback, 1))
-              ~local:(Unix.ADDR_UNIX "/run/s.sock") ~scheme:`Https ~alpn:"h2" ()
+              ~peer:(Weft.Net.Tcp ("::1", 1))
+              ~local:(Weft.Net.Unix "/run/s.sock") ~scheme:`Https ~alpn:"h2" ()
           in
           is_true (Conn_info.scheme c6 = `Https) ;
           equal (option string) (Some "h2") (Conn_info.alpn c6) ;
           expect (Format.asprintf "%a" Conn_info.pp c6)
           @@ __POS_OF__ {|#1 [::1]:1 -> /run/s.sock|} )
-    ; test "the stopping action of a connection is never enabled by default"
+    ; test "the stopping event of a connection is never ready by default"
         (fun () ->
           let c =
             Conn_info.make ~id:1 ~peer:(loopback 1) ~local:(loopback 2) ()
           in
-          let enabled =
-            Affect_unix.Unix.main ~domain_count:1 (fun () ->
-                Affect.Action.(
-                  invoke
+          let ready =
+            Sim_support.run (fun _ ->
+                Weft.(
+                  sync
                     (choose
-                       [ map (fun () -> true) (Conn_info.stopping c)
+                       [ wrap (Conn_info.stopping c) (fun () -> true)
                        ; always false ] ) ) )
           in
-          is_false enabled ) ]
+          is_false ready ) ]
 
 let request_tests =
   group "Request"
@@ -1079,441 +1207,368 @@ let handler_tests =
           in
           equal status Status.not_found (Response.status r) ) ]
 
-(* Time *)
+(* accept(2) errors *)
 
-(* 2^63 ns + 1 s. [Time.after] can represent the deadline, and the span from the
-   invoke to the deadline stays 2^63 ns or more. affect ends a wait of 2^63 ns
-   or more at once: it compares with a signed comparison. *)
-let beyond_2_63_ns = Affect_unix.Mtime.Span.(add (of_uint64_ns Int64.min_int) s)
+let accept_error_tests =
+  let module A = Private.Accept_error in
+  let show e =
+    match A.classify e with
+    | `Connection ->
+        "retry"
+    | `Resources ->
+        "wait"
+    | `Listener ->
+        "stop"
+  in
+  group "Accept_error"
+    [ test "what each accept error is about" (fun () ->
+          expect
+            (String.concat "\n"
+               (List.map
+                  (fun (name, e) -> Printf.sprintf "%-30s %s" name (show e))
+                  Weft.Net.
+                    [ ("EMFILE", No_resources "EMFILE")
+                    ; ("ENFILE", No_resources "ENFILE")
+                    ; ("ENOBUFS", No_resources "ENOBUFS")
+                    ; ("ENOMEM", No_resources "ENOMEM")
+                    ; ("EINTR", Other "EINTR")
+                    ; ("ENETDOWN", Other "ENETDOWN")
+                    ; ("ENOPROTOOPT", Other "ENOPROTOOPT")
+                    ; ("EHOSTUNREACH", Other "EHOSTUNREACH")
+                    ; ("EOPNOTSUPP", Other "EOPNOTSUPP")
+                    ; ("ENETUNREACH", Other "ENETUNREACH")
+                    ; ("EPERM", Other "EPERM")
+                    ; ("EPROTO", Other "EPROTO")
+                    ; ("ENONET", Other "ENONET")
+                    ; ("EHOSTDOWN", Other "EHOSTDOWN")
+                    ; ("Bad_fd", Bad_fd)
+                    ; ("EINVAL", Other "EINVAL")
+                    ; ("ENOTSOCK", Other "ENOTSOCK")
+                    ; ("Reset", Reset)
+                    ; ("other", Other "other") ] ) )
+          @@ __POS_OF__
+               {|
+            EMFILE                         wait
+            ENFILE                         wait
+            ENOBUFS                        wait
+            ENOMEM                         wait
+            EINTR                          retry
+            ENETDOWN                       retry
+            ENOPROTOOPT                    retry
+            EHOSTUNREACH                   retry
+            EOPNOTSUPP                     retry
+            ENETUNREACH                    retry
+            EPERM                          retry
+            EPROTO                         retry
+            ENONET                         retry
+            EHOSTDOWN                      retry
+            Bad_fd                         stop
+            EINVAL                         stop
+            ENOTSOCK                       stop
+            Reset                          stop
+            other                          stop
+            |} )
+    ]
 
-(* Whether [action] is enabled within 50 ms. *)
-let enabled_within_50ms action =
-  in_main (fun () -> Fake_time.within_50ms action)
+(* The source rules. The libraries caravan, caravan.client and caravan.websocket
+   must use only weft for the time, the I/O and the domains, so that they run in
+   each world of weft. The scan reads the .ml files of src, client and websocket
+   as text. It does not read run, because caravan.run uses Weft_linux. *)
 
-let time_tests =
-  group "Time"
-    [ test "a deadline that has passed is enabled at once" (fun () ->
-          (* 1 s ago: a timer that waits for the time that has passed waits 1
-             s. *)
-          let d = Affect_unix.Mtime.(sub_span (now ()) Span.s) in
-          is_true ~msg:"representable" (Option.is_some d) ;
-          is_true (enabled_within_50ms (Time.at Time.mono d ())) )
-    ; test "a timer reads the time when it is invoked" (fun () ->
-          let timer =
-            Time.at Time.mono
-              (Time.after Time.mono Affect_unix.Mtime.Span.(100 * ms))
-              ()
-          in
-          in_main (fun () ->
-              Affect_unix.Mtime.wait_for Affect_unix.Mtime.Span.(100 * ms) ) ;
-          is_true (enabled_within_50ms timer) )
-    ; test "a deadline 10 ms ahead is enabled" (fun () ->
-          let d = Time.after Time.mono Affect_unix.Mtime.Span.(10 * ms) in
-          (* A 2 s window: a slow machine can take more than 50 ms. *)
-          is_true
-            (in_main (fun () ->
-                 Affect.Action.invoke
-                   (Affect.Action.choose
-                      [ Time.at Time.mono d true
-                      ; Affect_unix.Mtime.wait_for'
-                          Affect_unix.Mtime.Span.(2 * s)
-                          false ] ) ) ) )
-    ; test "no deadline is never enabled" (fun () ->
-          is_false (enabled_within_50ms (Time.at Time.mono None ())) )
-    ; test "a deadline 2^63 ns or more ahead is never enabled" (fun () ->
-          let d = Time.after Time.mono beyond_2_63_ns in
-          is_true ~msg:"representable" (Option.is_some d) ;
-          is_false (enabled_within_50ms (Time.at Time.mono d ())) )
-    ; test "the last time is never enabled" (fun () ->
-          let d = Some Affect_unix.Mtime.max_stamp in
-          is_false (enabled_within_50ms (Time.at Time.mono d ())) )
-    ; test "the library reads the time and waits only through Time" (fun () ->
-          (* dune runs the test in _build/default/test; dune exec in the
+(* The texts that the libraries must not contain. The first text is the name of
+   the old effects library, in two parts, so that a search for that name in src,
+   client, websocket, run, examples and test finds nothing. The other texts are
+   the worlds and the internals of weft, the OS, the time and the processes of
+   the stdlib, the stdio of the stdlib, and the locks of the stdlib. The
+   internals of weft also have the names that follow "open Weft"
+   (Private.World). clock.mli tells that Clock.to_ns and Clock.of_ns are for the
+   worlds and the scheduler only. Fiber.Mutex and Fiber.Semaphore are
+   permitted. *)
+let forbidden =
+  [ "Aff" ^ "ect"
+  ; "Weft_linux"
+  ; "Weft_sim"
+  ; "Weft_posix"
+  ; "Weft_kqueue"
+  ; "Weft.Private"
+  ; "Private.run_world"
+  ; "Private.scope_ctx"
+  ; "Private.ivar_state"
+  ; "Private.promise_report"
+  ; "Private.Commit"
+  ; "Private.World"
+  ; "Private.Op"
+  ; "Private.Sched"
+  ; "Private.Event"
+  ; "Private.Net"
+  ; "Private.Chan"
+  ; "Private.Ring"
+  ; "Private.Job"
+  ; "Private.Process"
+  ; "Clock.to_ns"
+  ; "Clock.of_ns"
+  ; "Unix."
+  ; "UnixLabels."
+  ; "Thread."
+  ; "Domain."
+  ; "Sys.time"
+  ; "Sys.command"
+  ; "Sys.signal"
+  ; "Sys.set_signal"
+  ; "Sys.catch_break"
+  ; "Sys.getenv"
+  ; "Sys.readdir"
+  ; "Sys.file_exists"
+  ; "Sys.remove"
+  ; "Sys.rename"
+  ; "Random.self_init"
+  ; "Random.State.make_self_init"
+  ; "print_"
+  ; "prerr_"
+  ; "Printf.printf"
+  ; "Printf.eprintf"
+  ; "Format.printf"
+  ; "Format.eprintf"
+  ; "Format.std_formatter"
+  ; "Format.err_formatter"
+  ; "Format.get_std_formatter"
+  ; "Format.get_err_formatter"
+  ; "Scanf."
+  ; "stdout"
+  ; "stderr"
+  ; "stdin"
+  ; "open_in"
+  ; "open_out"
+  ; "In_channel."
+  ; "Out_channel."
+  ; "Printexc.print"
+  ; "Mutex."
+  ; "Condition."
+  ; "Semaphore." ]
+
+(* The texts that must also end a word: the next character is not a character of
+   a name and not a dot. The first texts are an alias and an open of a module of
+   [forbidden] ("module M = Mutex", "open Unix"). An alias or an open of Private
+   is for "open Weft". The last texts are the reads of the stdin of the stdlib.
+   The libraries have their own read_line functions, and [hits] permits them
+   (see [reader_call]). *)
+let forbidden_words =
+  let modules =
+    [ "Unix"
+    ; "UnixLabels"
+    ; "Thread"
+    ; "Domain"
+    ; "Sys"
+    ; "Random"
+    ; "Printf"
+    ; "Format"
+    ; "Scanf"
+    ; "In_channel"
+    ; "Out_channel"
+    ; "Printexc"
+    ; "Mutex"
+    ; "Condition"
+    ; "Semaphore"
+    ; "Private" ]
+  in
+  List.concat_map
+    (fun m ->
+      List.concat_map
+        (fun use -> [use ^ m; use ^ "Stdlib." ^ m])
+        ["= "; "open "; "open! "; "include "] )
+    modules
+  @ ["read_line"; "read_int"; "read_float"]
+
+(* The permitted uses: a file and a text of [forbidden]. *)
+let allowed =
+  [ (* The pool keeps a stdlib Mutex. No fiber code holds it across a sync, a
+       world effect, or a call into weft or into a Flow. *)
+    ("client/pool.ml", "Mutex.")
+  ; (* The default on_error writes to the standard error (write_error). *)
+    ("src/config.ml", "Printf.eprintf") ]
+
+let is_ident_char = function
+  | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' | '\'' ->
+      true
+  | _ ->
+      false
+
+(* [hits text] gives the line number and the text of each forbidden text in
+   [text]. It is a plain match, with no lexer: a comment or a string must not
+   contain a forbidden text. A match must start a word, so "print_" does not
+   match "pp_print_string". A text of [forbidden_words] must also end a word, so
+   "read_int" does not match "read_into". A lock of the stdlib does not match
+   after "Fiber.". The read_line functions of the libraries take the reader [r]
+   as the first argument, thus "read_line r " does not match. Also
+   "Buf_reader.read_line" does not match. *)
+let hits text =
+  let n = String.length text in
+  let at i sub =
+    let k = String.length sub in
+    let rec same j = j = k || (text.[i + j] = sub.[j] && same (j + 1)) in
+    i + k <= n && same 0
+  in
+  let ends_word i = i = n || not (is_ident_char text.[i] || text.[i] = '.') in
+  let after i prefix =
+    let k = String.length prefix in
+    i >= k && at (i - k) prefix
+  in
+  let is_lock sub = List.mem sub ["Mutex."; "Condition."; "Semaphore."] in
+  let reader_call i sub =
+    sub = "read_line" && (at (i + 9) " r " || after i "Buf_reader.")
+  in
+  let line = ref 1 and found = ref [] in
+  for i = 0 to n - 1 do
+    if i > 0 && text.[i - 1] = '\n' then incr line ;
+    if i = 0 || not (is_ident_char text.[i - 1]) then begin
+      List.iter
+        (fun sub ->
+          if at i sub && not (is_lock sub && after i "Fiber.") then
+            found := (!line, sub) :: !found )
+        forbidden ;
+      List.iter
+        (fun sub ->
+          if
+            at i sub
+            && ends_word (i + String.length sub)
+            && not (reader_call i sub)
+          then found := (!line, sub) :: !found )
+        forbidden_words
+    end
+  done ;
+  List.rev !found
+
+let show_hits l =
+  String.concat "\n"
+    (List.map (fun (line, sub) -> Printf.sprintf "%d %s" line sub) l)
+
+let source_tests =
+  group "Source rules"
+    [ test "the scan finds a forbidden text at the start of a word" (fun () ->
+          expect
+            (show_hits
+               (hits
+                  "Unix.read fd buf 0 1\n\
+                   let () = print_string \"x\"\n\
+                   let m = Fiber.Mutex.create ()\n\
+                   let s = Mutex.create ()\n\
+                   let p = Format.pp_print_string\n\
+                   let a = Net.Unix path\n\
+                   let l = Buf_reader.read_line r ~max\n\
+                   module M = Mutex\n\
+                   module U = Stdlib.Unix\n\
+                   open In_channel\n\
+                   let open! Domain in\n\
+                   let f = read_line\n\
+                   let i = read_int ()\n\
+                   let k = Buf_reader.read_into r b 0 1\n\
+                   let () = Printexc.print f x\n\
+                   let () = Sys.catch_break true\n\
+                   let x = Scanf.scanf \"%d\" Fun.id\n\
+                   let ppf = Format.get_std_formatter ()\n\
+                   let w = Private.World.x\n\
+                   let j = Private.Job.x\n\
+                   let p = Private.Process.x\n\
+                   module P = Private\n\
+                   let c = Private.Cancel.check\n\
+                   module F = Fiber.Mutex\n\
+                   include Unix" ) )
+          @@ __POS_OF__
+               {|
+            1 Unix.
+            2 print_
+            4 Mutex.
+            8 = Mutex
+            9 = Stdlib.Unix
+            10 open In_channel
+            11 open! Domain
+            12 read_line
+            13 read_int
+            15 Printexc.print
+            16 Sys.catch_break
+            17 Scanf.
+            18 Format.get_std_formatter
+            19 Private.World
+            20 Private.Job
+            21 Private.Process
+            22 = Private
+            25 include Unix
+            |} )
+    ; test "the libraries use only weft for the time, the I/O and the domains"
+        (fun () ->
+          (* dune runs the test in _build/default/test. dune exec runs it in the
              root. *)
-          let root = if Sys.file_exists "../src/time.ml" then ".." else "." in
-          let read dir file =
-            In_channel.with_open_bin
-              (Filename.concat (Filename.concat root dir) file)
-              In_channel.input_all
-          in
-          let contains s sub =
-            let n = String.length sub in
-            let rec at i =
-              i + n <= String.length s && (String.sub s i n = sub || at (i + 1))
-            in
-            at 0
-          in
-          let direct =
-            [ "Mtime.now"
-            ; "Mtime.wait_for"
-            ; "Mtime.observe_wait_for"
-            ; "Mtime.count"
-            ; "Mtime.elapsed"
-            ; "Mtime.("
-            ; "Unix.time"
-            ; "Unix.gettimeofday"
-            ; "Unix.sleep"
-            ; "Unix.select"
-            ; "Ptime.now"
-            ; "Ptime.wait_until"
-            ; "Ptime.observe_wait_until"
-            ; "Ptime.(" ]
-          in
-          (* The server, the client and the WebSocket use the time line of their
-             config or of their flows, also to add spans. *)
-          let injected =
-            [ "Time.mono"
-            ; "Time.posix"
-            ; "Mtime.add_span"
-            ; "Ptime.add_span"
-            ; "Time.("
-            ; "open Time"
-            ; "open Caravan.Time" ]
-          in
-          let files dir ~except =
+          let root = if Sys.file_exists "../src/config.ml" then ".." else "." in
+          let files dir =
             Sys.readdir (Filename.concat root dir)
             |> Array.to_list
+            (* The build of the mutation check also has the preprocessed files
+               (.pp.ml) in these directories. *)
             |> List.filter (fun file ->
-                Filename.check_suffix file ".ml" && not (List.mem file except) )
+                Filename.check_suffix file ".ml"
+                && not (Filename.check_suffix file ".pp.ml") )
+            |> List.sort compare
+            |> List.map (fun file -> dir ^ "/" ^ file)
           in
-          let src = files "src" ~except:["time.ml"]
-          and client = files "client" ~except:[]
-          and websocket = files "websocket" ~except:[] in
-          is_true ~msg:"the files of the server are found"
-            (List.mem "server.ml" src && List.mem "h1_server.ml" src) ;
-          is_true ~msg:"the files of the client are found"
-            (List.mem "pool.ml" client && List.mem "config.ml" client) ;
-          is_true ~msg:"the files of the WebSocket are found"
-            (List.mem "connection.ml" websocket) ;
-          let check dir file calls =
-            let text = read dir file in
-            List.iter
-              (fun call ->
-                is_false
-                  ~msg:(dir ^ "/" ^ file ^ " calls " ^ call)
-                  (contains text call) )
-              calls
-          in
+          let all = files "src" @ files "client" @ files "websocket" in
           List.iter
             (fun file ->
-              check "src" file
-                ( if List.mem file ["server.ml"; "h1_server.ml"] then
-                    direct @ injected
-                  else direct ) )
-            src ;
-          (* client/config.ml has the default time line. *)
-          List.iter
-            (fun file ->
-              check "client" file
-                (if file = "config.ml" then direct else direct @ injected) )
-            client ;
-          List.iter
-            (fun file -> check "websocket" file (direct @ injected))
-            websocket )
-    ; test "the POSIX time line reads the system clock" (fun () ->
-          let module Ptime = Affect_unix.Ptime in
-          let d = Ptime.diff (Time.now Time.posix) (Ptime.now ()) in
-          is_true ~msg:"within 2 s"
-            Ptime.Span.(is_shorter (abs d) ~than:(of_int_s 2)) ;
-          let t = Time.now Time.posix in
-          let d = Option.get (Time.after Time.posix (Ptime.Span.of_int_s 1)) in
-          is_false ~msg:"after adds the span"
-            Ptime.(
-              is_earlier d ~than:(Option.get (add_span t (Span.of_int_s 1))) ) ;
-          is_true ~msg:"within 2 s of the span"
-            Ptime.(
-              is_earlier d ~than:(Option.get (add_span t (Span.of_int_s 3))) ) ;
-          is_true ~msg:"the default of the config"
-            (Config.default.posix_time == Time.posix) )
-    ; test "a POSIX deadline that has passed is enabled at once" (fun () ->
-          let now = Affect_unix.Ptime.now () in
-          is_true (enabled_within_50ms (Time.at Time.posix (Some now) ())) )
-    ; test "a POSIX timer is enabled at its deadline" (fun () ->
-          let module Ptime = Affect_unix.Ptime in
-          let module Mtime = Affect_unix.Mtime in
-          in_main
-          @@ fun () ->
-          let t0 = Mtime.now () in
-          let span = Ptime.Span.of_mtime_span Mtime.Span.(20 * ms) in
-          let p = Option.get (Ptime.add_span (Ptime.now ()) span) in
-          ( match
-              Affect.Action.invoke
-                (Affect.Action.choose
-                   [ Time.at Time.posix (Some p) `Enabled
-                   ; Mtime.wait_for' Mtime.Span.(2 * s) `Late ] )
-            with
-          | `Enabled ->
-              ()
-          | `Late ->
-              fail "not enabled after 2 s" ) ;
-          is_false ~msg:"the POSIX clock before the deadline"
-            (Ptime.is_earlier (Ptime.now ()) ~than:p) ;
-          is_false ~msg:"less than 20 ms"
-            Mtime.Span.(
-              is_shorter (Mtime.span t0 (Mtime.now ())) ~than:(20 * ms) ) )
-    ; test "a sleep waits for its span" (fun () ->
-          in_main
-          @@ fun () ->
-          let t0 = Affect_unix.Mtime.now () in
-          Time.sleep Time.mono Affect_unix.Mtime.Span.(20 * ms) ;
-          let slept = Affect_unix.Mtime.(span t0 (now ())) in
-          is_false ~msg:"at least 20 ms"
-            Affect_unix.Mtime.Span.(is_shorter slept ~than:(20 * ms)) ) ]
-
-(* Fake time *)
-
-module Fake = Fake_time
-
-let ms n = Affect_unix.Mtime.Span.(n * ms)
-
-let sec n = Affect_unix.Mtime.Span.(n * s)
-
-let ( +: ) = Fake.( +: )
-
-(* The calls of a test. A test that fails must not leave a call that waits for
-   ever: [Unix.main] would wait for it. *)
-let calls = ref []
-
-(* One domain unless TEST_DOMAINS says otherwise. *)
-let domain_count =
-  Option.value ~default:1
-    (Option.bind (Sys.getenv_opt "TEST_DOMAINS") int_of_string_opt)
-
-(* [f] in [Unix.main]. At its end, the calls of the test are cancelled. *)
-let fake_main ?(domain_count = domain_count) f =
-  calls := [] ;
-  Affect_unix.Unix.main ~domain_count
-  @@ fun () ->
-  Fun.protect ~finally:(fun () -> List.iter (fun cancel -> cancel ()) !calls) f
-
-(* A call that waits for the fake timer at [d]. *)
-let timer_call f d =
-  let c =
-    Affect.Fun.Async.call (fun () ->
-        Affect.Action.invoke (Time.at (Fake.mono f) (Some d) ()) )
-  in
-  calls := (fun () -> Affect.Fun.Async.cancel c) :: !calls ;
-  c
-
-(* A call that waits for the fake timer at [d], made after a mark, and the proof
-   that the call made its timer. *)
-let waiting_call f d =
-  let m = Fake.mark f in
-  let c = timer_call f d in
-  Fake.wait_mono_timer f ~since:m d ;
-  c
-
-let ends_within_50ms = Fake.ends_within_50ms
-
-let get_2s = Server_support.get_2s
-
-let fake_time_tests =
-  group "Fake time"
-    [ test "a timer is enabled when the time reaches its deadline" (fun () ->
-          fake_main
-          @@ fun () ->
-          let f = Fake.make () in
-          let d = Fake.mono_now f +: sec 10 in
-          let c = waiting_call f d in
-          Fake.advance f Affect_unix.Mtime.Span.(sec 10 - ns) ;
-          is_false ~msg:"at the deadline - 1 ns" (ends_within_50ms c) ;
-          Fake.advance f Affect_unix.Mtime.Span.ns ;
-          (* At the deadline, the call ends. *)
-          get_2s c ;
-          (* The timer is first: it is enabled, so it wins. *)
-          let d = Fake.mono_now f +: sec 1 in
-          Fake.advance f (sec 1) ;
-          let first =
-            Affect.Action.invoke
-              (Affect.Action.choose
-                 [ Time.at (Fake.mono f) (Some d) `Timer
-                 ; Affect.Action.always `Always ] )
+              is_true ~msg:("the scan finds " ^ file) (List.mem file all) )
+            [ "src/server.ml"
+            ; "src/h1_server.ml"
+            ; "src/config.ml"
+            ; "client/pool.ml"
+            ; "websocket/connection.ml" ] ;
+          let found =
+            List.concat_map
+              (fun file ->
+                In_channel.with_open_bin
+                  (Filename.concat root file)
+                  In_channel.input_all
+                |> hits
+                |> List.map (fun (line, sub) -> (file, line, sub)) )
+              all
           in
-          is_true ~msg:"the timer wins" (first = `Timer) )
-    ; test "a timer made after its deadline is enabled at once" (fun () ->
-          fake_main
-          @@ fun () ->
-          let f = Fake.make () in
-          let d = Fake.mono_now f +: ms 500 in
-          Fake.advance f (sec 1) ;
-          (* A timer that is due at once is in the log too. *)
-          let m = Fake.mark f in
-          let c = timer_call f d in
-          Fake.wait_mono_timer f ~since:m d ;
-          get_2s c )
-    ; test "a wait for a timer sees only the timers after its mark" (fun () ->
-          fake_main
-          @@ fun () ->
-          let f = Fake.make () in
-          let d = Fake.mono_now f +: sec 10 in
-          let c1 = waiting_call f d in
-          let m = Fake.mark f in
-          ( match Fake.wait_mono_timer ~guard:(ms 50) f ~since:m d with
-          | () ->
-              fail "a timer before the mark"
-          | exception Fake.No_timer _ ->
-              () ) ;
-          let c2 = waiting_call f d in
-          ( match
-              Fake.wait_mono_timer ~guard:(ms 50) f ~since:m
-                (d +: Affect_unix.Mtime.Span.ns)
-            with
-          | () ->
-              fail "a timer at a different deadline"
-          | exception Fake.No_timer _ ->
-              () ) ;
-          Fake.advance f (sec 10) ;
-          get_2s c1 ;
-          get_2s c2 )
-    ; test "one advance wakes the calls on all domains" (fun () ->
-          (* The test needs several domains. TEST_DOMAINS=1 asks for one, for
-             example in mutation testing, which cannot fork after a domain
-             starts. *)
-          if Sys.getenv_opt "TEST_DOMAINS" = Some "1" then
-            skip ~reason:"TEST_DOMAINS=1 asks for one domain" () ;
-          fake_main ~domain_count:4
-          @@ fun () ->
-          let f = Fake.make () in
-          let d = Fake.mono_now f +: sec 10 in
-          let waiting = List.init 8 (fun _ -> waiting_call f d) in
-          Fake.advance f (sec 10) ;
-          List.iter get_2s waiting )
-    ; test "with_call_at_timer waits for the timer, and cancels the call"
+          let not_allowed =
+            List.filter
+              (fun (file, _, sub) -> not (List.mem (file, sub) allowed))
+              found
+          in
+          expect
+            (String.concat "\n"
+               (List.map
+                  (fun (file, line, sub) ->
+                    Printf.sprintf "%s:%d %s" file line sub )
+                  not_allowed ) )
+          @@ __POS_OF__ {||} ;
+          (* An entry that matches nothing is old: remove it. *)
+          List.iter
+            (fun (file, sub) ->
+              is_true
+                ~msg:(file ^ " uses " ^ sub)
+                (List.exists (fun (f, _, s) -> f = file && s = sub) found) )
+            allowed ) ]
+
+(* Caravan uses [is_own] where a handler, a writer job or a websocket function
+   raises. Each case of the rule needs a test: a plant of a branch can look
+   correct at the other sites. *)
+let cancel_tests =
+  let module C = Private.Cancel in
+  let open Weft in
+  group "Cancel"
+    [ test "is_own is true only for the Cancelled of a cancelled fiber"
         (fun () ->
-          fake_main
-          @@ fun () ->
-          let f = Fake.make () in
-          let d = Fake.mono_now f +: sec 10 in
-          let call = ref None in
-          Fake.with_call_at_timer f d
-            (fun () -> Affect.Action.invoke (Time.at (Fake.mono f) (Some d) ()))
-            (fun c ->
-              call := Some c ;
-              is_false ~msg:"waits at the timer" (ends_within_50ms c) ) ;
-          let c = Option.get !call in
-          raises Affect.Fun.Async.Cancelled (fun () -> Affect.Fun.Async.get c) ;
-          (* A call that makes no timer: No_timer after the guard. *)
-          raises_match
-            (function Fake.No_timer _ -> true | _ -> false)
-            (fun () -> Fake.with_call_at_timer f d (fun () -> ()) (fun _ -> ())) )
-    ; test "the fake time works outside Unix.main" (fun () ->
-          let f = Fake.make () in
-          let t0 = Time.now (Fake.mono f) in
-          is_true ~msg:"one day after the real time"
-            Affect_unix.Mtime.(is_later t0 ~than:(now () +: Span.hour)) ;
-          Fake.advance f (sec 3) ;
-          is_true ~msg:"3 s later"
-            (Affect_unix.Mtime.equal (Time.now (Fake.mono f)) (t0 +: sec 3)) ;
-          is_true ~msg:"the same value" (Fake.mono f == Fake.mono f) ) ]
-
-(* The fake POSIX clock *)
-
-module Ptime = Affect_unix.Ptime
-
-let fake_posix_tests =
-  group "Fake POSIX clock"
-    [ test "advance moves the two time lines" (fun () ->
-          let f = Fake.make () in
-          let m0 = Fake.mono_now f and p0 = Time.now (Fake.posix f) in
-          equal float_exact ~msg:"the POSIX start" 784111777.
-            (Ptime.to_float_s p0) ;
-          Fake.advance f (sec 3) ;
-          is_true ~msg:"mono"
-            (Affect_unix.Mtime.equal (Fake.mono_now f) (m0 +: sec 3)) ;
-          is_true ~msg:"POSIX"
-            (Ptime.equal
-               (Time.now (Fake.posix f))
-               (Option.get (Ptime.add_span p0 (Ptime.Span.of_int_s 3))) ) ;
-          is_true ~msg:"the same value" (Fake.posix f == Fake.posix f) )
-    ; test "an advance out of range changes nothing" (fun () ->
-          fake_main
-          @@ fun () ->
-          let f = Fake.make () in
-          let m0 = Fake.mono_now f and p0 = Time.now (Fake.posix f) in
-          let c = waiting_call f (m0 +: sec 1) in
-          raises_match
-            (function Invalid_argument _ -> true | _ -> false)
-            (fun () -> Fake.advance f Affect_unix.Mtime.Span.max_span) ;
-          is_true ~msg:"mono" (Affect_unix.Mtime.equal (Fake.mono_now f) m0) ;
-          is_true ~msg:"POSIX" (Ptime.equal (Time.now (Fake.posix f)) p0) ;
-          is_false ~msg:"no timer enabled" (ends_within_50ms c) ) ]
-
-(* The time line of flows *)
-
-(* A connected pair of non-blocking sockets. *)
-let socket_pair () =
-  let a, b = Unix.socketpair ~cloexec:true Unix.PF_UNIX Unix.SOCK_STREAM 0 in
-  Unix.set_nonblock a ; Unix.set_nonblock b ; (a, b)
-
-(* A call that reads one byte of [flow]. *)
-let read_call flow =
-  let c =
-    Affect.Fun.Async.call (fun () -> Flow.read flow (Bytes.create 1) 0 1)
-  in
-  calls := (fun () -> Affect.Fun.Async.cancel c) :: !calls ;
-  c
-
-(* The steps of F2 on [flow], which reads from the peer [peer]: a read with the
-   deadline L = 11 s gets a byte 1 ns before L, and a second read with the same
-   deadline times out at L. *)
-let read_until_deadline f ~deadline flow peer =
-  Flow.set_read_deadline flow (Some deadline) ;
-  let m = Fake.mark f in
-  let r = read_call flow in
-  Fake.wait_mono_timer f ~since:m deadline ;
-  Fake.advance f Affect_unix.Mtime.Span.(sec 11 - ns) ;
-  ignore (Unix.write_substring peer "x" 0 1) ;
-  equal int ~msg:"a byte 1 ns before the deadline" 1 (get_2s r) ;
-  let m = Fake.mark f in
-  let r = read_call flow in
-  Fake.wait_mono_timer f ~since:m deadline ;
-  Fake.advance f Affect_unix.Mtime.Span.ns ;
-  raises ~msg:"a timeout at the deadline" Flow.Timeout (fun () -> get_2s r)
-
-let flow_time_tests =
-  group "Flow time"
-    [ test "a flow keeps its time line" (fun () ->
-          let f = Fake.make () and a, b = socket_pair () in
-          Fun.protect ~finally:(fun () -> Unix.close a ; Unix.close b)
-          @@ fun () ->
-          let flow = Tcp.flow ~time:(Fake.mono f) a in
-          is_true ~msg:"Tcp.flow ~time" (Flow.time flow == Fake.mono f) ;
-          is_true ~msg:"prepend"
-            (Flow.time (Flow.prepend "x" flow) == Fake.mono f) ;
-          is_true ~msg:"the default of Tcp.flow"
-            (Flow.time (Tcp.flow b) == Time.mono) ;
-          is_true ~msg:"of_string"
-            (Flow.time (Flow.of_string "" (Buffer.create 0)) == Time.mono) )
-    ; test "a tcp flow waits for its deadlines on its time line" (fun () ->
-          let a, b = socket_pair () in
-          Fun.protect ~finally:(fun () -> Unix.close a ; Unix.close b)
-          @@ fun () ->
-          fake_main
-          @@ fun () ->
-          let f = Fake.make () in
-          let flow = Tcp.flow ~time:(Fake.mono f) a in
-          let deadline = Option.get (Time.after (Flow.time flow) (sec 11)) in
-          read_until_deadline f ~deadline flow b )
-    ; test "a wrapper flow with the time line of its inner flow" (fun () ->
-          let a, b = socket_pair () in
-          Fun.protect ~finally:(fun () -> Unix.close a ; Unix.close b)
-          @@ fun () ->
-          fake_main
-          @@ fun () ->
-          let f = Fake.make () in
-          let inner = Tcp.flow ~time:(Fake.mono f) a in
-          let wrapper =
-            Flow.make ~time:(Flow.time inner) ~read:(Flow.read inner)
-              ~read_now:(Flow.read_now inner) ~write:(Flow.write inner)
-              ~readable:(Flow.readable' inner ())
-              ~shutdown_send:(fun () -> Flow.shutdown_send inner)
-              ~close:(fun () -> Flow.close inner)
-              ~set_read_deadline:(Flow.set_read_deadline inner)
-              ~set_write_deadline:(Flow.set_write_deadline inner)
-              ()
-          in
-          let deadline = Option.get (Time.after (Flow.time wrapper) (sec 11)) in
-          read_until_deadline f ~deadline wrapper b ) ]
+          Sim_support.run (fun _ ->
+              is_false ~msg:"Cancelled, no cancel"
+                (C.is_own (Fiber.Cancelled Exit)) ;
+              is_false ~msg:"Failure, no cancel" (C.is_own (Failure "x")) ;
+              Fiber.scope (fun s ->
+                  Fiber.cancel s Exit ;
+                  is_true ~msg:"Cancelled, cancelled"
+                    (C.is_own (Fiber.Cancelled Exit)) ;
+                  is_false ~msg:"Failure, cancelled" (C.is_own (Failure "x")) ;
+                  is_false ~msg:"Promise.Cancelled, cancelled"
+                    (C.is_own Promise.Cancelled) ) ) ) ]
 
 let () =
   exit
@@ -1526,12 +1581,12 @@ let () =
        ; headers_stateful
        ; date_tests
        ; flow_tests
+       ; deadline_tests
        ; body_tests
        ; conn_info_tests
        ; request_tests
        ; response_tests
        ; handler_tests
-       ; time_tests
-       ; fake_time_tests
-       ; fake_posix_tests
-       ; flow_time_tests ] )
+       ; accept_error_tests
+       ; cancel_tests
+       ; source_tests ] )

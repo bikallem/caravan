@@ -1,7 +1,6 @@
-open Affect
+open Weft
 open Caravan
 open Caravan.Private
-module Mtime = Affect_unix.Mtime
 
 type message = Text of string | Binary of string
 
@@ -11,21 +10,17 @@ type t =
   { flow: Flow.t
   ; r: Buf_reader.t
   ; w: Buf_writer.t
-  ; writer: Semaphore.t (* one frame at a time on [w] *)
-  ; reader: Semaphore.t (* one fiber at a time reads frames *)
+  ; writer: Fiber.Semaphore.t (* one frame at a time on [w] *)
+  ; reader: Fiber.Semaphore.t (* one fiber at a time reads frames *)
   ; protocol: string option
   ; max_message: int
-  ; close_timeout: Mtime.Span.t
-  ; write_timeout: Mtime.Span.t
-  ; read_timeout: Mtime.Span.t
-  ; idle_timeout: Mtime.Span.t option
+  ; close_timeout: Span.t
+  ; read_timeout: Span.t option (* [Some] of the read timeout, made once *)
+  ; idle_timeout: Span.t option
   ; mutable in_frame: bool (* a byte of the frame came: with [reader] *)
-  ; deadlines: Mutex.t (* the deadlines change one at a time *)
-  ; close_at: Mtime.t option Atomic.t (* the deadline of [close] *)
-  ; mutable read_at: Mtime.t option (* the read deadline, with [deadlines] *)
-  ; mutable write_at: Mtime.t option (* the write deadline, with [deadlines] *)
+  ; close_at: Clock.mono option Atomic.t (* the deadline of [close], set once *)
   ; closing: exn option Atomic.t (* we sent a Close frame: what [send] raises *)
-  ; closed: exn Cell.Once.t (* the first [Closed] exception *) }
+  ; closed: exn Ivar.t (* the first [Closed] exception *) }
 
 (* RFC 6455 §7.4: the codes that a Close frame can contain. *)
 let is_permitted code =
@@ -35,62 +30,49 @@ let is_permitted code =
 
 let protocol t = t.protocol
 
-(* The time line of the deadlines: the time line of the flow. *)
-let time t = Flow.time t.flow
+(* The flow has a timeout for each read and each write that waits, and an
+   absolute deadline for each direction. A read or a write that waits ends at
+   the earlier of the two. The connection sets the read timeout in the fiber
+   that reads, and the write timeout one time in [make]. Only
+   [set_close_deadline] sets the absolute deadlines. Thus no lock is necessary.
 
-let earlier a b =
-  match (a, b) with
-  | Some x, Some y ->
-      if Mtime.is_earlier x ~than:y then a else b
-  | d, None | None, d ->
-      d
+   The first [close], or the first linger of [fail], sets the close deadline.
+   Only the fiber that wins the compare-and-set sets the two absolute deadlines
+   of the flow, thus each deadline of the flow has one writer. A later close
+   never gives an earlier deadline, because all closes use [close_timeout] on a
+   monotonic clock. The approximation: if two closes run at the same time, the
+   first compare-and-set wins, also if the other close read the clock a little
+   earlier. The deadline also stops the reads and writes that wait at this
+   time. *)
+let set_close_deadline t =
+  let d = Deadline.from_now t.close_timeout in
+  if Atomic.compare_and_set t.close_at None d then begin
+    Flow.set_read_deadline t.flow d ;
+    Flow.set_write_deadline t.flow d
+  end
 
-(* The deadlines change with [t.deadlines]: thus a deadline from a read or a
-   write and the deadline of [close] cannot replace each other. The critical
-   sections do not suspend the fiber. *)
-
-(* Sets the read deadline to the earlier of the time [span] after the call and
-   the deadline of [close]. With no [span], only the deadline of [close]
-   applies. *)
-let set_read_deadline t span =
-  Mutex.protect t.deadlines (fun () ->
-      let d = Option.bind span (fun span -> Time.after (time t) span) in
-      t.read_at <- earlier d (Atomic.get t.close_at) ;
-      Flow.set_read_deadline t.flow t.read_at )
-
-let set_write_deadline t span =
-  Mutex.protect t.deadlines (fun () ->
-      t.write_at <- earlier (Time.after (time t) span) (Atomic.get t.close_at) ;
-      Flow.set_write_deadline t.flow t.write_at )
-
-(* The deadline of [close] stops also the reads and writes that wait at this
-   time, but it does not make their deadlines later. A second [close] keeps the
-   earlier deadline. *)
-let set_close_deadline t d =
-  Mutex.protect t.deadlines (fun () ->
-      let d = earlier (Atomic.get t.close_at) d in
-      Atomic.set t.close_at d ;
-      t.read_at <- earlier t.read_at d ;
-      t.write_at <- earlier t.write_at d ;
-      Flow.set_read_deadline t.flow t.read_at ;
-      Flow.set_write_deadline t.flow t.write_at )
-
-(* The reads of [t.r]. Inside a frame, each read gets the deadline
-   [read_timeout] after its start. Thus a slow frame with no long pause can take
-   more time than [read_timeout]. *)
+(* The reads of [t.r]. Each read of the flow sets the timeout of its wait. Until
+   the first byte of a frame, the timeout is [idle_timeout]. Inside a frame,
+   each read that waits gets the timeout [read_timeout] from the start of its
+   wait. Thus a slow frame with no long pause can take more time than
+   [read_timeout]. *)
 let read_bytes t buf off len =
-  if t.in_frame then set_read_deadline t (Some t.read_timeout) ;
+  Flow.set_read_timeout t.flow
+    (if t.in_frame then t.read_timeout else t.idle_timeout) ;
   let n = Flow.read t.flow buf off len in
   (* A byte of the frame came, or the input ended: then [Frame.read] stops with
      End_of_file. *)
   t.in_frame <- true ;
   n
 
-let make ?protocol ?(max_message = 8 * 1024 * 1024)
-    ?(close_timeout = Mtime.Span.(5 * s)) ?(write_timeout = Mtime.Span.(30 * s))
-    ?(read_timeout = Mtime.Span.(30 * s)) ?idle_timeout flow =
+let make ?protocol ?(max_message = 8 * 1024 * 1024) ?(close_timeout = Span.s 5)
+    ?(write_timeout = Span.s 30) ?(read_timeout = Span.s 30) ?idle_timeout flow
+    =
   if max_message < 0 then
     invalid_arg "Caravan_websocket: max_message is negative" ;
+  (* Each write that waits gets the write timeout. A frame takes one or two
+     writes of the flow. *)
+  Flow.set_write_timeout flow (Some write_timeout) ;
   (* [read_bytes] is necessary to make [r], and it needs the connection. *)
   let self = ref None in
   let read buf off len = read_bytes (Option.get !self) buf off len in
@@ -100,37 +82,33 @@ let make ?protocol ?(max_message = 8 * 1024 * 1024)
     { flow
     ; r= Buf_reader.make read
     ; w= Buf_writer.make (Flow.write flow)
-    ; writer= Semaphore.make 1
-    ; reader= Semaphore.make 1
+    ; writer= Fiber.Semaphore.create 1
+    ; reader= Fiber.Semaphore.create 1
     ; protocol
     ; max_message
     ; close_timeout
-    ; write_timeout
-    ; read_timeout
+    ; read_timeout= Some read_timeout
     ; idle_timeout
     ; in_frame= false
-    ; deadlines= Mutex.create ()
     ; close_at= Atomic.make None
-    ; read_at= None
-    ; write_at= None
     ; closing= Atomic.make None
-    ; closed= Cell.Once.make () }
+    ; closed= Ivar.create () }
   in
   self := Some t ;
   t
 
-let is_closing t = Atomic.get t.closing <> None || Cell.Once.is_set t.closed
+let is_closing t =
+  Atomic.get t.closing <> None || Option.is_some (Ivar.peek t.closed)
 
-let check_closed t =
-  if Cell.Once.is_set t.closed then raise (Cell.Once.get t.closed)
+let check_closed t = Option.iter raise (Ivar.peek t.closed)
 
 (* If the connection is open, this function keeps [code] and [reason] as its
    [Closed] exception. Then it closes the flow and gives the exception that the
    connection keeps. *)
 let shut t code reason =
-  Cell.Once.try_set t.closed (Closed {code; reason}) ;
+  ignore (Ivar.try_fill t.closed (Closed {code; reason})) ;
   Flow.close t.flow ;
-  Cell.Once.get t.closed
+  Option.get (Ivar.peek t.closed)
 
 (* An exception in the middle of a frame, for example a cancel, puts the stream
    out of step. Thus the connection closes with 1006, and the exception goes on.
@@ -144,7 +122,7 @@ let abort t e =
    The check is in the semaphore, thus a frame cannot go after a Close frame
    that a different fiber wrote first. *)
 let write_frame t (frame : Frame.t) =
-  Semaphore.with_acquired t.writer (fun () ->
+  Fiber.Semaphore.use t.writer (fun () ->
       check_closed t ;
       match (frame.opcode, Atomic.get t.closing) with
       | Pong, Some _ ->
@@ -152,11 +130,7 @@ let write_frame t (frame : Frame.t) =
       | (Text | Binary | Continuation | Ping), Some e ->
           raise e
       | _ -> (
-        try
-          set_write_deadline t t.write_timeout ;
-          Frame.write t.w frame ;
-          Buf_writer.flush t.w
-        with
+        try Frame.write t.w frame ; Buf_writer.flush t.w with
         | Flow.Closed | Flow.Timeout ->
             raise (shut t 1006 "")
         | e ->
@@ -192,10 +166,12 @@ let code_payload code =
   Bytes.unsafe_to_string b
 
 (* A reset can delete our Close frame before the peer reads it. Thus we linger,
-   for at most the close timeout and 1 MiB. Only the fiber that reads frames can
-   call it. *)
+   for at most the close timeout and 1 MiB. The linger ends at the close
+   deadline: the deadline of the first close, if one, else the time
+   [close_timeout] from now. [Flow.linger] removes the read timeout. Only the
+   fiber that reads frames can call it. *)
 let linger t =
-  set_read_deadline t (Some t.close_timeout) ;
+  set_close_deadline t ;
   Flow.linger t.flow ~max:(1024 * 1024)
 
 (* The peer does not obey the protocol, or it is idle. We send a Close frame
@@ -239,12 +215,7 @@ let peer_closed t payload =
       (fun () -> write_close t echo) ;
   raise (shut t code reason)
 
-let after_close_deadline t =
-  match Atomic.get t.close_at with
-  | Some c ->
-      not (Mtime.is_earlier (Time.now (time t)) ~than:c)
-  | None ->
-      false
+let after_close_deadline t = Deadline.has_passed (Atomic.get t.close_at)
 
 (* Raised by the UTF-8 check of a part of a text message. *)
 exception Bad_text
@@ -276,7 +247,6 @@ let rec next t part =
   (* The idle timeout applies until the first byte of the frame. The bytes of
      the frame can be in [t.r] at this time. *)
   t.in_frame <- Buf_reader.buffered t.r > 0 ;
-  if not t.in_frame then set_read_deadline t t.idle_timeout ;
   let start = Buf_reader.consumed t.r in
   (* The UTF-8 of a text message, checked for each part of a frame as it
      arrives, after the [pending] bytes of an incomplete sequence (RFC 6455
@@ -365,23 +335,24 @@ let rec next t part =
         end )
 
 let recv t =
-  Semaphore.with_acquired t.reader (fun () -> check_closed t ; next t None)
+  Fiber.Semaphore.use t.reader (fun () -> check_closed t ; next t None)
 
 (* If a close started (a Close frame went or waits to go), waits until the
    connection closes. A fiber in [recv] reads the peer's Close frame. If no
    fiber reads, we read it. [close] sets the close deadline, and [fail] and
    [peer_closed] end with [shut], thus the wait has a limit. If the connection
-   is closed, [finished] is enabled at once. *)
+   is closed, [finished] is ready at once. The sync takes the permit of the
+   reader only if it selects [read]. *)
 let wait_closed t =
   if Atomic.get t.closing <> None then begin
-    let read = Semaphore.acquire' t.reader `Read
-    and finished = Action.map (fun _ -> `Finished) (Cell.Once.get' t.closed) in
-    match Action.invoke (Action.choose [finished; read]) with
+    let read = wrap (Fiber.Semaphore.acquire t.reader) (fun () -> `Read)
+    and finished = wrap (Ivar.read t.closed) (fun _ -> `Finished) in
+    match sync (choose [finished; read]) with
     | `Finished ->
         ()
     | `Read ->
         Fun.protect
-          ~finally:(fun () -> Semaphore.release t.reader)
+          ~finally:(fun () -> Fiber.Semaphore.release t.reader)
           (fun () ->
             try
               check_closed t ;
@@ -395,10 +366,10 @@ let close ?(code = 1000) ?(reason = "") t =
   if String.length reason > 123 || not (String.is_valid_utf_8 reason) then
     invalid_arg
       "Caravan_websocket.close: reason is not UTF-8 of at most 123 bytes" ;
-  if not (Cell.Once.is_set t.closed) then begin
+  if Option.is_none (Ivar.peek t.closed) then begin
     (* Also if a different fiber started the close, for example to reply to the
        peer: we wait at most the close timeout. *)
-    set_close_deadline t (Time.after (time t) t.close_timeout) ;
+    set_close_deadline t ;
     if claim_close t (Closed {code; reason}) then
       write_close t (code_payload code ^ reason)
   end ;

@@ -1,19 +1,19 @@
 (** Bidirectional byte streams.
 
     A flow is what a protocol engine reads requests from and writes responses
-    to. A TCP connection is a flow; later a TLS session or an HTTP/2 stream will
-    be too. Upgrade callbacks and [CONNECT] tunnels receive the raw flow of
+    to. A TCP connection is a flow. Later a TLS session or an HTTP/2 stream will
+    be one too. Upgrade callbacks and [CONNECT] tunnels get the raw flow of
     their connection.
 
-    Reads may run concurrently with writes, but two concurrent reads, or two
-    concurrent writes, on the same flow are not supported. *)
-
-open Affect
+    A read and a write can run at the same time in two fibers. Two reads at the
+    same time, or two writes at the same time, on one flow are not supported. A
+    function of this module needs a weft fiber only when a function that {!make}
+    got needs one. The flows of {!Tcp} need a fiber. {!of_string} needs none. *)
 
 (** The type for flows. *)
 type t
 
-(** Raised by a read or a write whose deadline has passed. *)
+(** Raised by a read or a write whose deadline or timeout passed. *)
 exception Timeout
 
 (** Raised by a read or a write on a closed flow, or when the peer reset the
@@ -21,134 +21,154 @@ exception Timeout
 exception Closed
 
 val make :
-     time:Time.mono
-  -> read:(bytes -> int -> int -> int)
+     read:(bytes -> int -> int -> int)
   -> read_now:(bytes -> int -> int -> int option)
   -> write:(bytes -> int -> int -> unit)
-  -> readable:unit Action.t
+  -> readable:unit Weft.event
   -> shutdown_send:(unit -> unit)
   -> close:(unit -> unit)
   -> ?reset:(unit -> unit)
-  -> set_read_deadline:(Affect_unix.Mtime.t option -> unit)
-  -> set_write_deadline:(Affect_unix.Mtime.t option -> unit)
+  -> set_read_deadline:(Weft.Clock.mono option -> unit)
+  -> set_write_deadline:(Weft.Clock.mono option -> unit)
+  -> ?set_read_timeout:(Weft.Span.t option -> unit)
+  -> ?set_write_timeout:(Weft.Span.t option -> unit)
   -> unit
   -> t
-(** [make ~time ~read ~read_now ~write ~readable ~shutdown_send ~close ~reset
-     ~set_read_deadline ~set_write_deadline ()] is a flow implemented by the
-    given functions:
-    - [time] is the time line of the deadlines. A flow that forwards its
-      deadlines to an inner flow gives [~time:(Flow.time inner)].
+(** [make ~read ~read_now ~write ~readable ~shutdown_send ~close ~reset
+     ~set_read_deadline ~set_write_deadline ~set_read_timeout ~set_write_timeout
+     ()] is a flow with these functions:
     - [read buf off len] reads at most [len > 0] bytes into [buf] from [off] and
-      returns how many it read, [0] at the end of the stream. It may block
-      cooperatively.
-    - [read_now buf off len] is like [read] but never blocks: it is [None] when
-      [read] would.
+      gives the count, [0] at the end of the stream. It can wait.
+    - [read_now buf off len] is as [read], but it never waits: it is [None] when
+      [read] would wait.
     - [write buf off len] writes all [len] bytes of [buf] from [off], or raises.
-    - [readable] is an action enabled when [read] can return without blocking,
-      including at the end of the stream.
-    - [shutdown_send ()] signals the end of the stream to the peer.
-    - [close ()] releases the flow's resources. The resulting flow calls it at
-      most once. It must make a read or a write that waits at that time, for
-      example in a different fiber, raise {!Closed}.
-    - [reset ()] releases them abortively, so that the peer sees the stream fail
-      rather than end (default: [close]). The resulting flow calls at most one
-      of [close] and [reset], once.
-    - [set_read_deadline d] and [set_write_deadline d] set or clear the time
-      after which a blocked read or write raises {!Timeout}. They must not
-      suspend the fiber or block: callers can call them while they hold a lock.
-*)
-
-val time : t -> Time.mono
-(** [time flow] is the monotonic time line of the deadlines of [flow], and of
-    the waits of the engine that serves it. Compute the deadlines of [flow] with
-    it, for example [Time.after (Flow.time flow) span]. *)
+    - [readable] is an event that is ready when [read] can give a result with no
+      wait. It is also ready at the end of the stream and after a close. It can
+      be stale: use [read_now] after it.
+    - [shutdown_send ()] sends the end of the stream to the peer.
+    - [close ()] releases the resources of the flow. The flow calls it at most
+      one time. After it, [readable] must be ready, and a read or a write that
+      waits in another fiber must raise {!Closed}.
+    - [reset ()] releases them with an abort, so that the peer sees a failure,
+      not the end of the stream (default: [close]). The flow calls at most one
+      of [close] and [reset], one time.
+    - [set_read_deadline d] and [set_write_deadline d] set or remove the time
+      after which a read or a write that waits raises {!Timeout}. They must not
+      wait. They can do a world effect (a wake of another domain), so a caller
+      must not hold a stdlib [Mutex].
+    - [set_read_timeout] and [set_write_timeout] set the timeout of each later
+      read or write that waits (see {!set_read_timeout}). They must not wait and
+      must not do a world effect. By default the flow ignores the timeouts. *)
 
 (** {1:reading Reading} *)
 
 val read : t -> bytes -> int -> int -> int
-(** [read flow buf off len] reads at most [len] bytes into [buf] starting at
-    [off], and returns the number of bytes read. It returns [0] only at the end
-    of the stream.
+(** [read flow buf off len] reads at most [len] bytes into [buf] from [off], and
+    gives the count. It gives [0] only at the end of the stream.
 
     @raise Invalid_argument
-      if [len <= 0] or [off] and [len] do not designate a valid range of [buf].
+      if [len <= 0], or if [off] and [len] are not a valid range of [buf].
     @raise Closed if [flow] is closed. *)
 
 val read_now : t -> bytes -> int -> int -> int option
-(** [read_now flow buf off len] is like {!read} but does not block: it is [None]
-    if no byte is available yet. A flow can be {!readable'} and still have none:
-    readiness can be stale, and under TLS the bytes that arrived may not
-    complete a record.
+(** [read_now flow buf off len] is as {!read}, but it does not wait: it is
+    [None] if no byte is ready. A flow can be {!readable} and have no byte:
+    readiness can be stale, and under TLS the bytes can be a part of a record.
 
     @raise Invalid_argument as {!read} does.
     @raise Closed if [flow] is closed. *)
 
-val readable' : t -> 'tag -> 'tag Action.t
-(** [readable' flow tag] is an action enabled with [tag] when a {!read} on
-    [flow] would not block. Use it with {!Affect.Action.choose} to wait for
-    input together with a timeout or a shutdown signal. *)
+val readable : t -> unit Weft.event
+(** [readable flow] is ready when a {!read} of [flow] would not wait. Use it in
+    a [Weft.choose] with a deadline or a stop, then use {!read_now}. On [None],
+    wait again. *)
 
 (** {1:writing Writing} *)
 
 val write : t -> bytes -> int -> int -> unit
-(** [write flow buf off len] writes the [len] bytes of [buf] starting at [off].
-    Writing zero bytes does nothing.
+(** [write flow buf off len] writes the [len] bytes of [buf] from [off]. A write
+    of zero bytes does nothing.
 
-    @raise Invalid_argument
-      if [off] and [len] do not designate a valid range of [buf].
+    @raise Invalid_argument if [off] and [len] are not a valid range of [buf].
     @raise Closed if [flow] is closed. *)
 
 val write_string : t -> string -> unit
 (** [write_string flow s] writes all of [s]. *)
 
 val shutdown_send : t -> unit
-(** [shutdown_send flow] tells the peer that nothing more will be written, while
-    reads remain possible (a TCP half-close). *)
+(** [shutdown_send flow] tells the peer that no more bytes come. Reads stay
+    possible (a TCP half-close). *)
 
-(** {1:lifetime Deadlines and closing} *)
+(** {1:lifetime Deadlines, timeouts and closing} *)
 
-val set_read_deadline : t -> Affect_unix.Mtime.t option -> unit
-(** [set_read_deadline flow d] makes reads that are blocked at time [d] raise
+val set_read_deadline : t -> Weft.Clock.mono option -> unit
+(** [set_read_deadline flow d] makes a read that waits at the time [d] raise
     {!Timeout}. [None] removes the deadline. The deadline applies also to a read
-    that waits at the time of the call, for example in a different fiber. *)
+    that waits at the time of the call in another fiber. *)
 
-val set_write_deadline : t -> Affect_unix.Mtime.t option -> unit
-(** [set_write_deadline flow d] is like {!set_read_deadline} for writes. *)
+val set_write_deadline : t -> Weft.Clock.mono option -> unit
+(** [set_write_deadline flow d] is as {!set_read_deadline}, for writes. *)
+
+val set_read_timeout : t -> Weft.Span.t option -> unit
+(** [set_read_timeout flow span] gives each later {!read} that waits the
+    deadline [span] after the start of its first wait. A second wait of the same
+    read keeps that deadline. The read raises {!Timeout} at the earlier of this
+    deadline and the read deadline ({!set_read_deadline}). [None] removes the
+    timeout.
+
+    A set does not change a read that waits at this time. Set it before the
+    reads that need it. It does no world effect, so a fiber can call it before
+    each read. *)
+
+val set_write_timeout : t -> Weft.Span.t option -> unit
+(** [set_write_timeout flow span] is as {!set_read_timeout}, for writes. A set
+    does not change a write that waits at this time. Set it before the writes
+    that need it. A write of many bytes is one call: its timeout starts at its
+    first wait and holds until all the bytes went. *)
 
 val close : t -> unit
-(** [close flow] closes [flow]. Closing is idempotent. Reads and writes on a
-    closed flow raise {!Closed}, also a read or a write that waits at the time
-    of the call, for example in a different fiber. *)
+(** [close flow] closes [flow]. A second close does nothing. Reads and writes on
+    a closed flow raise {!Closed}. This also applies to a read or a write that
+    waits in another fiber at the time of the call. It never waits, so a
+    cancelled fiber can call it. *)
 
 val reset : t -> unit
-(** [reset flow] closes [flow] abortively: a TCP peer gets a reset instead of
-    the end of the stream, so it can tell that what it received was cut short.
-    It does nothing on a closed flow. *)
+(** [reset flow] closes [flow] with an abort. A TCP peer gets a reset, not the
+    end of the stream, so it can tell that it got only a part of the data. After
+    {!shutdown_send}, the peer gets the end of the stream (Linux and the
+    simulator). On a closed flow, it does nothing. *)
 
 val linger : t -> max:int -> unit
-(** [linger flow ~max] prepares [flow] for a {!close} when the peer can still
-    send input. A close of a TCP socket with unread input sends a reset, and a
-    reset can delete our last bytes before the peer reads them. Thus [linger]
-    calls {!shutdown_send} first. Then it reads and discards the input until the
-    end of the stream, for at most [max] bytes. It stops at the read deadline of
-    [flow], and it ignores {!Timeout} and {!Closed}. Set the read deadline
-    before the call, and close [flow] after it. No other fiber can read [flow]
-    during the call. RFC 9112 §9.6 tells this procedure for HTTP. *)
+(** [linger flow ~max] prepares [flow] for a {!close} when the peer can send
+    more input. On Linux and in the simulator, a close of a socket with unread
+    input sends a reset. The reset can delete our last bytes before the peer
+    reads them. Thus [linger] calls {!shutdown_send}. Then it reads and discards
+    the input until the end of the stream, for at most [max] bytes. RFC 9112
+    section 9.6 gives this procedure for HTTP.
+
+    [linger] stops at the read deadline of [flow]. Before the shutdown, it sets
+    the read timeout of [flow] to [None], because each read of the linger is a
+    new call. The flow ends after the linger, so no caller needs the old
+    timeout. It ignores {!Timeout} and {!Closed}, but not
+    [Weft.Fiber.Cancelled].
+
+    Set the read deadline before the call, and close [flow] after it. No other
+    fiber can read [flow] during the call. *)
 
 (** {1:derived Derived flows} *)
 
 val prepend : string -> t -> t
-(** [prepend s flow] is [flow] with the bytes of [s] read first. Its
-    {!readable'} action is enabled at once while bytes of [s] remain. Writes,
-    deadlines and closing go to [flow], and its time line is the one of [flow].
+(** [prepend s flow] is [flow] with the bytes of [s] first. Its {!readable}
+    event is ready at once while bytes of [s] remain. Writes, deadlines,
+    timeouts and the close go to [flow].
 
-    An HTTP/1.1 connection uses it to hand the bytes it has already buffered to
-    an upgrade callback. *)
+    An HTTP/1.1 connection uses it to give the bytes that it has in its buffer
+    to an upgrade callback. *)
 
 val of_string : ?chunk:int -> string -> Buffer.t -> t
-(** [of_string ~chunk input output] is an in-memory flow for tests. Reads return
-    the bytes of [input], at most [chunk] bytes per read (default: no limit) to
-    imitate a network that splits data, and then [0]. Writes append to [output].
-    It is always readable and ignores deadlines. Its time line is {!Time.mono}.
+(** [of_string ~chunk input output] is a flow in memory, for tests. Reads give
+    the bytes of [input], at most [chunk] bytes in each read (default: no
+    limit), then [0]. Writes add to [output]. It is always readable, and it
+    ignores the deadlines and the timeouts. It needs no fiber.
 
     @raise Invalid_argument if [chunk <= 0]. *)

@@ -1,55 +1,55 @@
 (** Connection information.
 
-    What a handler knows about the connection a request arrived on. *)
+    What a handler knows about the connection of a request. *)
 
-(** The type for connection information. A value contains a function, thus [=]
-    and [compare] on it raise [Invalid_argument]. *)
+(** The type for connection information. *)
 type t
 
 val make :
      id:int
-  -> peer:Unix.sockaddr
-  -> local:Unix.sockaddr
+  -> peer:Weft.Net.addr
+  -> local:Weft.Net.addr
   -> ?scheme:[`Http | `Https]
   -> ?alpn:string
-  -> ?stopping:unit Affect.Action.t
+  -> ?stopping:unit Weft.event
   -> unit
   -> t
-(** [make ~id ~peer ~local ~scheme ~alpn ~stopping ()] describes connection
-    [id], from [peer] to our address [local]. [scheme] defaults to [`Http].
-    [alpn] is the protocol negotiated by TLS, if any. [stopping] is {!stopping},
-    {!Affect.Action.never} by default. *)
+(** [make ~id ~peer ~local ~scheme ~alpn ~stopping ()] tells about connection
+    [id], from [peer] to our address [local]. [scheme] is [`Http] by default.
+    [alpn] is the protocol that TLS selected, if one. [stopping] is {!stopping},
+    [Weft.never] by default. *)
 
 val id : t -> int
-(** [id c] is a number identifying [c] among the server's connections. *)
+(** [id c] is the number of [c] among the connections of the server. *)
 
-val peer : t -> Unix.sockaddr
-(** [peer c] is the address of the client. *)
+val peer : t -> Weft.Net.addr
+(** [peer c] is the address of the client. On macOS, an aborted connection can
+    have [Tcp ("", 0)]. *)
 
-val local : t -> Unix.sockaddr
-(** [local c] is the address the connection was accepted on. *)
+val local : t -> Weft.Net.addr
+(** [local c] is the address that accepted the connection. *)
 
 val scheme : t -> [`Http | `Https]
-(** [scheme c] is [`Https] iff [c] is secured by TLS. *)
+(** [scheme c] is [`Https] iff TLS secures [c]. *)
 
 val alpn : t -> string option
-(** [alpn c] is the protocol negotiated with TLS ALPN, for example ["h2"]. *)
+(** [alpn c] is the protocol that TLS ALPN selected, for example ["h2"]. *)
 
-val stopping : t -> unit Affect.Action.t
-(** [stopping c] is an action that is enabled when the server starts to stop:
-    after {!Server.shutdown}, {!Server.abort} or the first signal of
-    {!Server.run} (at once, or one step of the server's supervisor later for a
-    connection that the server takes at the same time), and soon after a failure
-    of the listener or a cancel of the caller of the server ("soon" is one step
-    of the supervisor). It stays enabled. A connection that ends while the
-    server runs does not enable it. A handler that runs for a long time, for
-    example a stream of events or a WebSocket handler, can choose it with its
-    other actions. Then the handler can end before the server cancels it at the
-    end of [shutdown_grace]. *)
+val stopping : t -> unit Weft.event
+(** [stopping c] is ready when the server starts to stop. These events start the
+    stop:
+    - [Server.shutdown] or [Server.abort]
+    - A failure of the listener
+    - A cancel of the scope of the server
+    - The first SIGINT or SIGTERM of [Server.stop_on_signals].
 
-val pp_addr : Format.formatter -> Unix.sockaddr -> unit
-(** [pp_addr] formats a socket address as [host:port], [[ipv6]:port] or a Unix
-    domain socket path. *)
+    It stays ready. A handler that runs for a long time can put it in a
+    [Weft.choose] with its other events. Examples are a stream of events and a
+    WebSocket handler. *)
+
+val pp_addr : Format.formatter -> Weft.Net.addr -> unit
+(** [pp_addr] prints an address as [host:port], [[ipv6]:port] or the path of a
+    Unix socket. *)
 
 val pp : Format.formatter -> t -> unit
-(** [pp] formats a connection as [#id peer -> local]. *)
+(** [pp] prints a connection as [#id peer -> local]. *)

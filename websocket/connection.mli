@@ -12,10 +12,10 @@ exception Closed of {code: int; reason: string}
 val make :
      ?protocol:string
   -> ?max_message:int
-  -> ?close_timeout:Affect_unix.Mtime.Span.t
-  -> ?write_timeout:Affect_unix.Mtime.Span.t
-  -> ?read_timeout:Affect_unix.Mtime.Span.t
-  -> ?idle_timeout:Affect_unix.Mtime.Span.t
+  -> ?close_timeout:Weft.Span.t
+  -> ?write_timeout:Weft.Span.t
+  -> ?read_timeout:Weft.Span.t
+  -> ?idle_timeout:Weft.Span.t
   -> Flow.t
   -> t
 

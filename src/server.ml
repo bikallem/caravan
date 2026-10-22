@@ -1,279 +1,253 @@
-open Affect
-module Mtime = Affect_unix.Mtime
+open Weft
 
 module type LISTENER = sig
   type t
 
-  val addr : t -> Unix.sockaddr
+  val addr : t -> Net.addr
 
-  val wait_acceptable : t -> 'tag -> 'tag Action.t
-
-  val try_accept : t -> (Unix.file_descr * Unix.sockaddr) option
+  val accept : t -> Net.t * Net.addr
 
   val close : t -> unit
 end
 
-(* The stop cells of the open connections, by id. A connection waits on its own
-   cell, not on the cell of the server: in affect 0.0.0 each new waiter of a
-   Cell.Once copies all the waiters, so one shared cell costs each wait time in
-   proportion to the open connections (#11). The supervisor adds each
-   connection. [shutdown] sets all the cells at once, the supervisor sets them
-   again when it ends, and a connection sets its own cell when it ends. No
-   effect runs under the lock. *)
-type registry = {lock: Mutex.t; cells: (int, unit Cell.Once.t) Hashtbl.t}
+(* The reasons of the cancels of the connections. Nothing matches them: they
+   only name the cancel in the reports. *)
+exception Aborted
 
-let register reg id c =
-  Mutex.protect reg.lock (fun () -> Hashtbl.replace reg.cells id c)
+exception Grace_expired
 
-let unregister reg id =
-  Mutex.protect reg.lock (fun () -> Hashtbl.remove reg.cells id)
-
-let broadcast reg =
-  let cells =
-    Mutex.protect reg.lock (fun () ->
-        Hashtbl.fold (fun _ c acc -> c :: acc) reg.cells [] )
-  in
-  List.iter (fun c -> Cell.Once.try_set c ()) cells
-
+(* [stop] is full when the server starts to stop. Each connection waits on it:
+   an Ivar adds a waiter in amortized O(1) (#11). [abort] is full after [abort].
+   Only the grace daemon reads it. *)
 type t =
-  { addr: Unix.sockaddr
-  ; acceptor: unit Fun.Async.t
-  ; supervisor: unit Fun.Async.t
-  ; grace: unit Fun.Async.t
-  ; stopping: unit Cell.Once.t
-  ; registry: registry }
+  { addr: Net.addr
+  ; stop: unit Ivar.t
+  ; abort: unit Ivar.t
+  ; close_listener: unit -> unit
+  ; open_connections: int Atomic.t
+  ; server: unit Promise.t }
 
-let report (config : Config.t) e =
-  config.on_error e (Printexc.get_raw_backtrace ())
+(* The pause after an error of accept for resources, for example EMFILE. *)
+let pause = Span.ms 100
 
-(* Accepts a pending connection, if there is one: readiness can be spurious.
-   Errors that do not concern the listener are ridden out: a connection that
-   failed while queued, or running out of file descriptors, which is reported
-   and waited out for 100 ms, or until the stop. *)
-let accept config (module L : LISTENER) listener ~stopping =
-  match L.try_accept listener with
-  | conn ->
-      conn
-  | exception (Unix.Unix_error (err, _, _) as e) -> (
-    match Accept_error.classify err with
-    | `Connection ->
-        None
-    | `Resources ->
-        report config e ;
-        let time = config.Config.mono_time in
-        Action.invoke
-          (Action.choose
-             [ Time.at time (Time.after time Mtime.Span.(100 * ms)) ()
-             ; Cell.Once.get' stopping ] ) ;
-        None
-    | `Listener ->
-        raise e )
-
-(* [own] is the stop cell of the connection, for the actions that wait. A poll
-   reads the cell of the server: it adds no waiter, and it sees the stop at
-   once. *)
-let serve_connection (config : Config.t) engine handler ~stopping ~own ~id flow
-    (fd, peer) =
-  let local = try Unix.getsockname fd with Unix.Unix_error _ -> peer in
-  let conn =
-    Conn_info.make ~id ~peer ~local ~stopping:(Cell.Once.get' own) ()
-  in
-  let ctx =
-    { Engine.config
-    ; conn
-    ; stopping= Cell.Once.get' own
-    ; is_stopping= (fun () -> Cell.Once.is_set stopping) }
-  in
-  match engine ctx flow handler with
-  | () ->
-      ()
-  | exception Fun.Async.Cancelled ->
-      raise Fun.Async.Cancelled
-  | exception e ->
-      report config e
-
-(* Takes a free connection slot, accepts a connection and hands it to the
-   supervisor, until [stopping] is set. Then closes the listener, so that new
-   clients are refused. *)
-let acceptor config (module L : LISTENER) listener ~stopping ~slots handoff =
-  (* The check before the choose does not rely on the order of choose: after a
-     stop, a listener that stays ready does not win again. *)
-  let wait action =
-    if Cell.Once.is_set stopping then `Stop
-    else
-      Action.invoke
-        (Action.choose
-           [Action.map (fun () -> `Stop) (Cell.Once.get' stopping); action] )
-  in
-  let rec loop () =
-    match wait (Semaphore.acquire' slots `Slot) with
-    | `Stop ->
-        ()
-    | `Slot ->
-        with_slot ()
-  and with_slot () =
-    match wait (L.wait_acceptable listener `Ready) with
-    | `Stop ->
-        Semaphore.release slots
-    | `Ready -> (
-      match accept config (module L) listener ~stopping with
-      | exception e ->
-          Semaphore.release slots ; raise e
-      | None ->
-          with_slot ()
-      | Some conn -> (
-        match wait (Port.offer' handoff conn `Taken) with
-        | `Taken ->
-            loop ()
-        | `Stop ->
-            (* The supervisor saw [stopping] first and takes no more. *)
-            Affect_unix.Unix.close_noerr (fst conn) ;
-            Semaphore.release slots ) )
-  in
-  Fun.Async.protect ~finally:(fun () -> L.close listener) loop
-
-(* Owns the connections: each one is an asynchronous call of the supervisor,
-   which therefore returns only once they have all finished. *)
-let supervisor config engine handler ~stopping ~registry ~slots handoff =
-  let conn = Action.map (fun c -> `Conn c) (Port.take' handoff) in
-  let stop = Action.map (fun () -> `Stop) (Cell.Once.get' stopping) in
-  let rec loop id =
-    match Action.invoke (Action.choose [stop; conn]) with
-    | `Stop ->
-        ()
-    | `Conn conn ->
-        let own = Cell.Once.make () in
-        (* Added before the call starts. The supervisor also sets the cells at
-           the stop, so each connection that it starts sees the stop. *)
-        register registry id own ;
-        Fun.Async.call_trap_exn (fun () ->
-            let flow = Tcp.flow ~time:config.Config.mono_time (fst conn) in
-            Fun.Async.protect
-              ~finally:(fun () ->
-                (* A connection that ends at a stop or a cancel is out of the
-                   registry, so the broadcast misses it: its own cell is set
-                   here. A child of the connection that masks the cancel can
-                   still wait on it. A connection that ends while the server
-                   runs does not set it. *)
-                if
-                  Fun.Async.is_current_cancelled () || Cell.Once.is_set stopping
-                then Cell.Once.try_set own () ;
-                unregister registry id ;
-                Flow.close flow ;
-                Semaphore.release slots )
-              (fun () ->
-                serve_connection config engine handler ~stopping ~own ~id flow
-                  conn ) ) ;
-        loop (id + 1)
-  in
-  (* The supervisor ends at a stop (shutdown, a signal, a failure of the
-     listener) or a cancel (abort, the end of the grace, a cancel of the
-     server's caller). It sets the cells of the connections that are still in
-     the registry; a connection that ended before sets its own cell. *)
-  Fun.Async.protect
+(* The fiber of one connection. It owns the socket [c] and one slot. The flow
+   owns [c] from the start: [Tcp.flow] does not sync and does not raise.
+   [finally] does not sync, so it runs also in a cancelled fiber. *)
+let connection (config : Config.t) engine handler ~stop ~slots ~count ~id c peer
+    () =
+  let f = Tcp.flow c in
+  Fun.protect
     ~finally:(fun () ->
-      Cell.Once.try_set stopping () ;
-      broadcast registry )
-    (fun () -> loop 0)
+      Flow.close f ;
+      Atomic.decr count ;
+      Fiber.Semaphore.release slots )
+    (fun () ->
+      let local = try Net.local_addr c with Net.Error _ -> peer in
+      let conn =
+        Conn_info.make ~id ~peer ~local ~stopping:(Ivar.read stop) ()
+      in
+      engine
+        {Engine.config; conn; is_stopping= (fun () -> Ivar.peek stop <> None)}
+        f handler )
 
-let start_with ?(config = Config.default) ?(engine = H1_server.serve)
-    (module L : LISTENER) listener handler =
-  let addr, slots =
-    match (L.addr listener, Semaphore.make config.max_connections) with
-    | setup ->
-        setup
-    | exception e ->
+(* The acceptor loop: it takes a free slot, accepts a connection and forks the
+   fiber of the connection into [conns], until the stop. *)
+let acceptor (config : Config.t) (module L : LISTENER) l ~conns ~slots ~stop
+    ~count engine handler =
+  (* The acceptor holds a slot and accepts until a connection comes or the stop.
+     It does not report an error of a connection: it accepts again. It reports
+     an error for resources, then it pauses for [pause] or until the stop.
+     [reported] tells that it reported an error of this series: it reports only
+     the first one: Linux and the simulator give EMFILE also when no client
+     waits, thus with no flag the acceptor reports the same error after each
+     pause. An error of the listener goes to the caller. *)
+  let rec accept_conn ~reported =
+    match L.accept l with
+    | c, peer ->
+        if Ivar.peek stop <> None then (Net.close c ; `Stop) else `Conn (c, peer)
+    | exception Net.Error (Bad_fd, _) when Ivar.peek stop <> None ->
+        `Stop
+    | exception (Net.Error (e, _) as exn) -> (
         let bt = Printexc.get_raw_backtrace () in
-        L.close listener ;
-        Printexc.raise_with_backtrace e bt
+        match Accept_error.classify e with
+        | `Connection ->
+            accept_conn ~reported
+        | `Resources -> (
+            if not reported then config.on_error exn bt ;
+            match
+              sync
+                (choose
+                   [ wrap (Time.after Mono pause) (fun () -> `Retry)
+                   ; wrap (Ivar.read stop) (fun () -> `Stop) ] )
+            with
+            | `Retry ->
+                accept_conn ~reported:true
+            | `Stop ->
+                `Stop )
+        | `Listener ->
+            Printexc.raise_with_backtrace exn bt )
   in
-  let stopping = Cell.Once.make () in
-  let registry = {lock= Mutex.create (); cells= Hashtbl.create 64} in
-  let handoff = Port.make () in
-  let supervisor =
-    Fun.Async.call (fun () ->
-        supervisor config engine handler ~stopping ~registry ~slots handoff )
+  (* One slot. The connection fiber owns it after the fork. On each other exit
+     (a stop, a failure or a cancel), the guard releases it, one time only: a
+     second release adds a permit with no error, and then the server serves more
+     than [max_connections] connections. *)
+  let with_slot id =
+    let handed = ref false in
+    Fun.protect
+      ~finally:(fun () -> if not !handed then Fiber.Semaphore.release slots)
+      (fun () ->
+        match accept_conn ~reported:false with
+        | `Stop ->
+            `Stop
+        | `Conn (c, peer) -> (
+            Atomic.incr count ;
+            match
+              Fiber.fork_isolated ~name:"caravan.conn" conns
+                ~on_error:config.on_error
+                (connection config engine handler ~stop ~slots ~count ~id c peer)
+            with
+            | () ->
+                handed := true ;
+                (* The acceptor yields after each 16 accepts. weft does not
+                   switch at an accept that finds a connection. A yield after
+                   each accept made the accepts slow on a busy domain: each
+                   yield can wait for a full round of the run queue. A cancel at
+                   the yield leaves the slot with the connection. *)
+                if id land 15 = 15 then Fiber.yield () ;
+                `Next
+            | exception Fiber.Scope_closed ->
+                (* [conns] is cancelled. The next sync raises the cancel. *)
+                Atomic.decr count ; Net.close c ; `Next ) )
   in
-  let acceptor =
-    Fun.Async.call (fun () ->
-        (* If accepting fails, the connections still finish. *)
-        Fun.Async.protect
-          ~finally:(fun () -> Cell.Once.try_set stopping ())
-          (fun () ->
-            acceptor config (module L) listener ~stopping ~slots handoff ) )
+  let rec loop id =
+    (* The peek before the choose: weft selects a ready branch at random. *)
+    if Ivar.peek stop = None then
+      match
+        sync
+          (choose
+             [ wrap (Fiber.Semaphore.acquire slots) (fun () -> `Slot)
+             ; wrap (Ivar.read stop) (fun () -> `Stop) ] )
+      with
+      | `Stop ->
+          ()
+      | `Slot -> (
+        match with_slot id with `Next -> loop (id + 1) | `Stop -> () )
   in
-  (* Once stopping, the connections get [shutdown_grace] to finish. *)
-  let grace =
-    Fun.Async.call (fun () ->
-        Action.invoke (Cell.Once.get' stopping) ;
-        let finished =
-          Action.map (fun () -> `Finished) (Fun.Async.get' supervisor)
-        in
-        (* The grace starts at the stop. *)
-        let expired =
-          Time.at config.mono_time
-            (Time.after config.mono_time config.shutdown_grace)
-            `Expired
-        in
-        match Action.invoke (Action.choose [finished; expired]) with
-        | `Finished ->
-            ()
-        | `Expired ->
-            Fun.Async.cancel supervisor
-        (* Aborted: the supervisor was cancelled, see [wait]. *)
-        | exception Fun.Async.Cancelled
-          when not (Fun.Async.is_current_cancelled ()) ->
-            () )
+  loop 0
+
+(* The grace daemon. It starts at the end of the acceptor. It cancels the
+   connections at the end of the grace or at [abort]. The scope cancels it when
+   the last connection ends. A grace that overflows never ends. *)
+let grace (config : Config.t) ~conns ~abort () =
+  let reason =
+    sync
+      (choose
+         [ wrap (Time.after Mono config.shutdown_grace) (fun () -> Grace_expired)
+         ; wrap (Ivar.read abort) (fun () -> Aborted) ] )
   in
-  {addr; acceptor; supervisor; grace; stopping; registry}
+  Fiber.cancel conns reason
 
-let start ?(config = Config.default) ?engine handler =
-  let listener = Tcp.Listener.listen ~backlog:config.backlog config.addr in
-  start_with ~config ?engine (module Tcp.Listener) listener handler
+(* The fiber of the server. The acceptor loop is the body of [conns]. Its
+   [finally] fills [stop] at each end of the acceptor: a stop, a failure of the
+   listener and a cancel of the scope of the server. A failure of the listener
+   goes to [wait] after the connections ended.
 
-let local_addr s = s.addr
+   A cancel of the scope of the server also cancels [conns]. Then the fork of
+   the grace raises [Scope_closed], and the server fiber raises the cancel
+   again: weft makes it a cancel of [server]. A [Cancelled] of a different scope
+   from [L.accept] is a failure of the listener as each other exception is. *)
+let server_body config engine handler (module L : LISTENER) l ~slots ~stop
+    ~abort ~count () =
+  let failure = ref None in
+  Fiber.scope (fun conns ->
+      ( match
+          Fun.protect
+            ~finally:(fun () ->
+              ignore (Ivar.try_fill stop ()) ;
+              L.close l )
+            (fun () ->
+              acceptor config
+                (module L)
+                l ~conns ~slots ~stop ~count engine handler )
+        with
+      | () ->
+          ()
+      | exception e ->
+          failure := Some (e, Printexc.get_raw_backtrace ()) ) ;
+      (* A cancel of the scope of the server before this fork: no grace is
+         necessary. *)
+      try
+        Fiber.fork_daemon ~name:"caravan.grace" conns
+          (grace config ~conns ~abort)
+      with Fiber.Scope_closed -> () ) ;
+  Option.iter (fun (e, bt) -> Printexc.raise_with_backtrace e bt) !failure
 
-let open_connections s =
-  Mutex.protect s.registry.lock (fun () -> Hashtbl.length s.registry.cells)
+let start_with ?(config = Config.default) ?(engine = H1_server.serve) sw
+    (module L : LISTENER) l handler =
+  match
+    let addr = L.addr l in
+    let slots = Fiber.Semaphore.create config.max_connections in
+    let stop = Ivar.create () and abort = Ivar.create () in
+    let count = Atomic.make 0 in
+    let server =
+      Fiber.fork_promise ~name:"caravan.server" sw
+        (server_body config engine handler
+           (module L)
+           l ~slots ~stop ~abort ~count )
+    in
+    { addr
+    ; stop
+    ; abort
+    ; close_listener= (fun () -> L.close l)
+    ; open_connections= count
+    ; server }
+  with
+  | t ->
+      t
+  | exception e ->
+      let bt = Printexc.get_raw_backtrace () in
+      L.close l ;
+      Printexc.raise_with_backtrace e bt
 
-(* The cells of the open connections are set here at once, and again by the
-   supervisor when it ends, for a connection that it adds at the same time. *)
-let shutdown s =
-  Cell.Once.try_set s.stopping () ;
-  broadcast s.registry
+let start ?(config = Config.default) ?engine sw handler =
+  let l = Tcp.Listener.listen ~backlog:config.backlog config.addr in
+  start_with ~config ?engine sw (module Tcp.Listener) l handler
 
-let abort s =
-  shutdown s ;
-  Fun.Async.cancel s.supervisor
+let local_addr t = t.addr
 
-(* The supervisor returns as soon as it sees [stopping], then waits for its
-   connections. Cancelled before it sees it, by [abort] or a grace of zero, it
-   ends with [Cancelled]: a stop too. *)
-let wait s =
-  ( match Fun.Async.get s.supervisor with
+let open_connections t = Atomic.get t.open_connections
+
+(* The listener closes in the fiber of the caller. On one domain, the OS then
+   refuses a connect right after [shutdown]. On more than one domain, weft can
+   do the close(2) later, on the domain that registered the listener. A client
+   that connects before that close gets a reset. *)
+let shutdown t =
+  ignore (Ivar.try_fill t.stop ()) ;
+  t.close_listener ()
+
+let abort t =
+  shutdown t ;
+  ignore (Ivar.try_fill t.abort ())
+
+(* [Promise.Cancelled] comes only from a cancel of the scope of the server (or
+   of an outer scope): a stop too. A cancel of the caller raises
+   [Fiber.Cancelled]. A [Cancelled] of a different scope that the server fiber
+   raised is a failure, and [wait] raises it. *)
+let wait t =
+  match Promise.await t.server with
   | () ->
       ()
-  | exception Fun.Async.Cancelled
-    when Cell.Once.is_set s.stopping && not (Fun.Async.is_current_cancelled ())
-    ->
-      () ) ;
-  Fun.Async.get s.grace ; Fun.Async.get s.acceptor
+  | exception Promise.Cancelled ->
+      ()
 
-let run ?config ?engine ?domain_count ?(on_start = ignore) handler =
-  let signals = Stop_signal.install () in
-  Stdlib.Fun.protect ~finally:(fun () -> Stop_signal.release signals)
-  @@ fun () ->
-  Affect_unix.Unix.main ?domain_count
-  @@ fun () ->
-  let server = start ?config ?engine handler in
-  on_start server ;
-  let stopper =
-    Fun.Async.call (fun () ->
-        ignore (Stop_signal.wait signals) ;
-        shutdown server ;
-        ignore (Stop_signal.wait signals) ;
-        abort server )
+let stop_on_signals t =
+  let signal =
+    choose [Signal.received Signal.SIGINT; Signal.received Signal.SIGTERM]
   in
-  Fun.Async.protect
-    ~finally:(fun () -> Fun.Async.cancel stopper)
-    (fun () -> wait server)
+  (* A commit can count more than one signal. *)
+  if sync signal < 2 then (
+    shutdown t ;
+    ignore (sync signal) ) ;
+  abort t ;
+  Signal.unwatch Signal.SIGINT ;
+  Signal.unwatch Signal.SIGTERM

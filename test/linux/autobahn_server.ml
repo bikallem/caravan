@@ -16,9 +16,7 @@ let handler req =
   Ws.accept ~origin:(fun _ -> true) ~max_message:(64 * 1024 * 1024) req echo
 
 let () =
-  let config =
-    {Config.default with addr= Unix.ADDR_INET (Unix.inet_addr_loopback, 9001)}
-  in
+  let config = {Config.default with addr= Weft.Net.Tcp ("127.0.0.1", 9001)} in
   (* make autobahn starts the test suite after this line. *)
   let on_start _ = print_endline "listening on port 9001" in
-  Server.run ~config ~on_start handler
+  Caravan_run.run ~config ~on_start handler

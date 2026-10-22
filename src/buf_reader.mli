@@ -36,7 +36,8 @@ val make :
       given. *)
 
 val of_flow : ?size:int -> Flow.t -> t
-(** [of_flow ~size flow] reads from [flow]. *)
+(** [of_flow ~size flow] reads from [flow]. Reads that wait are reads of [flow].
+    Use {!fill_now} after [Flow.readable]. *)
 
 val of_string : ?size:int -> ?chunk:int -> string -> t
 (** [of_string ~size ~chunk s] reads [s], at most [chunk] bytes per read of the

@@ -15,61 +15,55 @@ type error = Error.t =
 
 exception Error = Error.Error
 
-type t =
-  { config: Config.t
-  ; writers: Writers.t
-  ; pool: Pool.t
-  ; reaper: unit Affect.Fun.Async.t }
+open Weft
+module Cancel = Caravan.Private.Cancel
+
+type t = {config: Config.t; writers: Writers.t; pool: Pool.t}
 
 (* Half of [idle_timeout], and 10 ms or more: a short [idle_timeout] does not
    make a busy loop. *)
 let reap_interval (config : Config.t) =
-  let open Affect_unix.Mtime.Span in
-  let h = config.idle_timeout / 2 in
-  if is_shorter h ~than:(10 * ms) then 10 * ms else h
+  let h = Span.of_ns (Int64.div (Span.to_ns config.idle_timeout) 2L) in
+  if Span.compare h (Span.ms 10) < 0 then Span.ms 10 else h
 
-(* The reaper closes the idle connections that are too old. *)
-let reaper (config : Config.t) pool =
-  let half = reap_interval config in
-  Affect.Fun.Async.call (fun () ->
-      try
-        while true do
-          Caravan.Time.sleep config.mono_time half ;
-          Pool.reap pool
-        done
-      with Affect.Fun.Async.Cancelled -> () )
-
-let make ?(config = Config.default) () =
+(* The reaper closes the idle connections that are too old. It is a daemon of
+   the scope of the writers: [close] cancels it, and the end of the jobs ends
+   it. *)
+let make ?(config = Config.default) sw =
   let pool = Pool.make config in
-  (* A cancel of the fiber that made the client is a close too. *)
-  let writers = Writers.make ~on_stop:(fun () -> Pool.close pool) () in
-  {config; writers; pool; reaper= reaper config pool}
+  (* A cancel of [sw] is a close too. *)
+  let writers = Writers.make ~on_stop:(fun () -> Pool.close pool) sw in
+  let half = reap_interval config in
+  Fiber.fork_daemon ~name:"caravan.client.reaper" (Writers.scope writers)
+    (fun () ->
+      while true do
+        Time.sleep Mono half ; Pool.reap pool
+      done ) ;
+  {config; writers; pool}
 
-let close t =
-  Writers.stop t.writers ;
-  Affect.Fun.Async.cancel t.reaper ;
-  Pool.close t.pool
+let close t = Writers.stop t.writers ; Pool.close t.pool
 
 let run ?config f =
-  let t = make ?config () in
-  (* The request bodies that still go get [close_grace]. A cancel of the caller
-     ends the grace at once. *)
-  let finish () =
-    Writers.finish t.writers ~time:t.config.mono_time
-      ~grace:t.config.close_grace ;
-    close t ;
-    Writers.wait t.writers ;
-    Affect.Fun.Async.mask_cancellation (fun () -> Affect.Fun.Async.get t.reaper)
-  in
-  match f t with
-  | v ->
-      finish () ;
-      Affect.Fun.Async.check_cancellation () ;
-      v
-  | exception e ->
-      let bt = Printexc.get_raw_backtrace () in
-      finish () ;
-      Printexc.raise_with_backtrace e bt
+  Fiber.scope (fun s ->
+      match make ?config s with
+      | exception Fiber.Scope_closed ->
+          (* The scope [s] is new, so only a cancel of the caller closes it. *)
+          Cancel.scope_closed ()
+      | t -> (
+          (* The request bodies that still go get [close_grace]. A cancel of the
+             caller ends the grace at once. *)
+          let finish () =
+            Writers.finish t.writers ~grace:t.config.close_grace ;
+            close t ;
+            Writers.wait t.writers
+          in
+          match f t with
+          | v ->
+              finish () ; Cancel.check () ; v
+          | exception e ->
+              let bt = Printexc.get_raw_backtrace () in
+              finish () ;
+              Printexc.raise_with_backtrace e bt ) )
 
 (* [host[:port]], with an IPv6 host in brackets. An empty port is 80. *)
 let host_port authority =
@@ -115,6 +109,23 @@ let host_port authority =
 let idempotent m =
   List.exists (Method.equal m) Method.[GET; HEAD; PUT; DELETE; OPTIONS; TRACE]
 
+(* A closed client refuses a request. A cancel of the caller can close the
+   client at the same time. For example, the daemon of the writers calls
+   [Pool.close] on a different domain, or a different fiber calls [close]. Then
+   the caller gets [Fiber.Cancelled], not the refusal. [Cancel.check] is a sync,
+   thus it is outside the lock of the pool. *)
+let checkout ?reuse t ~host ~port =
+  match
+    if Writers.is_stopping t.writers then Error.refuse_closed () ;
+    Pool.checkout ?reuse t.pool ~host ~port
+  with
+  | c ->
+      c
+  | exception (Invalid_argument _ as e) ->
+      let bt = Printexc.get_raw_backtrace () in
+      Cancel.check () ;
+      Printexc.raise_with_backtrace e bt
+
 let request t req =
   (* If [request] raises before the exchange, the body of the request closes
      here. A second close does nothing. *)
@@ -133,9 +144,7 @@ let request t req =
       (* A bad request, and a request during the grace of [run], raise before a
          connect. *)
       Caravan.Private.H1_write.check_request req ;
-      if Writers.is_stopping t.writers then
-        invalid_arg "Caravan_client: the client is closed" ;
-      let c, kind = Pool.checkout t.pool ~host ~port in
+      let c, kind = checkout t ~host ~port in
       (host, port, c, kind)
     with e ->
       let bt = Printexc.get_raw_backtrace () in
@@ -159,7 +168,7 @@ let request t req =
         && Body.length (Request.body req) = Some 0
         && not (Writers.is_stopping t.writers)
       then begin
-        let c, _ = Pool.checkout ~reuse:false t.pool ~host ~port in
+        let c, _ = checkout ~reuse:false t ~host ~port in
         Exchange.run t.config t.writers c ~on_release:release
           (Request.with_body Body.empty req)
       end

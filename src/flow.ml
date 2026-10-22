@@ -1,26 +1,25 @@
-open Affect
-
 exception Timeout
 
 exception Closed
 
 type t =
-  { time: Time.mono
-  ; read: bytes -> int -> int -> int
+  { read: bytes -> int -> int -> int
   ; read_now: bytes -> int -> int -> int option
   ; write: bytes -> int -> int -> unit
-  ; readable: unit Action.t
+  ; readable: unit Weft.event
   ; shutdown_send: unit -> unit
   ; close: unit -> unit
   ; reset: unit -> unit
-  ; set_read_deadline: Affect_unix.Mtime.t option -> unit
-  ; set_write_deadline: Affect_unix.Mtime.t option -> unit
+  ; set_read_deadline: Weft.Clock.mono option -> unit
+  ; set_write_deadline: Weft.Clock.mono option -> unit
+  ; set_read_timeout: Weft.Span.t option -> unit
+  ; set_write_timeout: Weft.Span.t option -> unit
   ; closed: bool Atomic.t }
 
-let make ~time ~read ~read_now ~write ~readable ~shutdown_send ~close
-    ?(reset = close) ~set_read_deadline ~set_write_deadline () =
-  { time
-  ; read
+let make ~read ~read_now ~write ~readable ~shutdown_send ~close ?(reset = close)
+    ~set_read_deadline ~set_write_deadline ?(set_read_timeout = ignore)
+    ?(set_write_timeout = ignore) () =
+  { read
   ; read_now
   ; write
   ; readable
@@ -29,9 +28,9 @@ let make ~time ~read ~read_now ~write ~readable ~shutdown_send ~close
   ; reset
   ; set_read_deadline
   ; set_write_deadline
+  ; set_read_timeout
+  ; set_write_timeout
   ; closed= Atomic.make false }
-
-let time flow = flow.time
 
 let check_range fn buf off len =
   if off < 0 || len < 0 || off > Bytes.length buf - len then
@@ -50,7 +49,7 @@ let read_now flow buf off len =
   check_read "read_now" flow buf off len ;
   flow.read_now buf off len
 
-let readable' flow tag = Action.map (fun () -> tag) flow.readable
+let readable flow = flow.readable
 
 let write flow buf off len =
   check_range "write" buf off len ;
@@ -67,6 +66,10 @@ let set_read_deadline flow d = flow.set_read_deadline d
 
 let set_write_deadline flow d = flow.set_write_deadline d
 
+let set_read_timeout flow span = flow.set_read_timeout span
+
+let set_write_timeout flow span = flow.set_write_timeout span
+
 let close flow = if not (Atomic.exchange flow.closed true) then flow.close ()
 
 let reset flow = if not (Atomic.exchange flow.closed true) then flow.reset ()
@@ -81,6 +84,9 @@ let linger flow ~max =
       | n ->
           discard (left - n)
   in
+  (* Each read of the linger is a new call, so a read timeout would give each
+     read a new deadline. Only the read deadline must end the linger. *)
+  set_read_timeout flow None ;
   (* A different fiber can close [flow] at any time. *)
   try shutdown_send flow ; discard max with Closed | Timeout -> ()
 
@@ -103,15 +109,17 @@ let prepend s flow =
       else Some (take buf off len)
     in
     let readable =
-      Action.guard (fun () ->
-          if remaining () > 0 then Action.always () else flow.readable )
+      Weft.guard (fun () ->
+          if remaining () > 0 then Weft.always () else flow.readable )
     in
-    make ~time:flow.time ~read ~read_now ~write:(write flow) ~readable
+    make ~read ~read_now ~write:(write flow) ~readable
       ~shutdown_send:(fun () -> shutdown_send flow)
       ~close:(fun () -> close flow)
       ~reset:(fun () -> reset flow)
       ~set_read_deadline:(set_read_deadline flow)
-      ~set_write_deadline:(set_write_deadline flow) ()
+      ~set_write_deadline:(set_write_deadline flow)
+      ~set_read_timeout:(set_read_timeout flow)
+      ~set_write_timeout:(set_write_timeout flow) ()
   end
 
 let of_string ?(chunk = max_int) input output =
@@ -124,8 +132,7 @@ let of_string ?(chunk = max_int) input output =
     n
   in
   let write buf off len = Buffer.add_subbytes output buf off len in
-  let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
-  make ~time:Time.mono ~read
+  make ~read
     ~read_now:(fun buf off len -> Some (read buf off len))
-    ~write ~readable:(Action.always ()) ~shutdown_send:ignore ~close:ignore
-    ~set_read_deadline:ignore_deadline ~set_write_deadline:ignore_deadline ()
+    ~write ~readable:(Weft.always ()) ~shutdown_send:ignore ~close:ignore
+    ~set_read_deadline:ignore ~set_write_deadline:ignore ()

@@ -1101,6 +1101,10 @@ let framing_props =
 
 module H1_body = Private.H1_body
 
+(* [in_sim f ()] runs [f] in a fiber of the simulator. [H1_body.make] and the
+   reads of a body fill an Ivar, and a fill needs a fiber. *)
+let in_sim f () = Sim_support.run (fun _ -> f ())
+
 (* Reads [b] to its end, [size] bytes at a time. *)
 let read_body ?(size = 4096) b =
   let buf = Bytes.create size and out = Buffer.create 64 in
@@ -1322,7 +1326,8 @@ let chunked_tests =
           ignore (Buf_reader.read_line r ~max:100) ;
           equal string "helloworld"
             (Body.to_string (H1_body.chunked ~max_body:18 ~limits r)) )
-    ; test "make: framing and max_body" (fun () ->
+    ; test "make: framing and max_body"
+      @@ in_sim (fun () ->
           let reads = ref 0 in
           let r = Buf_reader.make (fun _ _ _ -> incr reads ; 0) in
           equal (option int) (Some 0)
@@ -1387,7 +1392,8 @@ let next = "GET /next HTTP/1.1\r\n"
 
 let handle_tests =
   group "H1_body handle"
-    [ test "expect_continue runs once, before the first read" (fun () ->
+    [ test "expect_continue runs once, before the first read"
+      @@ in_sim (fun () ->
           let log = ref [] in
           let r, t =
             handle
@@ -1402,7 +1408,8 @@ let handle_tests =
           log := "read" :: !log ;
           ignore (Body.read b buf 0 2) ;
           equal (list string) ["100"; "read"] (List.rev !log) )
-    ; test "expect_continue never runs without a body" (fun () ->
+    ; test "expect_continue never runs without a body"
+      @@ in_sim (fun () ->
           let ran = ref false in
           let _, t =
             handle ~expect_continue:(fun () -> ran := true) "" No_body
@@ -1410,16 +1417,15 @@ let handle_tests =
           equal string "" (Body.to_string (H1_body.body t)) ;
           is_true (H1_body.drain t ~max:0) ;
           is_true (not !ran) )
-    ; test "completed is enabled once the handler has read the body" (fun () ->
-          (* Enabled now, or not within 5ms. *)
+    ; test "completed is ready after the handler read the body"
+      @@ in_sim (fun () ->
+          (* Ready now, or not before 5 ms. *)
           let completed t =
-            Affect_unix.Unix.main ~domain_count:1 (fun () ->
-                let soon =
-                  Affect_unix.Mtime.wait_for' Affect_unix.Mtime.Span.(5 * ms) ()
-                in
-                Either.is_left
-                  (Affect.Action.invoke
-                     (Affect.Action.either (H1_body.completed t) soon) ) )
+            Weft.(
+              sync
+                (choose
+                   [ wrap (H1_body.completed t) (fun () -> true)
+                   ; wrap (Time.after Mono (Span.ms 5)) (fun () -> false) ] ) )
           in
           let _, t = handle "" No_body in
           is_true ~msg:"no body" (completed t) ;
@@ -1437,7 +1443,8 @@ let handle_tests =
           is_true ~msg:"before the last chunk" (not (completed t)) ;
           ignore (Body.to_string b) ;
           is_true ~msg:"after the last chunk" (completed t) )
-    ; test "is_complete" (fun () ->
+    ; test "is_complete"
+      @@ in_sim (fun () ->
           let _, t = handle "" No_body in
           is_true (H1_body.is_complete t) ;
           let _, t = handle ("hello" ^ next) (Fixed 5) in
@@ -1450,7 +1457,8 @@ let handle_tests =
             (not (H1_body.is_complete t)) ;
           ignore (Body.to_string (H1_body.body t)) ;
           is_true (H1_body.is_complete t) )
-    ; test "drain within max keeps the next request" (fun () ->
+    ; test "drain within max keeps the next request"
+      @@ in_sim (fun () ->
           let r, t = handle ~chunk:3 ("hello world" ^ next) (Fixed 11) in
           let read = Body.read (H1_body.body t) (Bytes.create 4) 0 4 in
           is_true (H1_body.drain t ~max:(11 - read)) ;
@@ -1463,7 +1471,8 @@ let handle_tests =
           in
           is_true (H1_body.drain t ~max:32) ;
           equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100) )
-    ; test "drain counts chunk extensions" (fun () ->
+    ; test "drain counts chunk extensions"
+      @@ in_sim (fun () ->
           (* Ten bytes of data in 1-byte chunks, each with a 100-byte extension:
              about 1.1 KiB as sent. *)
           let ext = ";" ^ String.make 99 'e' in
@@ -1477,7 +1486,8 @@ let handle_tests =
           let r, t = handle (body ^ next) Chunked in
           is_true ~msg:"2000 are" (H1_body.drain t ~max:2000) ;
           equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100) )
-    ; test "drain gives up past max" (fun () ->
+    ; test "drain gives up past max"
+      @@ in_sim (fun () ->
           let _, t = handle ~chunk:3 ("hello world" ^ next) (Fixed 11) in
           let read = Body.read (H1_body.body t) (Bytes.create 4) 0 4 in
           is_true (not (H1_body.drain t ~max:(11 - read - 1))) ;
@@ -1491,7 +1501,8 @@ let handle_tests =
           is_true (not (H1_body.drain t ~max:4096)) ;
           let _, t = handle (String.make 4096 'x') (Fixed 4096) in
           is_true (H1_body.drain t ~max:4096) )
-    ; test "a body whose read failed stays failed" (fun () ->
+    ; test "a body whose read failed stays failed"
+      @@ in_sim (fun () ->
           let r, t = handle ("zz\r\n0\r\n\r\n" ^ next) Chunked in
           let b = H1_body.body t and buf = Bytes.create 8 in
           let bad () =
@@ -1509,14 +1520,16 @@ let handle_tests =
           equal (option int) ~msg:"unread unknown" None (H1_body.unread t) ;
           let _, t = handle "hello" (Fixed 5) in
           is_true ~msg:"a sound body has not failed" (not (H1_body.failed t)) )
-    ; test "drain fails on bad or truncated bodies" (fun () ->
+    ; test "drain fails on bad or truncated bodies"
+      @@ in_sim (fun () ->
           let _, t = handle "5\r\nhelloX" Chunked in
           is_true (not (H1_body.drain t ~max:100)) ;
           let _, t = handle "hel" (Fixed 5) in
           is_true (not (H1_body.drain t ~max:100)) ;
           let _, t = handle ~max_body:3 "5\r\nhello\r\n0\r\n\r\n" Chunked in
           is_true (not (H1_body.drain t ~max:100)) )
-    ; test "drain refuses while 100 Continue is owed" (fun () ->
+    ; test "drain refuses while 100 Continue is owed"
+      @@ in_sim (fun () ->
           let r, t =
             handle ~expect_continue:ignore ("hello" ^ next) (Fixed 5)
           in
@@ -1533,7 +1546,8 @@ let handle_tests =
           is_true ~msg:"not owed for an empty body"
             (not (H1_body.continue_owed t)) ;
           equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100) )
-    ; test "drain works after the handler closed the body" (fun () ->
+    ; test "drain works after the handler closed the body"
+      @@ in_sim (fun () ->
           let r, t = handle ("hello" ^ next) (Fixed 5) in
           Body.close (H1_body.body t) ;
           is_true (H1_body.drain t ~max:5) ;
@@ -1543,6 +1557,8 @@ let handle_tests =
           triple (pair string bool) (int_range 0 40)
             (pair (int_range 1 9) (list ~size:(int_range 0 4) string)) )
         (fun ((body, chunked), read, (chunk, pieces)) ->
+          Sim_support.run
+          @@ fun _ ->
           let input, framing =
             if chunked then
               ( encode_chunked (body :: pieces) "" []
@@ -1564,7 +1580,8 @@ let handle_tests =
           is_true (H1_body.drain t ~max:max_int) ;
           is_true (H1_body.is_complete t) ;
           equal string "GET /next HTTP/1.1" (Buf_reader.read_line r ~max:100) )
-    ; test "unread" (fun () ->
+    ; test "unread"
+      @@ in_sim (fun () ->
           let _, t = handle "" No_body in
           equal (option int) (Some 0) (H1_body.unread t) ;
           let _, t = handle "hello" (Fixed 5) in
@@ -1576,7 +1593,7 @@ let handle_tests =
           ignore (Body.to_string (H1_body.body t)) ;
           equal (option int) (Some 0) (H1_body.unread t) )
     ; test "drain reads nothing when more than max is known to remain"
-        (fun () ->
+      @@ in_sim (fun () ->
           let r, t = handle ("hello world" ^ next) (Fixed 11) in
           ignore (Body.read (H1_body.body t) (Bytes.create 4) 0 4) ;
           let consumed = Buf_reader.consumed r in
@@ -2496,6 +2513,8 @@ let request_write_props =
   group "H1_write.request_head properties"
     [ prop "the server parser reads what the client writes" request_round_trip
         (fun ((meth, path), fields, (known, pieces)) ->
+          Sim_support.run
+          @@ fun _ ->
           let all = String.concat "" pieces in
           let body =
             if known then Body.of_string all

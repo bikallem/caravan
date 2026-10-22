@@ -13,8 +13,9 @@ val serve : config:Config.t -> Handler.t -> string list -> output list
 (** [serve ~config handler inputs] serves each input on its own connection, one
     after the other, with [Private.H1_server.serve]. The client sends all of its
     input at once, and then closes its side. The server does not watch for the
-    close: [serve] sets [cancel_on_disconnect] to [false]. Call it outside
-    [Unix.main].
+    close: [serve] sets [cancel_on_disconnect] to [false]. The connections run
+    in one run of the simulator, with the wall clock at Sun, 06 Nov 1994
+    08:49:37 GMT. Call it outside a run.
 
     A write after a half-close raises [Failure] in the server. A write after a
     reset raises [Flow.Closed] in the server, and the bytes are dropped. *)

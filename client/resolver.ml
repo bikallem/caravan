@@ -1,19 +1,11 @@
-open Affect
+(* Host names to addresses. Weft does each lookup on the name pool of the world,
+   and the pool queues the lookups: thus the resolver has no limit of its
+   own. *)
 
-(* getaddrinfo blocks its system thread, and a blocked domain stops all its
-   fibers. Thus a system thread does the lookup and writes one byte to a pipe,
-   and the fiber waits on the pipe. The read end has two owners, the thread and
-   the fiber: the last one closes it. Thus the thread never writes to a closed
-   pipe, also after a cancel of the fiber. *)
+open Weft
 
-let threads_started = Atomic.make 0
-
-(* The fibers that wait for a lookup. A cancelled lookup releases its place, but
-   its thread runs until getaddrinfo returns. *)
-let lookups = Semaphore.make 16
-
-(* The numeric hosts are the texts that inet_pton accepts. The parser does not
-   call Unix: the weft port forbids Unix in the library. *)
+(* The numeric hosts are the texts that inet_pton accepts. The parser is pure:
+   it does no system call. *)
 
 let is_digit c = c >= '0' && c <= '9'
 
@@ -80,60 +72,23 @@ let numeric host =
   in
   if is_ipv4 h || is_ipv6 h then Some h else None
 
-let close_noerr fd = try Unix.close fd with Unix.Unix_error _ -> ()
+(* [Dns.resolve] can give an address more than one time. Keep the first one, in
+   the order of the lookup. *)
+let dedup addrs =
+  List.rev
+    (List.fold_left
+       (fun acc a -> if List.mem a acc then acc else a :: acc)
+       [] addrs )
 
-let lookup getaddrinfo host port =
-  Semaphore.with_acquired lookups
-  @@ fun () ->
-  let rd, wr = Unix.pipe ~cloexec:true () in
-  let result = Atomic.make None and owners = Atomic.make 2 in
-  let drop () = if Atomic.fetch_and_add owners (-1) = 1 then close_noerr rd in
-  let work () =
-    let r =
-      try
-        Ok
-          (getaddrinfo host (string_of_int port)
-             [Unix.AI_SOCKTYPE Unix.SOCK_STREAM] )
-      with e -> Error e
-    in
-    Atomic.set result (Some r) ;
-    (try ignore (Unix.write_substring wr "x" 0 1) with Unix.Unix_error _ -> ()) ;
-    close_noerr wr ; drop ()
-  in
-  ( match Unix.set_nonblock rd ; Thread.create work () with
-  | _ ->
-      Atomic.incr threads_started
-  | exception e ->
-      close_noerr rd ; close_noerr wr ; raise e ) ;
-  Stdlib.Fun.protect ~finally:drop
-  @@ fun () ->
-  let rec wait () =
-    match Atomic.get result with
-    | Some (Ok addrs) ->
-        addrs
-    | Some (Error e) ->
-        raise e
-    | None ->
-        Action.invoke (Affect_unix.Unix.wait_readable rd ()) ;
-        wait ()
-  in
-  wait ()
-
-let resolve ?(getaddrinfo = Unix.getaddrinfo) ~host ~port () =
+let resolve host =
   match numeric host with
   | Some a ->
-      (* This second parse is temporary. The port of the client to weft removes
-         it, because [resolve] then gives the address as text. *)
-      [Unix.ADDR_INET (Unix.inet_addr_of_string a, port)]
+      [a]
   | None -> (
-      let addrs =
-        List.filter_map
-          (fun (a : Unix.addr_info) ->
-            match a.ai_addr with Unix.ADDR_INET _ as s -> Some s | _ -> None )
-          (lookup getaddrinfo host port)
-      in
-      match addrs with
-      | [] ->
-          Error.fail (Connect ("no address for " ^ host))
-      | l ->
-          l )
+    match Dns.resolve host with
+    | [] | (exception Net.Error (No_entry, _)) ->
+        Error.fail (Connect ("no address for " ^ host))
+    | exception Net.Error (e, _) ->
+        Error.fail (Connect (Error.net_text e))
+    | addrs ->
+        dedup addrs )

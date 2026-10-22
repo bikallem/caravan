@@ -1,0 +1,8 @@
+; A server in the OS world. weft.linux builds only on Linux.
+
+(library
+ (name caravan_run)
+ (public_name caravan.run)
+ (enabled_if
+  (= %{system} linux))
+ (libraries caravan weft weft.linux))

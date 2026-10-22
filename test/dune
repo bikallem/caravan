@@ -1,55 +1,66 @@
+; The suites of caravan. They run in the simulator of weft. The deps give the
+; source scan of test_core the files of the three libraries.
+
 (tests
  (names
   test_core
+  test_tcp
   test_h1
   test_h1_server
+  test_conformance
   test_net
   test_server
   test_server_stateful
-  test_stop_signal
-  test_websocket
   test_client
-  test_conformance)
+  test_websocket)
  (modules
   test_core
+  test_tcp
   test_h1
   test_h1_server
+  test_conformance
   test_net
   test_server
   test_server_stateful
-  test_stop_signal
-  test_websocket
   test_client
-  test_conformance
-  server_support
-  fake_time
+  test_websocket
   memory_server
   wire)
  (libraries
   caravan
+  caravan.client
   caravan.websocket
   conformance_app
-  caravan.client
-  affect
-  affect.unix
+  server_support
+  sim_support
+  weft
+  weft.sim
   windtrap
   http-date
+  numeric_hosts
+  ; test_net puts the standard error on a broken pipe for one test
+  ; (with_broken_stderr). No fiber code of the suites calls Unix.
   unix)
  (deps
-  serve_until_signal.exe
   (glob_files ../src/*.ml)
   (glob_files ../client/*.ml)
   (glob_files ../websocket/*.ml)))
 
-(executable
- (name serve_until_signal)
- (modules serve_until_signal)
- (libraries caravan affect.unix unix))
+; The hosts of the numeric tests of Resolver, shared by test_client and
+; test_numeric_unix.
 
-(executable
- (name autobahn_server)
- (modules autobahn_server)
- (libraries caravan caravan.websocket unix))
+(library
+ (name numeric_hosts)
+ (modules numeric_hosts))
+
+; The numeric parser of Resolver against inet_pton, through
+; Unix.inet_addr_of_string. It is a suite of its own, so that the suites on the
+; simulator do not call this parser of Unix.
+
+(test
+ (name test_numeric_unix)
+ (modules test_numeric_unix)
+ (libraries caravan.client numeric_hosts windtrap unix))
 
 ; The application of the conformance tests, shared by test_conformance and
 ; conformance_server (make conformance).
@@ -59,21 +70,22 @@
  (modules conformance_app)
  (libraries caravan))
 
-(executable
- (name conformance_server)
- (modules conformance_server)
- (libraries caravan conformance_app unix))
+; The helpers of the caravan tests on the simulator: the core helpers and the
+; server helpers.
 
-; The harness of the simulator. It has no dependency on caravan, because
-; caravan is on affect in M1.
+(library
+ (name server_support)
+ (modules server_support)
+ (libraries caravan weft weft.sim sim_support windtrap))
+
+; The harness of the simulator. It has no dependency on caravan.
 
 (library
  (name sim_support)
  (modules sim_support)
  (libraries weft weft.sim))
 
-; The tests of the harness. This suite is not in SUITES of the Makefile,
-; because it has no mutant of caravan.
+; The tests of the harness. This suite reaches no mutant of caravan.
 
 (test
  (name test_sim_support)

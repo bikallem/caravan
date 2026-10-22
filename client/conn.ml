@@ -1,5 +1,3 @@
-module Mtime = Affect_unix.Mtime
-
 type t =
   { flow: Caravan.Flow.t
   ; host: string
@@ -16,9 +14,11 @@ type t =
            producer returns. A write that a different fiber of the producer
            started before the return can still end after it (see
            Body.of_writer): such a producer can write into a later exchange. *)
-  ; mutable released_at: Mtime.t
+  ; mutable released_at: Weft.Clock.mono option
         (* The time of the last release. Pool.release sets it before the
-           connection goes idle, and only idle connections read it. *) }
+           connection goes idle, and only idle connections read it. [None] until
+           the first release: user code cannot make the smallest
+           [Clock.mono]. *) }
 
 let next_id = Atomic.make 0
 
@@ -32,4 +32,4 @@ let make ~host ~port flow =
   ; id= Atomic.fetch_and_add next_id 1
   ; read_buf= Bytes.create buffer_size
   ; write_buf= Bytes.create buffer_size
-  ; released_at= Mtime.min_stamp }
+  ; released_at= None }

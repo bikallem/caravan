@@ -1,5 +1,5 @@
-(** Caravan, an HTTP server built on
-    {{:https://erratique.ch/software/affect}affect}. *)
+(** Caravan, an HTTP server built on weft. Code that uses caravan runs in a weft
+    world: [Weft_sim] in tests, [Caravan_run] or [Weft_linux] in production. *)
 
 (** {1:core Core types} *)
 
@@ -7,7 +7,6 @@ module Method = Method
 module Version = Version
 module Status = Status
 module Headers = Headers
-module Time = Time
 module Flow = Flow
 module Body = Body
 module Conn_info = Conn_info
@@ -21,13 +20,14 @@ module Tcp = Tcp
 module Config = Config
 module Engine = Engine
 module Server = Server
-module Stop_signal = Stop_signal
 
 (**/**)
 
 (** Internal modules, exposed for tests. Not part of the public API. *)
 module Private : sig
   module Date = Date
+  module Deadline = Deadline
+  module Cancel = Cancel
   module Buf_reader = Buf_reader
   module Buf_writer = Buf_writer
   module H1_error = H1_error

@@ -206,8 +206,13 @@ type t =
   ; body: Body.t
   ; src: source option
   ; continue: continue ref
-  ; completed: unit Affect.Cell.Once.t
-        (* set when the handler's reads reach the end *) }
+  ; completion: unit Weft.Ivar.t option
+        (* [None] if the body is complete at [make]. If not, the read of the
+           handler that reaches the end fills it. *) }
+
+(* The [completed] event of each body that is complete at [make]. [Weft.always]
+   is a pure value, so all handles share it. *)
+let complete_at_make = Weft.always ()
 
 let make ?max_body ?expect_continue ~limits r (framing : H1_parse.framing) =
   let raw =
@@ -231,7 +236,14 @@ let make ?max_body ?expect_continue ~limits r (framing : H1_parse.framing) =
       | Some f ->
           Expected f )
   in
-  let completed = Affect.Cell.Once.make () in
+  (* No body, or [Content-Length: 0]: nothing to read, and thus no Ivar. *)
+  let completion =
+    match raw with
+    | Some raw when not (raw.finished ()) ->
+        Some (Weft.Ivar.create ())
+    | None | Some _ ->
+        None
+  in
   (* Reads send 100 Continue first, if it is expected. A read that times out is
      the client's fault: 408. A reset connection is a client that left. Whatever
      fails, fails for good: [failed] then tells that the request is to blame. *)
@@ -250,24 +262,32 @@ let make ?max_body ?expect_continue ~limits r (framing : H1_parse.framing) =
         | Flow.Closed ->
             raise Body.Truncated
       in
-      if raw.finished () then Affect.Cell.Once.try_set completed () ;
+      ( match completion with
+      | Some iv when raw.finished () && Option.is_none (Weft.Ivar.peek iv) ->
+          (* [peek] is an atomic read. After the end, it skips the world effect
+             of [try_fill]. *)
+          ignore (Weft.Ivar.try_fill iv ())
+      | None | Some _ ->
+          () ) ;
       n
     in
     fail_for_good {raw with read}
   in
   let src = Option.map wrap raw in
-  (* No body, or [Content-Length: 0]: nothing to read. *)
-  if Option.fold ~none:true ~some:(fun src -> src.finished ()) src then
-    Affect.Cell.Once.try_set completed () ;
   { r
   ; body= Option.fold ~none:Body.empty ~some:to_body src
   ; src
   ; continue
-  ; completed }
+  ; completion }
 
 let body t = t.body
 
-let completed t = Affect.Cell.Once.get' t.completed
+let completed t =
+  match t.completion with
+  | None ->
+      complete_at_make
+  | Some iv ->
+      Weft.Ivar.read iv
 
 let is_complete t =
   match t.src with None -> true | Some src -> src.finished ()

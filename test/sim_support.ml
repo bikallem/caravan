@@ -50,6 +50,8 @@ let ( +: ) t d =
       failf "%s after the time is out of the range of the mono line"
         (span_text d)
 
+let just_before t = t +: Span.ns (-1)
+
 (* [is_at_or_after a b] is true if [a] is not before [b]. *)
 let is_at_or_after a b = Span.compare (Time.diff Mono a b) Span.zero >= 0
 
@@ -140,8 +142,25 @@ let race_with ~replay ?(seeds = 100) ?(domains = 4) ?guard f =
             (Printexc.raw_backtrace_to_string bt) )
     to_run
 
+(* The default seed count of [race]: the value of [CARAVAN_RACE_SEEDS], or 100.
+   The mutation runs set it to 10. *)
+let default_seeds () =
+  match Sys.getenv_opt "CARAVAN_RACE_SEEDS" with
+  | None | Some "" ->
+      100
+  | Some s -> (
+    match int_of_string_opt s with
+    | Some n when n >= 1 ->
+        n
+    | Some _ | None ->
+        failf
+          "CARAVAN_RACE_SEEDS has the value %S, which is not a count of 1 or \
+           more"
+          s )
+
 let race ?seeds ?domains ?guard f =
-  race_with ~replay:(Sys.getenv_opt "CARAVAN_SEED") ?seeds ?domains ?guard f
+  let seeds = match seeds with Some n -> n | None -> default_seeds () in
+  race_with ~replay:(Sys.getenv_opt "CARAVAN_SEED") ~seeds ?domains ?guard f
 
 let manual ?(seed = 0) ?(domains = 1) f =
   Weft_sim.run ~seed ~domains ~auto:false f
@@ -179,7 +198,7 @@ let steps fn sim ~t0 d ~yes ~no p =
   if Span.compare d (Span.ns 1) < 0 then
     failf "%s: the span %s is less than 1 ns" fn (span_text d) ;
   let target = t0 +: d in
-  let last = target +: Span.ns (-1) in
+  let last = just_before target in
   not_after fn ~limit:last "t0 + d - 1 ns" ;
   Weft_sim.settle sim ;
   if p () then failf "%s: %s at the start, before t0 + d" fn yes ;

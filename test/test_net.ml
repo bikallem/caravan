@@ -1,457 +1,31 @@
-(* Tests over real loopback sockets, inside affect's scheduler. *)
+(* The tests of Server on the simulator of weft. Each test runs in Sim_support:
+   1 seed and 1 domain, except a test whose name starts with "race:" (100 seeds
+   on 4 domains). A test that checks a time runs in manual mode.
+
+   Most tests use Fake_engine, so that they examine only the server. The tests
+   of the HTTP/1.1 behavior over the server use the H1 engine. *)
 
 open Windtrap
-open Affect
+open Weft
 open Caravan
-module Mtime = Affect_unix.Mtime
+open Server_support
 
-let domain_count = Server_support.domain_count
+let fake = Fake_engine.serve
 
-let in_main f = Affect_unix.Unix.main ~domain_count f
+let h1 = Private.H1_server.serve
 
-let loopback = Server_support.loopback
+let ( +: ) = Sim_support.( +: )
 
-module Fake = Fake_time
+let just_before = Sim_support.just_before
 
-let ( +: ) = Fake.( +: )
-
-let within_2s = Server_support.within_2s
-
-(* [f server client] with a connected pair of flows. The server end is on the
-   time line [time]. The client end stays on the real time line: a real deadline
-   on a fake time line is about one day in the past, and gives Timeout at
-   once. *)
-let with_flows = Server_support.with_flows
-
-let read_all flow =
-  let buf = Bytes.create 65536 and out = Buffer.create 65536 in
-  let rec loop () =
-    match Flow.read flow buf 0 (Bytes.length buf) with
-    | 0 ->
-        Buffer.contents out
-    | n ->
-        Buffer.add_subbytes out buf 0 n ;
-        loop ()
-  in
-  loop ()
-
-let read_exactly flow n =
-  let buf = Bytes.create n in
-  let rec loop got =
-    if got < n then loop (got + Flow.read flow buf got (n - got))
-  in
-  loop 0 ; Bytes.to_string buf
-
-let deadline_in n =
-  Mtime.add_span (Mtime.now ()) Mtime.Span.(n * ms) |> Option.get
-
-(* More than the socket buffers hold: the write blocks when the peer does not
-   read. *)
-let write_much flow =
-  let chunk = Bytes.make (1024 * 1024) 'x' in
-  for _ = 1 to 256 do
-    Flow.write flow chunk 0 (Bytes.length chunk)
-  done
-
-let get_2s = Server_support.get_2s
-
-(* [call] must end with Timeout in less than 2 s. If it does not, the test
-   cancels it, so that a failure does not stop the suite. *)
-let times_out call =
-  let ended = Action.map (fun () -> `Ended) (Fun.Async.get' call) in
-  match
-    Action.invoke
-      (Action.choose [ended; Mtime.wait_for' Mtime.Span.(2 * s) `Late])
-  with
-  | exception Flow.Timeout ->
-      ()
-  | `Ended ->
-      fail "ended without Timeout"
-  | `Late ->
-      Fun.Async.cancel call ;
-      (try Fun.Async.get call with _ -> ()) ;
-      fail "no Timeout after 2 s"
-
-let tcp_tests =
-  group "Tcp"
-    [ test "listening on port 0 gets a port" (fun () ->
-          in_main
-          @@ fun () ->
-          let l = Tcp.Listener.listen loopback in
-          ( match Tcp.Listener.addr l with
-          | Unix.ADDR_INET (_, port) ->
-              is_true (port > 0)
-          | Unix.ADDR_UNIX _ ->
-              fail "not an inet address" ) ;
-          Tcp.Listener.close l )
-    ; test "a request and its echo" (fun () ->
-          with_flows
-          @@ fun server client ->
-          Flow.write_string client "ping" ;
-          equal string "ping" (read_exactly server 4) ;
-          Flow.write_string server "pong" ;
-          equal string "pong" (read_exactly client 4) )
-    ; test "read_now does not wait for input" (fun () ->
-          with_flows
-          @@ fun server client ->
-          let buf = Bytes.create 8 in
-          let now () = Flow.read_now server buf 0 8 in
-          (* A wakeup may come without input. *)
-          let rec next () =
-            Action.invoke (Flow.readable' server ()) ;
-            match now () with None -> next () | r -> r
-          in
-          let before = now () in
-          Flow.write_string client "hi" ;
-          let data = next () in
-          Flow.shutdown_send client ;
-          equal
-            (list (option int))
-            [None; Some 2; Some 0]
-            [before; data; next ()] )
-    ; test "half-close: the peer reads the end and can still answer" (fun () ->
-          with_flows
-          @@ fun server client ->
-          Flow.write_string client "request" ;
-          Flow.shutdown_send client ;
-          equal string "request" (read_all server) ;
-          Flow.write_string server "response" ;
-          Flow.shutdown_send server ;
-          equal string "response" (read_all client) )
-    ; test "4 MiB each way at once" (fun () ->
-          with_flows
-          @@ fun server client ->
-          let data =
-            String.init (4 * 1024 * 1024) (fun i -> Char.chr (i land 0xff))
-          in
-          let send flow =
-            Fun.Async.call (fun () ->
-                Flow.write_string flow data ;
-                Flow.shutdown_send flow )
-          in
-          let s1 = send client and s2 = send server in
-          let r1 = Fun.Async.call (fun () -> read_all server) in
-          let r2 = Fun.Async.call (fun () -> read_all client) in
-          Fun.Async.get s1 ;
-          Fun.Async.get s2 ;
-          is_true ~msg:"server received it"
-            (String.equal data (Fun.Async.get r1)) ;
-          is_true ~msg:"client received it"
-            (String.equal data (Fun.Async.get r2)) )
-    ; test "a read deadline ends a wait with Timeout" (fun () ->
-          let f = Fake.make () in
-          with_flows ~time:(Fake.mono f)
-          @@ fun server _client ->
-          let span = Mtime.Span.(5 * s) in
-          let d = Fake.mono_now f +: span in
-          Flow.set_read_deadline server (Some d) ;
-          Fake.with_call_at_timer f d (fun () ->
-              ignore (Flow.read server (Bytes.create 1) 0 1) )
-          @@ fun reader ->
-          (* No data comes: only an advance can end the read. *)
-          Fake.advance f Mtime.Span.(span - ns) ;
-          is_false ~msg:"no end 1 ns before the deadline"
-            (Fake.ends_within_50ms reader) ;
-          Fake.advance f Mtime.Span.ns ;
-          times_out reader ;
-          (* A deadline at the time of the time line has passed. *)
-          Flow.set_read_deadline server (Some (Fake.mono_now f)) ;
-          raises Flow.Timeout (fun () -> Flow.read server (Bytes.create 1) 0 1) )
-    ; test "without a deadline a read waits for data" (fun () ->
-          let f = Fake.make () in
-          with_flows ~time:(Fake.mono f)
-          @@ fun server client ->
-          let span = Mtime.Span.(5 * s) in
-          Flow.set_read_deadline server (Some (Fake.mono_now f +: span)) ;
-          Flow.set_read_deadline server None ;
-          let reader = Fun.Async.call (fun () -> read_exactly server 4) in
-          Fun.protect ~finally:(fun () -> Fun.Async.cancel reader)
-          @@ fun () ->
-          (* Past the deadline that the read does not have. *)
-          Fake.advance f Mtime.Span.(2 * span) ;
-          is_false ~msg:"no end" (Fake.ends_within_50ms reader) ;
-          Flow.write_string client "late" ;
-          equal string "late" (get_2s reader) )
-    ; test "a write deadline ends a blocked write with Timeout" (fun () ->
-          let f = Fake.make () in
-          with_flows ~time:(Fake.mono f)
-          @@ fun server _client ->
-          let span = Mtime.Span.(5 * s) in
-          let d = Fake.mono_now f +: span in
-          Flow.set_write_deadline server (Some d) ;
-          (* The client does not read: the write blocks with the deadline. *)
-          Fake.with_call_at_timer f d (fun () -> write_much server)
-          @@ fun writer -> Fake.advance f span ; times_out writer )
-    ; (* A deadline set from a different fiber reaches a read or a write that
-         waits already. The wait starts with a deadline D1, whose timer proves
-         the wait. Then the next two tests show a change from D1 to an earlier
-         D2, and a change from no deadline to a deadline D3. *)
-      test "a new deadline ends a read that waits" (fun () ->
-          let f = Fake.make () in
-          with_flows ~time:(Fake.mono f)
-          @@ fun server _client ->
-          let t0 = Fake.mono_now f in
-          let d1 = t0 +: Mtime.Span.(10 * s)
-          and d2 = t0 +: Mtime.Span.(5 * s)
-          and d3 = t0 +: Mtime.Span.(7 * s) in
-          Flow.set_read_deadline server (Some d1) ;
-          Fake.with_call_at_timer f d1 (fun () ->
-              ignore (Flow.read server (Bytes.create 1) 0 1) )
-          @@ fun reader ->
-          let m = Fake.mark f in
-          Flow.set_read_deadline server (Some d2) ;
-          Fake.wait_mono_timer f ~since:m d2 ;
-          (* The read waits again, with no deadline. No timer can prove this
-             wait: the check of 50 ms gives it the time, and it cannot fail on
-             correct code. *)
-          Flow.set_read_deadline server None ;
-          is_false ~msg:"no end without a deadline"
-            (Fake.ends_within_50ms reader) ;
-          let m = Fake.mark f in
-          Flow.set_read_deadline server (Some d3) ;
-          Fake.wait_mono_timer f ~since:m d3 ;
-          Fake.advance f Mtime.Span.(7 * s) ;
-          times_out reader )
-    ; test "a new deadline ends a write that waits" (fun () ->
-          let f = Fake.make () in
-          with_flows ~time:(Fake.mono f)
-          @@ fun server _client ->
-          let t0 = Fake.mono_now f in
-          let d1 = t0 +: Mtime.Span.(10 * s)
-          and d2 = t0 +: Mtime.Span.(5 * s)
-          and d3 = t0 +: Mtime.Span.(7 * s) in
-          Flow.set_write_deadline server (Some d1) ;
-          Fake.with_call_at_timer f d1 (fun () -> write_much server)
-          @@ fun writer ->
-          let m = Fake.mark f in
-          Flow.set_write_deadline server (Some d2) ;
-          Fake.wait_mono_timer f ~since:m d2 ;
-          (* The write waits again, with no deadline. No timer can prove this
-             wait: the check of 50 ms gives it the time, and it cannot fail on
-             correct code. *)
-          Flow.set_write_deadline server None ;
-          is_false ~msg:"no end without a deadline"
-            (Fake.ends_within_50ms writer) ;
-          let m = Fake.mark f in
-          Flow.set_write_deadline server (Some d3) ;
-          Fake.wait_mono_timer f ~since:m d3 ;
-          Fake.advance f Mtime.Span.(7 * s) ;
-          times_out writer )
-    ; test "a deadline removed from a read that waits stops it no more"
-        (fun () ->
-          let f = Fake.make () in
-          with_flows ~time:(Fake.mono f)
-          @@ fun server client ->
-          let d = Fake.mono_now f +: Mtime.Span.(5 * s) in
-          Flow.set_read_deadline server (Some d) ;
-          Fake.with_call_at_timer f d (fun () -> read_exactly server 4)
-          @@ fun reader ->
-          Flow.set_read_deadline server None ;
-          Fake.advance f Mtime.Span.(10 * s) ;
-          is_false ~msg:"no end" (Fake.ends_within_50ms reader) ;
-          Flow.write_string client "late" ;
-          equal string "late" (get_2s reader) )
-    ; test "writing to a closed peer raises Closed" (fun () ->
-          with_flows
-          @@ fun server client ->
-          Flow.close server ;
-          Mtime.wait_for Mtime.Span.(20 * ms) ;
-          raises Flow.Closed (fun () ->
-              for _ = 1 to 100 do
-                Flow.write_string client "x" ;
-                Mtime.wait_for Mtime.Span.(5 * ms)
-              done ) )
-    ; test "a reset connection raises Closed; shutdown_send then does nothing"
-        (fun () ->
-          in_main
-          @@ fun () ->
-          let l = Tcp.Listener.listen loopback in
-          (* A raw peer that closes with SO_LINGER 0, which sends a RST. *)
-          let peer = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-          Unix.connect peer (Tcp.Listener.addr l) ;
-          let fd, _ = Tcp.Listener.accept l in
-          let server = Tcp.flow fd in
-          Unix.setsockopt_optint peer Unix.SO_LINGER (Some 0) ;
-          Unix.close peer ;
-          (* The RST makes the socket readable. *)
-          within_2s (fun () -> Action.invoke (Flow.readable' server ())) ;
-          raises Flow.Closed (fun () -> Flow.read server (Bytes.create 1) 0 1) ;
-          Flow.shutdown_send server ;
-          Flow.close server ;
-          Tcp.Listener.close l )
-    ; test "reset makes the peer see a reset, not the end of the stream"
-        (fun () ->
-          with_flows
-          @@ fun server client ->
-          Flow.write_string server "cut" ;
-          Flow.reset server ;
-          equal string "cut" (read_exactly client 3) ;
-          raises Flow.Closed (fun () -> Flow.read client (Bytes.create 1) 0 1) ;
-          Flow.close client )
-    ; (* In the next tests, the timer of a read or a write deadline proves that
-         the call waits. No advance comes: the deadline does not end the
-         call. *)
-      test "cancelling a blocked read" (fun () ->
-          let f = Fake.make () in
-          with_flows ~time:(Fake.mono f)
-          @@ fun server _client ->
-          let d = Fake.mono_now f +: Mtime.Span.(100 * s) in
-          Flow.set_read_deadline server (Some d) ;
-          Fake.with_call_at_timer f d (fun () ->
-              Flow.read server (Bytes.create 1) 0 1 )
-          @@ fun reader ->
-          Fun.Async.cancel reader ;
-          raises Fun.Async.Cancelled (fun () -> get_2s reader) ;
-          Flow.close server ;
-          raises Flow.Closed (fun () -> Flow.read server (Bytes.create 1) 0 1) )
-    ; (* A different fiber closes the flow. The waits end with Closed, and the
-         fd keeps its number until they end. *)
-      test "a close ends a read that waits with Closed" (fun () ->
-          let f = Fake.make () in
-          with_flows ~time:(Fake.mono f)
-          @@ fun server _client ->
-          let d = Fake.mono_now f +: Mtime.Span.(100 * s) in
-          Flow.set_read_deadline server (Some d) ;
-          Fake.with_call_at_timer f d (fun () ->
-              Flow.read server (Bytes.create 1) 0 1 )
-          @@ fun reader ->
-          Flow.close server ;
-          raises Flow.Closed (fun () -> get_2s reader) )
-    ; (* The check of a passed deadline in Tcp.wait. The read waits with D1.
-         With no yield, the test sets a deadline that has passed (the wait ends,
-         to take the change) and closes the flow. The read waits again: the
-         deadline has passed and the flow is closed. The check gives Timeout.
-         Without it, the choose of the wait gives Closed on one domain, because
-         it is left-leaning; on more domains the test can pass without the
-         check, but it cannot fail on correct code. *)
-      test "a passed deadline wins over a close" (fun () ->
-          let f = Fake.make () in
-          with_flows ~domain_count:1 ~time:(Fake.mono f)
-          @@ fun server _client ->
-          let d1 = Fake.mono_now f +: Mtime.Span.(100 * s) in
-          Flow.set_read_deadline server (Some d1) ;
-          Fake.with_call_at_timer f d1 (fun () ->
-              Flow.read server (Bytes.create 1) 0 1 )
-          @@ fun reader ->
-          Flow.set_read_deadline server (Some (Fake.mono_now f)) ;
-          Flow.close server ;
-          raises Flow.Timeout (fun () -> get_2s reader) )
-    ; test "a close ends a write that waits with Closed" (fun () ->
-          let f = Fake.make () in
-          with_flows ~time:(Fake.mono f)
-          @@ fun server _client ->
-          let d = Fake.mono_now f +: Mtime.Span.(100 * s) in
-          Flow.set_write_deadline server (Some d) ;
-          Fake.with_call_at_timer f d (fun () -> write_much server)
-          @@ fun writer ->
-          Flow.close server ;
-          raises Flow.Closed (fun () -> get_2s writer) )
-    ; test "the fd closes when the last read that waits ends" (fun () ->
-          let f = Fake.make () in
-          with_flows ~time:(Fake.mono f)
-          @@ fun server client ->
-          let d = Fake.mono_now f +: Mtime.Span.(100 * s) in
-          Flow.set_read_deadline server (Some d) ;
-          Fake.with_call_at_timer f d (fun () ->
-              Flow.read server (Bytes.create 1) 0 1 )
-          @@ fun reader ->
-          Flow.close server ;
-          raises Flow.Closed (fun () -> get_2s reader) ;
-          Flow.set_read_deadline client (Some (deadline_in 2000)) ;
-          equal int ~msg:"the end of the stream" 0
-            (Flow.read client (Bytes.create 1) 0 1) )
-    ; test
-        "a read that waits on a closed flow takes no bytes of a new connection"
-        (fun () ->
-          in_main
-          @@ fun () ->
-          let f = Fake.make () in
-          let l = Tcp.Listener.listen loopback in
-          Fun.protect ~finally:(fun () -> Tcp.Listener.close l)
-          @@ fun () ->
-          let connect () =
-            Fun.Async.call (fun () -> Tcp.connect (Tcp.Listener.addr l))
-          in
-          let accept ?time () = Tcp.flow ?time (fst (Tcp.Listener.accept l)) in
-          let first = connect () in
-          let old = accept ~time:(Fake.mono f) () in
-          let d = Fake.mono_now f +: Mtime.Span.(100 * s) in
-          Flow.set_read_deadline old (Some d) ;
-          let buf = Bytes.create 64 in
-          Fake.with_call_at_timer f d (fun () -> Flow.read old buf 0 64)
-          @@ fun reader ->
-          Flow.close old ;
-          let second = connect () in
-          let fresh = accept () in
-          let client = Fun.Async.get second in
-          Flow.write_string client "0123456789" ;
-          raises Flow.Closed (fun () -> get_2s reader) ;
-          Flow.set_read_deadline fresh (Some (deadline_in 2000)) ;
-          equal string "0123456789" (read_exactly fresh 10) ;
-          List.iter Flow.close [fresh; client; Fun.Async.get first] )
-    ; test "connecting to a closed port fails" (fun () ->
-          in_main
-          @@ fun () ->
-          let l = Tcp.Listener.listen loopback in
-          let addr = Tcp.Listener.addr l in
-          Tcp.Listener.close l ;
-          raises_match
-            (function
-              | Unix.Unix_error (Unix.ECONNREFUSED, _, _) -> true | _ -> false )
-            (fun () -> Tcp.connect addr) )
-    ; test "wait_acceptable is enabled by a pending connection" (fun () ->
-          in_main
-          @@ fun () ->
-          let l = Tcp.Listener.listen loopback in
-          let ready within =
-            Action.invoke
-              (Action.choose
-                 [ Tcp.Listener.wait_acceptable l true
-                 ; Mtime.wait_for' within false ] )
-          in
-          is_true ~msg:"nothing pending" (not (ready Mtime.Span.(30 * ms))) ;
-          let client = Tcp.connect (Tcp.Listener.addr l) in
-          (* A slow machine can take more than 30 ms. *)
-          is_true ~msg:"a connection is pending" (ready Mtime.Span.(2 * s)) ;
-          let fd, _ = Tcp.Listener.accept l in
-          Unix.close fd ; Flow.close client ; Tcp.Listener.close l )
-    ; test "try_accept does not wait" (fun () ->
-          in_main
-          @@ fun () ->
-          let l = Tcp.Listener.listen loopback in
-          Fun.protect ~finally:(fun () -> Tcp.Listener.close l)
-          @@ fun () ->
-          let none () =
-            within_2s (fun () -> Tcp.Listener.try_accept l) = None
-          in
-          is_true ~msg:"nothing pending" (none ()) ;
-          let client = Tcp.connect (Tcp.Listener.addr l) in
-          (* The readiness can be spurious: after a None, it waits again. *)
-          let rec accept () =
-            Action.invoke (Tcp.Listener.wait_acceptable l ()) ;
-            match Tcp.Listener.try_accept l with
-            | Some (fd, _) ->
-                Unix.close fd
-            | None ->
-                accept ()
-          in
-          within_2s accept ;
-          is_true ~msg:"nothing pending again" (none ()) ;
-          Flow.close client ) ]
-
-(* Server *)
-
-let quiet = Server_support.config
-
-(* Set when /pause starts, so that a test can stop the server while it is in
-   progress. *)
-let started = ref (Cell.Once.make ())
+(* Filled when /pause starts. A test makes a new Ivar before it starts. *)
+let started : unit Ivar.t ref = ref (Ivar.create ())
 
 let handler req =
   match Request.path_only req with
   | "/pause" ->
-      Cell.Once.try_set !started () ;
-      Mtime.wait_for Mtime.Span.(300 * ms) ;
+      ignore (Ivar.try_fill !started ()) ;
+      Time.sleep Mono (Span.ms 300) ;
       Response.string "done"
   | "/id" ->
       Response.string
@@ -463,50 +37,121 @@ let handler req =
   | _ ->
       Response.string "hello"
 
-let get ?(close = false) path =
-  Printf.sprintf "GET %s HTTP/1.1\r\nHost: x\r\n%s\r\n" path
-    (if close then "Connection: close\r\n" else "")
+(* [with_server] of Server_support with the handler of this suite. The engine is
+   Fake_engine by default. *)
+let with_server ?(config = config) ?(engine = fake) ?(handler = handler) f =
+  Server_support.with_server ~config ~engine ~handler f
 
-(* Reads one response with a Content-Length body from [r]. [field] gets each
-   field line. *)
-let read_response_from ?(field = ignore) r =
-  let status = Private.Buf_reader.read_line r ~max:1000 in
-  let rec headers len =
-    match Private.Buf_reader.read_line r ~max:1000 with
-    | "" ->
-        len
-    | line ->
-        field line ;
-        let lower = String.lowercase_ascii line in
-        if String.starts_with ~prefix:"content-length: " lower then
-          headers (int_of_string (String.sub line 16 (String.length line - 16)))
-        else headers len
+(* [collect config] is [config] with an [on_error] that keeps the errors, and
+   the list of the errors, the last first. *)
+let collect (config : Config.t) =
+  let errors = Atomic.make [] in
+  let rec push e =
+    let l = Atomic.get errors in
+    if not (Atomic.compare_and_set errors l (e :: l)) then push e
   in
-  let len = headers 0 in
-  let buf = Bytes.create len in
-  let rec body got =
-    if got < len then
-      match Private.Buf_reader.read_into r buf got (len - got) with
-      | 0 ->
-          failwith "the response ended early"
-      | n ->
-          body (got + n)
+  ({config with on_error= (fun e _ -> push e)}, errors)
+
+let is_bad_fd = function Net.Error (Bad_fd, _) -> true | _ -> false
+
+let is_refused = function Net.Error (Refused, _) -> true | _ -> false
+
+let is_emfile = function
+  | Net.Error (No_resources "EMFILE", _) ->
+      true
+  | _ ->
+      false
+
+let ends_with suffix s = is_true ~msg:s (String.ends_with ~suffix s)
+
+(* [read_all] of [c], and an end of the stream by a reset. *)
+let read_to_end c = try read_all c with Flow.Closed -> ""
+
+(* [on_error_failures n] runs [n] handlers that fail at the same time, with an
+   [on_error] that raises [Sys_error "Broken pipe"] (the error of a broken
+   stderr). It gives the name of the exception of [Server.wait], then the names
+   of the exceptions in it if it is [Fiber.Multiple]. *)
+let on_error_failures n =
+  let config =
+    {config with on_error= (fun _ _ -> raise (Sys_error "Broken pipe"))}
   in
-  body 0 ;
-  (status, Bytes.to_string buf)
+  let go = Ivar.create () and all_running = Ivar.create () in
+  let running = Atomic.make 0 in
+  let handler req =
+    if Atomic.fetch_and_add running 1 = n - 1 then Ivar.fill all_running () ;
+    sync (Ivar.read go) ;
+    failwith ("handler " ^ Request.path_only req)
+  in
+  Sim_support.run
+  @@ fun _ ->
+  Fiber.scope
+  @@ fun sw ->
+  let server = Server.start ~config ~engine:h1 sw handler in
+  Fiber.scope (fun s ->
+      for i = 1 to n do
+        ignore
+          (Sim_support.call ~name:"client" s (fun () ->
+               let c, r = connect server in
+               Fun.protect ~finally:(fun () -> Flow.close c)
+               @@ fun () ->
+               Flow.write_string c (get (Printf.sprintf "/%d" i)) ;
+               (* The cancel of the connections closes them. *)
+               try ignore (read_response r)
+               with Flow.Closed | Buf_reader.Eof | Failure _ -> () ) )
+      done ;
+      sync (Ivar.read all_running) ;
+      Ivar.fill go () ) ;
+  match Server.wait server with
+  | () ->
+      ["no exception"]
+  | exception Fiber.Multiple l ->
+      "Multiple" :: List.map (fun (e, _) -> Printexc.to_string e) l
+  | exception e ->
+      [Printexc.to_string e]
 
-let read_response flow = read_response_from (Private.Buf_reader.of_flow flow)
-
-let with_server ?(config = quiet) ?engine f =
-  Server_support.with_server ~config ?engine ~handler f
+(* [with_broken_stderr f] runs [f ()] with the standard error on a pipe with no
+   reader and with SIGPIPE ignored, as in the world of weft. Then it puts back
+   the standard error and the SIGPIPE behavior. It runs outside the fibers. *)
+let with_broken_stderr f =
+  flush stderr ;
+  let saved = Unix.dup ~cloexec:true Unix.stderr in
+  let sigpipe = ref None in
+  let restore () =
+    (* A failed write keeps its text in the buffer of [stderr]. /dev/null takes
+       this text, so that it does not come out later. If /dev/null does not
+       open, the restore continues. *)
+    ( try
+        let null = Unix.openfile "/dev/null" [O_WRONLY; O_CLOEXEC] 0 in
+        Unix.dup2 null Unix.stderr ; Unix.close null
+      with Unix.Unix_error _ -> () ) ;
+    (try flush stderr with Sys_error _ -> ()) ;
+    Unix.dup2 saved Unix.stderr ;
+    Unix.close saved ;
+    Option.iter (Sys.set_signal Sys.sigpipe) !sigpipe
+  in
+  Fun.protect ~finally:restore (fun () ->
+      sigpipe := Some (Sys.signal Sys.sigpipe Sys.Signal_ignore) ;
+      let r, w = Unix.pipe ~cloexec:true () in
+      Unix.close r ;
+      Fun.protect
+        ~finally:(fun () -> Unix.close w)
+        (fun () -> Unix.dup2 w Unix.stderr) ;
+      f () )
 
 let server_tests =
   group "Server"
     [ test "serves a GET on a free port" (fun () ->
-          with_server
+          Sim_support.run
+          @@ fun _ ->
+          with_server ~engine:h1
           @@ fun server ->
+          ( match Server.local_addr server with
+          | Net.Tcp ("127.0.0.1", port) ->
+              is_true ~msg:"a port that the world selected" (port > 0)
+          | _ ->
+              fail "not a TCP address on 127.0.0.1" ) ;
           let c = Tcp.connect (Server.local_addr server) in
-          Flow.write_string c (get ~close:true "/") ;
+          Flow.write_string c (get ~conn:"close" "/") ;
           equal string
             "HTTP/1.1 200 OK\r\n\
              Content-Type: text/plain; charset=utf-8\r\n\
@@ -517,209 +162,154 @@ let server_tests =
             (read_all c) ;
           Flow.close c )
     ; test "keeps a connection alive" (fun () ->
-          with_server
+          Sim_support.run
+          @@ fun _ ->
+          with_server ~engine:h1
           @@ fun server ->
-          let c = Tcp.connect (Server.local_addr server) in
-          let r = Private.Buf_reader.of_flow c in
+          let c, r = connect server in
           Flow.write_string c (get "/id") ;
-          let status, id1 = read_response_from r in
+          let first = read_response r in
           Flow.write_string c (get "/id") ;
-          let _, id2 = read_response_from r in
-          equal string "HTTP/1.1 200 OK" status ;
-          equal string id1 id2 ;
+          let second = read_response r in
+          equal string {|200 "0"|} first ;
+          equal string first second ;
           Flow.close c )
     ; test "connections are numbered in order from 0" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
           with_server
           @@ fun server ->
           let id () =
-            let c = Tcp.connect (Server.local_addr server) in
-            Flow.write_string c (get ~close:true "/id") ;
-            let _, id = read_response c in
-            Flow.close c ; id
+            let c, r = connect server in
+            Flow.write_string c (get ~conn:"close" "/id") ;
+            let response = read_response r in
+            Flow.close c ; response
           in
           let first = id () in
           let second = id () in
-          equal (list string) ["0"; "1"] [first; second] )
-    ; test "serves 20 clients at once" (fun () ->
-          with_server
-          @@ fun server ->
-          let clients =
-            List.init 20 (fun _ ->
-                Fun.Async.call (fun () ->
-                    let c = Tcp.connect (Server.local_addr server) in
-                    Flow.write_string c (get ~close:true "/") ;
-                    let _, body = read_response c in
-                    Flow.close c ; body ) )
-          in
           equal (list string)
-            (List.init 20 (fun _ -> "hello"))
-            (Fun.Async.get_all clients) )
+            [{|200 "0" close|}; {|200 "1" close|}]
+            [first; second] )
     ; test "max_connections holds back extra connections" (fun () ->
-          with_server ~config:{quiet with max_connections= 1}
+          Sim_support.run
+          @@ fun sim ->
+          with_server ~config:{config with max_connections= 1}
           @@ fun server ->
-          let first = Tcp.connect (Server.local_addr server) in
+          let first, r1 = connect server in
           Flow.write_string first (get "/") ;
-          ignore (read_response first) ;
-          let second = Tcp.connect (Server.local_addr server) in
-          Flow.write_string second (get ~close:true "/") ;
-          Flow.set_read_deadline second (Some (deadline_in 200)) ;
-          raises Flow.Timeout (fun () -> Flow.read second (Bytes.create 1) 0 1) ;
-          Flow.set_read_deadline second None ;
+          equal string {|200 "hello"|} (read_response r1) ;
+          let second, r2 = connect server in
+          Flow.write_string second (get ~conn:"close" "/") ;
+          Weft_sim.settle sim ;
+          is_true ~msg:"no byte for the second client"
+            (Flow.read_now second (Bytes.create 1) 0 1 = None) ;
           Flow.close first ;
-          let _, body = read_response second in
-          equal string "hello" body ; Flow.close second )
+          equal string {|200 "hello" close|} (read_response r2) ;
+          Flow.close second )
     ; test "an engine sees the server stopping" (fun () ->
           let engine (ctx : Engine.ctx) flow _handler =
             let before = ctx.is_stopping () in
             Flow.write_string flow "ready " ;
-            Action.invoke ctx.stopping ;
+            sync (Conn_info.stopping ctx.conn) ;
             Flow.write_string flow
               (Printf.sprintf "%b %b" before (ctx.is_stopping ()))
           in
-          in_main
-          @@ fun () ->
-          let server = Server.start ~config:quiet ~engine handler in
+          Sim_support.run
+          @@ fun _ ->
+          Fiber.scope
+          @@ fun sw ->
+          let server = Server.start ~config ~engine sw handler in
           let c = Tcp.connect (Server.local_addr server) in
           equal string "ready " (read_exactly c 6) ;
           Server.shutdown server ;
           Server.wait server ;
           equal string "false true" (read_all c) ;
           Flow.close c )
-    ; test "with every slot busy, shutdown still refuses new clients at once"
-        (fun () ->
-          let started = Cell.Once.make () and release = Cell.Once.make () in
+    ; test
+        "on 1 domain, with every slot busy, shutdown refuses new clients at \
+         once" (fun () ->
+          (* On 1 domain, the close(2) of the listener occurs in [shutdown]. On
+             more than one domain, it can occur later, and a client can connect
+             and then get a reset. *)
+          Sim_support.run
+          @@ fun _ ->
+          let started = Ivar.create () and release = Ivar.create () in
           let handler _ =
-            Cell.Once.try_set started () ;
-            Cell.Once.get release ;
+            Ivar.fill started () ;
+            sync (Ivar.read release) ;
             Response.string "done"
           in
-          in_main
-          @@ fun () ->
-          let server =
-            Server.start ~config:{quiet with max_connections= 1} handler
-          in
-          (* A failure must not hang: the request ends with the test. *)
-          Fun.protect ~finally:(fun () -> Cell.Once.try_set release ())
-          @@ fun () ->
+          with_server ~config:{config with max_connections= 1} ~handler
+          @@ fun server ->
           let addr = Server.local_addr server in
-          let c = Tcp.connect addr in
+          let c, r = connect server in
           Flow.write_string c (get "/") ;
-          within_2s (fun () -> Cell.Once.get started) ;
+          sync (Ivar.read started) ;
           Server.shutdown server ;
-          (* The listener closes while the only slot is still taken. The test
-             tries again for 2 s at most. *)
-          let deadline = deadline_in 2000 in
-          let rec refused () =
-            let retry () =
-              Mtime.is_earlier (Mtime.now ()) ~than:deadline
-              &&
-              ( Mtime.wait_for Mtime.Span.(5 * ms) ;
-                refused () )
-            in
-            match Tcp.connect addr with
-            | exception Unix.Unix_error (Unix.ECONNREFUSED, _, _) ->
-                true
-            (* Queued just as the listener closed. *)
-            | exception Unix.Unix_error (Unix.ECONNRESET, _, _) ->
-                retry ()
-            | c ->
-                Flow.close c ; retry ()
-          in
-          is_true ~msg:"refused" (refused ()) ;
-          Cell.Once.try_set release () ;
-          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
-          let _, body = read_response c in
-          equal string "done" body ;
-          Flow.close c ;
-          within_2s (fun () -> Server.wait server) )
-    ; test "200 starts and shutdowns in a row all finish" (fun () ->
-          (* Readiness of the listener can be spurious: the acceptor must not
-             then block in accept, deaf to the stop. *)
-          let engine _ctx flow _handler = Flow.write_string flow "x" in
-          for _ = 1 to 200 do
-            in_main
-            @@ fun () ->
-            let server = Server.start ~config:quiet ~engine handler in
-            let c = Tcp.connect (Server.local_addr server) in
-            Flow.set_read_deadline c (Some (deadline_in 2000)) ;
-            equal string "x" (read_all c) ;
-            Flow.close c ;
-            Server.shutdown server ;
-            Server.wait server
-          done )
-    ; test "after shutdown, new clients are refused" (fun () ->
-          in_main
+          (* The listener closes while the only slot is taken. *)
+          raises_match ~msg:"the first connect after the shutdown" is_refused
+            (fun () -> Tcp.connect addr ) ;
+          Ivar.fill release () ;
+          equal string {|200 "done" close|} (read_response r) ;
+          Flow.close c )
+    ; test "race: clients during a shutdown leave no fd" (fun () ->
+          Sim_support.race
+          @@ fun sim ->
+          Sim_support.no_fd_leak sim
           @@ fun () ->
-          let server = Server.start ~config:quiet handler in
-          let addr = Server.local_addr server in
-          Server.shutdown server ;
-          Server.wait server ;
-          raises_match
-            (function
-              | Unix.Unix_error (Unix.ECONNREFUSED, _, _) -> true | _ -> false )
-            (fun () -> Tcp.connect addr) )
-    ; test "clients arriving during shutdown leave no descriptor behind"
-        (fun () ->
-          in_main
-          @@ fun () ->
-          let fds () = Array.length (Sys.readdir "/proc/self/fd") in
-          let before = fds () in
+          Fiber.scope
+          @@ fun sw ->
           let server =
-            Server.start ~config:{quiet with max_connections= 8} handler
+            Server.start
+              ~config:{config with max_connections= 8}
+              ~engine:fake sw handler
           in
           let addr = Server.local_addr server in
-          (* Over 10ms, clients connect, send a request and read until the
-             server closes; some arrive after it stopped. *)
+          (* Over 10 ms, clients connect, send a request and read until the
+             server closes. Some come after the stop. *)
           let client i () =
-            let delay = i * 200 in
-            Mtime.wait_for Mtime.Span.(delay * us) ;
+            Time.sleep Mono (Span.us (i * 200)) ;
             match Tcp.connect addr with
-            | exception Unix.Unix_error _ ->
+            | exception Net.Error _ ->
                 ()
             | c -> (
                 Fun.protect ~finally:(fun () -> Flow.close c)
                 @@ fun () ->
-                Flow.set_read_deadline c (Some (deadline_in 2000)) ;
                 try
                   Flow.write_string c (get "/") ;
                   ignore (read_all c)
                 with Flow.Closed -> () )
           in
-          let clients = List.init 50 (fun i -> Fun.Async.call (client i)) in
-          Mtime.wait_for Mtime.Span.(5 * ms) ;
+          Fiber.scope
+          @@ fun s ->
+          let clients =
+            List.init 50 (fun i -> Sim_support.call ~name:"client" s (client i))
+          in
+          Time.sleep Mono (Span.ms 5) ;
           Server.shutdown server ;
           Server.wait server ;
-          ignore (Fun.Async.get_all clients) ;
-          equal int before (fds ()) )
-    ; test "an address in use is an error" (fun () ->
-          with_server
-          @@ fun server ->
-          raises_match
-            (function
-              | Unix.Unix_error (Unix.EADDRINUSE, _, _) -> true | _ -> false )
-            (fun () ->
-              Server.start
-                ~config:{quiet with addr= Server.local_addr server}
-                handler ) )
+          List.iter Sim_support.await clients )
     ; test "the engine can be replaced" (fun () ->
           let engine _ctx flow _handler =
             Flow.write_string flow "custom engine"
           in
+          Sim_support.run
+          @@ fun _ ->
           with_server ~engine
           @@ fun server ->
           let c = Tcp.connect (Server.local_addr server) in
           equal string "custom engine" (read_all c) ;
           Flow.close c )
     ; test "an engine that raises is reported and the server goes on" (fun () ->
-          let errors = Atomic.make [] and calls = Atomic.make 0 in
-          let on_error e _ =
-            Atomic.set errors (Printexc.to_string e :: Atomic.get errors)
-          in
+          let calls = Atomic.make 0 in
           let engine _ctx flow _handler =
             if Atomic.fetch_and_add calls 1 = 0 then failwith "engine"
             else Flow.write_string flow "ok"
           in
-          with_server ~config:{quiet with on_error} ~engine
+          let config, errors = collect config in
+          Sim_support.run
+          @@ fun _ ->
+          with_server ~config ~engine
           @@ fun server ->
           let a = Tcp.connect (Server.local_addr server) in
           equal string "" (read_all a) ;
@@ -727,923 +317,907 @@ let server_tests =
           let b = Tcp.connect (Server.local_addr server) in
           equal string "ok" (read_all b) ;
           Flow.close b ;
-          equal (list string) [{|Failure("engine")|}] (Atomic.get errors) ) ]
+          equal (list string) [{|Failure("engine")|}]
+            (List.map Printexc.to_string (Atomic.get errors)) )
+    ; test "an on_error that raises at a handler error makes wait raise it"
+        (fun () ->
+          let names = on_error_failures 1 in
+          equal (list string) [{|Sys_error("Broken pipe")|}] names )
+    ; test
+        "two exceptions of on_error at the same time make wait raise Multiple"
+        (fun () ->
+          let names = on_error_failures 2 in
+          equal (list string)
+            [ {|Multiple|}
+            ; {|Sys_error("Broken pipe")|}
+            ; {|Sys_error("Broken pipe")|} ]
+            names )
+    ; test "the default on_error ignores a broken stderr" (fun () ->
+          let handler _ = failwith "handler" in
+          let served =
+            with_broken_stderr
+            @@ fun () ->
+            Sim_support.run
+            @@ fun _ ->
+            (* [config] keeps the default on_error. *)
+            with_server ~engine:h1 ~handler
+            @@ fun server ->
+            let request () =
+              let c, r = connect server in
+              Flow.write_string c (get ~conn:"close" "/") ;
+              let status = read_response r in
+              Flow.close c ; status
+            in
+            let first = request () in
+            let second = request () in
+            [first; second]
+          in
+          equal int ~msg:"responses" 2 (List.length served) ;
+          List.iter
+            (fun s ->
+              is_true ~msg:"a 500 response"
+                (String.length s >= 3 && String.sub s 0 3 = "500") )
+            served ) ]
 
-(* Races between stopping and the supervisor, which show with more than two
-   domains; mutation testing runs with one. *)
-
+(* A stop at once after the start, on 4 domains: the server fiber can run before
+   or after the stop. *)
 let race_tests =
-  let domains = if domain_count = 1 then 1 else 4 in
-  let cycles stop config =
-    for _ = 1 to 200 do
-      Affect_unix.Unix.main ~domain_count:domains (fun () ->
-          let server = Server.start ~config handler in
-          Fun.Async.yield () ; stop server ; Server.wait server )
-    done
+  let cycle stop config =
+    Sim_support.race
+    @@ fun _ ->
+    Fiber.scope
+    @@ fun sw ->
+    let server = Server.start ~config ~engine:fake sw handler in
+    Fiber.yield () ; stop server ; Server.wait server
   in
   group "Stopping races"
-    [ test "abort right after start never makes wait raise" (fun () ->
-          cycles Server.abort quiet )
-    ; test "a shutdown with no grace never makes wait raise" (fun () ->
-          cycles Server.shutdown {quiet with shutdown_grace= Mtime.Span.(0 * ms)} )
-    ]
+    [ test "race: abort right after start never makes wait raise" (fun () ->
+          cycle Server.abort config )
+    ; test "race: a shutdown with no grace never makes wait raise" (fun () ->
+          cycle Server.shutdown {config with shutdown_grace= Span.zero} ) ]
 
-(* accept(2) errors *)
-
-let accept_error_tests =
-  let module A = Private.Accept_error in
-  let show e =
-    match A.classify e with
-    | `Connection ->
-        "retry"
-    | `Resources ->
-        "wait"
-    | `Listener ->
-        "stop"
-  in
-  group "Accept_error"
-    [ test "what each accept error is about" (fun () ->
-          expect
-            (String.concat "\n"
-               (List.map
-                  (fun (name, e) -> Printf.sprintf "%-13s %s" name (show e))
-                  Unix.
-                    [ ("ECONNABORTED", ECONNABORTED)
-                    ; ("EINTR", EINTR)
-                    ; ("ENETDOWN", ENETDOWN)
-                    ; ("ENOPROTOOPT", ENOPROTOOPT)
-                    ; ("EHOSTDOWN", EHOSTDOWN)
-                    ; ("EHOSTUNREACH", EHOSTUNREACH)
-                    ; ("EOPNOTSUPP", EOPNOTSUPP)
-                    ; ("ENETUNREACH", ENETUNREACH)
-                    ; ("EPERM", EPERM)
-                    ; ("EPROTO", EUNKNOWNERR 71)
-                    ; ("ENONET", EUNKNOWNERR 64)
-                    ; ("EMFILE", EMFILE)
-                    ; ("ENFILE", ENFILE)
-                    ; ("ENOBUFS", ENOBUFS)
-                    ; ("ENOMEM", ENOMEM)
-                    ; ("EBADF", EBADF)
-                    ; ("EINVAL", EINVAL)
-                    ; ("ENOTSOCK", ENOTSOCK)
-                    ; ("other", EUNKNOWNERR 999) ] ) )
-          @@ __POS_OF__
-               {|
-            ECONNABORTED  retry
-            EINTR         retry
-            ENETDOWN      retry
-            ENOPROTOOPT   retry
-            EHOSTDOWN     retry
-            EHOSTUNREACH  retry
-            EOPNOTSUPP    retry
-            ENETUNREACH   retry
-            EPERM         retry
-            EPROTO        retry
-            ENONET        retry
-            EMFILE        wait
-            ENFILE        wait
-            ENOBUFS       wait
-            ENOMEM        wait
-            EBADF         stop
-            EINVAL        stop
-            ENOTSOCK      stop
-            other         stop
-            |} )
-    ]
-
-(* The accept loop, with a fake listener. A real socket cannot make accept(2)
-   fail on demand: EMFILE needs a process without free descriptors, and Linux
-   does not give ECONNABORTED for a reset queued connection. *)
-
-(* A listener without a socket. [try_accept] gives its steps in order. After the
-   last step, it waits for clients that never come. But if the server does not
-   stop in 2 s, it raises ETIMEDOUT, so that a test that does not stop the
-   server ends: the acceptor stops on this error. *)
+(* The accept loop. The simulator cannot make some errors of accept(2), for
+   example EPROTO. The fake listener raises the errors of a list, one for each
+   call of [accept]. Then it forwards each call to a real listener. *)
 module Fake_listener = struct
-  (* A step: a connection, an accept(2) error, or a gate that holds the next
-     steps until its action is enabled. *)
-  type step =
-    | Conn of Unix.file_descr
-    | Error of Unix.error
-    | Gate of unit Action.t
+  type t = {real: Tcp.Listener.t; errors: Net.error list Atomic.t}
 
-  type t =
-    { mutable steps: step list (* Only the acceptor changes it. *)
-    ; calls: Mtime.t list Atomic.t (* When try_accept ran, the last first. *)
-    ; closed: bool Atomic.t
-    ; deadline: Mtime.t }
+  let make errors real = {real; errors= Atomic.make errors}
 
-  let make steps =
-    { steps
-    ; calls= Atomic.make []
-    ; closed= Atomic.make false
-    ; deadline= deadline_in 2000 }
+  let addr l = Tcp.Listener.addr l.real
 
-  let is_late l = not (Mtime.is_earlier (Mtime.now ()) ~than:l.deadline)
-
-  let addr _ = Unix.ADDR_UNIX "fake"
-
-  let wait_acceptable l tag =
-    match l.steps with
+  let accept l =
+    match Atomic.get l.errors with
+    | e :: rest ->
+        Atomic.set l.errors rest ;
+        raise (Net.Error (e, "Net.accept"))
     | [] ->
-        if is_late l then Action.always tag
-        else Mtime.wait_for' (Mtime.span (Mtime.now ()) l.deadline) tag
-    | Gate gate :: _ ->
-        Action.map (fun () -> tag) gate
-    | (Conn _ | Error _) :: _ ->
-        Action.always tag
+        Tcp.Listener.accept l.real
 
-  let try_accept l =
-    Atomic.set l.calls (Mtime.now () :: Atomic.get l.calls) ;
-    match l.steps with
-    | [] ->
-        if is_late l then
-          raise (Unix.Unix_error (ETIMEDOUT, "Fake_listener", "no stop in 2 s"))
-        else None
-    | Gate _ :: rest ->
-        (* A spurious readiness. *)
-        l.steps <- rest ;
-        None
-    | Conn fd :: rest ->
-        l.steps <- rest ;
-        Some (fd, addr l)
-    | Error e :: rest ->
-        l.steps <- rest ;
-        raise (Unix.Unix_error (e, "accept", ""))
-
-  let close l = Atomic.set l.closed true
+  let close l = Tcp.Listener.close l.real
 end
 
-(* The server end, as the listener gives it, and the client flow of a
-   connection. *)
-let socket_pair () =
-  let server, client =
-    Unix.socketpair ~cloexec:true Unix.PF_UNIX Unix.SOCK_STREAM 0
-  in
-  Unix.set_nonblock server ;
-  Unix.set_nonblock client ;
-  (server, Tcp.flow client)
+(* A listener with connections that wait in its queue: [accept] gives them with
+   no wait, as accept(2) when connections wait. When the queue is empty, the
+   first [accept] calls [empty]. Then [accept] waits until [close], and raises
+   EBADF. Only the acceptor calls [accept]. *)
+module Fake_queued_listener = struct
+  type t =
+    { queue: Net.t list Atomic.t
+    ; empty: (unit -> unit) Atomic.t
+    ; closed: unit Ivar.t }
 
-(* Serves [handler] with [config] and [engine] on a [Fake_listener] with
-   [steps]. [f] gets the listener, the server and the errors that [on_error]
-   got: the helper sets [on_error] of [config]. Then the server stops, if it did
-   not before, and the [clients] flows and the connections that the server did
-   not take close. A server that does not stop makes the test fail after 2 s
-   with ETIMEDOUT, unless the last step is a gate that is never enabled. *)
-let with_fake_listener ?(clients = []) ?(config = quiet) ?(handler = handler)
-    ?engine steps f =
-  let errors = Atomic.make [] in
-  let config =
-    { config with
-      on_error= (fun e _ -> Atomic.set errors (e :: Atomic.get errors)) }
-  in
-  in_main
-  @@ fun () ->
-  let l = Fake_listener.make steps in
-  let server =
-    Server.start_with ~config ?engine (module Fake_listener) l handler
-  in
-  Fun.protect
-    ~finally:(fun () ->
-      List.iter Flow.close clients ;
-      Server.abort server ;
-      (* The acceptor stopped: the steps do not change. *)
-      Fun.protect
-        ~finally:(fun () ->
-          List.iter
-            (function
-              | Fake_listener.Conn fd -> Unix.close fd | Error _ | Gate _ -> () )
-            l.steps )
-        (fun () ->
-          (* The error of a test that stops the server with EBADF. *)
-          try Server.wait server with Unix.Unix_error (EBADF, _, _) -> () ) )
-    (fun () -> f l server errors)
+  let peer = Net.Tcp ("10.0.0.2", 40000)
 
-(* All that [c] gets until it ends, in 2 s at most. Then [c] closes, so that the
-   server does not linger on the connection. *)
-let response c =
-  Flow.set_read_deadline c (Some (deadline_in 2000)) ;
-  Fun.protect ~finally:(fun () -> Flow.close c) (fun () -> read_all c)
+  let make ?(empty = ignore) sockets =
+    { queue= Atomic.make sockets
+    ; empty= Atomic.make empty
+    ; closed= Ivar.create () }
 
-let ends_with suffix s = is_true ~msg:s (String.ends_with ~suffix s)
+  let addr _ = Net.Tcp ("10.0.0.1", 80)
 
-let contains s sub =
-  let n = String.length sub in
-  let rec at i =
-    i + n <= String.length s && (String.sub s i n = sub || at (i + 1))
-  in
-  at 0
+  let accept l =
+    match Atomic.get l.queue with
+    | c :: rest ->
+        Atomic.set l.queue rest ; (c, peer)
+    | [] ->
+        (Atomic.exchange l.empty ignore) () ;
+        sync (Ivar.read l.closed) ;
+        raise (Net.Error (Bad_fd, "Net.accept"))
+
+  let close l = ignore (Ivar.try_fill l.closed ())
+end
+
+(* An engine that keeps its connection until the stop. *)
+let until_stop (ctx : Engine.ctx) _flow _handler =
+  sync (Conn_info.stopping ctx.conn)
 
 let accept_loop_tests =
   group "Accept loop"
-    [ (* A test does not prove that the retry has no pause: a limit on the time
-         makes a test fail on a slow machine. *)
-      test "ECONNABORTED is not reported, and the server accepts again"
-        (fun () ->
-          let fd, c = socket_pair () in
-          with_fake_listener ~clients:[c] [Error ECONNABORTED; Conn fd]
-          @@ fun _ _ errors ->
-          Flow.write_string c (get ~close:true "/") ;
-          ends_with "hello" (response c) ;
-          equal int 0 (List.length (Atomic.get errors)) )
+    [ test
+        "a connection error of accept (EPROTO) is not reported, and the server \
+         accepts again" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          let config, errors = collect config in
+          let l =
+            Fake_listener.make [Other "EPROTO"] (Tcp.Listener.listen loopback)
+          in
+          Fiber.scope
+          @@ fun sw ->
+          let server =
+            Server.start_with ~config ~engine:fake sw
+              (module Fake_listener)
+              l handler
+          in
+          let c, r = connect server in
+          Flow.write_string c (get ~conn:"close" "/") ;
+          equal string {|200 "hello" close|} (read_response r) ;
+          Flow.close c ;
+          equal int ~msg:"errors reported" 0 (List.length (Atomic.get errors)) ;
+          Server.shutdown server ;
+          Server.wait server )
     ; test
-        "EBADF stops the server: the listener closes, a request in progress \
-         finishes, and wait raises EBADF" (fun () ->
-          started := Cell.Once.make () ;
-          let fd, c = socket_pair () in
-          with_fake_listener ~clients:[c]
-            [Conn fd; Gate (Cell.Once.get' !started); Error EBADF]
-          @@ fun l server errors ->
+        "EBADF stops the server: a request in progress finishes, and wait \
+         raises EBADF" (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          let config, errors = collect config in
+          started := Ivar.create () ;
+          let t0 = Time.now Mono in
+          let l = Tcp.Listener.listen loopback in
+          Fiber.scope
+          @@ fun sw ->
+          let server =
+            Server.start_with ~config ~engine:fake sw
+              (module Tcp.Listener)
+              l handler
+          in
+          let c, r = connect server in
+          Fiber.scope
+          @@ fun s ->
+          let response = Sim_support.call s (fun () -> read_response r) in
           Flow.write_string c (get "/pause") ;
-          let r = response c in
-          ends_with "done" r ;
-          is_true ~msg:"the response ends the connection"
-            (contains r "\r\nConnection: close\r\n") ;
-          raises_match
-            (function
-              | Unix.Unix_error (EBADF, "accept", _) -> true | _ -> false )
-            (fun () -> Server.wait server) ;
-          is_true ~msg:"listener closed" (Atomic.get l.closed) ;
-          equal int ~msg:"calls of try_accept: no call after EBADF" 3
-            (List.length (Atomic.get l.calls)) ;
-          equal int 0 (List.length (Atomic.get errors)) )
-    ; test "a server that cannot start closes the listener" (fun () ->
-          in_main
-          @@ fun () ->
-          let l = Fake_listener.make [] in
-          raises_match
-            (function Invalid_argument _ -> true | _ -> false)
-            (fun () ->
-              Server.start_with
-                ~config:{quiet with max_connections= -1}
-                (module Fake_listener)
-                l handler ) ;
-          is_true ~msg:"listener closed" (Atomic.get l.closed) )
-    ; test "a shutdown closes the listener" (fun () ->
-          with_fake_listener []
-          @@ fun l server _ ->
+          sync (Ivar.read !started) ;
+          (* The stop is empty: the acceptor gets EBADF as a failure. *)
+          Tcp.Listener.close l ;
+          equal string {|200 "done" close|}
+            (Sim_support.ends_at sim ~t0 (Span.ms 300) response) ;
+          raises_match is_bad_fd (fun () -> Server.wait server) ;
+          equal int ~msg:"errors reported" 0 (List.length (Atomic.get errors)) ;
+          Flow.close c )
+    ; test "the acceptor lets the other fibers run after 16 accepts" (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          let pairs = List.init 17 (fun _ -> Weft_sim.socket_pair sim) in
+          let l = Fake_queued_listener.make (List.map snd pairs) in
+          Fiber.scope
+          @@ fun sw ->
+          let server =
+            Server.start_with ~config ~engine:until_stop sw
+              (module Fake_queued_listener)
+              l handler
+          in
+          (* On 1 domain, the server fiber runs before this fiber. *)
+          let seen =
+            Fiber.scope (fun s ->
+                Sim_support.await
+                  (Sim_support.call s (fun () -> Server.open_connections server)) )
+          in
+          (* 16, not 17: the acceptor yields after the 16th accept. Not 1: it
+             does not yield after each accept, because on a busy domain each
+             yield slows the accepts. *)
+          equal int ~msg:"connections at the first switch" 16 seen ;
+          Weft_sim.settle sim ;
+          equal int ~msg:"open connections" 17 (Server.open_connections server) ;
           Server.shutdown server ;
           Server.wait server ;
-          is_true ~msg:"listener closed" (Atomic.get l.closed) ) ]
+          List.iter (fun (c, _) -> Net.close c) pairs )
+    ; test
+        "a Cancelled of a different scope from accept is a failure of the \
+         listener: a request in progress gets the grace" (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          let config, errors = collect config in
+          started := Ivar.create () ;
+          let go = Ivar.create () in
+          let client, socket = Weft_sim.socket_pair sim in
+          (* The second accept raises a cancel of no scope of the server. *)
+          let l =
+            Fake_queued_listener.make [socket] ~empty:(fun () ->
+                sync (Ivar.read go) ;
+                raise (Fiber.Cancelled Exit) )
+          in
+          let t0 = Time.now Mono in
+          Fiber.scope
+          @@ fun sw ->
+          let server =
+            Server.start_with ~config ~engine:fake sw
+              (module Fake_queued_listener)
+              l handler
+          in
+          let c = Tcp.flow client in
+          let r = Buf_reader.of_flow c in
+          Fiber.scope
+          @@ fun s ->
+          let response = Sim_support.call s (fun () -> read_response r) in
+          Flow.write_string c (get "/pause") ;
+          sync (Ivar.read !started) ;
+          Ivar.fill go () ;
+          equal string {|200 "done" close|}
+            (Sim_support.ends_at sim ~t0 (Span.ms 300) response) ;
+          raises (Fiber.Cancelled Exit) (fun () -> Server.wait server) ;
+          equal int ~msg:"errors reported" 0 (List.length (Atomic.get errors)) ;
+          Flow.close c )
+    ; test "a server that cannot start closes the listener" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          List.iter
+            (fun n ->
+              let l = Tcp.Listener.listen loopback in
+              Fiber.scope (fun sw ->
+                  raises_match
+                    (function Invalid_argument _ -> true | _ -> false)
+                    (fun () ->
+                      Server.start_with
+                        ~config:{config with max_connections= n}
+                        sw
+                        (module Tcp.Listener)
+                        l handler ) ) ;
+              raises_match
+                ~msg:(Printf.sprintf "max_connections %d: listener closed" n)
+                is_refused (fun () -> Tcp.connect (Tcp.Listener.addr l) ) )
+            [-1; 0] )
+    ; test "a cancel of the scope of the server closes the listener" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          let l = Tcp.Listener.listen loopback in
+          let started = Ivar.create () in
+          Fiber.scope
+          @@ fun s ->
+          (* No shutdown: only the cancel stops the server. *)
+          let caller =
+            Sim_support.call ~name:"caller" s (fun () ->
+                Fiber.scope (fun sw ->
+                    let server =
+                      Server.start_with ~config ~engine:fake sw
+                        (module Tcp.Listener)
+                        l handler
+                    in
+                    Ivar.fill started () ; Server.wait server ) )
+          in
+          sync (Ivar.read started) ;
+          Sim_support.cancel caller ;
+          raises Promise.Cancelled (fun () -> Sim_support.await caller) ;
+          raises_match ~msg:"listener closed" is_bad_fd (fun () ->
+              Tcp.Listener.accept l ) ) ]
 
-(* A stop before the supervisor runs. These tests use one domain, whatever
-   TEST_DOMAINS is: there, the calls that Server.start makes do not run before
-   the caller blocks, so an abort right after start cancels the supervisor
-   before it sees the stop. The tests depend on this order of affect: with more
-   domains, the supervisor can end normally, and a cancelled caller of
-   Fun.Async.get then gets its result. *)
-
+(* A stop before the server fiber runs. In manual mode on 1 domain, the forked
+   server fiber runs only when the test fiber waits. The "Stopping races" run an
+   abort at once after the start on 4 domains. *)
 let early_stop_tests =
-  let start () =
-    Server.start_with ~config:quiet
-      (module Fake_listener)
-      (Fake_listener.make [Gate Action.never])
-      handler
-  in
-  group "A stop before the supervisor runs"
-    [ (* The supervisor ends with Cancelled: the grace call gets it from the
-         supervisor, and wait gets it too. The two take it as the end. *)
-      test "an abort right after start: wait returns" (fun () ->
-          Affect_unix.Unix.main ~domain_count:1
-          @@ fun () ->
-          let server = start () in
+  group "A stop before the server fiber runs"
+    [ test "after an abort, a cancelled caller of wait gets Cancelled" (fun () ->
+          Sim_support.manual
+          @@ fun _ ->
+          Fiber.scope
+          @@ fun sw ->
+          let server = Server.start ~config ~engine:fake sw handler in
           Server.abort server ;
-          within_2s (fun () -> Server.wait server) )
-    ; (* wait takes Cancelled from the supervisor as the end, but not the cancel
-         of its own caller. *)
-      test "after that abort, a cancelled caller of wait gets Cancelled"
+          Server.wait server ;
+          Fiber.scope (fun s ->
+              Fiber.cancel s Exit ;
+              raises (Fiber.Cancelled Exit) (fun () -> Server.wait server) ) )
+    ]
+
+(* A listener for one connection that comes at the time of a stop. The first
+   [accept] waits until the test calls [go]. Then it runs [act], for example a
+   shutdown, and gives [socket]: as accept(2) that returns a connection at the
+   time of the stop. A later [accept] waits until [close], then raises EBADF. *)
+module Fake_late_listener = struct
+  type t =
+    { socket: Net.t
+    ; act: unit -> unit
+    ; first: bool Atomic.t
+    ; go: unit Ivar.t
+    ; closed: unit Ivar.t }
+
+  let peer = Net.Tcp ("10.0.0.2", 40000)
+
+  let make ~act socket =
+    { socket
+    ; act
+    ; first= Atomic.make true
+    ; go= Ivar.create ()
+    ; closed= Ivar.create () }
+
+  let go l = Ivar.fill l.go ()
+
+  let addr _ = Net.Tcp ("10.0.0.1", 80)
+
+  let accept l =
+    let closed () = raise (Net.Error (Bad_fd, "Net.accept")) in
+    if Atomic.exchange l.first false then
+      sync
+        (choose
+           [ wrap (Ivar.read l.go) (fun () -> l.act () ; (l.socket, peer))
+           ; wrap (Ivar.read l.closed) closed ] )
+    else sync (wrap (Ivar.read l.closed) closed)
+
+  let close l = ignore (Ivar.try_fill l.closed ())
+end
+
+(* [counted_engine ()] is Fake_engine with a count of its calls. *)
+let counted_engine () =
+  let calls = Atomic.make 0 in
+  ((fun ctx flow h -> Atomic.incr calls ; fake ctx flow h), calls)
+
+(* [is_closed_by_server client] tells if the server closed its side of the
+   connection of [client]: [client] reads the end of the stream with no wait. *)
+let is_closed_by_server client =
+  Net.read_now client (Bytes.create 1) 0 1 = Some 0
+
+(* The connection that accept gives at the time of a stop or of a cancel (also
+   at the fork of the grace), and the error of Net.local_addr on an accepted
+   socket. *)
+let late_accept_tests =
+  group "A connection that comes at the stop"
+    [ test "a connection that the acceptor gets after a shutdown is closed"
         (fun () ->
-          Affect_unix.Unix.main ~domain_count:1
-          @@ fun () ->
-          let server = start () in
-          Server.abort server ;
-          within_2s (fun () -> Server.wait server) ;
-          let w =
-            Fun.Async.call (fun () ->
-                Fun.Async.cancel_current () ;
-                Server.wait server )
+          Sim_support.run
+          @@ fun sim ->
+          Sim_support.with_pair sim
+          @@ fun client socket ->
+          let config, errors = collect config in
+          let engine, calls = counted_engine () in
+          let server = ref None in
+          let l =
+            Fake_late_listener.make socket ~act:(fun () ->
+                Server.shutdown (Option.get !server) )
           in
-          (* If this fails on correct code, examine affect first: the test needs
-             a call that does not run before its caller blocks, on one
-             domain. *)
-          raises
-            ~msg:
-              "Cancelled (needs: on one domain, a call of start runs only \
-               after the caller blocks)" Fun.Async.Cancelled (fun () ->
-              get_2s w ) ) ]
-
-(* Stop_signal. Only installing: SIGUSR2 is never sent. test_stop_signal.ml
-   sends signals to its own process, and test_server.ml to a child process. *)
-
-let stop_signal_tests =
-  group "Stop_signal"
-    [ test "installing again gives the same value, with the same signals only"
+          Fiber.scope
+          @@ fun sw ->
+          let s =
+            Server.start_with ~config ~engine sw
+              (module Fake_late_listener)
+              l handler
+          in
+          server := Some s ;
+          Fake_late_listener.go l ;
+          Server.wait s ;
+          equal int ~msg:"engine calls" 0 (Atomic.get calls) ;
+          equal int ~msg:"open connections" 0 (Server.open_connections s) ;
+          equal int ~msg:"errors reported" 0 (List.length (Atomic.get errors)) ;
+          is_true ~msg:"the server closed the connection"
+            (is_closed_by_server client) )
+    ; test
+        "a connection that the acceptor gets after a cancel of the scope of \
+         the server is closed, and wait returns" (fun () ->
+          Sim_support.run
+          @@ fun sim ->
+          Sim_support.with_pair sim
+          @@ fun client socket ->
+          let config, errors = collect config in
+          let engine, calls = counted_engine () in
+          let started = Ivar.create () in
+          Fiber.scope
+          @@ fun s ->
+          let caller =
+            Sim_support.call ~name:"caller" s (fun () ->
+                Fiber.scope (fun sw ->
+                    let l =
+                      Fake_late_listener.make socket ~act:(fun () ->
+                          Fiber.cancel sw Exit )
+                    in
+                    Ivar.fill started
+                      ( Server.start_with ~config ~engine sw
+                          (module Fake_late_listener)
+                          l handler
+                      , l ) ) )
+          in
+          let server, l = sync (Ivar.read started) in
+          Fake_late_listener.go l ;
+          Server.wait server ;
+          Sim_support.await caller ;
+          equal int ~msg:"engine calls" 0 (Atomic.get calls) ;
+          equal int ~msg:"open connections" 0 (Server.open_connections server) ;
+          equal int ~msg:"errors reported" 0 (List.length (Atomic.get errors)) ;
+          is_true ~msg:"the server closed the connection"
+            (is_closed_by_server client) )
+    ; test
+        "a cancel of the scope of the server at the end of the acceptor: wait \
+         returns" (fun () ->
+          Sim_support.run
+          @@ fun sim ->
+          Sim_support.with_pair sim
+          @@ fun client socket ->
+          let config, errors = collect config in
+          let engine, calls = counted_engine () in
+          let started = Ivar.create () in
+          let server = ref None in
+          Fiber.scope
+          @@ fun s ->
+          let caller =
+            Sim_support.call ~name:"caller" s (fun () ->
+                Fiber.scope (fun sw ->
+                    let l =
+                      Fake_late_listener.make socket ~act:(fun () ->
+                          Fiber.cancel sw Exit ;
+                          Server.shutdown (Option.get !server) )
+                    in
+                    let t =
+                      Server.start_with ~config ~engine sw
+                        (module Fake_late_listener)
+                        l handler
+                    in
+                    server := Some t ;
+                    Ivar.fill started (t, l) ) )
+          in
+          let server, l = sync (Ivar.read started) in
+          Fake_late_listener.go l ;
+          Server.wait server ;
+          Sim_support.await caller ;
+          equal int ~msg:"engine calls" 0 (Atomic.get calls) ;
+          equal int ~msg:"errors reported" 0 (List.length (Atomic.get errors)) ;
+          is_true ~msg:"the server closed the connection"
+            (is_closed_by_server client) )
+    ; test "an error of local_addr gives the peer as the local address"
         (fun () ->
-          let t = Stop_signal.install ~signals:[Sys.sigusr2] () in
-          is_true ~msg:"same value"
-            (t == Stop_signal.install ~signals:[Sys.sigusr2] ()) ;
-          raises_match
-            (function Invalid_argument _ -> true | _ -> false)
-            (fun () -> Stop_signal.install ()) )
-    ; test "release unblocks the signals, and installing again blocks them"
-        (fun () ->
-          let blocked () =
-            List.mem Sys.sigusr2 (Thread.sigmask Unix.SIG_BLOCK [])
+          Sim_support.run
+          @@ fun sim ->
+          Sim_support.with_pair sim
+          @@ fun _ socket ->
+          let config, errors = collect config in
+          let local = Ivar.create () in
+          let engine (ctx : Engine.ctx) _ _ =
+            Ivar.fill local (Conn_info.local ctx.conn)
           in
-          let t = Stop_signal.install ~signals:[Sys.sigusr2] () in
-          is_true ~msg:"installed" (blocked ()) ;
-          Stop_signal.release t ;
-          is_true ~msg:"released" (not (blocked ())) ;
-          is_true ~msg:"same value"
-            (t == Stop_signal.install ~signals:[Sys.sigusr2] ()) ;
-          is_true ~msg:"installed again" (blocked ()) ) ]
-
-(* Date across domains *)
-
-let date_tests =
-  group "Date"
-    [ test "dates are computed safely on several domains at once" (fun () ->
-          in_main
-          @@ fun () ->
-          let expected t =
-            Format.asprintf "%a" Http_date.pp (Private.Date.of_unix_time t)
+          (* The close makes Net.local_addr raise EBADF. *)
+          let l =
+            Fake_late_listener.make socket ~act:(fun () -> Net.close socket)
           in
-          let worker k =
-            Fun.Async.call (fun () ->
-                for i = 0 to 20_000 do
-                  (* A new second each time, so that every call formats. *)
-                  let t = Float.of_int ((i * 8) + k) in
-                  let p = Option.get (Affect_unix.Ptime.of_float_s t) in
-                  if Private.Date.of_posix p <> expected t then
-                    failwith (Printf.sprintf "wrong date for %.0f" t) ;
-                  if i mod 1000 = 0 then Fun.Async.yield ()
-                done )
+          Fiber.scope
+          @@ fun sw ->
+          let server =
+            Server.start_with ~config ~engine sw
+              (module Fake_late_listener)
+              l handler
           in
-          ignore (Fun.Async.get_all (List.init 8 worker)) ) ]
-
-(* The server on a fake time line *)
-
-(* The spans and the config of the server on a fake time line. *)
-let header_h = Server_support.header_h
-
-let idle_i = Server_support.idle_i
-
-let grace_g = Server_support.grace_g
-
-let linger_l = Server_support.linger_l
-
-let read_r = Server_support.read_r
-
-let write_w = Server_support.write_w
-
-let fake_config = Server_support.fake_config
-
-(* [with_fake_listener] with the fake time [f] and the config [config] (default
-   [fake_config f]). When [test] ends, also by a failure, the fake time advances
-   one day: then each wait on it ends, and the server can stop. *)
-let with_fake_server f ?(config = fake_config f) ?handler ?engine ~clients steps
-    test =
-  with_fake_listener ~config ?handler ?engine ~clients steps
-  @@ fun l server errors ->
-  Fun.protect
-    ~finally:(fun () -> Fake.advance f Mtime.Span.day)
-    (fun () -> test l server errors)
-
-let half_head = Server_support.half_head
-
-let status_is code (status, _) =
-  is_true ~msg:status (String.starts_with ~prefix:("HTTP/1.1 " ^ code) status)
-
-let fake_time_tests =
-  group "Server on a fake time line"
-    [ test "with_fake_time_server ends when a request is in progress" (fun () ->
-          (* Only a cancel ends the handler. A shutdown in place of the abort
-             can compute the grace deadline after the advance, and then wait for
-             ever. *)
-          let f = Fake.make () and started = Cell.Once.make () in
-          let handler _ =
-            Cell.Once.try_set started () ;
-            Cell.Once.get (Cell.Once.make ())
-          in
-          Server_support.with_fake_time_server f ~handler
-          @@ fun server ->
-          (* The client stays open: the server must end it. *)
-          let c = Tcp.connect (Server.local_addr server) in
-          Flow.write_string c (get "/") ;
-          within_2s (fun () -> Cell.Once.get started) )
-    ; test "EMFILE pauses the accepts for 100 ms" (fun () ->
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let fd, c = socket_pair () in
-          with_fake_server f ~clients:[c]
-            [Error EMFILE; Conn fd; Gate Action.never]
-          @@ fun l server errors ->
-          Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.(100 * ms)) ;
-          equal int ~msg:"calls of try_accept in the pause" 1
-            (List.length (Atomic.get l.calls)) ;
-          is_true ~msg:"one EMFILE reported"
-            ( match Atomic.get errors with
-            | [Unix.Unix_error (EMFILE, "accept", _)] ->
-                true
-            | _ ->
-                false ) ;
-          Fake.advance f Mtime.Span.(100 * ms) ;
-          Flow.write_string c (get ~close:true "/") ;
-          ends_with "hello" (response c) ;
-          (* The gate is never enabled: no more calls come. *)
-          equal int ~msg:"calls of try_accept: the EMFILE and the connection" 2
-            (List.length (Atomic.get l.calls)) ;
-          equal bool true (Server.local_addr server = Unix.ADDR_UNIX "fake") )
-    ; (* No advance of the fake time: only the stop can end the pause. *)
-      test "a shutdown ends the pause after EMFILE at once" (fun () ->
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          with_fake_server f ~clients:[] [Error EMFILE; Gate Action.never]
-          @@ fun _ server errors ->
-          Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.(100 * ms)) ;
-          is_true ~msg:"the EMFILE reported before the pause"
-            ( match Atomic.get errors with
-            | [Unix.Unix_error (EMFILE, "accept", _)] ->
-                true
-            | _ ->
-                false ) ;
+          Fake_late_listener.go l ;
+          Weft_sim.settle sim ;
+          is_true ~msg:"the engine got the peer as the local address"
+            (Ivar.peek local = Some Fake_late_listener.peer) ;
           Server.shutdown server ;
-          within_2s (fun () -> Server.wait server) )
-    ; test "a head that completes 1 ns before the header timeout gets 200"
+          Server.wait server ;
+          equal int ~msg:"errors reported" 0 (List.length (Atomic.get errors)) )
+    ]
+
+(* The accepts after EMFILE. The limit of fds makes [accept] fail. *)
+let emfile_tests =
+  group "Accept errors for resources"
+    [ test "EMFILE pauses the accepts for 100 ms" (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          let config, errors = collect config in
+          with_server ~config
+          @@ fun server ->
+          Weft_sim.settle sim ;
+          (* One fd for the client socket. Then the accept of its connection
+             fails. *)
+          Weft_sim.set_fd_limit sim (Some (Weft_sim.open_fds sim + 1)) ;
+          let c, r = connect server in
+          Weft_sim.settle sim ;
+          let t0 = Time.now Mono in
+          is_true ~msg:"one EMFILE reported"
+            (match Atomic.get errors with [e] -> is_emfile e | _ -> false) ;
+          Sim_support.advance sim (Span.ms 50) ;
+          Weft_sim.set_fd_limit sim None ;
+          Fiber.scope
+          @@ fun s ->
+          let response = Sim_support.call s (fun () -> read_response r) in
+          Flow.write_string c (get ~conn:"close" "/") ;
+          equal string {|200 "hello" close|}
+            (Sim_support.ends_at sim ~t0 (Span.ms 100) response) ;
+          equal int ~msg:"errors reported" 1 (List.length (Atomic.get errors)) ;
+          Flow.close c )
+    ; test "a shutdown ends the pause after EMFILE at once" (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          let config, errors = collect config in
+          Fiber.scope
+          @@ fun sw ->
+          let server = Server.start ~config ~engine:fake sw handler in
+          Weft_sim.settle sim ;
+          Weft_sim.set_fd_limit sim (Some (Weft_sim.open_fds sim + 1)) ;
+          let c = Tcp.connect (Server.local_addr server) in
+          Weft_sim.settle sim ;
+          is_true ~msg:"the EMFILE reported before the pause"
+            (match Atomic.get errors with [e] -> is_emfile e | _ -> false) ;
+          Fiber.scope (fun s ->
+              let waiting = Sim_support.call s (fun () -> Server.wait server) in
+              Server.shutdown server ;
+              (* Manual mode: the time does not move. *)
+              is_true ~msg:"wait ended at the shutdown"
+                (Sim_support.ended sim waiting) ;
+              Sim_support.await waiting ) ;
+          Weft_sim.set_fd_limit sim None ;
+          Flow.close c )
+    ; test "at the fd limit with no client, the server reports EMFILE one time"
         (fun () ->
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let fd, c = socket_pair () in
-          with_fake_server f ~clients:[c] [Conn fd; Gate Action.never]
-          @@ fun _ _ _ ->
-          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
-          half_head f c ~t0 ~since:m ;
-          Fake.advance f Mtime.Span.(header_h - ns) ;
-          Flow.write_string c "Host: x\r\n\r\n" ;
-          status_is "200" (read_response c) )
-    ; test "a head that is not complete at the header timeout gets 408"
-        (fun () ->
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let fd, c = socket_pair () in
-          with_fake_server f ~clients:[c] [Conn fd; Gate Action.never]
-          @@ fun _ _ _ ->
-          half_head f c ~t0 ~since:m ;
-          Fake.advance f header_h ;
-          let r = response c in
-          is_true ~msg:r (String.starts_with ~prefix:"HTTP/1.1 408" r) )
-    ; test "a kept-alive connection closes at the idle timeout" (fun () ->
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let fd, c = socket_pair () in
-          with_fake_server f ~clients:[c] [Conn fd; Gate Action.never]
-          @@ fun _ _ _ ->
-          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
-          Fake.wait_mono_timer f ~since:m (t0 +: header_h) ;
-          let r = Private.Buf_reader.of_flow c in
-          let m = Fake.mark f in
+          Sim_support.manual
+          @@ fun sim ->
+          let config, errors = collect config in
+          let count () = List.length (Atomic.get errors) in
+          with_server ~config
+          @@ fun server ->
+          (* The server fiber did not run yet: its first accept fails. *)
+          Weft_sim.set_fd_limit sim (Some (Weft_sim.open_fds sim)) ;
+          Sim_support.advance sim (Span.s 1) ;
+          equal int ~msg:"errors after the first second" 1 (count ()) ;
+          Weft_sim.set_fd_limit sim None ;
+          let c, r = connect server in
+          Flow.write_string c (get ~conn:"close" "/") ;
+          Fiber.scope (fun s ->
+              let response = Sim_support.call s (fun () -> read_response r) in
+              (* The next accept after the pause gets the connection. *)
+              Sim_support.advance sim (Span.ms 100) ;
+              equal string {|200 "hello" close|} (Sim_support.await response) ) ;
+          Flow.close c ;
+          (* A new series: one fd for the client socket. *)
+          Weft_sim.set_fd_limit sim (Some (Weft_sim.open_fds sim + 1)) ;
+          let c2 = Tcp.connect (Server.local_addr server) in
+          Sim_support.advance sim (Span.s 1) ;
+          equal int ~msg:"errors after the second series" 2 (count ()) ;
+          Weft_sim.set_fd_limit sim None ;
+          Flow.close c2 ) ]
+
+(* The HTTP/1.1 deadlines over the server, in manual mode, with the spans of
+   [timed_config]. These tests also examine the server: the slot of a
+   connection, the stop and the Date field. test_h1_server has the head and read
+   deadlines. *)
+let h1_deadline_tests =
+  let with_server ?(config = timed_config) ?handler f =
+    with_server ~config ~engine:h1 ?handler f
+  in
+  group "H1 deadlines over the server"
+    [ test "a kept-alive connection closes at the idle timeout" (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_server
+          @@ fun server ->
+          let t0 = Time.now Mono in
+          let c, r = connect server in
           Flow.write_string c (get "/") ;
-          status_is "200" (read_response_from r) ;
-          Fake.wait_mono_timer f ~since:m (t0 +: idle_i) ;
-          Fake.advance f Mtime.Span.(idle_i - ns) ;
-          let m = Fake.mark f in
+          equal string {|200 "hello"|} (read_response r) ;
+          (* The connection waits for the next request until t0 + I. *)
+          let t2 = just_before (t0 +: idle_i) in
+          Sim_support.advance_to sim t2 ;
           Flow.write_string c (get "/") ;
-          status_is "200" (read_response_from r) ;
-          let t2 = t0 +: Mtime.Span.(idle_i - ns) in
-          Fake.wait_mono_timer f ~since:m (t2 +: idle_i) ;
-          Fake.advance f idle_i ;
-          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
-          equal int ~msg:"the end of the stream" 0
-            (Private.Buf_reader.read_into r (Bytes.create 1) 0 1) )
-    ; test "the Date field is on the POSIX time line of the config" (fun () ->
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let fd, c = socket_pair () in
-          let config = {(fake_config f) with date_header= true} in
-          with_fake_server f ~config ~clients:[c] [Conn fd; Gate Action.never]
-          @@ fun _ _ _ ->
-          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
-          let r = Private.Buf_reader.of_flow c in
+          equal string {|200 "hello"|} (read_response r) ;
+          Fiber.scope
+          @@ fun s ->
+          let eof = Sim_support.call s (fun () -> is_eof r) in
+          is_true ~msg:"the end of the stream"
+            (Sim_support.ends_at sim ~t0:t2 idle_i eof) ;
+          Flow.close c )
+    ; test "the Date field is the world's POSIX time" (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          Weft_sim.set_posix sim (Time.posix_of_unix_s 784111777.) ;
+          with_server ~config:{timed_config with date_header= true}
+          @@ fun server ->
+          let c, r = connect server in
           let date () =
             let date = ref "none" in
             let field line =
               if String.starts_with ~prefix:"Date: " line then date := line
             in
             Flow.write_string c (get "/") ;
-            status_is "200" (read_response_from ~field r) ;
+            equal string {|200 "hello"|} (read_response ~field r) ;
             !date
           in
           equal string "Date: Sun, 06 Nov 1994 08:49:37 GMT" (date ()) ;
-          (* The connection waits for the next request until t0 + I. An advance
-             of 1 s is before each deadline of the test. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: idle_i) ;
-          Fake.advance f Mtime.Span.s ;
-          equal string "Date: Sun, 06 Nov 1994 08:49:38 GMT" (date ()) )
-    ; test "a body read that waits until the read timeout gets 408" (fun () ->
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let handler req =
-            Response.string (Body.to_string (Request.body req))
-          in
-          let fd, c = socket_pair () in
-          with_fake_server f ~handler ~clients:[c] [Conn fd; Gate Action.never]
-          @@ fun _ _ _ ->
-          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
-          Flow.write_string c
-            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n" ;
-          (* The handler reads the body: each read waits [read_timeout]. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: read_r) ;
-          Fake.advance f Mtime.Span.(read_r - ns) ;
-          let m = Fake.mark f in
-          Flow.write_string c "a" ;
-          let t1 = t0 +: Mtime.Span.(read_r - ns) in
-          Fake.wait_mono_timer f ~since:m (t1 +: read_r) ;
-          Fake.advance f read_r ;
-          let r = response c in
-          is_true ~msg:r (String.starts_with ~prefix:"HTTP/1.1 408" r) )
+          (* 1 s is before each deadline of the connection. *)
+          Sim_support.advance sim (Span.s 1) ;
+          equal string "Date: Sun, 06 Nov 1994 08:49:38 GMT" (date ()) ;
+          Flow.close c )
     ; test
         "a response write that waits until the write timeout ends the \
          connection" (fun () ->
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          (* More than the buffers of the socket pair hold. *)
-          let size = 8 * 1024 * 1024 in
           let handler req =
             match Request.path_only req with
             | "/big" ->
-                Response.string (String.make size 'x')
+                Response.string (String.make big 'x')
             | _ ->
                 Response.string "hello"
           in
-          let fd, c = socket_pair () and fd2, c2 = socket_pair () in
-          let config = {(fake_config f) with max_connections= 1} in
-          with_fake_server f ~config ~handler ~clients:[c; c2]
-            [Conn fd; Conn fd2; Gate Action.never]
-          @@ fun _ _ _ ->
-          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+          Sim_support.manual
+          @@ fun sim ->
+          with_server ~config:{timed_config with max_connections= 1} ~handler
+          @@ fun server ->
+          let t0 = Time.now Mono in
+          let c = Tcp.connect (Server.local_addr server) in
+          (* The client does not read: the write of the response waits. *)
           Flow.write_string c (get "/big") ;
-          (* The client does not read until the timeout: only an advance can
-             wake the write that waits. A read before the timeout wakes the
-             write more than once, and then the test cannot prove which wait is
-             the last. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: write_w) ;
           (* [c2] waits for the only slot, which [c] holds until the write
              timeout. *)
-          Flow.write_string c2 (get ~close:true "/") ;
-          Fake.advance f Mtime.Span.(write_w - ns) ;
-          let r2 = Fun.Async.call (fun () -> response c2) in
-          is_false ~msg:"no slot 1 ns before the write timeout"
-            (Fake.ends_within_50ms r2) ;
-          Fake.advance f Mtime.Span.ns ;
-          let rest = read_all c in
+          let c2, r2 = connect server in
+          Flow.write_string c2 (get ~conn:"close" "/") ;
+          Fiber.scope
+          @@ fun s ->
+          let second = Sim_support.call s (fun () -> read_response r2) in
+          equal string {|200 "hello" close|}
+            (Sim_support.ends_at sim ~t0 write_w second) ;
           is_true ~msg:"the connection ends before the whole body"
-            (String.length rest < size) ;
-          (* The end of the connection frees its slot. *)
-          ends_with "hello" (get_2s r2) )
-    ; test "a stop gives the requests in progress the shutdown grace" (fun () ->
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f in
-          let started_a = Cell.Once.make ()
-          and started_b = Cell.Once.make ()
-          and release_a = Cell.Once.make ()
-          and release_b = Cell.Once.make ()
-          and cancelled_a = Cell.Once.make () in
-          let handler req =
-            match Request.path_only req with
-            | "/a" -> (
-                Cell.Once.try_set started_a () ;
-                match Cell.Once.get release_a with
-                | () ->
-                    Response.string "a"
-                | exception Fun.Async.Cancelled ->
-                    Cell.Once.try_set cancelled_a () ;
-                    raise Fun.Async.Cancelled )
-            | _ ->
-                Cell.Once.try_set started_b () ;
-                Cell.Once.get release_b ;
-                Response.string "b"
-          in
-          let fd1, c1 = socket_pair () and fd2, c2 = socket_pair () in
-          with_fake_server f ~handler ~clients:[c1; c2]
-            [Conn fd1; Conn fd2; Gate Action.never]
-          @@ fun _ server _ ->
-          Flow.write_string c1 (get "/a") ;
-          Flow.write_string c2 (get "/b") ;
-          within_2s (fun () ->
-              Cell.Once.get started_a ; Cell.Once.get started_b ) ;
-          (* The grace starts at the stop, not at the start of the server. *)
-          Fake.advance f Mtime.Span.s ;
-          let m = Fake.mark f in
-          Server.shutdown server ;
-          Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.s +: grace_g) ;
-          Fake.advance f Mtime.Span.(grace_g - ns) ;
-          Cell.Once.try_set release_b () ;
-          let r = response c2 in
-          ends_with "b" r ;
-          is_true ~msg:"the response ends the connection"
-            (contains r "\r\nConnection: close\r\n") ;
-          Fake.advance f Mtime.Span.ns ;
-          within_2s (fun () -> Server.wait server) ;
-          is_true ~msg:"the request in progress is cancelled"
-            (Cell.Once.is_set cancelled_a) )
-    ; test "abort cancels requests in progress without a grace" (fun () ->
-          (* No advance: the fake grace never ends. Thus only the abort can end
-             the request. *)
-          let f = Fake.make () and started = Cell.Once.make () in
-          let handler _ =
-            Cell.Once.try_set started () ;
-            Cell.Once.get (Cell.Once.make () : unit Cell.Once.t) ;
-            Response.string "late"
-          in
-          let fd, c = socket_pair () in
-          with_fake_server f ~handler ~clients:[c] [Conn fd; Gate Action.never]
-          @@ fun _ server _ ->
-          Flow.write_string c (get "/") ;
-          within_2s (fun () -> Cell.Once.get started) ;
-          Server.abort server ;
-          within_2s (fun () -> Server.wait server) ;
-          (* The cancelled request ends its connection with no bytes. *)
-          equal string "" (response c) )
-    ; test "idle connections close at once on shutdown" (fun () ->
-          (* No advance: the fake idle timeout and the fake grace never end.
-             Thus this test shows that [Server.wait] ends when the last
-             connection ends. *)
-          let f = Fake.make () in
-          let fd, c = socket_pair () in
-          with_fake_server f ~clients:[c] [Conn fd; Gate Action.never]
-          @@ fun _ server _ ->
-          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
-          let r = Private.Buf_reader.of_flow c in
-          Flow.write_string c (get "/") ;
-          ignore (read_response_from r) ;
-          Server.shutdown server ;
-          equal int ~msg:"the end of the stream" 0
-            (Private.Buf_reader.read_into r (Bytes.create 1) 0 1) ;
-          within_2s (fun () -> Server.wait server) )
-    ; test "each of 20 idle connections closes on shutdown" (fun () ->
-          (* Each connection waits on its own stop cell (#11): the stop must
-             reach each one. No advance, as above. *)
-          let f = Fake.make () in
-          let pairs = List.init 20 (fun _ -> socket_pair ()) in
-          let clients = List.map snd pairs in
-          with_fake_server f ~clients
-            ( List.map (fun (fd, _) -> Fake_listener.Conn fd) pairs
-            @ [Gate Action.never] )
-          @@ fun _ server _ ->
-          let readers =
-            List.map
-              (fun c ->
-                Flow.set_read_deadline c (Some (deadline_in 2000)) ;
-                let r = Private.Buf_reader.of_flow c in
-                Flow.write_string c (get "/") ;
-                ignore (read_response_from r) ;
-                r )
-              clients
-          in
-          Server.shutdown server ;
-          List.iteri
-            (fun i r ->
-              equal int
-                ~msg:(Printf.sprintf "the end of stream %d" i)
-                0
-                (Private.Buf_reader.read_into r (Bytes.create 1) 0 1) )
-            readers ;
-          within_2s (fun () -> Server.wait server) )
-    ; test "a handler that masks the cancel sees the stop after abort"
-        (fun () ->
-          let f = Fake.make () in
-          let started = Cell.Once.make () and saw = Cell.Once.make () in
-          let handler req =
-            Fun.Async.mask_cancellation (fun () ->
-                Cell.Once.try_set started () ;
-                (* The real limit ends the handler if the stop does not come:
-                   then the test fails, and does not hang. *)
-                match
-                  Action.invoke
-                    (Action.choose
-                       [ Action.map
-                           (fun () -> `Stop)
-                           (Conn_info.stopping (Option.get (Request.conn req)))
-                       ; Affect_unix.Mtime.wait_for' Mtime.Span.(3 * s) `Limit
-                       ] )
-                with
-                | `Stop ->
-                    Cell.Once.try_set saw ()
-                | `Limit ->
-                    () ) ;
-            Response.string "late"
-          in
-          let fd, c = socket_pair () in
-          with_fake_server f ~handler ~clients:[c] [Conn fd; Gate Action.never]
-          @@ fun _ server _ ->
-          Flow.write_string c (get "/") ;
-          within_2s (fun () -> Cell.Once.get started) ;
-          Server.abort server ;
-          within_2s (fun () -> Cell.Once.get saw) ;
-          within_2s (fun () -> Server.wait server) )
-    ; test
-        "a handler that masks the cancel sees the stop when the caller of the \
-         server is cancelled" (fun () ->
-          (* No shutdown: the cancel of the caller stops the server. *)
-          let started = Cell.Once.make () and saw = Atomic.make false in
-          let handler req =
-            Fun.Async.mask_cancellation (fun () ->
-                Cell.Once.try_set started () ;
-                match
-                  Action.invoke
-                    (Action.choose
-                       [ Action.map
-                           (fun () -> `Stop)
-                           (Conn_info.stopping (Option.get (Request.conn req)))
-                       ; Affect_unix.Mtime.wait_for' Mtime.Span.(3 * s) `Limit
-                       ] )
-                with
-                | `Stop ->
-                    Atomic.set saw true
-                | `Limit ->
-                    () ) ;
-            Response.string "late"
-          in
-          let fd, c = socket_pair () in
-          in_main
-          @@ fun () ->
-          let caller =
-            Fun.Async.call (fun () ->
-                let l = Fake_listener.make [Conn fd; Gate Action.never] in
-                let server =
-                  Server.start_with ~config:quiet
-                    (module Fake_listener)
-                    l handler
-                in
-                Server.wait server )
-          in
-          Stdlib.Fun.protect ~finally:(fun () -> Flow.close c)
-          @@ fun () ->
-          Flow.write_string c (get "/") ;
-          within_2s (fun () -> Cell.Once.get started) ;
-          Fun.Async.cancel caller ;
-          (* The masked handler ends at the stop, or after its 3 s limit. With 4
-             domains this test can miss a missing stop: the finally of the
-             connection and that of the supervisor race. With 1 or 2 domains it
-             is deterministic. *)
-          ( match
-              Server_support.within
-                Mtime.Span.(5 * s)
-                (fun () -> Fun.Async.get caller)
-            with
-          | () ->
-              ()
-          | exception Fun.Async.Cancelled ->
-              () ) ;
-          is_true ~msg:"the handler saw the stop" (Atomic.get saw) )
-    ; test
-        "a connection that ends while the server runs does not enable stopping"
-        (fun () ->
-          let f = Fake.make () in
-          let kept = ref None in
-          let handler req =
-            kept := Request.conn req ;
-            Response.string "one"
-          in
-          let fd, c = socket_pair () in
-          with_fake_server f ~handler ~clients:[c] [Conn fd; Gate Action.never]
-          @@ fun _ server _ ->
-          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
-          Flow.write_string c (get ~close:true "/") ;
-          ignore (read_response c) ;
+            (String.length (read_to_end c) < big) ;
           Flow.close c ;
-          Server_support.eventually ~msg:"the connection ended" (fun () ->
-              Server.open_connections server = 0 ) ;
-          is_true ~msg:"the action is not enabled"
-            (not (Fake.within_50ms (Conn_info.stopping (Option.get !kept)))) )
+          Flow.close c2 )
     ; test "a response after a shutdown in its handler closes the connection"
         (fun () ->
-          (* The engine polls the cell of the server when it decides to keep the
-             connection. *)
-          let f = Fake.make () in
           let server_ref = ref None in
           let handler _ =
             Server.shutdown (Option.get !server_ref) ;
             Response.string "bye"
           in
-          let fd, c = socket_pair () in
-          with_fake_server f ~handler ~clients:[c] [Conn fd; Gate Action.never]
-          @@ fun _ server _ ->
+          Sim_support.run
+          @@ fun _ ->
+          with_server ~handler
+          @@ fun server ->
           server_ref := Some server ;
-          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
+          let c, r = connect server in
           Flow.write_string c (get "/") ;
-          let fields = ref [] in
-          ignore
-            (read_response_from
-               ~field:(fun l -> fields := String.lowercase_ascii l :: !fields)
-               (Private.Buf_reader.of_flow c) ) ;
-          is_true
-            ~msg:(String.concat "; " !fields)
-            (List.mem "connection: close" !fields) )
-    ; test "an idle connection closes when the listener fails" (fun () ->
-          (* Only the supervisor sets the cells here: no shutdown. No advance:
-             the idle timeout never ends. *)
-          let f = Fake.make () in
-          let fd, c = socket_pair () in
-          let fail = Cell.Once.make () in
-          with_fake_server f ~clients:[c]
-            [Conn fd; Gate (Cell.Once.get' fail); Error EBADF]
-          @@ fun _ _ _ ->
-          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
-          let r = Private.Buf_reader.of_flow c in
-          Flow.write_string c (get "/") ;
-          ignore (read_response_from r) ;
-          Cell.Once.try_set fail () ;
-          equal int ~msg:"the end of the stream" 0
-            (Private.Buf_reader.read_into r (Bytes.create 1) 0 1) )
-    ; test "the server forgets each connection that ends" (fun () ->
-          let f = Fake.make () in
-          let pairs = List.init 50 (fun _ -> socket_pair ()) in
-          let clients = List.map snd pairs in
-          with_fake_server f ~clients
-            ( List.map (fun (fd, _) -> Fake_listener.Conn fd) pairs
-            @ [Gate Action.never] )
-          @@ fun _ server _ ->
-          List.iter
-            (fun c ->
-              Flow.set_read_deadline c (Some (deadline_in 2000)) ;
-              Flow.write_string c (get ~close:true "/") ;
-              ignore (read_response c) ;
-              (* The server lingers until the client closes: the fake linger
-                 timeout never ends. *)
-              Flow.close c )
-            clients ;
-          Server_support.eventually ~msg:"no open connection" (fun () ->
-              Server.open_connections server = 0 ) )
+          equal string {|200 "bye" close|} (read_response r) ;
+          Flow.close c )
     ; test "a connection that the server ends lingers for the linger timeout"
         (fun () ->
-          let f = Fake.make () in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let served = Cell.Once.make () in
+          let served = Ivar.create () in
           let engine ctx flow handler =
             Fun.protect
-              ~finally:(fun () -> Cell.Once.try_set served ())
-              (fun () -> Private.H1_server.serve ctx flow handler)
+              ~finally:(fun () -> ignore (Ivar.try_fill served ()))
+              (fun () -> h1 ctx flow handler)
           in
-          let fd, c = socket_pair () and fd2, c2 = socket_pair () in
-          let config = {(fake_config f) with max_connections= 1} in
-          with_fake_server f ~config ~engine ~clients:[c; c2]
-            [Conn fd; Conn fd2; Gate Action.never]
-          @@ fun _ _ _ ->
-          Flow.write_string c (get ~close:true "/") ;
+          Sim_support.manual
+          @@ fun sim ->
+          Server_support.with_server ~handler ~engine
+            ~config:{timed_config with max_connections= 1}
+          @@ fun server ->
+          let t0 = Time.now Mono in
+          let c = Tcp.connect (Server.local_addr server) in
+          Flow.write_string c (get ~conn:"close" "/") ;
           (* The server half-closes at once: the client gets the response and
              the end of the stream, and keeps its socket open. *)
-          Flow.set_read_deadline c (Some (deadline_in 2000)) ;
           ends_with "hello" (read_all c) ;
           (* [c2] waits for the only slot, which [c] holds while the server
              lingers on it. *)
-          Flow.write_string c2 (get ~close:true "/") ;
-          Fake.wait_mono_timer f ~since:m (t0 +: linger_l) ;
-          Fake.advance f Mtime.Span.(linger_l - ns) ;
-          let m = Fake.mark f in
+          let c2, r2 = connect server in
+          Flow.write_string c2 (get ~conn:"close" "/") ;
+          Sim_support.advance_to sim (just_before (t0 +: linger_l)) ;
+          (* The linger reads the bytes and waits again, to the same
+             deadline. *)
           Flow.write_string c "more" ;
-          (* The linger read the bytes and waits again, to the same deadline. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: linger_l) ;
-          is_false ~msg:"the engine ended" (Cell.Once.is_set served) ;
-          Fake.advance f Mtime.Span.ns ;
-          within_2s (fun () -> Cell.Once.get served) ;
+          Weft_sim.settle sim ;
+          is_true ~msg:"the engine lingers" (Ivar.peek served = None) ;
+          Sim_support.advance_to sim (t0 +: linger_l) ;
+          is_true ~msg:"the engine ended" (Ivar.peek served <> None) ;
           (* The end of the linger frees the slot. *)
-          ends_with "hello" (response c2) )
-    ; test "the engine uses the time line of its flow" (fun () ->
-          in_main
-          @@ fun () ->
-          let f = Fake.make () in
-          let fd, c = socket_pair () in
-          let flow = Tcp.flow ~time:(Fake.mono f) fd in
-          let ctx =
-            { Engine.config= {(fake_config f) with mono_time= Time.mono}
-            ; conn=
-                Conn_info.make ~id:1 ~peer:(Unix.ADDR_UNIX "peer")
-                  ~local:(Unix.ADDR_UNIX "local") ()
-            ; stopping= Action.never
-            ; is_stopping= (fun () -> false) }
+          equal string {|200 "hello" close|} (read_response r2) ;
+          Flow.close c ;
+          Flow.close c2 ) ]
+
+(* A handler that masks the cancel. In a shield, it fills [started], then it
+   fills [saw] with "stop" at the stop of the server, or with "limit" after 3 s.
+   The limit ends the handler if the stop does not come. *)
+let shielded_handler ~started ~saw req =
+  let stopping = Conn_info.stopping (Option.get (Request.conn req)) in
+  Fiber.shield (fun () ->
+      Ivar.fill started () ;
+      Ivar.fill saw
+        (sync
+           (choose
+              [ wrap stopping (fun () -> "stop")
+              ; wrap (Time.after Mono (Span.s 3)) (fun () -> "limit") ] ) ) ) ;
+  Response.string "late"
+
+(* The stop of the server and the connections, with Fake_engine. *)
+let stop_tests =
+  group "Server stop and connections"
+    [ test "a stop gives the requests in progress the shutdown grace" (fun () ->
+          let started_a = Ivar.create ()
+          and started_b = Ivar.create ()
+          and release_a = Ivar.create ()
+          and release_b = Ivar.create ()
+          and cancelled_a = Ivar.create () in
+          let handler req =
+            match Request.path_only req with
+            | "/a" -> (
+                Ivar.fill started_a () ;
+                match sync (Ivar.read release_a) with
+                | () ->
+                    Response.string "a"
+                | exception (Fiber.Cancelled _ as e) ->
+                    Ivar.fill cancelled_a () ; raise e )
+            | _ ->
+                Ivar.fill started_b () ;
+                sync (Ivar.read release_b) ;
+                Response.string "b"
           in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let serving =
-            Fun.Async.call (fun () -> Private.H1_server.serve ctx flow handler)
+          Sim_support.manual
+          @@ fun sim ->
+          with_server ~config:timed_config ~handler
+          @@ fun server ->
+          let c1, _ = connect server and c2, r2 = connect server in
+          Flow.write_string c1 (get "/a") ;
+          Flow.write_string c2 (get "/b") ;
+          sync (Ivar.read started_a) ;
+          sync (Ivar.read started_b) ;
+          (* The grace starts at the stop, not at the start of the server. *)
+          Sim_support.advance sim (Span.s 1) ;
+          let t1 = Time.now Mono in
+          Server.shutdown server ;
+          Sim_support.advance_to sim (just_before (t1 +: grace_g)) ;
+          Ivar.fill release_b () ;
+          equal string {|200 "b" close|} (read_response r2) ;
+          is_true ~msg:"a is not cancelled before the end of the grace"
+            (Ivar.peek cancelled_a = None) ;
+          Sim_support.advance_to sim (t1 +: grace_g) ;
+          is_true ~msg:"a is cancelled at the end of the grace"
+            (Ivar.peek cancelled_a <> None) ;
+          Server.wait server ;
+          Flow.close c1 ;
+          Flow.close c2 )
+    ; test "abort cancels requests in progress without a grace" (fun () ->
+          let started = Ivar.create () in
+          let handler _ =
+            Ivar.fill started () ;
+            sync (Ivar.read (Ivar.create () : unit Ivar.t)) ;
+            Response.string "late"
           in
-          Fun.protect ~finally:(fun () ->
-              Fun.Async.cancel serving ; Flow.close c ; Flow.close flow )
-          @@ fun () ->
-          half_head f c ~t0 ~since:m ;
-          Fake.advance f header_h ;
-          let r = response c in
-          is_true ~msg:r (String.starts_with ~prefix:"HTTP/1.1 408" r) ) ]
+          Sim_support.manual
+          @@ fun _ ->
+          with_server ~config:timed_config ~handler
+          @@ fun server ->
+          let c = Tcp.connect (Server.local_addr server) in
+          Flow.write_string c (get "/") ;
+          sync (Ivar.read started) ;
+          Server.abort server ;
+          (* Manual mode: the time does not move. *)
+          Server.wait server ;
+          (* The cancelled request ends its connection with no bytes. *)
+          equal string "" (read_to_end c) ;
+          Flow.close c )
+    ; test "each of 20 idle connections closes on shutdown" (fun () ->
+          (* All connections wait on the one stop Ivar of the server (#11): the
+             stop must reach each one. *)
+          Sim_support.manual
+          @@ fun _ ->
+          with_server ~config:timed_config
+          @@ fun server ->
+          let clients =
+            List.init 20 (fun _ ->
+                let c, r = connect server in
+                Flow.write_string c (get "/") ;
+                equal string {|200 "hello"|} (read_response r) ;
+                (c, r) )
+          in
+          Server.shutdown server ;
+          List.iteri
+            (fun i (_, r) ->
+              is_true ~msg:(Printf.sprintf "the end of stream %d" i) (is_eof r) )
+            clients ;
+          Server.wait server ;
+          List.iter (fun (c, _) -> Flow.close c) clients )
+    ; test "a handler that masks the cancel sees the stop after abort"
+        (fun () ->
+          let started = Ivar.create () and saw = Ivar.create () in
+          let handler = shielded_handler ~started ~saw in
+          Sim_support.manual
+          @@ fun sim ->
+          with_server ~config:timed_config ~handler
+          @@ fun server ->
+          let c = Tcp.connect (Server.local_addr server) in
+          Flow.write_string c (get "/") ;
+          sync (Ivar.read started) ;
+          Server.abort server ;
+          Weft_sim.settle sim ;
+          equal (option string) ~msg:"at the abort" (Some "stop")
+            (Ivar.peek saw) ;
+          Server.wait server ;
+          Flow.close c )
+    ; test
+        "a handler that masks the cancel sees the stop when the caller of the \
+         server is cancelled" (fun () ->
+          let started = Ivar.create () and saw = Ivar.create () in
+          let handler = shielded_handler ~started ~saw in
+          Sim_support.manual
+          @@ fun sim ->
+          let addr = Ivar.create () in
+          Fiber.scope
+          @@ fun s ->
+          (* No shutdown: the cancel of the caller stops the server. *)
+          let caller =
+            Sim_support.call ~name:"caller" s (fun () ->
+                Fiber.scope (fun sw ->
+                    let server =
+                      Server.start ~config:timed_config ~engine:fake sw handler
+                    in
+                    Ivar.fill addr (Server.local_addr server) ;
+                    Server.wait server ) )
+          in
+          let c = Tcp.connect (sync (Ivar.read addr)) in
+          Flow.write_string c (get "/") ;
+          sync (Ivar.read started) ;
+          Sim_support.cancel caller ;
+          Weft_sim.settle sim ;
+          equal (option string) ~msg:"at the cancel" (Some "stop")
+            (Ivar.peek saw) ;
+          raises Promise.Cancelled (fun () -> Sim_support.await caller) ;
+          Flow.close c )
+    ; test
+        "a connection that ends while the server runs does not enable stopping"
+        (fun () ->
+          let kept = ref None in
+          let handler req =
+            kept := Request.conn req ;
+            Response.string "one"
+          in
+          Sim_support.run
+          @@ fun sim ->
+          with_server ~handler
+          @@ fun server ->
+          let c, r = connect server in
+          Flow.write_string c (get ~conn:"close" "/") ;
+          equal string {|200 "one" close|} (read_response r) ;
+          Flow.close c ;
+          Weft_sim.settle sim ;
+          equal int ~msg:"open connections" 0 (Server.open_connections server) ;
+          let stopping = Conn_info.stopping (Option.get !kept) in
+          Fiber.scope (fun s ->
+              let probe = Sim_support.call s (fun () -> sync stopping) in
+              is_false ~msg:"stopping is ready" (Sim_support.ended sim probe) ;
+              Sim_support.cancel probe ;
+              raises Promise.Cancelled (fun () -> Sim_support.await probe) ) )
+    ; test "an idle connection closes when the listener fails" (fun () ->
+          Sim_support.manual
+          @@ fun _ ->
+          let l = Tcp.Listener.listen loopback in
+          Fiber.scope
+          @@ fun sw ->
+          let server =
+            Server.start_with ~config:timed_config ~engine:fake sw
+              (module Tcp.Listener)
+              l handler
+          in
+          let c, r = connect server in
+          Flow.write_string c (get "/") ;
+          equal string {|200 "hello"|} (read_response r) ;
+          (* No shutdown: the stop is empty when the acceptor gets EBADF. *)
+          Tcp.Listener.close l ;
+          is_true ~msg:"the end of the stream" (is_eof r) ;
+          raises_match is_bad_fd (fun () -> Server.wait server) ;
+          Flow.close c )
+    ; test "the server forgets each connection that ends" (fun () ->
+          Sim_support.run
+          @@ fun sim ->
+          with_server
+          @@ fun server ->
+          for _ = 1 to 50 do
+            let c, r = connect server in
+            Flow.write_string c (get ~conn:"close" "/") ;
+            equal string {|200 "hello" close|} (read_response r) ;
+            Flow.close c
+          done ;
+          Weft_sim.settle sim ;
+          equal int ~msg:"open connections" 0 (Server.open_connections server) )
+    ]
 
 let () =
   exit
-    (run "net"
-       [ tcp_tests
-       ; server_tests
+    (Windtrap.run "net"
+       [ server_tests
        ; race_tests
-       ; accept_error_tests
        ; accept_loop_tests
        ; early_stop_tests
-       ; fake_time_tests
-       ; stop_signal_tests
-       ; date_tests ] )
+       ; late_accept_tests
+       ; emfile_tests
+       ; h1_deadline_tests
+       ; stop_tests ] )

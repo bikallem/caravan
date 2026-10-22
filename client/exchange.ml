@@ -1,8 +1,7 @@
 module Cfg = Config
-open Affect
+open Weft
 open Caravan
 open Caravan.Private
-module Mtime = Affect_unix.Mtime
 
 (* An error of the request writer that stops the reader. *)
 exception Writer_failed of exn * Printexc.raw_backtrace
@@ -23,15 +22,6 @@ let stops phase = function
   | _ ->
       true
 
-let () =
-  Printexc.register_printer (function
-    | Net e ->
-        Some
-          ( "Caravan_client: a write of the request failed: "
-          ^ Printexc.to_string e )
-    | _ ->
-        None )
-
 let writer_error (e, bt) =
   match e with
   | Net Flow.Timeout ->
@@ -40,8 +30,8 @@ let writer_error (e, bt) =
       invalid_arg
         "Caravan_client: the request body length differs from its \
          Content-Length"
-  | Fun.Async.Cancelled ->
-      (* The cancel of a different call: the caller is not cancelled. *)
+  | Fiber.Cancelled _ ->
+      (* The cancel of a different scope: the caller is not cancelled. *)
       failwith "Caravan_client: the request body producer raised Cancelled"
   | e ->
       Printexc.raise_with_backtrace e bt
@@ -78,7 +68,6 @@ let body_error e bt =
 
 let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
   let flow = conn.flow in
-  let time = Flow.time flow in
   let framing = H1_write.request_framing req in
   let inner = Request.body req in
   (* A bad request raises in the caller, and the connection did not change. For
@@ -94,12 +83,12 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
       let bt = Printexc.get_raw_backtrace () in
       on_release conn ~reusable:true ;
       match e with
-      | Fun.Async.Cancelled when not (Fun.Async.is_current_cancelled ()) ->
+      | Fiber.Cancelled _ when not (Cancel.is_own e) ->
           failwith
             "Caravan_client: the close of the request body raised Cancelled"
       | e ->
           Printexc.raise_with_backtrace e bt ) ) ;
-  let sent = Cell.Once.make () in
+  let sent = Ivar.create () in
   (* [produced] is set when the user code of the body ends: the producer of a
      writer body, or the reads and the close of a source. After that, the job
      only writes to the network, with [write_timeout]. A body of length 0 with
@@ -107,12 +96,12 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
   let produced = Atomic.make (framing = H1_write.No_body) in
   let job =
     Writers.job (fun () ->
+        (* One timeout for each write that waits, set one time for the job. *)
+        Flow.set_write_timeout flow (Some config.Cfg.write_timeout) ;
         let w =
           Buf_writer.make ~buffer:conn.write_buf (fun buf off len ->
-              Flow.set_write_deadline flow
-                (Time.after time config.Cfg.write_timeout) ;
               try Flow.write flow buf off len
-              with (Flow.Closed | Flow.Timeout | Unix.Unix_error _) as e ->
+              with (Flow.Closed | Flow.Timeout | Net.Error _) as e ->
                 raise (Net e) )
         in
         (* The body closes in all cases, also when a write of the head fails. A
@@ -133,15 +122,18 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
               end
             in
             H1_write.body w framing body ) ;
-        Cell.Once.try_set sent (Time.now time) )
+        ignore (Ivar.try_fill sent (Time.now Mono)) )
   in
   (* One read function for the exchange: only the reader waits for input, and it
      also sees the end of the request and the end of the writer. *)
   let phase = ref `Head and sent_at = ref None and writer_seen = ref false in
+  (* The read deadline of a call starts at its first wait: the clock is read
+     only on the wait path, one time for each call. A wake by [`Sent], [`Writer]
+     or stale readiness keeps it. *)
   let read buf off len =
-    let start = Time.now time in
+    let start = ref None in
     let rec loop () =
-      Fun.Async.check_cancellation () ;
+      Cancel.check () ;
       match Flow.read_now flow buf off len with
       | Some n ->
           n
@@ -150,25 +142,33 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
             match !phase with
             | `Head ->
                 Option.bind !sent_at (fun t ->
-                    Time.add time t config.response_timeout )
+                    Time.add Mono t config.response_timeout )
             | `Body ->
-                Time.add time start config.read_timeout
+                let t =
+                  match !start with
+                  | Some t ->
+                      t
+                  | None ->
+                      let t = Time.now Mono in
+                      start := Some t ;
+                      t
+                in
+                Time.add Mono t config.read_timeout
           in
           let events =
-            [Flow.readable' flow `Readable; Time.at time deadline `Timeout]
+            [ wrap (Flow.readable flow) (fun () -> `Readable)
+            ; wrap (Deadline.at deadline) (fun () -> `Timeout) ]
           in
           let events =
             if !sent_at = None then
-              Action.map (fun t -> `Sent t) (Cell.Once.get' sent) :: events
+              wrap (Ivar.read sent) (fun t -> `Sent t) :: events
             else events
           in
           let events =
             if !writer_seen then events
-            else
-              Action.map (fun r -> `Writer r) (Cell.Once.get' job.result)
-              :: events
+            else wrap (Writers.result job) (fun r -> `Writer r) :: events
           in
-          match Action.invoke (Action.choose events) with
+          match sync (choose events) with
           | `Readable ->
               loop ()
           | `Timeout ->
@@ -180,7 +180,7 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
               writer_seen := true ;
               (* A writer that ends before [sent], for example with a write
                  error, starts the response deadline too. *)
-              if !sent_at = None then sent_at := Some (Time.now time) ;
+              if !sent_at = None then sent_at := Some (Time.now Mono) ;
               match r with
               | Error (e, bt) when stops !phase e ->
                   raise (Writer_failed (e, bt))
@@ -220,7 +220,7 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
         "Caravan_client: a request body producer used its own response"
     end ;
     if Atomic.exchange released true then None
-    else if not (Atomic.get job.taken) then (
+    else if not (Writers.is_started job) then (
       on_release conn ~reusable:false ;
       None )
     else begin
@@ -242,10 +242,10 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
         let r =
           if not keep then Writers.await ~cancel:true job
           else
-            match Cell.Once.get job.result with
+            match sync (Writers.result job) with
             | r ->
                 r
-            | exception (Fun.Async.Cancelled as e) ->
+            | exception (Fiber.Cancelled _ as e) ->
                 let bt = Printexc.get_raw_backtrace () in
                 ignore (Writers.await ~cancel:true job) ;
                 on_release conn ~reusable:false ;
@@ -306,10 +306,9 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
       (* RFC 9112 §9.6: the server closes, thus the rest of the request is not
          necessary. The reader still reads the response. *)
       if closes h then
-        (* The job is taken at this time. A cancel of a call that ended has no
-           effect. *)
-        Fun.Async.mask_cancellation (fun () ->
-            Fun.Async.cancel (Cell.Once.get job.handle) ) ;
+        (* The job started at this time. A cancel of a fiber that ended has no
+           effect, and the cancel does no sync. *)
+        Writers.cancel job ;
       let inner =
         match fr with
         | No_body ->

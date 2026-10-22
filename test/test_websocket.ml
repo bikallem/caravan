@@ -1,4 +1,10 @@
+(* The tests of caravan.websocket. The tests of a connection or a server run in
+   the simulator of weft (Sim_support): 1 seed and 1 domain, except a test whose
+   name starts with "race:" (100 seeds on 4 domains). A test that checks a time
+   runs in manual mode. *)
+
 open Windtrap
+open Weft
 open Caravan.Private
 open Caravan_websocket.Private
 
@@ -377,12 +383,13 @@ let frames out =
   in
   loop []
 
-(* Runs [app] on a server connection that reads [input]. The result is the lines
-   that [app] logs, a "--" line, then the frames that the server sent. *)
+(* Runs [app] on a server connection that reads [input], in the simulator. The
+   result is the lines that [app] logs, a "--" line, then the frames that the
+   server sent. *)
 let converse ?max_message ?chunk input app =
   let out = Buffer.create 64 and log = ref [] in
   let note s = log := s :: !log in
-  Affect_unix.Unix.main ~domain_count:1 (fun () ->
+  Sim_support.run (fun _ ->
       app note
         (Ws.Private.of_flow ?max_message
            (Caravan.Flow.of_string ?chunk input out) ) ) ;
@@ -766,6 +773,14 @@ let utf8_tests =
             |} )
     ]
 
+(* A flow in memory that reads with [read] and writes with [write]. The default
+   [write] drops the bytes. The flow ignores the deadlines and the timeouts. *)
+let memory_flow ?(write = fun _ _ _ -> ()) read =
+  Caravan.Flow.make ~read
+    ~read_now:(fun b o l -> Some (read b o l))
+    ~write ~readable:(always ()) ~shutdown_send:ignore ~close:ignore
+    ~set_read_deadline:ignore ~set_write_deadline:ignore ()
+
 let connection_tests =
   group "Connection"
     [ test "messages, then a Close from the peer" (fun () ->
@@ -972,7 +987,7 @@ let connection_tests =
           let size = String.length empty in
           let body = count * size in
           let total = String.length first + body + String.length last in
-          let pos = ref 0 and top = ref 0 in
+          let pos = ref 0 and top = ref 0 and reads = ref 0 in
           let byte i =
             if i < String.length first then first.[i]
             else if i < String.length first + body then
@@ -980,6 +995,7 @@ let connection_tests =
             else last.[i - String.length first - body]
           in
           let read buf off len =
+            incr reads ;
             top := Int.max !top (Gc.quick_stat ()).heap_words ;
             let n = Int.min len (total - !pos) in
             for i = 0 to n - 1 do
@@ -988,21 +1004,15 @@ let connection_tests =
             pos := !pos + n ;
             n
           in
-          let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
-          let flow =
-            Caravan.Flow.make ~time:Caravan.Time.mono ~read
-              ~read_now:(fun b o l -> Some (read b o l))
-              ~write:(fun _ _ _ -> ())
-              ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
-              ~close:ignore ~set_read_deadline:ignore_deadline
-              ~set_write_deadline:ignore_deadline ()
-          in
+          let flow = memory_flow read in
           let start = (Gc.quick_stat ()).heap_words in
-          Affect_unix.Unix.main ~domain_count:1 (fun () ->
+          Sim_support.run (fun _ ->
               is_true (Ws.recv (Ws.Private.of_flow flow) = Binary "xy") ) ;
           let grew = (!top - start) * (Sys.word_size / 8) in
           is_true
-            ~msg:(Printf.sprintf "the heap grew by %d bytes" grew)
+            ~msg:
+              (Printf.sprintf
+                 "the heap grew by %d bytes in %d reads of the flow" grew !reads )
             (grew < 4_000_000) )
     ; test "small frames take one read of the input" (fun () ->
           let input = client Binary "hello" ^ client Text "hi"
@@ -1015,35 +1025,31 @@ let connection_tests =
             pos := !pos + n ;
             n
           in
-          let ignore_deadline (_ : Affect_unix.Mtime.t option) = () in
-          let flow =
-            Caravan.Flow.make ~time:Caravan.Time.mono ~read
-              ~read_now:(fun b o l -> Some (read b o l))
-              ~write:(fun _ _ _ -> ())
-              ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
-              ~close:ignore ~set_read_deadline:ignore_deadline
-              ~set_write_deadline:ignore_deadline ()
-          in
-          Affect_unix.Unix.main ~domain_count:1 (fun () ->
+          let flow = memory_flow read in
+          Sim_support.run (fun _ ->
               let c = Ws.Private.of_flow flow in
               is_true (Ws.recv c = Binary "hello") ;
               is_true (Ws.recv c = Text "hi") ) ;
-          equal int 1 !reads )
+          equal int ~msg:"the reads of the flow" 1 !reads )
     ; test "the buffer of a fragmented message stays within max_message"
         (fun () ->
           (* What recv allocates for a message of [m] bytes in fragments of
              [sizes], more than for the same message in one frame. The expected
              message is made before the measure. *)
           let m = 1024 * 1024 in
-          let expected = String.make m 'x' in
+          let expected = String.make m 'x' and reads = ref 0 in
           let allocated frames =
-            let flow =
-              Caravan.Flow.of_string (String.concat "" frames)
-                (Buffer.create 16)
+            let input = String.concat "" frames and pos = ref 0 in
+            let read buf off len =
+              incr reads ;
+              let n = Int.min len (String.length input - !pos) in
+              Bytes.blit_string input !pos buf off n ;
+              pos := !pos + n ;
+              n
             in
             let used = ref 0. in
-            Affect_unix.Unix.main ~domain_count:1 (fun () ->
-                let c = Ws.Private.of_flow ~max_message:m flow in
+            Sim_support.run (fun _ ->
+                let c = Ws.Private.of_flow ~max_message:m (memory_flow read) in
                 let before = Gc.allocated_bytes () in
                 let msg = Ws.recv c in
                 used := Gc.allocated_bytes () -. before ;
@@ -1074,12 +1080,13 @@ let connection_tests =
              [m]: without the limit, they give 2.44 m to 3.00 m. *)
           List.iter
             (fun (sizes, limit) ->
+              reads := 0 ;
               let r = more sizes in
               is_true
                 ~msg:
-                  (Printf.sprintf "%s: %.2f m"
+                  (Printf.sprintf "%s: %.2f m in %d reads of the flow"
                      (String.concat " + " (List.map string_of_int sizes))
-                     r )
+                     r !reads )
                 (r < limit) )
             [ ([m; 0], 0.5)
             ; ([(m / 2) - 1; (m / 2) + 1], 1.75)
@@ -1250,24 +1257,28 @@ let close_tests =
                    ; (1000, "\xff") ] ;
                  Ws.close ~code:4999 ~reason c ) ) ) ]
 
-(* Runs [f] with the flows of the server and of the peer of a TCP connection. *)
-let with_flows = Server_support.with_flows
+module Flow = Caravan.Flow
 
-(* Runs [f] with a server connection and the flow of its peer, on a TCP
-   connection. The flow of the server is on the time line [time]. *)
-let with_socket ?time ?close_timeout ?write_timeout ?read_timeout ?idle_timeout
-    f =
-  with_flows ?time (fun server peer ->
+(* [with_socket sim f] runs [f c peer] with a server connection [c] on a TCP
+   connection of the simulator, and the flow [peer] of the other side. *)
+let with_socket ?close_timeout ?write_timeout ?read_timeout ?idle_timeout sim f
+    =
+  Server_support.with_flows sim (fun ~server ~client ->
       f
         (Ws.Private.of_flow ?close_timeout ?write_timeout ?read_timeout
            ?idle_timeout server )
-        peer )
+        client )
 
-let ms n = Affect_unix.Mtime.Span.(n * ms)
+(* [in_scope f] runs [f s] in a new scope [s]. When [f] ends, also by an
+   exception, the scope cancels the calls that did not end. Thus a call that
+   waits for ever does not stop the end of the test. *)
+let in_scope f =
+  Fiber.scope (fun s ->
+      Fun.protect ~finally:(fun () -> Fiber.cancel s Exit) (fun () -> f s) )
 
-(* [f ()], in a call that must end in 2 s. If not, the test cancels the call and
-   fails, so that a regression does not stop the suite. *)
-let within_2s f = Server_support.within_2s f
+let call = Sim_support.call
+
+let await = Sim_support.await
 
 (* The code of the [Closed] exception that [f] raises. *)
 let closed_code f =
@@ -1277,113 +1288,91 @@ let closed_code f =
   | exception Ws.Closed {code; _} ->
       code
 
-(* Waits at most 2 s until a close starts on [c]. *)
-let wait_closing c =
-  let rec wait n =
-    if (not (is_closing c)) && n > 0 then (
-      Affect_unix.Mtime.wait_for (ms 5) ;
-      wait (n - 1) )
-  in
-  wait 400 ;
+(* [f ()], with its [Closed] exception as text. *)
+let outcome f =
+  match f () with
+  | () ->
+      "ended"
+  | exception Ws.Closed {code; reason} ->
+      Printf.sprintf "closed %d %S" code reason
+
+(* [was_cancelled c] makes sure that the call [c] ended with a cancel. *)
+let was_cancelled c = raises Promise.Cancelled (fun () -> ignore (await c))
+
+(* Settles, then makes sure that a close started on [c]. *)
+let is_closing_now sim c =
+  Weft_sim.settle sim ;
   is_true ~msg:"a close started" (is_closing c)
+
+(* A payload larger than the buffers of a socket of the simulator: a send of it
+   waits until the peer reads. *)
+let large = String.make (1024 * 1024) 'x'
 
 let socket_tests =
   group "Connection on a socket"
-    [ test ~timeout:30.
-        "fibers that send at the same time do not mix their frames" (fun () ->
-          let open Affect in
-          with_socket
-          @@ fun c peer ->
-          (* Some messages are larger than a socket buffer: they need many
-             writes. *)
-          let body name i =
-            String.make (if i mod 50 = 0 then 100_000 else i) name
-          in
-          let sender name =
-            Fun.Async.call (fun () ->
-                for i = 1 to 200 do
-                  Ws.send c
-                    (Binary (Printf.sprintf "%c %d %s" name i (body name i)))
-                done )
-          in
-          let a = sender 'a' and b = sender 'b' in
-          let r = Buf_reader.of_flow peer and last = Hashtbl.create 2 in
-          for _ = 1 to 400 do
-            let f = Frame.read r ~masked:false ~max:max_int in
-            match String.split_on_char ' ' f.payload with
-            | [name; i; data] ->
-                let i = int_of_string i
-                and prev =
-                  Option.value ~default:0 (Hashtbl.find_opt last name)
-                in
-                equal int ~msg:name (prev + 1) i ;
-                is_true ~msg:"intact" (data = body name.[0] i) ;
-                Hashtbl.replace last name i
-            | _ ->
-                fail "a message with incorrect content"
-          done ;
-          Fun.Async.get a ;
-          Fun.Async.get b )
-    ; test
+    [ test
         "after a protocol error, the peer gets the Close frame and the end of \
          the stream" (fun () ->
-          let open Affect in
-          with_socket
+          (* The linger ends at the close timeout of 5 s. *)
+          Sim_support.run ~guard:(Span.s 10)
+          @@ fun sim ->
+          with_socket sim
           @@ fun c peer ->
-          let reader =
-            Fun.Async.call (fun () -> closed_code (fun () -> Ws.recv c))
-          in
+          in_scope
+          @@ fun s ->
+          let reader = call s (fun () -> closed_code (fun () -> Ws.recv c)) in
           (* A frame of 20 MiB, over the limit of 8 MiB: the server reads only
-             its header, and 1 MiB stays unread. *)
+             its header, and 1 MB stays unread. *)
           let header =
             of_hex "82ff" ^ "\x00\x00\x00\x00\x01\x40\x00\x00"
             ^ "\x01\x02\x03\x04"
           in
-          Caravan.Flow.write_string peer (header ^ String.make 1_000_000 'x') ;
+          Flow.write_string peer (header ^ String.make 1_000_000 'x') ;
           let r = Buf_reader.of_flow peer in
           equal string "close 1009"
             (show_frame (Frame.read r ~masked:false ~max:125)) ;
           raises End_of_file (fun () -> Frame.read r ~masked:false ~max:125) ;
-          Caravan.Flow.close peer ;
-          equal int 1009 (Fun.Async.get reader) )
+          Flow.close peer ;
+          equal int 1009 (await reader) )
     ; test "a cancel in the reply to a Close frame closes the connection"
         (fun () ->
-          let open Affect in
-          with_socket
+          Sim_support.run
+          @@ fun sim ->
+          with_socket sim
           @@ fun c peer ->
+          in_scope
+          @@ fun s ->
           (* The peer reads only the first bytes: the send holds the writer
              until the connection closes. *)
           let sender =
-            Fun.Async.call (fun () ->
-                closed_code (fun () ->
-                    Ws.send c (Binary (String.make 10_000_000 'x')) ) )
+            call s (fun () -> closed_code (fun () -> Ws.send c (Binary large)))
           in
           is_false (Buf_reader.peek_eof (Buf_reader.of_flow peer)) ;
-          let reader = Fun.Async.call (fun () -> Ws.recv c) in
-          Caravan.Flow.write_string peer (client Close (code_reason 1000 "")) ;
+          let reader = call s (fun () -> Ws.recv c) in
+          Flow.write_string peer (client Close (code_reason 1000 "")) ;
           (* The reply to the Close frame waits for the writer. *)
-          wait_closing c ;
-          Fun.Async.cancel reader ;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get reader) ;
-          within_2s (fun () -> Ws.close c) ;
+          is_closing_now sim c ;
+          Sim_support.cancel reader ;
+          was_cancelled reader ;
+          Ws.close c ;
           equal int 1000 (closed_code (fun () -> Ws.recv c)) ;
-          ignore (Fun.Async.get sender) )
+          ignore (await sender) )
     ; (* A cancel in the middle of a frame closes the connection, because the
-         stream is out of step. The fake time tests have the cancels of a
+         stream is out of step. The tests on exact time have the cancels of a
          recv. *)
       test "a cancel in the middle of a send closes with 1006" (fun () ->
-          let open Affect in
-          with_socket
+          Sim_support.run
+          @@ fun sim ->
+          with_socket sim
           @@ fun c peer ->
-          let sender =
-            Fun.Async.call (fun () ->
-                Ws.send c (Binary (String.make 10_000_000 'x')) )
-          in
+          in_scope
+          @@ fun s ->
+          let sender = call s (fun () -> Ws.send c (Binary large)) in
           (* When the first bytes come, the send is in its frame. *)
           let r = Buf_reader.of_flow peer in
           is_false (Buf_reader.peek_eof r) ;
-          Fun.Async.cancel sender ;
-          raises Fun.Async.Cancelled (fun () -> Fun.Async.get sender) ;
+          Sim_support.cancel sender ;
+          was_cancelled sender ;
           equal int 1006 (closed_code (fun () -> Ws.send c (Text "hello"))) ;
           raises End_of_file (fun () -> Frame.read r ~masked:false ~max:max_int) )
     ]
@@ -1589,11 +1578,12 @@ let handshake_tests =
              |} )
     ]
 
-(* What recv raised in the handler of "/record". *)
-let recorded = Atomic.make None
+(* What recv raised in the handler of "/record". A test makes a new Ivar before
+   it starts. *)
+let recorded : string Ivar.t ref = ref (Ivar.create ())
 
-(* "/ticker" sets it after its first message, and "/late" when it starts. *)
-let started = ref (Affect.Cell.Once.make ())
+(* "/ticker" fills it after its first message, and "/late" when it starts. *)
+let started : unit Ivar.t ref = ref (Ivar.create ())
 
 let echo c =
   let rec loop () =
@@ -1607,25 +1597,24 @@ let server_handler req =
   | "/echo" ->
       Ws.accept req echo
   | "/echo-fast" ->
-      Ws.accept ~close_timeout:(ms 100) req echo
+      Ws.accept ~close_timeout:(Span.ms 100) req echo
   | "/wait" ->
-      Ws.accept req (fun _ -> Affect_unix.Mtime.wait_for (ms 10_000))
+      Ws.accept req (fun _ -> Time.sleep Mono (Span.s 10))
   | "/wait-slow-close" ->
-      Ws.accept ~close_timeout:(ms 2000) req (fun _ ->
-          Affect_unix.Mtime.wait_for (ms 10_000) )
+      Ws.accept ~close_timeout:(Span.s 2) req (fun _ ->
+          Time.sleep Mono (Span.s 10) )
   | "/ticker" ->
-      Ws.accept ~close_timeout:(ms 300) req (fun c ->
+      Ws.accept ~close_timeout:(Span.ms 300) req (fun c ->
           let rec loop () =
             Ws.send c (Text "tick") ;
-            Affect.Cell.Once.try_set !started () ;
-            Affect_unix.Mtime.wait_for (ms 10) ;
+            ignore (Ivar.try_fill !started ()) ;
+            Time.sleep Mono (Span.ms 10) ;
             loop ()
           in
           loop () )
   | "/late" ->
-      Affect.Cell.Once.try_set !started () ;
-      Affect.Action.invoke
-        (Caravan.Conn_info.stopping (Option.get (Caravan.Request.conn req))) ;
+      ignore (Ivar.try_fill !started ()) ;
+      sync (Caravan.Conn_info.stopping (Option.get (Caravan.Request.conn req))) ;
       Ws.accept req echo
   | "/protocol" ->
       Ws.accept ~protocols:["chat"; "echo"] req (fun c ->
@@ -1638,24 +1627,29 @@ let server_handler req =
           | _ ->
               ()
           | exception e ->
-              Atomic.set recorded (Some (Printexc.to_string e)) ;
+              ignore (Ivar.try_fill !recorded (Printexc.to_string e)) ;
               raise e )
   | "/other" ->
       (* A Closed of a different connection is an exception of the handler. *)
       Ws.accept req (fun _ ->
           let input = client Close (code_reason 1000 "") in
           let other =
-            Ws.Private.of_flow (Caravan.Flow.of_string input (Buffer.create 16))
+            Ws.Private.of_flow (Flow.of_string input (Buffer.create 16))
           in
           ignore (Ws.recv other) )
   | "/child" ->
-      (* The Cancelled of a child call is not a stop of the server. *)
+      (* The await of a cancelled child is not a stop of the server. *)
       Ws.accept req (fun _ ->
-          let open Affect in
-          let child =
-            Fun.Async.call (fun () -> Affect_unix.Mtime.wait_for (ms 10_000))
-          in
-          Fun.Async.cancel child ; Fun.Async.get child )
+          Fiber.scope (fun s ->
+              let child =
+                Fiber.fork_promise s (fun () -> Time.sleep Mono (Span.s 10))
+              in
+              Promise.cancel child ; Promise.await child ) )
+  | "/inner" ->
+      (* The Cancelled of a scope inside the handler is not a stop of the
+         server. *)
+      Ws.accept req (fun _ ->
+          Fiber.scope (fun s -> Fiber.cancel s Exit ; sync never) )
   | _ ->
       Caravan.Handler.not_found req
 
@@ -1688,12 +1682,12 @@ let response_head r =
 let session ?first ?(after = "") ?(during = ignore) ?(reply = true) server path
     =
   let flow = Caravan.Tcp.connect (Caravan.Server.local_addr server) in
-  Stdlib.Fun.protect ~finally:(fun () -> Caravan.Flow.close flow)
+  Fun.protect ~finally:(fun () -> Flow.close flow)
   @@ fun () ->
-  Caravan.Flow.write_string flow (upgrade_request ?first path) ;
+  Flow.write_string flow (upgrade_request ?first path) ;
   let r = Buf_reader.of_flow flow in
   let head = response_head r in
-  Caravan.Flow.write_string flow after ;
+  Flow.write_string flow after ;
   during () ;
   let rec frames acc =
     match Frame.read r ~masked:false ~max:max_int with
@@ -1701,21 +1695,39 @@ let session ?first ?(after = "") ?(during = ignore) ?(reply = true) server path
         List.rev acc
     | f ->
         if reply && f.opcode = Close then
-          Caravan.Flow.write_string flow (client Close f.payload) ;
+          Flow.write_string flow (client Close f.payload) ;
         frames (show_frame f :: acc)
   in
   String.concat "\n" (head @ ("--" :: frames []))
+
+let with_server = Server_support.with_server
+
+(* The configuration of the server, with the errors in [errors]. *)
+let config_with errors =
+  { Server_support.config with
+    on_error= (fun e _ -> errors := Printexc.to_string e :: !errors) }
+
+(* [session server path] in the simulator, with the errors of the server. *)
+let errors_of_session path =
+  let errors = ref [] in
+  let s =
+    Sim_support.run (fun _ ->
+        with_server ~config:(config_with errors) ~handler:server_handler
+          (fun server -> session server path ) )
+  in
+  (s, List.rev !errors)
 
 let server_tests =
   group "Server"
     [ test "an echo, with a first frame in the write of the request" (fun () ->
           expect
-            (Server_support.with_server ~handler:server_handler (fun server ->
-                 session server "/echo" ~first:(client Text "early")
-                   ~reply:false
-                   ~after:
-                     ( client Text "hi" ^ client Binary "\x01"
-                     ^ client Close (code_reason 1000 "bye") ) ) )
+            (Sim_support.run (fun _ ->
+                 with_server ~handler:server_handler (fun server ->
+                     session server "/echo" ~first:(client Text "early")
+                       ~reply:false
+                       ~after:
+                         ( client Text "hi" ^ client Binary "\x01"
+                         ^ client Close (code_reason 1000 "bye") ) ) ) )
           @@ __POS_OF__
                {|
             HTTP/1.1 101 Switching Protocols
@@ -1730,8 +1742,9 @@ let server_tests =
             |} )
     ; test "a handler that ends closes with 1000" (fun () ->
           expect
-            (Server_support.with_server ~handler:server_handler (fun server ->
-                 session server "/protocol" ) )
+            (Sim_support.run (fun _ ->
+                 with_server ~handler:server_handler (fun server ->
+                     session server "/protocol" ) ) )
           @@ __POS_OF__
                {|
             HTTP/1.1 101 Switching Protocols
@@ -1745,15 +1758,8 @@ let server_tests =
             |} )
     ; test "a handler that raises closes with 1011, and the server reports it"
         (fun () ->
-          let errors = ref [] in
-          let config =
-            { Server_support.config with
-              on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
-            }
-          in
-          expect
-            (Server_support.with_server ~config ~handler:server_handler
-               (fun server -> session server "/boom" ) )
+          let s, errors = errors_of_session "/boom" in
+          expect s
           @@ __POS_OF__
                {|
             HTTP/1.1 101 Switching Protocols
@@ -1763,19 +1769,26 @@ let server_tests =
             --
             close 1011
             |} ;
-          equal (list string) ["Failure(\"boom\")"] !errors )
+          equal (list string) ["Failure(\"boom\")"] errors )
     ; test
         "a Cancelled from a child call closes with 1011, and the server \
          reports it" (fun () ->
-          let errors = ref [] in
-          let config =
-            { Server_support.config with
-              on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
-            }
-          in
-          expect
-            (Server_support.with_server ~config ~handler:server_handler
-               (fun server -> session server "/child" ) )
+          let s, errors = errors_of_session "/child" in
+          expect s
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 101 Switching Protocols
+            Upgrade: websocket
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+            Connection: Upgrade
+            --
+            close 1011
+            |} ;
+          equal (list string) [Printexc.to_string Promise.Cancelled] errors )
+    ; test "a Fiber.Cancelled from a scope inside the handler closes with 1011"
+        (fun () ->
+          let s, errors = errors_of_session "/inner" in
+          expect s
           @@ __POS_OF__
                {|
             HTTP/1.1 101 Switching Protocols
@@ -1786,21 +1799,16 @@ let server_tests =
             close 1011
             |} ;
           equal (list string)
-            [ "Failure(\"Caravan_websocket: a call of the handler was \
-               cancelled\")" ]
-            !errors )
+            [ Printexc.to_string
+                (Failure
+                   "Caravan_websocket: the handler raised the Cancelled of a \
+                    different scope" ) ]
+            errors )
     ; test
         "a Closed of a different connection closes with 1011, and the server \
          reports it" (fun () ->
-          let errors = ref [] in
-          let config =
-            { Server_support.config with
-              on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
-            }
-          in
-          expect
-            (Server_support.with_server ~config ~handler:server_handler
-               (fun server -> session server "/other" ) )
+          let s, errors = errors_of_session "/other" in
+          expect s
           @@ __POS_OF__
                {|
             HTTP/1.1 101 Switching Protocols
@@ -1810,56 +1818,44 @@ let server_tests =
             --
             close 1011
             |} ;
-          equal int 1 (List.length !errors) )
+          equal int 1 (List.length errors) )
     ; test "a peer that leaves without a Close frame is not an error" (fun () ->
           let errors = ref [] in
-          let config =
-            { Server_support.config with
-              on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
-            }
+          recorded := Ivar.create () ;
+          let recorded =
+            Sim_support.run (fun _ ->
+                with_server ~config:(config_with errors) ~handler:server_handler
+                  (fun server ->
+                    let flow =
+                      Caravan.Tcp.connect (Caravan.Server.local_addr server)
+                    in
+                    Flow.write_string flow (upgrade_request "/record") ;
+                    equal string "HTTP/1.1 101 Switching Protocols"
+                      (List.hd (response_head (Buf_reader.of_flow flow))) ;
+                    Flow.close flow ;
+                    sync (Ivar.read !recorded) ) )
           in
-          Atomic.set recorded None ;
-          Server_support.with_server ~config ~handler:server_handler
-            (fun server ->
-              let flow =
-                Caravan.Tcp.connect (Caravan.Server.local_addr server)
-              in
-              Caravan.Flow.write_string flow (upgrade_request "/record") ;
-              equal string "HTTP/1.1 101 Switching Protocols"
-                (List.hd (response_head (Buf_reader.of_flow flow))) ;
-              Caravan.Flow.close flow ;
-              (* Waits at most 2 s for the handler to get Closed 1006. Then the
-                 server stops: it waits for the end of the handler. *)
-              let rec wait n =
-                if Atomic.get recorded = None && n > 0 then (
-                  Affect_unix.Mtime.wait_for (ms 10) ;
-                  wait (n - 1) )
-              in
-              wait 200 ) ;
-          equal (option string)
-            (Some "Caravan_websocket__Connection.Closed(1006, \"\")")
-            (Atomic.get recorded) ;
+          equal string "Caravan_websocket__Connection.Closed(1006, \"\")"
+            recorded ;
           equal (list string) [] !errors )
     ; test "a server that stops sends Close 1001, and the handler ends"
         (fun () ->
           let errors = ref [] in
-          let config =
-            { Server_support.config with
-              shutdown_grace= ms 30_000
-            ; on_error= (fun e _ -> errors := Printexc.to_string e :: !errors)
-            }
-          in
+          let config = {(config_with errors) with shutdown_grace= Span.s 30} in
+          (* Manual mode: the session and the stop end with no time. *)
           expect
-            (Server_support.with_server ~config ~handler:server_handler
-               (fun server ->
-                 let s =
-                   within_2s (fun () ->
+            (Sim_support.manual (fun _ ->
+                 let t0 = Time.now Mono in
+                 with_server ~config ~handler:server_handler (fun server ->
+                     let s =
                        session server "/echo" ~during:(fun () ->
-                           Caravan.Server.shutdown server ) )
-                 in
-                 (* The handler does not wait for the grace of 30 s. *)
-                 within_2s (fun () -> Caravan.Server.wait server) ;
-                 s ) )
+                           Caravan.Server.shutdown server )
+                     in
+                     (* The handler does not wait for the grace of 30 s. *)
+                     Caravan.Server.wait server ;
+                     equal Server_support.span Span.zero
+                       (Time.diff Mono (Time.now Mono) t0) ;
+                     s ) ) )
           @@ __POS_OF__
                {|
             HTTP/1.1 101 Switching Protocols
@@ -1872,55 +1868,57 @@ let server_tests =
           equal (list string) [] !errors )
     ; test "a handler that is in recv when the server stops gets Closed 1001"
         (fun () ->
-          let config = {Server_support.config with shutdown_grace= ms 30_000} in
-          Atomic.set recorded None ;
-          Server_support.with_server ~config ~handler:server_handler
-            (fun server ->
-              ignore
-                (within_2s (fun () ->
-                     session server "/record" ~during:(fun () ->
+          let config = {Server_support.config with shutdown_grace= Span.s 30} in
+          recorded := Ivar.create () ;
+          Sim_support.run (fun _ ->
+              with_server ~config ~handler:server_handler (fun server ->
+                  ignore
+                    (session server "/record" ~during:(fun () ->
                          Caravan.Server.shutdown server ) ) ) ) ;
           (* The server waits for the handler. *)
           equal (option string)
             (Some
                "Caravan_websocket__Connection.Closed(1001, \"server shutdown\")"
-            ) (Atomic.get recorded) )
+            ) (Ivar.peek !recorded) )
     ; test
         "a stop before the handler gives its response: 503, and no WebSocket \
          connection" (fun () ->
-          let open Affect in
-          started := Cell.Once.make () ;
-          let config = {Server_support.config with shutdown_grace= ms 30_000} in
+          started := Ivar.create () ;
+          let config = {Server_support.config with shutdown_grace= Span.s 30} in
           expect
-            (Server_support.with_server ~config ~handler:server_handler
-               (fun server ->
-                 (* The response comes only after the stop. *)
-                 let s =
-                   Fun.Async.call (fun () ->
-                       let flow =
-                         Caravan.Tcp.connect (Caravan.Server.local_addr server)
-                       in
-                       Stdlib.Fun.protect ~finally:(fun () ->
-                           Caravan.Flow.close flow )
-                       @@ fun () ->
-                       Caravan.Flow.write_string flow (upgrade_request "/late") ;
-                       let r = Buf_reader.of_flow flow in
-                       let head = response_head r in
-                       let buf = Bytes.create 256 and body = Buffer.create 64 in
-                       let rec rest () =
-                         match Buf_reader.read_into r buf 0 256 with
-                         | 0 ->
-                             ()
-                         | n ->
-                             Buffer.add_subbytes body buf 0 n ;
-                             rest ()
-                       in
-                       rest () ;
-                       String.concat "\n" (head @ ["--"; Buffer.contents body]) )
-                 in
-                 within_2s (fun () -> Cell.Once.get !started) ;
-                 Caravan.Server.shutdown server ;
-                 within_2s (fun () -> Fun.Async.get s) ) )
+            (Sim_support.run (fun _ ->
+                 with_server ~config ~handler:server_handler (fun server ->
+                     in_scope
+                     @@ fun s ->
+                     (* The response comes only after the stop. *)
+                     let session =
+                       call s (fun () ->
+                           let flow =
+                             Caravan.Tcp.connect
+                               (Caravan.Server.local_addr server)
+                           in
+                           Fun.protect ~finally:(fun () -> Flow.close flow)
+                           @@ fun () ->
+                           Flow.write_string flow (upgrade_request "/late") ;
+                           let r = Buf_reader.of_flow flow in
+                           let head = response_head r in
+                           let buf = Bytes.create 256
+                           and body = Buffer.create 64 in
+                           let rec rest () =
+                             match Buf_reader.read_into r buf 0 256 with
+                             | 0 ->
+                                 ()
+                             | n ->
+                                 Buffer.add_subbytes body buf 0 n ;
+                                 rest ()
+                           in
+                           rest () ;
+                           String.concat "\n"
+                             (head @ ["--"; Buffer.contents body]) )
+                     in
+                     sync (Ivar.read !started) ;
+                     Caravan.Server.shutdown server ;
+                     await session ) ) )
           @@ __POS_OF__
                {|
             HTTP/1.1 503 Service Unavailable
@@ -1936,881 +1934,859 @@ let server_tests =
              check: the handler then starts with the stop set. *)
           let input = client Close (code_reason 1001 "") in
           let out = Buffer.create 16 in
-          Affect_unix.Unix.main ~domain_count:1 (fun () ->
-              within_2s (fun () ->
-                  run_handler ~stopping:(Affect.Action.always ())
-                    (fun c -> try ignore (Ws.recv c) with Ws.Closed _ -> ())
-                    (Caravan.Flow.of_string input out) ) ) ;
+          Sim_support.run (fun _ ->
+              run_handler ~stopping:(always ())
+                (fun c -> try ignore (Ws.recv c) with Ws.Closed _ -> ())
+                (Flow.of_string input out) ) ;
           equal (list string) ["close 1001"] (frames (Buffer.contents out)) )
     ; test "the end of the handler stops the wait for the stop" (fun () ->
           let input = client Close (code_reason 1000 "") in
           let out = Buffer.create 16 in
-          Affect_unix.Unix.main ~domain_count:1 (fun () ->
-              within_2s (fun () ->
-                  run_handler (fun _ -> ()) (Caravan.Flow.of_string input out) ) ) ;
+          Sim_support.run (fun _ ->
+              run_handler (fun _ -> ()) (Flow.of_string input out) ) ;
           equal (list string) ["close 1000"] (frames (Buffer.contents out)) )
     ; test "a cancel of the handler after the peer left gives Cancelled"
         (fun () ->
-          let open Affect in
-          with_flows
-          @@ fun server peer ->
-          let left = Cell.Once.make () in
+          Sim_support.run
+          @@ fun sim ->
+          Server_support.with_flows sim
+          @@ fun ~server ~client:peer ->
+          in_scope
+          @@ fun s ->
+          let left = Ivar.create () in
           let handler =
-            Fun.Async.call (fun () ->
+            call s (fun () ->
                 run_handler
                   (fun c ->
                     (* The recv sees the end of the stream, and the connection
                        is closed. Thus a close after the cancel ends at once,
                        without a check of the cancel. *)
                     (try ignore (Ws.recv c) with Ws.Closed _ -> ()) ;
-                    Cell.Once.try_set left () ;
-                    Cell.Once.get (Cell.Once.make ()) )
+                    Ivar.fill left () ; sync never )
                   server )
           in
-          Stdlib.Fun.protect ~finally:(fun () -> Fun.Async.cancel handler)
-          @@ fun () ->
-          Caravan.Flow.close peer ;
-          within_2s (fun () -> Cell.Once.get left) ;
+          Flow.close peer ;
+          sync (Ivar.read left) ;
           (* The cancel is not an error of the handler. *)
-          Fun.Async.cancel handler ;
-          within_2s (fun () ->
-              raises Fun.Async.Cancelled (fun () -> Fun.Async.get handler) ) )
-    ]
+          Sim_support.cancel handler ;
+          was_cancelled handler )
+    ; test "a handler that catches Cancelled and returns sends no Close frame"
+        (fun () ->
+          Sim_support.run
+          @@ fun sim ->
+          Server_support.with_flows sim
+          @@ fun ~server ~client:peer ->
+          in_scope
+          @@ fun s ->
+          let waits = Ivar.create () in
+          let handler =
+            call s (fun () ->
+                run_handler
+                  (fun _ ->
+                    Ivar.fill waits () ;
+                    try sync never with Fiber.Cancelled _ -> () )
+                  server )
+          in
+          sync (Ivar.read waits) ;
+          Sim_support.cancel handler ;
+          was_cancelled handler ;
+          (* The engine closes the flow after the handler. *)
+          Flow.close server ;
+          equal (list string) [] (frames (Server_support.read_all peer)) )
+    ; test "the context is cancelled before run starts" (fun () ->
+          let out = Buffer.create 16 and ran = ref false in
+          let result =
+            Sim_support.run (fun _ ->
+                Fiber.scope (fun inner ->
+                    Fiber.cancel inner Exit ;
+                    (* No sync comes before the call. *)
+                    match
+                      run_handler
+                        (fun c ->
+                          ran := true ;
+                          ignore (Ws.recv c) )
+                        (Flow.of_string "" out)
+                    with
+                    | () ->
+                        "returned"
+                    | exception Fiber.Cancelled Exit ->
+                        "the cancel of the caller"
+                    | exception e ->
+                        Printexc.to_string e ) )
+          in
+          equal string "the cancel of the caller" result ;
+          is_false ~msg:"the handler ran" !ran ;
+          equal (list string) [] (frames (Buffer.contents out)) ) ]
 
-(* The connection on a fake time line *)
+(* The connection and exact time. The tests run in manual mode: only an advance
+   moves the time. *)
 
-module Fake = Fake_time
-module Mtime = Affect_unix.Mtime
+let ( +: ) = Sim_support.( +: )
 
-let ( +: ) = Fake.( +: )
+(* [before t] is 1 ns before [t]. *)
+let before t = t +: Span.ns (-1)
 
-(* The spans of the fake time tests: different from each other and from the
-   spans of the server. A test advances only to deadlines that it proved with
-   [Fake.wait_mono_timer]. *)
-let ws_idle = Mtime.Span.(19 * s)
+(* The spans of the tests of exact time: different from each other and from the
+   spans of the server. *)
+let ws_idle = Span.s 19
 
-let ws_close = Mtime.Span.(23 * s)
+let ws_close = Span.s 23
 
-let ws_write = Mtime.Span.(29 * s)
+let ws_write = Span.s 29
 
-let ws_read = Mtime.Span.(31 * s)
+let ws_read = Span.s 31
 
-(* A connection with the server flow on the fake time line [f], and its peer.
-   The spans are [idle], [close], [write] and [ws_read]. With [~idle:None], no
-   idle timeout: then [close] waits for its own deadline. The connection reads
-   and writes through [Server_support.counted]: [test] gets the counts too. When
-   [test] ends, also by a failure, the fake time advances one day: then each
-   wait on it ends. *)
+(* A connection on the server flow of a TCP connection of the simulator, and its
+   peer. The spans are [idle], [close], [write] and [ws_read]. With
+   [~idle:None], no idle timeout: then [close] waits for its own deadline. The
+   connection reads and writes through [Server_support.counted]: [test] gets the
+   counts too. [test] runs in [in_scope]. *)
 let with_counted_socket ?(idle = Some ws_idle) ?(close = ws_close)
-    ?(write = ws_write) f test =
-  with_flows ~time:(Fake.mono f)
-  @@ fun server peer ->
+    ?(write = ws_write) sim test =
+  Server_support.with_flows sim
+  @@ fun ~server ~client:peer ->
   let counted = Server_support.counted server in
   let c =
     Ws.Private.of_flow ~close_timeout:close ~write_timeout:write
       ~read_timeout:ws_read ?idle_timeout:idle counted.flow
   in
-  Stdlib.Fun.protect
-    ~finally:(fun () -> Fake.advance f Mtime.Span.day)
-    (fun () -> test c peer counted)
+  in_scope (fun s -> test s c peer counted)
 
 (* [with_counted_socket] without the counts. *)
-let with_fake_socket ?idle ?close ?write f test =
-  with_counted_socket ?idle ?close ?write f (fun c peer _ -> test c peer)
+let with_timed_socket ?idle ?close ?write sim test =
+  with_counted_socket ?idle ?close ?write sim (fun s c peer _ -> test s c peer)
 
-let eventually = Server_support.eventually
+let ended = Sim_support.ended
 
-(* [f ()], with its [Closed] exception as text. *)
-let outcome f =
-  match f () with
-  | () ->
-      "ended"
-  | exception Ws.Closed {code; reason} ->
-      Printf.sprintf "closed %d %S" code reason
+let ends_at = Sim_support.ends_at
 
-(* [f ()] in a child call that gives [outcome f]. [test] gets the call, and the
-   call is cancelled at the end. *)
-let with_call f test =
-  let call = Affect.Fun.Async.call (fun () -> outcome f) in
-  Stdlib.Fun.protect
-    ~finally:(fun () -> Affect.Fun.Async.cancel call)
-    (fun () -> test call)
+(* [all_end_at sim ~t0 d calls] makes sure that no call of [calls] ended at [t0
+   + d - 1 ns], and that each one ended at [t0 + d]. *)
+let all_end_at sim ~t0 d calls =
+  Sim_support.holds_from sim ~t0 d ~what:"the end of a call" (fun () ->
+      List.exists (ended sim) calls ) ;
+  List.iteri
+    (fun i c -> is_true ~msg:(Printf.sprintf "call %d ended" i) (ended sim c))
+    calls
 
-let get_2s = Server_support.get_2s
-
-let ends_within_50ms = Fake.ends_within_50ms
-
+(* The next frame that the peer reads. *)
 let peer_frame peer =
-  within_2s (fun () ->
-      show_frame (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125) )
+  show_frame (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125)
 
-let fake_time_tests =
-  group "Connection on a fake time line"
+let time_tests =
+  group "Connection and exact time"
     [ test "a frame 1 ns before the idle timeout comes, and then Close 1001"
         (fun () ->
-          let f = Fake.make () in
-          with_fake_socket f
-          @@ fun c peer ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let first = Affect.Fun.Async.call (fun () -> Ws.recv c) in
-          Stdlib.Fun.protect ~finally:(fun () -> Affect.Fun.Async.cancel first)
-          @@ fun () ->
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_idle) ;
-          Fake.advance f Mtime.Span.(ws_idle - ns) ;
-          Caravan.Flow.write_string peer (client Text "one") ;
-          is_true ~msg:"the frame"
-            (within_2s (fun () -> Affect.Fun.Async.get first) = Text "one") ;
-          let t1 = t0 +: Mtime.Span.(ws_idle - ns) and m = Fake.mark f in
-          with_call (fun () -> ignore (Ws.recv c))
-          @@ fun second ->
-          Fake.wait_mono_timer f ~since:m (t1 +: ws_idle) ;
-          Fake.advance f ws_idle ;
-          equal string "closed 1001 \"idle timeout\"" (get_2s second) ;
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket sim
+          @@ fun s c peer ->
+          let t0 = Time.now Mono in
+          let first = call s (fun () -> Ws.recv c) in
+          let t1 = before (t0 +: ws_idle) in
+          Sim_support.advance_to sim t1 ;
+          is_false ~msg:"no end 1 ns before the idle timeout" (ended sim first) ;
+          Flow.write_string peer (client Text "one") ;
+          is_true ~msg:"the frame" (await first = Text "one") ;
+          let second =
+            call s (fun () -> outcome (fun () -> ignore (Ws.recv c)))
+          in
+          equal string "closed 1001 \"idle timeout\""
+            (ends_at sim ~t0:t1 ws_idle second) ;
           equal string "close 1001" (peer_frame peer) )
     ; test "a frame that stops in the middle gets the read timeout" (fun () ->
-          let f = Fake.make () in
-          with_fake_socket f
-          @@ fun c peer ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket sim
+          @@ fun s c peer ->
           let frame = client Text "hello" and next = client Text "two" in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let first = Affect.Fun.Async.call (fun () -> Ws.recv c) in
-          Stdlib.Fun.protect ~finally:(fun () -> Affect.Fun.Async.cancel first)
-          @@ fun () ->
+          let t0 = Time.now Mono in
+          let first = call s (fun () -> Ws.recv c) in
           (* The first read gets 2 bytes. The next read in the frame waits
              [read_timeout]. *)
-          Caravan.Flow.write_string peer (String.sub frame 0 2) ;
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_read) ;
-          Fake.advance f Mtime.Span.(ws_read - ns) ;
-          let m = Fake.mark f in
-          Caravan.Flow.write_string peer (String.sub frame 2 1) ;
-          (* The new timer proves that the code took the byte. *)
-          let t1 = t0 +: Mtime.Span.(ws_read - ns) in
-          Fake.wait_mono_timer f ~since:m (t1 +: ws_read) ;
+          Flow.write_string peer (String.sub frame 0 2) ;
+          let t1 = before (t0 +: ws_read) in
+          Sim_support.advance_to sim t1 ;
+          is_false ~msg:"no end 1 ns before the read timeout" (ended sim first) ;
+          Flow.write_string peer (String.sub frame 2 1) ;
           (* A slow frame with no long pause gets no timeout: the frame passed
-             the idle deadline and the first read deadline. *)
-          Fake.advance f Mtime.Span.(ws_read - ns) ;
-          Caravan.Flow.write_string peer
-            (String.sub frame 3 (String.length frame - 3)) ;
-          is_true ~msg:"the slow frame"
-            (within_2s (fun () -> Affect.Fun.Async.get first) = Text "hello") ;
+             the idle timeout and the timeout of the first read. *)
+          let t2 = before (t1 +: ws_read) in
+          Sim_support.advance_to sim t2 ;
+          is_false ~msg:"no end 1 ns before the second read timeout"
+            (ended sim first) ;
+          Flow.write_string peer (String.sub frame 3 (String.length frame - 3)) ;
+          is_true ~msg:"the slow frame" (await first = Text "hello") ;
           (* The next frame stops in the middle. *)
-          let t2 = t1 +: Mtime.Span.(ws_read - ns) and m = Fake.mark f in
-          with_call (fun () -> ignore (Ws.recv c))
-          @@ fun reader ->
-          Caravan.Flow.write_string peer (String.sub next 0 2) ;
-          Fake.wait_mono_timer f ~since:m (t2 +: ws_read) ;
-          Fake.advance f ws_read ;
-          equal string "close 1001" (peer_frame peer) ;
+          let reader =
+            call s (fun () -> outcome (fun () -> ignore (Ws.recv c)))
+          in
+          Flow.write_string peer (String.sub next 0 2) ;
+          let close_frame = call s (fun () -> peer_frame peer) in
+          equal string "close 1001" (ends_at sim ~t0:t2 ws_read close_frame) ;
           (* Then the connection lingers for [close_timeout]. *)
-          let t3 = t2 +: ws_read in
-          Fake.wait_mono_timer f ~since:m (t3 +: ws_close) ;
-          Fake.advance f ws_close ;
-          equal string "closed 1001 \"read timeout\"" (get_2s reader) )
+          equal string "closed 1001 \"read timeout\""
+            (ends_at sim ~t0:(t2 +: ws_read) ws_close reader) )
     ; test "a send that waits ends at the write timeout and not 1 ns before"
         (fun () ->
-          let f = Fake.make () in
-          with_fake_socket f
-          @@ fun c _peer ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          (* The peer never reads: only an advance can wake the send. *)
-          with_call (fun () -> Ws.send c (Binary (String.make 10_000_000 'x')))
-          @@ fun sender ->
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_write) ;
-          Fake.advance f Mtime.Span.(ws_write - ns) ;
-          is_false ~msg:"no end 1 ns before the write timeout"
-            (ends_within_50ms sender) ;
-          Fake.advance f Mtime.Span.ns ;
-          equal string "closed 1006 \"\"" (get_2s sender) )
-    ; test "each frame gets a new write deadline" (fun () ->
-          let f = Fake.make () in
-          with_fake_socket f
-          @@ fun c _peer ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket sim
+          @@ fun s c _peer ->
+          let t0 = Time.now Mono in
+          (* The peer never reads: only an advance can end the send. *)
+          let sender =
+            call s (fun () -> outcome (fun () -> Ws.send c (Binary large)))
+          in
+          equal string "closed 1006 \"\"" (ends_at sim ~t0 ws_write sender) )
+    ; test "each frame gets a new write timeout" (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket sim
+          @@ fun s c _peer ->
+          let t0 = Time.now Mono in
           Ws.send c (Text "one") ;
-          Fake.advance f Mtime.Span.(ws_write - ns) ;
-          let t1 = Fake.mono_now f and m = Fake.mark f in
+          let t1 = before (t0 +: ws_write) in
+          Sim_support.advance_to sim t1 ;
           (* The peer never reads: the second frame waits from t1. *)
-          with_call (fun () -> Ws.send c (Binary (String.make 10_000_000 'x')))
-          @@ fun sender ->
-          Fake.wait_mono_timer f ~since:m (t1 +: ws_write) ;
-          Fake.advance f ws_write ;
-          equal string "closed 1006 \"\"" (get_2s sender) )
+          let sender =
+            call s (fun () -> outcome (fun () -> Ws.send c (Binary large)))
+          in
+          equal string "closed 1006 \"\"" (ends_at sim ~t0:t1 ws_write sender) )
     ; test "close ends at the close timeout and not 1 ns before" (fun () ->
-          let f = Fake.make () in
-          with_fake_socket ~idle:None f
-          @@ fun c peer ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          with_call (fun () -> Ws.close c)
-          @@ fun closer ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket ~idle:None sim
+          @@ fun s c peer ->
+          let t0 = Time.now Mono in
+          let closer = call s (fun () -> outcome (fun () -> Ws.close c)) in
           equal string "close 1000" (peer_frame peer) ;
           (* The peer does not reply: only an advance can end the close. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_close) ;
-          Fake.advance f Mtime.Span.(ws_close - ns) ;
-          is_false ~msg:"no end 1 ns before the close timeout"
-            (ends_within_50ms closer) ;
-          Fake.advance f Mtime.Span.ns ;
-          equal string "ended" (get_2s closer) ;
+          equal string "ended" (ends_at sim ~t0 ws_close closer) ;
           equal string "closed 1006 \"\""
             (outcome (fun () -> ignore (Ws.recv c))) )
     ; test "close stops at its deadline if the peer sends without a stop"
         (fun () ->
           (* A flow that always has a frame: a read never waits for a deadline,
              thus only the check of the close deadline stops [close]. The reads
-             advance the fake time: to 1 ns before the close deadline at read
-             10, and to the deadline at read 20. *)
-          let f = Fake.make () in
+             sleep: until 1 ns before the close deadline at read 10, and until
+             the deadline at read 20. The program is then quiescent, and the
+             time moves in auto mode. *)
           let frame = client Binary "" and count = 1000 in
           let size = String.length frame in
-          let reads = Atomic.make 0
-          and served = Atomic.make 0
-          and at_deadline = Atomic.make (-1) in
+          let reads = ref 0 and served = ref 0 and at_deadline = ref (-1) in
           let read buf off len =
-            if Atomic.get served >= count * size then 0
+            if !served >= count * size then 0
             else begin
-              let k = Atomic.fetch_and_add reads 1 + 1 in
-              if k = 10 then Fake.advance f Mtime.Span.(ws_close - ns) ;
-              if k = 20 then Fake.advance f Mtime.Span.ns ;
-              let pos = Atomic.get served in
+              incr reads ;
+              if !reads = 10 then
+                Time.sleep Mono (Span.of_ns (Int64.pred (Span.to_ns ws_close))) ;
+              if !reads = 20 then Time.sleep Mono (Span.ns 1) ;
+              let pos = !served in
               let n = Int.min len (size - (pos mod size)) in
               Bytes.blit_string frame (pos mod size) buf off n ;
-              Atomic.set served (pos + n) ;
-              if k = 20 then Atomic.set at_deadline (Atomic.get served) ;
+              served := pos + n ;
+              if !reads = 20 then at_deadline := !served ;
               n
             end
           in
-          let out = Buffer.create 16 and lock = Mutex.create () in
-          let ignore_deadline (_ : Mtime.t option) = () in
+          let out = Buffer.create 16 in
           let flow =
-            Caravan.Flow.make ~time:(Fake.mono f) ~read
-              ~read_now:(fun b o l -> Some (read b o l))
-              ~write:(fun b o l ->
-                Mutex.protect lock (fun () -> Buffer.add_subbytes out b o l) )
-              ~readable:(Affect.Action.always ()) ~shutdown_send:ignore
-              ~close:ignore ~set_read_deadline:ignore_deadline
-              ~set_write_deadline:ignore_deadline ()
+            memory_flow ~write:(fun b o l -> Buffer.add_subbytes out b o l) read
           in
-          Affect_unix.Unix.main ~domain_count:Server_support.domain_count
-            (fun () ->
-              within_2s (fun () ->
-                  Ws.close (Ws.Private.of_flow ~close_timeout:ws_close flow) ) ) ;
+          Sim_support.run ~guard:(Span.s 60) (fun _ ->
+              Ws.close (Ws.Private.of_flow ~close_timeout:ws_close flow) ) ;
           equal (list string) ["close 1000"] (frames (Buffer.contents out)) ;
-          is_true ~msg:"reads 1 ns before the close deadline"
-            (Atomic.get reads >= 20) ;
-          equal int ~msg:"bytes after the close deadline"
-            (Atomic.get at_deadline) (Atomic.get served) )
+          is_true ~msg:"reads 1 ns before the close deadline" (!reads >= 20) ;
+          equal int ~msg:"bytes after the close deadline" !at_deadline !served )
     ; test "a fiber in recv stops at the time limit of close" (fun () ->
-          let f = Fake.make () in
-          with_fake_socket ~idle:None f
-          @@ fun c peer ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          with_call (fun () -> ignore (Ws.recv c))
-          @@ fun reader ->
-          (* The reader waits inside a frame until its read deadline. *)
-          Caravan.Flow.write_string peer (String.sub (client Text "hello") 0 2) ;
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_read) ;
-          let m = Fake.mark f in
-          with_call (fun () -> Ws.close c)
-          @@ fun closer ->
-          (* The close deadline is earlier: the read waits for it. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_close) ;
-          Fake.advance f Mtime.Span.(ws_close - ns) ;
-          is_false ~msg:"no end 1 ns before the close timeout"
-            (ends_within_50ms closer) ;
-          Fake.advance f Mtime.Span.ns ;
-          equal string "closed 1006 \"\"" (get_2s reader) ;
-          equal string "ended" (get_2s closer) )
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket ~idle:None sim
+          @@ fun s c peer ->
+          let t0 = Time.now Mono in
+          let reader =
+            call s (fun () -> outcome (fun () -> ignore (Ws.recv c)))
+          in
+          (* The reader waits inside a frame until its read timeout. *)
+          Flow.write_string peer (String.sub (client Text "hello") 0 2) ;
+          Weft_sim.settle sim ;
+          (* The close deadline is earlier: the read ends at it. *)
+          let closer = call s (fun () -> outcome (fun () -> Ws.close c)) in
+          all_end_at sim ~t0 ws_close [reader; closer] ;
+          equal string "closed 1006 \"\"" (await reader) ;
+          equal string "ended" (await closer) )
     ; test "a fiber blocked in send stops at the time limit of close" (fun () ->
-          let f = Fake.make () in
-          with_fake_socket ~idle:None f
-          @@ fun c _peer ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          (* The peer reads nothing: the send waits until its write deadline. *)
-          with_call (fun () -> Ws.send c (Binary (String.make 10_000_000 'x')))
-          @@ fun sender ->
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_write) ;
-          let m = Fake.mark f in
-          with_call (fun () -> Ws.close c)
-          @@ fun closer ->
-          (* The close deadline is earlier: the write waits for it. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_close) ;
-          Fake.advance f Mtime.Span.(ws_close - ns) ;
-          is_false ~msg:"no end 1 ns before the close timeout"
-            (ends_within_50ms closer) ;
-          Fake.advance f Mtime.Span.ns ;
-          equal string "closed 1006 \"\"" (get_2s sender) ;
-          equal string "ended" (get_2s closer) )
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket ~idle:None sim
+          @@ fun s c _peer ->
+          let t0 = Time.now Mono in
+          (* The peer reads nothing: the send waits until its write timeout. *)
+          let sender =
+            call s (fun () -> outcome (fun () -> Ws.send c (Binary large)))
+          in
+          Weft_sim.settle sim ;
+          (* The close deadline is earlier: the write ends at it. *)
+          let closer = call s (fun () -> outcome (fun () -> Ws.close c)) in
+          all_end_at sim ~t0 ws_close [sender; closer] ;
+          equal string "closed 1006 \"\"" (await sender) ;
+          equal string "ended" (await closer) )
     ; test "a frame that is in part in the buffer gets the read timeout"
         (fun () ->
-          let f = Fake.make () in
-          with_counted_socket ~idle:None f
-          @@ fun c peer counted ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_counted_socket ~idle:None sim
+          @@ fun s c peer counted ->
           (* One read gets the first frame and 1 byte of the next frame. Without
              an idle timeout, only the read timeout stops the wait. *)
           let input = client Text "one" ^ String.sub (client Text "two") 0 1 in
-          Caravan.Flow.write_string peer input ;
-          is_true (within_2s (fun () -> Ws.recv c) = Text "one") ;
+          Flow.write_string peer input ;
+          is_true (Ws.recv c = Text "one") ;
           equal int ~msg:"the bytes in the buffer" (String.length input)
             (Atomic.get counted.read_bytes) ;
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          with_call (fun () -> ignore (Ws.recv c))
-          @@ fun second ->
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_read) ;
-          Fake.advance f ws_read ;
-          equal string "close 1001" (peer_frame peer) ;
+          let t0 = Time.now Mono in
+          let second =
+            call s (fun () -> outcome (fun () -> ignore (Ws.recv c)))
+          in
+          let close_frame = call s (fun () -> peer_frame peer) in
+          equal string "close 1001" (ends_at sim ~t0 ws_read close_frame) ;
           (* Then the connection lingers for [close_timeout]. *)
-          let t1 = t0 +: ws_read in
-          Fake.wait_mono_timer f ~since:m (t1 +: ws_close) ;
-          Fake.advance f ws_close ;
-          equal string "closed 1001 \"read timeout\"" (get_2s second) )
+          equal string "closed 1001 \"read timeout\""
+            (ends_at sim ~t0:(t0 +: ws_read) ws_close second) )
     ; test "the read timeout does not apply between frames" (fun () ->
-          let f = Fake.make () in
-          let idle = Mtime.Span.(37 * s) in
-          with_fake_socket ~idle:(Some idle) f
-          @@ fun c peer ->
-          (* A read inside the first frame sets the read deadline. *)
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket ~idle:(Some (Span.s 37)) sim
+          @@ fun s c peer ->
+          (* A read inside the first frame sets the read timeout. *)
           let frame = client Text "one" in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let first = Affect.Fun.Async.call (fun () -> Ws.recv c) in
-          Stdlib.Fun.protect ~finally:(fun () -> Affect.Fun.Async.cancel first)
-          @@ fun () ->
-          Caravan.Flow.write_string peer (String.sub frame 0 2) ;
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_read) ;
-          Caravan.Flow.write_string peer
-            (String.sub frame 2 (String.length frame - 2)) ;
-          is_true (within_2s (fun () -> Affect.Fun.Async.get first) = Text "one") ;
-          (* The second recv waits past the read deadline of the first frame.
-             Its idle timer, later than the read deadline, proves the wait. *)
-          let m = Fake.mark f in
-          with_call (fun () -> ignore (Ws.recv c))
-          @@ fun second ->
-          Fake.wait_mono_timer f ~since:m (t0 +: idle) ;
-          Fake.advance f ws_read ;
-          is_false ~msg:"no end after the read deadline"
-            (ends_within_50ms second) ;
-          Caravan.Flow.write_string peer (client Text "two") ;
-          equal string "ended" (get_2s second) )
+          let t0 = Time.now Mono in
+          let first = call s (fun () -> Ws.recv c) in
+          Flow.write_string peer (String.sub frame 0 2) ;
+          Weft_sim.settle sim ;
+          Flow.write_string peer (String.sub frame 2 (String.length frame - 2)) ;
+          is_true (await first = Text "one") ;
+          (* The second recv waits past the read timeout. *)
+          let second =
+            call s (fun () -> outcome (fun () -> ignore (Ws.recv c)))
+          in
+          Sim_support.advance_to sim (t0 +: ws_read) ;
+          is_false ~msg:"no end at the read timeout" (ended sim second) ;
+          Flow.write_string peer (client Text "two") ;
+          equal string "ended" (await second) )
     ; test "each frame gets a new idle timeout" (fun () ->
-          let f = Fake.make () in
-          with_fake_socket f
-          @@ fun c peer ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let reader = Affect.Fun.Async.call (fun () -> Ws.recv c) in
-          Stdlib.Fun.protect ~finally:(fun () -> Affect.Fun.Async.cancel reader)
-          @@ fun () ->
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_idle) ;
-          (* A Ping 1 ns before the idle deadline. The new timer proves that the
-             code took it. *)
-          Fake.advance f Mtime.Span.(ws_idle - ns) ;
-          let t1 = Fake.mono_now f and m = Fake.mark f in
-          Caravan.Flow.write_string peer (client Ping "") ;
-          Fake.wait_mono_timer f ~since:m (t1 +: ws_idle) ;
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket sim
+          @@ fun s c peer ->
+          let t0 = Time.now Mono in
+          let reader = call s (fun () -> Ws.recv c) in
+          (* A Ping 1 ns before the idle timeout. *)
+          let t1 = before (t0 +: ws_idle) in
+          Sim_support.advance_to sim t1 ;
+          Flow.write_string peer (client Ping "") ;
           equal string "pong \"\"" (peer_frame peer) ;
-          Fake.advance f Mtime.Span.(ws_idle - ns) ;
-          Caravan.Flow.write_string peer (client Text "end") ;
-          is_true
-            (within_2s (fun () -> Affect.Fun.Async.get reader) = Text "end") )
+          Sim_support.advance_to sim (before (t1 +: ws_idle)) ;
+          Flow.write_string peer (client Text "end") ;
+          is_true (await reader = Text "end") )
     ; test "close stops at a shorter idle timeout" (fun () ->
-          let f = Fake.make () in
+          Sim_support.manual
+          @@ fun sim ->
           (* The idle timeout is shorter than the close timeout. *)
-          with_fake_socket f
-          @@ fun c _peer ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          with_call (fun () -> Ws.close c)
-          @@ fun closer ->
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_idle) ;
-          Fake.advance f Mtime.Span.(ws_idle - ns) ;
-          is_false ~msg:"no end 1 ns before the idle timeout"
-            (ends_within_50ms closer) ;
-          Fake.advance f Mtime.Span.ns ;
-          equal string "ended" (get_2s closer) )
+          with_timed_socket sim
+          @@ fun s c _peer ->
+          let t0 = Time.now Mono in
+          let closer = call s (fun () -> outcome (fun () -> Ws.close c)) in
+          equal string "ended" (ends_at sim ~t0 ws_idle closer) )
     ; test "close keeps the shorter write timeout of a send that waits"
         (fun () ->
-          let f = Fake.make () in
+          Sim_support.manual
+          @@ fun sim ->
           (* The write timeout is shorter than the close timeout. *)
-          with_fake_socket ~close:Mtime.Span.(37 * s) f
-          @@ fun c _peer ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          (* The peer reads nothing: the send waits until its write deadline. *)
-          with_call (fun () -> Ws.send c (Binary (String.make 10_000_000 'x')))
-          @@ fun sender ->
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_write) ;
-          with_call (fun () -> Ws.close c)
-          @@ fun closer ->
-          (* The close sets its deadline before the close starts. *)
-          wait_closing c ;
-          Fake.advance f Mtime.Span.(ws_write - ns) ;
-          is_false ~msg:"no end 1 ns before the write timeout"
-            (ends_within_50ms sender) ;
-          Fake.advance f Mtime.Span.ns ;
-          equal string "closed 1006 \"\"" (get_2s sender) ;
-          equal string "ended" (get_2s closer) )
+          with_timed_socket ~close:(Span.s 37) sim
+          @@ fun s c _peer ->
+          let t0 = Time.now Mono in
+          (* The peer reads nothing: the send waits until its write timeout. *)
+          let sender =
+            call s (fun () -> outcome (fun () -> Ws.send c (Binary large)))
+          in
+          Weft_sim.settle sim ;
+          let closer = call s (fun () -> outcome (fun () -> Ws.close c)) in
+          is_closing_now sim c ;
+          all_end_at sim ~t0 ws_write [sender; closer] ;
+          equal string "closed 1006 \"\"" (await sender) ;
+          equal string "ended" (await closer) )
     ; test "close keeps its time limit with a long idle timeout" (fun () ->
-          let f = Fake.make () in
+          Sim_support.manual
+          @@ fun sim ->
           (* The idle timeout is longer than the close timeout. *)
-          with_fake_socket ~idle:(Some Mtime.Span.(37 * s)) f
-          @@ fun c _peer ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          with_call (fun () -> Ws.close c)
-          @@ fun closer ->
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_close) ;
-          Fake.advance f Mtime.Span.(ws_close - ns) ;
-          is_false ~msg:"no end 1 ns before the close timeout"
-            (ends_within_50ms closer) ;
-          Fake.advance f Mtime.Span.ns ;
-          equal string "ended" (get_2s closer) )
+          with_timed_socket ~idle:(Some (Span.s 37)) sim
+          @@ fun s c _peer ->
+          let t0 = Time.now Mono in
+          let closer = call s (fun () -> outcome (fun () -> Ws.close c)) in
+          equal string "ended" (ends_at sim ~t0 ws_close closer) )
     ; test
         "close keeps its time limit when the reply to the peer waits for a send"
         (fun () ->
-          let f = Fake.make () in
-          with_fake_socket f
-          @@ fun c peer ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket sim
+          @@ fun s c peer ->
+          let t0 = Time.now Mono in
           (* The peer reads nothing: the send holds the writer until its write
-             deadline. *)
-          with_call (fun () -> Ws.send c (Binary (String.make 10_000_000 'x')))
-          @@ fun sender ->
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_write) ;
+             timeout. *)
+          let sender =
+            call s (fun () -> outcome (fun () -> Ws.send c (Binary large)))
+          in
+          Weft_sim.settle sim ;
           (* The reply to the Close frame of the peer waits for the writer. *)
-          with_call (fun () -> ignore (Ws.recv c))
-          @@ fun reader ->
-          Caravan.Flow.write_string peer (client Close (code_reason 1000 "")) ;
-          wait_closing c ;
-          let m = Fake.mark f in
-          with_call (fun () -> Ws.close c)
-          @@ fun closer ->
-          (* The close deadline is earlier: the write waits for it. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_close) ;
-          Fake.advance f Mtime.Span.(ws_close - ns) ;
-          is_false ~msg:"no end 1 ns before the close timeout"
-            (ends_within_50ms closer) ;
-          Fake.advance f Mtime.Span.ns ;
-          equal string "ended" (get_2s closer) ;
-          equal string "closed 1006 \"\"" (get_2s sender) ;
-          equal string "closed 1006 \"\"" (get_2s reader) )
+          let reader =
+            call s (fun () -> outcome (fun () -> ignore (Ws.recv c)))
+          in
+          Flow.write_string peer (client Close (code_reason 1000 "")) ;
+          is_closing_now sim c ;
+          (* The close deadline is earlier: the write ends at it. *)
+          let closer = call s (fun () -> outcome (fun () -> Ws.close c)) in
+          all_end_at sim ~t0 ws_close [closer; sender; reader] ;
+          equal string "ended" (await closer) ;
+          equal string "closed 1006 \"\"" (await sender) ;
+          equal string "closed 1006 \"\"" (await reader) )
     ; test "a second close does not make the close deadline later" (fun () ->
-          let f = Fake.make () in
-          with_counted_socket ~idle:None f
-          @@ fun c peer counted ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          with_call (fun () -> Ws.close c)
-          @@ fun first ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket ~idle:None sim
+          @@ fun s c peer ->
+          let t0 = Time.now Mono in
+          let first = call s (fun () -> outcome (fun () -> Ws.close c)) in
           equal string "close 1000" (peer_frame peer) ;
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_close) ;
-          (* The second close comes 1 s after the first. A close sets the write
-             deadline: the count proves that the second close set its
-             deadline. *)
-          Fake.advance f Mtime.Span.s ;
-          let m = Fake.mark f and w = Atomic.get counted.write_deadlines in
-          with_call (fun () -> Ws.close c)
-          @@ fun second ->
-          eventually ~msg:"the second close set its deadline" (fun () ->
-              Atomic.get counted.write_deadlines > w ) ;
+          (* The second close comes 1 s after the first. *)
+          Sim_support.advance sim (Span.s 1) ;
+          let second = call s (fun () -> outcome (fun () -> Ws.close c)) in
+          is_false ~msg:"the second close waits" (ended sim second) ;
           (* After a frame, the read waits again, until the first deadline. *)
-          Caravan.Flow.write_string peer (client Text "x") ;
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_close) ;
-          Fake.advance f Mtime.Span.(ws_close - s) ;
-          equal string "ended" (get_2s first) ;
-          equal string "ended" (get_2s second) )
+          Flow.write_string peer (client Text "x") ;
+          all_end_at sim ~t0 ws_close [first; second] ;
+          equal string "ended" (await first) ;
+          equal string "ended" (await second) )
     ; test "a fiber in recv reads the reply to close" (fun () ->
-          let f = Fake.make () in
-          with_fake_socket f
-          @@ fun c peer ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          with_call (fun () -> ignore (Ws.recv c))
-          @@ fun reader ->
-          (* The idle timer proves that the reader waits. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_idle) ;
-          with_call (fun () -> Ws.close ~code:1001 c)
-          @@ fun closer ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket sim
+          @@ fun s c peer ->
+          let reader =
+            call s (fun () -> outcome (fun () -> ignore (Ws.recv c)))
+          in
+          Weft_sim.settle sim ;
+          let closer =
+            call s (fun () -> outcome (fun () -> Ws.close ~code:1001 c))
+          in
           equal string "close 1001" (peer_frame peer) ;
-          Caravan.Flow.write_string peer (client Close (code_reason 1001 "")) ;
-          equal string "ended" (get_2s closer) ;
-          equal string "closed 1001 \"\"" (get_2s reader) )
+          Flow.write_string peer (client Close (code_reason 1001 "")) ;
+          equal string "ended" (await closer) ;
+          equal string "closed 1001 \"\"" (await reader) )
     ; test "a send that waits for a different send raises Closed after close"
         (fun () ->
-          let f = Fake.make () in
-          with_fake_socket f
-          @@ fun c peer ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          (* The peer reads nothing yet: [big] fills the socket buffers. Its
-             write timer proves that it waits. *)
-          let size = 10_000_000 in
-          with_call (fun () -> Ws.send c (Binary (String.make size 'x')))
-          @@ fun big ->
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_write) ;
-          (* No proof shows that [late] waits for the writer before the close
-             starts. If it starts after, it raises at once: the result is the
-             same. *)
-          with_call (fun () -> Ws.send c (Text "late"))
-          @@ fun late ->
-          with_call (fun () -> Ws.close c)
-          @@ fun closer ->
-          wait_closing c ;
-          let r = Buf_reader.of_flow peer in
-          let next () =
-            within_2s (fun () -> Frame.read r ~masked:false ~max:max_int)
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket sim
+          @@ fun s c peer ->
+          (* The peer reads nothing yet: [big] fills the socket buffers. *)
+          let big =
+            call s (fun () -> outcome (fun () -> Ws.send c (Binary large)))
           in
-          equal int size (String.length (next ()).payload) ;
+          Weft_sim.settle sim ;
+          (* [late] waits for the writer before the close starts. *)
+          let late =
+            call s (fun () -> outcome (fun () -> Ws.send c (Text "late")))
+          in
+          Weft_sim.settle sim ;
+          let closer = call s (fun () -> outcome (fun () -> Ws.close c)) in
+          is_closing_now sim c ;
+          let r = Buf_reader.of_flow peer in
+          let next () = Frame.read r ~masked:false ~max:max_int in
+          equal int (String.length large) (String.length (next ()).payload) ;
           equal string "close 1000" (show_frame (next ())) ;
-          Caravan.Flow.write_string peer (client Close (code_reason 1000 "")) ;
-          equal string "ended" (get_2s big) ;
-          equal string "closed 1000 \"\"" (get_2s late) ;
-          equal string "ended" (get_2s closer) )
+          Flow.write_string peer (client Close (code_reason 1000 "")) ;
+          equal string "ended" (await big) ;
+          equal string "closed 1000 \"\"" (await late) ;
+          equal string "ended" (await closer) )
     ; test "a second close waits for the end of the first closing handshake"
         (fun () ->
-          let f = Fake.make () in
-          with_counted_socket f
-          @@ fun c peer counted ->
-          with_call (fun () -> Ws.close ~code:1001 c)
-          @@ fun first ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket sim
+          @@ fun s c peer ->
+          let first =
+            call s (fun () -> outcome (fun () -> Ws.close ~code:1001 c))
+          in
           let r = Buf_reader.of_flow peer in
           equal string "close 1001"
-            (within_2s (fun () ->
-                 show_frame (Frame.read r ~masked:false ~max:125) ) ) ;
-          (* The count proves that the second close set its deadline. No proof
-             shows that it then waits: the check of 50 ms can miss a bug, but it
-             cannot fail on correct code. *)
-          let w = Atomic.get counted.write_deadlines in
-          with_call (fun () -> Ws.close c)
-          @@ fun second ->
-          eventually ~msg:"the second close set its deadline" (fun () ->
-              Atomic.get counted.write_deadlines > w ) ;
-          is_false ~msg:"the second close waits" (ends_within_50ms second) ;
-          Caravan.Flow.write_string peer (client Close (code_reason 1001 "")) ;
-          equal string "ended" (get_2s first) ;
-          equal string "ended" (get_2s second) ;
+            (show_frame (Frame.read r ~masked:false ~max:125)) ;
+          let second = call s (fun () -> outcome (fun () -> Ws.close c)) in
+          is_false ~msg:"the second close waits" (ended sim second) ;
+          Flow.write_string peer (client Close (code_reason 1001 "")) ;
+          equal string "ended" (await first) ;
+          equal string "ended" (await second) ;
           raises End_of_file (fun () -> Frame.read r ~masked:false ~max:125) )
     ; test "a cancel in the linger after a protocol error closes the connection"
         (fun () ->
-          let f = Fake.make () in
-          with_fake_socket f
-          @@ fun c peer ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket sim
+          @@ fun s c peer ->
           (* The peer does not close, and the time does not advance: only the
              cancel ends the linger. *)
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let reader = Affect.Fun.Async.call (fun () -> Ws.recv c) in
-          Caravan.Flow.write_string peer (client Continuation "x") ;
+          let reader = call s (fun () -> Ws.recv c) in
+          Flow.write_string peer (client Continuation "x") ;
           let r = Buf_reader.of_flow peer in
           equal string "close 1002"
-            (within_2s (fun () ->
-                 show_frame (Frame.read r ~masked:false ~max:125) ) ) ;
-          (* The end of the stream and the timer of the linger prove that the
-             server is in the linger. *)
-          is_true (within_2s (fun () -> Buf_reader.peek_eof r)) ;
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_close) ;
-          Affect.Fun.Async.cancel reader ;
-          raises Affect.Fun.Async.Cancelled (fun () ->
-              Affect.Fun.Async.get reader ) ;
-          equal int 1002
-            (within_2s (fun () -> closed_code (fun () -> Ws.recv c))) )
+            (show_frame (Frame.read r ~masked:false ~max:125)) ;
+          (* The end of the stream shows that the server is in the linger. *)
+          is_true (Buf_reader.peek_eof r) ;
+          is_false ~msg:"the reader lingers" (ended sim reader) ;
+          Sim_support.cancel reader ;
+          was_cancelled reader ;
+          equal int 1002 (closed_code (fun () -> Ws.recv c)) )
     ; test "the linger after a protocol error discards at most 1 MiB" (fun () ->
-          let f = Fake.make () in
-          with_fake_socket f
-          @@ fun c peer ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket sim
+          @@ fun s c peer ->
           (* The peer sends 3 MiB after a frame that is too large, and does not
              close. The time does not advance: only the limit of 1 MiB stops the
-             linger. *)
-          with_call (fun () -> ignore (Ws.recv c))
-          @@ fun reader ->
+             linger. Then the server closes with unread input, and the peer gets
+             a reset. *)
+          let reader =
+            call s (fun () -> outcome (fun () -> ignore (Ws.recv c)))
+          in
           let header =
             of_hex "82ff" ^ "\x00\x00\x00\x00\x01\x40\x00\x00"
             ^ "\x01\x02\x03\x04"
           in
           let writer =
-            Affect.Fun.Async.call (fun () ->
-                try
-                  Caravan.Flow.write_string peer
+            call s (fun () ->
+                match
+                  Flow.write_string peer
                     (header ^ String.make (3 * 1024 * 1024) 'x')
-                with Caravan.Flow.Closed -> () )
+                with
+                | () ->
+                    "all written"
+                | exception Flow.Closed ->
+                    "reset" )
           in
-          equal string "closed 1009 \"message is too large\"" (get_2s reader) ;
-          Caravan.Flow.close peer ;
-          within_2s (fun () -> Affect.Fun.Async.get writer) )
+          equal string "closed 1009 \"message is too large\"" (await reader) ;
+          equal string "reset" (await writer) )
     ; test "a cancel between messages does not close" (fun () ->
-          let f = Fake.make () in
-          with_fake_socket f
-          @@ fun c peer ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let reader = Affect.Fun.Async.call (fun () -> Ws.recv c) in
-          (* The idle timer proves that the reader waits. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_idle) ;
-          Affect.Fun.Async.cancel reader ;
-          raises Affect.Fun.Async.Cancelled (fun () ->
-              Affect.Fun.Async.get reader ) ;
-          Caravan.Flow.write_string peer (client Text "hello") ;
-          is_true (within_2s (fun () -> Ws.recv c) = Text "hello") )
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket sim
+          @@ fun s c peer ->
+          let reader = call s (fun () -> Ws.recv c) in
+          Weft_sim.settle sim ;
+          Sim_support.cancel reader ;
+          was_cancelled reader ;
+          Flow.write_string peer (client Text "hello") ;
+          is_true (Ws.recv c = Text "hello") )
     ; test "a cancel in the middle of a received frame closes with 1006"
         (fun () ->
-          let f = Fake.make () in
-          with_fake_socket f
-          @@ fun c peer ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let reader = Affect.Fun.Async.call (fun () -> Ws.recv c) in
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket sim
+          @@ fun s c peer ->
+          let reader = call s (fun () -> Ws.recv c) in
           let frame = client Text "hello" in
-          Caravan.Flow.write_string peer (String.sub frame 0 3) ;
-          (* The read timer proves that the reader took the bytes and waits
-             inside the frame. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_read) ;
-          Affect.Fun.Async.cancel reader ;
-          raises Affect.Fun.Async.Cancelled (fun () ->
-              Affect.Fun.Async.get reader ) ;
-          Caravan.Flow.write_string peer
-            (String.sub frame 3 (String.length frame - 3) ^ client Text "next") ;
-          equal int 1006
-            (within_2s (fun () -> closed_code (fun () -> Ws.recv c))) )
+          Flow.write_string peer (String.sub frame 0 3) ;
+          (* The reader took the bytes and waits inside the frame. *)
+          Weft_sim.settle sim ;
+          Sim_support.cancel reader ;
+          was_cancelled reader ;
+          (* The connection is closed: the write can get a reset. *)
+          ( try
+              Flow.write_string peer
+                ( String.sub frame 3 (String.length frame - 3)
+                ^ client Text "next" )
+            with Flow.Closed -> () ) ;
+          equal int 1006 (closed_code (fun () -> Ws.recv c)) )
     ; test
         "a cancel in the wait to send a Pong inside a fragmented message \
          closes with 1006" (fun () ->
-          let f = Fake.make () in
-          with_counted_socket f
-          @@ fun c peer counted ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          (* The peer reads nothing: [big] keeps the writer. Its write timer
-             proves that it waits. *)
-          with_call (fun () -> Ws.send c (Binary (String.make 10_000_000 'x')))
-          @@ fun big ->
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_write) ;
-          let reader = Affect.Fun.Async.call (fun () -> Ws.recv c) in
+          Sim_support.manual
+          @@ fun sim ->
+          with_counted_socket sim
+          @@ fun s c peer counted ->
+          (* The peer reads nothing: [big] keeps the writer. *)
+          let big =
+            call s (fun () -> outcome (fun () -> Ws.send c (Binary large)))
+          in
+          Weft_sim.settle sim ;
+          let reader = call s (fun () -> Ws.recv c) in
           let input = client ~fin:false Text "Hel" ^ client Ping "p" in
-          Caravan.Flow.write_string peer input ;
-          (* The count proves that the reader took the fragment and the Ping.
+          Flow.write_string peer input ;
+          (* The count shows that the reader took the fragment and the Ping.
              Then it waits for the writer to send the Pong. *)
-          eventually ~msg:"the reader took the input" (fun () ->
-              Atomic.get counted.read_bytes >= String.length input ) ;
-          Affect.Fun.Async.cancel reader ;
-          raises Affect.Fun.Async.Cancelled (fun () ->
-              Affect.Fun.Async.get reader ) ;
-          Caravan.Flow.write_string peer (client Continuation "lo") ;
-          (* Without the fix, the next recv waits for the write deadline of
+          Weft_sim.settle sim ;
+          equal int ~msg:"the reader took the input" (String.length input)
+            (Atomic.get counted.read_bytes) ;
+          Sim_support.cancel reader ;
+          was_cancelled reader ;
+          ( try Flow.write_string peer (client Continuation "lo")
+            with Flow.Closed -> () ) ;
+          (* Without the fix, the next recv waits for the write timeout of
              [big]. The time does not advance. *)
-          equal int 1006
-            (within_2s (fun () -> closed_code (fun () -> Ws.recv c))) ;
-          equal string "closed 1006 \"\"" (get_2s big) )
+          equal int 1006 (closed_code (fun () -> Ws.recv c)) ;
+          equal string "closed 1006 \"\"" (await big) )
+    ; test
+        "a recv after a cancel in a frame raises Closed, also with frames in \
+         the buffer" (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_counted_socket sim
+          @@ fun s c peer counted ->
+          (* The peer reads nothing: [big] keeps the writer. *)
+          let big =
+            call s (fun () -> outcome (fun () -> Ws.send c (Binary large)))
+          in
+          Weft_sim.settle sim ;
+          let reader = call s (fun () -> Ws.recv c) in
+          (* One read takes the three frames. The reader waits for the writer to
+             send the Pong, and a complete message stays in the buffer. *)
+          let input =
+            client ~fin:false Text "Hel" ^ client Ping "p" ^ client Text "after"
+          in
+          Flow.write_string peer input ;
+          Weft_sim.settle sim ;
+          equal int ~msg:"the reader took the input" (String.length input)
+            (Atomic.get counted.read_bytes) ;
+          Sim_support.cancel reader ;
+          was_cancelled reader ;
+          equal int 1006 (closed_code (fun () -> Ws.recv c)) ;
+          equal string "closed 1006 \"\"" (await big) )
+    ; test "a Pong that waits for the writer is dropped after a close starts"
+        (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket sim
+          @@ fun s c peer ->
+          (* The peer reads nothing yet: [big] keeps the writer. *)
+          let big =
+            call s (fun () -> outcome (fun () -> Ws.send c (Binary large)))
+          in
+          Weft_sim.settle sim ;
+          (* The Pong for the Ping waits for the writer. Then the Close frame of
+             [close] waits after it. *)
+          let reader =
+            call s (fun () -> outcome (fun () -> ignore (Ws.recv c)))
+          in
+          Flow.write_string peer (client Ping "p") ;
+          Weft_sim.settle sim ;
+          let closer = call s (fun () -> outcome (fun () -> Ws.close c)) in
+          is_closing_now sim c ;
+          let r = Buf_reader.of_flow peer in
+          let next () = Frame.read r ~masked:false ~max:max_int in
+          equal int (String.length large) (String.length (next ()).payload) ;
+          equal string "ended" (await big) ;
+          (* RFC 6455 §5.5.1: no Pong after our Close frame. *)
+          equal string "close 1000" (show_frame (next ())) ;
+          Flow.write_string peer (client Close (code_reason 1000 "")) ;
+          equal string "ended" (await closer) ;
+          equal string "closed 1000 \"\"" (await reader) ;
+          raises End_of_file (fun () -> Frame.read r ~masked:false ~max:125) )
     ; test "a cancel inside a fragmented message closes with 1006" (fun () ->
-          let f = Fake.make () in
-          with_fake_socket f
-          @@ fun c peer ->
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          let reader = Affect.Fun.Async.call (fun () -> Ws.recv c) in
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_idle) ;
-          (* The fragment comes 1 s later: then the idle deadline of the next
-             frame is different. Its timer proves that the reader took the
-             fragment. *)
-          Fake.advance f Mtime.Span.s ;
-          let t1 = Fake.mono_now f and m = Fake.mark f in
-          Caravan.Flow.write_string peer (client ~fin:false Text "Hel") ;
-          Fake.wait_mono_timer f ~since:m (t1 +: ws_idle) ;
-          Affect.Fun.Async.cancel reader ;
-          raises Affect.Fun.Async.Cancelled (fun () ->
-              Affect.Fun.Async.get reader ) ;
-          Caravan.Flow.write_string peer (client Continuation "lo") ;
-          equal int 1006
-            (within_2s (fun () -> closed_code (fun () -> Ws.recv c))) )
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket sim
+          @@ fun s c peer ->
+          let reader = call s (fun () -> Ws.recv c) in
+          Flow.write_string peer (client ~fin:false Text "Hel") ;
+          (* The reader took the fragment and waits for the next frame. *)
+          Weft_sim.settle sim ;
+          Sim_support.cancel reader ;
+          was_cancelled reader ;
+          ( try Flow.write_string peer (client Continuation "lo")
+            with Flow.Closed -> () ) ;
+          equal int 1006 (closed_code (fun () -> Ws.recv c)) )
     ; test
         "the end of the handler does not stop the closing handshake of a stop"
         (fun () ->
-          let open Affect in
-          let f = Fake.make () in
-          with_flows ~time:(Fake.mono f)
-          @@ fun server peer ->
-          Stdlib.Fun.protect ~finally:(fun () -> Fake.advance f Mtime.Span.day)
-          @@ fun () ->
-          let stop = Cell.Once.make () and raised = Cell.Once.make () in
-          let close = Mtime.Span.(37 * s) in
+          Sim_support.manual
+          @@ fun sim ->
+          Server_support.with_flows sim
+          @@ fun ~server ~client:peer ->
+          in_scope
+          @@ fun s ->
+          let stop = Ivar.create ()
+          and conn = Ivar.create ()
+          and go = Ivar.create () in
           let handler =
-            Fun.Async.call (fun () ->
-                run_handler ~stopping:(Cell.Once.get' stop) ~close_timeout:close
+            call s (fun () ->
+                run_handler ~stopping:(Ivar.read stop)
+                  ~close_timeout:(Span.s 37)
                   (fun c ->
-                    (* The peer does not read yet: the send holds the writer,
-                       and the Close frame of the stop waits for it. *)
-                    ignore
-                      (Fun.Async.call (fun () ->
-                           try Ws.send c (Binary (String.make 10_000_000 'x'))
-                           with Ws.Closed _ -> () ) ) ;
-                    Cell.Once.get stop ;
-                    wait_closing c ;
-                    Cell.Once.try_set raised () ;
+                    Ivar.fill conn c ;
+                    sync (Ivar.read go) ;
                     raise (Ws.Closed {code= 1001; reason= "server shutdown"}) )
                   server )
           in
-          Stdlib.Fun.protect ~finally:(fun () -> Fun.Async.cancel handler)
-          @@ fun () ->
+          let c = sync (Ivar.read conn) in
+          (* The peer does not read yet: the send holds the writer, and the
+             Close frame of the stop waits for it. *)
+          let sender =
+            call s (fun () ->
+                try Ws.send c (Binary large) with Ws.Closed _ -> () )
+          in
+          Weft_sim.settle sim ;
+          Ivar.fill stop () ;
+          is_closing_now sim c ;
+          Ivar.fill go () ;
+          (* After the end of the handler, the connection waits for the end of
+             the closing handshake. *)
+          is_false ~msg:"the handshake waits" (ended sim handler) ;
           let r = Buf_reader.of_flow peer in
-          is_false (within_2s (fun () -> Buf_reader.peek_eof r)) ;
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          Cell.Once.try_set stop () ;
-          within_2s (fun () -> Cell.Once.get raised) ;
-          (* The read of the close is the only read: its timer proves that after
-             the end of the handler, the connection waits for the end of the
-             closing handshake. Then the peer reads. *)
-          Fake.wait_mono_timer f ~since:m (t0 +: close) ;
-          let first =
-            within_2s (fun () -> Frame.read r ~masked:false ~max:max_int)
-          in
+          let first = Frame.read r ~masked:false ~max:max_int in
           let second =
-            within_2s (fun () ->
-                match Frame.read r ~masked:false ~max:125 with
-                | f ->
-                    Caravan.Flow.write_string peer (client Close f.payload) ;
-                    show_frame f
-                | exception End_of_file ->
-                    "end of the stream" )
+            match Frame.read r ~masked:false ~max:125 with
+            | f ->
+                Flow.write_string peer (client Close f.payload) ;
+                show_frame f
+            | exception End_of_file ->
+                "end of the stream"
           in
-          within_2s (fun () -> Fun.Async.get handler) ;
+          await handler ;
+          await sender ;
           equal (list string)
             ["binary"; "close 1001 \"server shutdown\""]
             [opcode_name first.opcode; second] )
-    ; test "an upgraded connection keeps the time line of the server" (fun () ->
-          let f = Fake.make () in
+    ; test
+        "an upgraded connection gets the idle timeout, and the first frame \
+         from Flow.prepend" (fun () ->
           (* The handler reads the first frame. Then it waits for a frame until
              the idle timeout. *)
-          let first = Affect.Cell.Once.make () in
+          let first = Ivar.create () in
           let handler req =
             Ws.accept ~close_timeout:ws_close ~write_timeout:ws_write
               ~read_timeout:ws_read ~idle_timeout:ws_idle req (fun c ->
-                Affect.Cell.Once.try_set first (Ws.recv c) ;
+                Ivar.fill first (Ws.recv c) ;
                 ignore (Ws.recv c) )
           in
-          let t0 = Fake.mono_now f and m = Fake.mark f in
-          Server_support.with_fake_time_server f ~handler
+          Sim_support.manual
+          @@ fun sim ->
+          let t0 = Time.now Mono in
+          with_server ~handler
           @@ fun server ->
           let flow = Caravan.Tcp.connect (Caravan.Server.local_addr server) in
-          Stdlib.Fun.protect ~finally:(fun () -> Caravan.Flow.close flow)
+          Fun.protect ~finally:(fun () -> Flow.close flow)
           @@ fun () ->
-          Caravan.Flow.set_read_deadline flow
-            (Some (Mtime.now () +: Mtime.Span.(2 * s))) ;
           (* The first frame goes in the write of the request: the connection
              gets it through Flow.prepend. *)
-          Caravan.Flow.write_string flow
+          Flow.write_string flow
             (upgrade_request ~first:(client Text "early") "/") ;
           let r = Buf_reader.of_flow flow in
           equal string "HTTP/1.1 101 Switching Protocols"
             (List.hd (response_head r)) ;
-          Fake.wait_mono_timer f ~since:m (t0 +: ws_idle) ;
-          Fake.advance f ws_idle ;
-          equal string "close 1001"
-            (show_frame (Frame.read r ~masked:false ~max:125)) ;
-          is_true ~msg:"the first frame"
-            (within_2s (fun () -> Affect.Cell.Once.get first) = Text "early") )
+          in_scope
+          @@ fun s ->
+          let close_frame =
+            call s (fun () -> show_frame (Frame.read r ~masked:false ~max:125))
+          in
+          equal string "close 1001" (ends_at sim ~t0 ws_idle close_frame) ;
+          is_true ~msg:"the first frame" (Ivar.peek first = Some (Text "early")) )
     ]
 
-(* The server on a fake time line *)
+(* The server and exact time *)
 
-(* [Server_support.fake_config] with an idle timeout of 41 s: the default close
-   timeout of a WebSocket connection is 5 s, the idle timeout of [fake_config].
+(* [Server_support.timed_config] with an idle timeout of 41 s: the default close
+   timeout of a WebSocket connection is 5 s, the idle timeout of [timed_config].
    The errors go to [errors]. *)
-let fake_server_config f errors =
-  { (Server_support.fake_config f) with
-    idle_timeout= Mtime.Span.(41 * s)
+let timed_server_config errors =
+  { Server_support.timed_config with
+    idle_timeout= Span.s 41
   ; on_error= (fun e _ -> errors := Printexc.to_string e :: !errors) }
 
-(* [session server path] in a child call. [test] gets the call when the response
-   head came. The call is cancelled at the end. *)
-let with_session ?reply server path test =
-  let head = Affect.Cell.Once.make () in
+(* [session server path] in a call of [s]. [test] gets the call when the
+   response head came. *)
+let with_session ?reply s server path test =
+  let head = Ivar.create () in
   let call =
-    Affect.Fun.Async.call (fun () ->
-        session ?reply server path ~during:(fun () ->
-            Affect.Cell.Once.try_set head () ) )
+    call s (fun () ->
+        session ?reply server path ~during:(fun () -> Ivar.fill head ()) )
   in
-  Stdlib.Fun.protect ~finally:(fun () -> Affect.Fun.Async.cancel call)
-  @@ fun () ->
-  within_2s (fun () -> Affect.Cell.Once.get head) ;
+  sync (Ivar.read head) ;
   test call
 
 (* The Close frame of the server in the result of [session]. *)
 let server_close s = List.nth (String.split_on_char '\n' s) 5
 
-let fake_server_tests =
-  group "Server on a fake time line"
+(* [with_timed_server config test] runs [test sim s server] in manual mode, with
+   a server of [server_handler]. *)
+let with_timed_server config test =
+  Sim_support.manual
+  @@ fun sim ->
+  with_server ~config ~handler:server_handler
+  @@ fun server -> in_scope (fun s -> test sim s server)
+
+let timed_server_tests =
+  group "Server and exact time"
     [ test
         "a handler that does not use the connection gets Close 1001, then the \
          cancel" (fun () ->
-          let f = Fake.make () and errors = ref [] in
-          Server_support.with_fake_time_server f
-            ~config:(fake_server_config f errors) ~handler:server_handler
-            (fun server ->
-              with_session server "/wait"
+          let errors = ref [] in
+          with_timed_server (timed_server_config errors) (fun sim s server ->
+              with_session s server "/wait"
               @@ fun exchange ->
-              let t0 = Fake.mono_now f and m = Fake.mark f in
+              let t0 = Time.now Mono in
               Caravan.Server.shutdown server ;
               (* The peer replies to the Close frame, and the session ends. The
                  handler waits until the grace. *)
-              let s = within_2s (fun () -> Affect.Fun.Async.get exchange) in
-              equal string "close 1001 \"server shutdown\"" (server_close s) ;
-              let grace = Server_support.grace_g in
-              with_call (fun () -> Caravan.Server.wait server)
-              @@ fun wait ->
-              Fake.wait_mono_timer f ~since:m (t0 +: grace) ;
-              Fake.advance f Mtime.Span.(grace - ns) ;
-              is_false ~msg:"no end 1 ns before the grace"
-                (ends_within_50ms wait) ;
-              Fake.advance f Mtime.Span.ns ;
-              equal string "ended" (get_2s wait) ) ;
+              equal string "close 1001 \"server shutdown\""
+                (server_close (await exchange)) ;
+              let wait = call s (fun () -> Caravan.Server.wait server) in
+              ends_at sim ~t0 Server_support.grace_g wait ) ;
           equal (list string) [] !errors )
     ; test
         "a cancel at the grace while the stop waits for the reply is not an \
          error" (fun () ->
-          let f = Fake.make () and errors = ref [] in
+          let errors = ref [] in
           (* The grace of 1 s ends before the close timeout of 2 s of the
              handler. *)
           let config =
-            {(fake_server_config f errors) with shutdown_grace= Mtime.Span.s}
+            {(timed_server_config errors) with shutdown_grace= Span.s 1}
           in
-          Server_support.with_fake_time_server f ~config ~handler:server_handler
-            (fun server ->
-              with_session ~reply:false server "/wait-slow-close"
+          with_timed_server config (fun sim s server ->
+              with_session ~reply:false s server "/wait-slow-close"
               @@ fun exchange ->
-              let t0 = Fake.mono_now f and m = Fake.mark f in
+              let t0 = Time.now Mono in
               Caravan.Server.shutdown server ;
-              (* The close timer proves that the stop waits for the reply. *)
-              Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.(2 * s)) ;
-              Fake.wait_mono_timer f ~since:m (t0 +: Mtime.Span.s) ;
-              Fake.advance f Mtime.Span.s ;
-              let s = within_2s (fun () -> Affect.Fun.Async.get exchange) in
-              equal string "close 1001 \"server shutdown\"" (server_close s) ) ;
+              equal string "close 1001 \"server shutdown\""
+                (server_close (ends_at sim ~t0 (Span.s 1) exchange)) ) ;
           equal (list string) [] !errors )
     ; test
         "a peer that does not reply to Close 1001 gets the end of the stream \
          at the close timeout" (fun () ->
-          let f = Fake.make () and errors = ref [] in
-          Server_support.with_fake_time_server f
-            ~config:(fake_server_config f errors) ~handler:server_handler
-            (fun server ->
-              with_session ~reply:false server "/echo-fast"
+          let errors = ref [] in
+          with_timed_server (timed_server_config errors) (fun sim s server ->
+              with_session ~reply:false s server "/echo-fast"
               @@ fun exchange ->
-              let t0 = Fake.mono_now f and m = Fake.mark f in
+              let t0 = Time.now Mono in
               Caravan.Server.shutdown server ;
-              let close = Mtime.Span.(100 * ms) in
-              Fake.wait_mono_timer f ~since:m (t0 +: close) ;
-              Fake.advance f Mtime.Span.(close - ns) ;
-              is_false ~msg:"no end 1 ns before the close timeout"
-                (ends_within_50ms exchange) ;
-              Fake.advance f Mtime.Span.ns ;
-              let s = within_2s (fun () -> Affect.Fun.Async.get exchange) in
-              equal string "close 1001 \"server shutdown\"" (server_close s) ) ;
+              equal string "close 1001 \"server shutdown\""
+                (server_close (ends_at sim ~t0 (Span.ms 100) exchange)) ) ;
           equal (list string) [] !errors )
     ; test "a handler that only sends gets the full closing handshake"
         (fun () ->
-          let f = Fake.make () and errors = ref [] in
-          started := Affect.Cell.Once.make () ;
-          Server_support.with_fake_time_server f
-            ~config:(fake_server_config f errors) ~handler:server_handler
-            (fun server ->
-              with_session ~reply:false server "/ticker"
+          let errors = ref [] in
+          started := Ivar.create () ;
+          with_timed_server (timed_server_config errors) (fun sim s server ->
+              with_session ~reply:false s server "/ticker"
               @@ fun exchange ->
-              within_2s (fun () -> Affect.Cell.Once.get !started) ;
-              let t0 = Fake.mono_now f and m = Fake.mark f in
+              sync (Ivar.read !started) ;
+              let t0 = Time.now Mono in
               Caravan.Server.shutdown server ;
-              (* The close waits for the reply until the close timeout. *)
-              let close = Mtime.Span.(300 * ms) in
-              Fake.wait_mono_timer f ~since:m (t0 +: close) ;
-              Fake.advance f Mtime.Span.(close - ns) ;
-              is_false ~msg:"no end 1 ns before the close timeout"
-                (ends_within_50ms exchange) ;
-              Fake.advance f Mtime.Span.ns ;
-              let s = within_2s (fun () -> Affect.Fun.Async.get exchange) in
+              (* The close waits for the reply until the close timeout. The
+                 advance goes through each tick of 10 ms. *)
+              let out = ends_at sim ~t0 (Span.ms 300) exchange in
               let frames =
-                List.filteri (fun i _ -> i > 4) (String.split_on_char '\n' s)
+                List.filteri (fun i _ -> i > 4) (String.split_on_char '\n' out)
               in
               is_true ~msg:"one or more ticks" (List.hd frames = "text \"tick\"") ;
               equal (list string)
@@ -2820,9 +2796,97 @@ let fake_server_tests =
                 (List.nth frames (List.length frames - 1)) ) ;
           equal (list string) [] !errors ) ]
 
+(* Races on 4 domains *)
+
+let race_tests =
+  group "Races"
+    [ test "race: fibers that send at the same time do not mix their frames"
+        (fun () ->
+          (* Two messages of each sender are larger than the buffers of a
+             socket: they need many writes. The total is less than 256 KiB. *)
+          let count = 40 in
+          let body name i =
+            String.make (if i mod 20 = 0 then 60_000 else i) name
+          in
+          Sim_support.race
+          @@ fun sim ->
+          with_socket sim
+          @@ fun c peer ->
+          in_scope
+          @@ fun s ->
+          let sender name =
+            call ~name:"sender" s (fun () ->
+                for i = 1 to count do
+                  Ws.send c
+                    (Binary (Printf.sprintf "%c %d %s" name i (body name i)))
+                done )
+          in
+          let a = sender 'a' and b = sender 'b' in
+          let r = Buf_reader.of_flow peer and last = Hashtbl.create 2 in
+          for _ = 1 to 2 * count do
+            let f = Frame.read r ~masked:false ~max:max_int in
+            match String.split_on_char ' ' f.payload with
+            | [name; i; data] ->
+                let i = int_of_string i
+                and prev =
+                  Option.value ~default:0 (Hashtbl.find_opt last name)
+                in
+                equal int ~msg:name (prev + 1) i ;
+                is_true ~msg:"intact" (data = body name.[0] i) ;
+                Hashtbl.replace last name i
+            | _ ->
+                fail "a message with incorrect content"
+          done ;
+          await a ;
+          await b )
+    ; test "race: recv, send and close set deadlines at the same time"
+        (fun () ->
+          (* A reader inside a slow frame sets its read timeout before each
+             read. A sender waits in a write, and a close sets the two deadlines
+             of the flow from a different domain. The three calls end at the
+             close deadline. The payload of the sender is 200 KiB. *)
+          Sim_support.race ~guard:(Span.s 60)
+          @@ fun sim ->
+          with_socket ~close_timeout:ws_close ~write_timeout:ws_write
+            ~read_timeout:ws_read sim
+          @@ fun c peer ->
+          in_scope
+          @@ fun s ->
+          let t0 = Time.now Mono in
+          let timed f =
+            call s (fun () ->
+                let r = outcome f in
+                (r, Time.diff Mono (Time.now Mono) t0) )
+          in
+          (* A frame of 100 bytes that comes one byte each 2 s. *)
+          let frame = client Text (String.make 100 'x') in
+          let _slow =
+            call s (fun () ->
+                try
+                  String.iter
+                    (fun ch ->
+                      Flow.write_string peer (String.make 1 ch) ;
+                      Time.sleep Mono (Span.s 2) )
+                    frame
+                with Flow.Closed -> () )
+          in
+          let reader = timed (fun () -> ignore (Ws.recv c)) in
+          let sender =
+            timed (fun () -> Ws.send c (Binary (String.make (200 * 1024) 'x')))
+          in
+          (* The first byte of the frame shows that the sender holds the
+             writer. *)
+          ignore (Flow.read peer (Bytes.create 1) 0 1) ;
+          let closer = timed (fun () -> Ws.close c) in
+          let closed = ("closed 1006 \"\"", ws_close) in
+          equal
+            (list (pair string Server_support.span))
+            [closed; closed; ("ended", ws_close)]
+            (List.map await [reader; sender; closer]) ) ]
+
 let () =
   exit
-    (run "websocket"
+    (Windtrap.run "websocket"
        [ sha1_tests
        ; base64_tests
        ; frame_tests
@@ -2832,5 +2896,6 @@ let () =
        ; socket_tests
        ; handshake_tests
        ; server_tests
-       ; fake_time_tests
-       ; fake_server_tests ] )
+       ; time_tests
+       ; timed_server_tests
+       ; race_tests ] )

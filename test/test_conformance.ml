@@ -11,11 +11,11 @@ open Caravan
 (* The errors that the engine reported, for example a handler that raised. *)
 let errors = ref []
 
-(* The fixed time of the Date fields: Sun, 06 Nov 1994 08:49:37 GMT. *)
+(* Memory_server fixes the time of the Date fields: Sun, 06 Nov 1994 08:49:37
+   GMT. *)
 let config =
   { Config.default with
     date_header= true
-  ; posix_time= Fake_time.posix (Fake_time.make ())
   ; on_error= (fun e _ -> errors := Printexc.to_string e :: !errors) }
 
 let date = "Sun, 06 Nov 1994 08:49:37 GMT"

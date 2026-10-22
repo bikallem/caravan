@@ -45,13 +45,17 @@ val run : ?seed:int -> ?domains:int -> ?guard:Span.t -> (Weft_sim.t -> 'a) -> 'a
 
 val race :
   ?seeds:int -> ?domains:int -> ?guard:Span.t -> (Weft_sim.t -> unit) -> unit
-(** [race f] runs [f] as {!run} does, one time for each seed from 1 to [seeds]
-    (100 by default). The simulator has [domains] virtual domains (4 by
-    default). The first failure stops the loop. Then [race] raises {!Failed}.
-    The text starts with "seed ", and gives the seed, the number of domains and
-    the exception with its backtrace. If the environment variable [CARAVAN_SEED]
-    has a value, [race] runs only that seed. The name of the variable is fixed,
-    also when the harness runs without caravan. *)
+(** [race f] runs [f] as {!run} does, one time for each seed from 1 to [seeds].
+    The simulator has [domains] virtual domains (4 by default). The default of
+    [seeds] is the value of the environment variable [CARAVAN_RACE_SEEDS], or
+    100 if it has no value. The mutation runs set it to 10. A value that is not
+    an integer of 1 or more makes [race] raise {!Failed}.
+
+    The first failure stops the loop. Then [race] raises {!Failed}. The text
+    starts with "seed ", and gives the seed, the number of domains and the
+    exception with its backtrace. If the environment variable [CARAVAN_SEED] has
+    a value, [race] runs only that seed. The name of the variable is fixed, also
+    when the harness runs without caravan. *)
 
 val manual : ?seed:int -> ?domains:int -> (Weft_sim.t -> 'a) -> 'a
 (** [manual f] runs [f sim] in [Weft_sim.run ~auto:false]. Only {!advance_to}
@@ -89,6 +93,11 @@ val cancel : _ call -> unit
 
 val ( +: ) : Clock.mono -> Span.t -> Clock.mono
 (** [t +: d] is the time [d] after [t].
+
+    @raise Failed on overflow. *)
+
+val just_before : Clock.mono -> Clock.mono
+(** [just_before t] is the time 1 ns before [t].
 
     @raise Failed on overflow. *)
 

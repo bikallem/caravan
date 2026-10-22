@@ -1,11 +1,23 @@
 module Cfg = Config
-module Mtime = Affect_unix.Mtime
+open Weft
 open Caravan
 
 (* The idle connections of each (host, port), the newest first, and the
-   connections in use. A Mutex protects them, and no critical section suspends
-   the fiber: the connect, the checks of an idle connection and the clock reads
-   happen outside the lock. *)
+   connections in use. A stdlib Mutex protects them. This is the only stdlib
+   lock of caravan.
+
+   The rule: no critical section holds the lock across a sync, a world effect,
+   or a call into weft or into a Flow. Thus a critical section has only Hashtbl
+   operations, list operations, and field reads and writes. The connect, the
+   checks of an idle connection, the close of a flow and the clock reads occur
+   outside the lock. [Time.now] is a world effect.
+
+   In the simulator, all the virtual domains run on one OS thread, and a world
+   effect can switch the domain. Thus a lock across a world effect gives
+   [Sys_error] at the next lock of the same Mutex.
+
+   A [Fiber.Mutex] is not a fit: its [lock] is a cancellation point, and a
+   deferred release runs in a cancelled job fiber. *)
 type t =
   { config: Cfg.t
   ; connect: host:string -> port:int -> Flow.t
@@ -29,12 +41,10 @@ let make ?connect config =
   ; in_use= Hashtbl.create 8
   ; closed= false }
 
-let refuse () = invalid_arg "Caravan_client: the client is closed"
-
 (* The newest idle connection of [key], now in use. *)
 let take t key =
   Mutex.protect t.lock (fun () ->
-      if t.closed then refuse () ;
+      if t.closed then Error.refuse_closed () ;
       match Hashtbl.find_opt t.idle key with
       | Some (c :: rest) ->
           if rest = [] then Hashtbl.remove t.idle key
@@ -47,14 +57,14 @@ let take t key =
 (* An idle connection is stale when it is too old, or when its server closed it,
    reset it, or sent bytes that no request asked for. *)
 let too_old t ~now (c : Conn.t) =
-  match Time.add t.config.mono_time c.released_at t.config.idle_timeout with
-  | Some d ->
-      not (Mtime.is_earlier now ~than:d)
+  match c.released_at with
+  | Some r ->
+      Span.compare (Time.diff Mono now r) t.config.idle_timeout >= 0
   | None ->
       false
 
 let stale t c =
-  too_old t ~now:(Time.now t.config.mono_time) c
+  too_old t ~now:(Time.now Mono) c
   ||
   match Flow.read_now c.flow (Bytes.create 1) 0 1 with
   | None ->
@@ -73,7 +83,9 @@ let is_closed t = Mutex.protect t.lock (fun () -> t.closed)
 let rec checkout ?(reuse = true) t ~host ~port =
   let key = (String.lowercase_ascii host, port) in
   match
-    if reuse then take t key else if is_closed t then refuse () else None
+    if reuse then take t key
+    else if is_closed t then Error.refuse_closed ()
+    else None
   with
   | Some c when stale t c ->
       discard t c ;
@@ -89,10 +101,10 @@ let rec checkout ?(reuse = true) t ~host ~port =
               Hashtbl.replace t.in_use c.id c ;
               true ) )
       in
-      if added then (c, `New) else (Flow.close c.flow ; refuse ())
+      if added then (c, `New) else (Flow.close c.flow ; Error.refuse_closed ())
 
 let release t (c : Conn.t) ~reusable =
-  let now = Time.now t.config.mono_time in
+  let now = Time.now Mono in
   let kept =
     Mutex.protect t.lock (fun () ->
         Hashtbl.remove t.in_use c.id ;
@@ -102,7 +114,7 @@ let release t (c : Conn.t) ~reusable =
           reusable && (not t.closed)
           && List.length idle < t.config.max_idle_per_host
         then begin
-          c.released_at <- now ;
+          c.released_at <- Some now ;
           Hashtbl.replace t.idle key (c :: idle) ;
           true
         end
@@ -113,7 +125,7 @@ let release t (c : Conn.t) ~reusable =
 (* Closes the idle connections whose age is [idle_timeout] or more. Thus a host
    that the client does not use again keeps no socket open. *)
 let reap t =
-  let now = Time.now t.config.mono_time and old = ref [] in
+  let now = Time.now Mono and old = ref [] in
   Mutex.protect t.lock (fun () ->
       Hashtbl.filter_map_inplace
         (fun _ cs ->
@@ -124,6 +136,8 @@ let reap t =
   List.iter (fun (c : Conn.t) -> Flow.close c.flow) !old
 
 let idle_hosts t = Mutex.protect t.lock (fun () -> Hashtbl.length t.idle)
+
+let in_use t = Mutex.protect t.lock (fun () -> Hashtbl.length t.in_use)
 
 (* The connections in use close too: their exchanges then fail. *)
 let close t =

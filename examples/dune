@@ -1,3 +1,13 @@
+; The examples run in the OS world of weft. weft.linux builds only on Linux.
+
 (executables
  (names hello ws_echo fetch)
- (libraries caravan caravan.websocket caravan.client affect affect.unix))
+ (enabled_if
+  (= %{system} linux))
+ (libraries
+  caravan
+  caravan.websocket
+  caravan.client
+  caravan.run
+  weft
+  weft.linux))

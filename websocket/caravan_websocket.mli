@@ -25,10 +25,10 @@ val accept :
      ?protocols:string list
   -> ?origin:(string -> bool)
   -> ?max_message:int
-  -> ?close_timeout:Affect_unix.Mtime.Span.t
-  -> ?write_timeout:Affect_unix.Mtime.Span.t
-  -> ?read_timeout:Affect_unix.Mtime.Span.t
-  -> ?idle_timeout:Affect_unix.Mtime.Span.t
+  -> ?close_timeout:Weft.Span.t
+  -> ?write_timeout:Weft.Span.t
+  -> ?read_timeout:Weft.Span.t
+  -> ?idle_timeout:Weft.Span.t
   -> Caravan.Request.t
   -> (t -> unit)
   -> Caravan.Response.t
@@ -56,12 +56,14 @@ val accept :
       permits it.
     - [max_message] is the size limit of a received message, 8 MiB by default.
     - [close_timeout] is the time limit of {!close}, 5 s by default.
-    - [write_timeout] is the time limit to send one frame, 30 s by default. If a
-      frame does not go in this time, the connection closes with 1006.
-    - [read_timeout] is the time limit of each read inside a frame, 30 s by
-      default. Each read that gets bytes starts a new limit, thus a slow frame
-      with no long pause can take more time. If no byte comes in this time, the
-      connection sends a Close frame with 1001 and closes.
+    - [write_timeout] is the time limit for each write of the connection that
+      waits, from the start of its first wait, 30 s by default. A message takes
+      one or two writes. If a write does not end in this time, the connection
+      closes with 1006.
+    - [read_timeout] is the time limit of each read inside a frame that waits,
+      from the start of its wait, 30 s by default. Each read starts a new limit,
+      thus a slow frame with no long pause can take more time. If no byte comes
+      in this time, the connection sends a Close frame with 1001 and closes.
     - [idle_timeout] is the time limit between two frames: from the time that
       {!recv} waits for a frame until its first byte. If no byte comes in this
       time, the connection sends a Close frame with 1001 and closes at once,
@@ -69,16 +71,19 @@ val accept :
       Use {!ping} to keep a connection open through proxies that close idle
       connections.
 
-    The time limits are on the time line of the connection
-    ({!Caravan.Flow.time}), which is [Config.mono_time] of the server.
+    The time limits are on the monotonic clock of the world ([Weft.Time] on the
+    line [Mono]). In [Weft_sim], this clock is the virtual clock.
 
     When [f] ends, [accept] closes the connection with 1000. If [f] raises
     {!Closed} for its connection, the connection is closed already. If [f]
     raises a different exception, [accept] closes the connection with 1011 and
     gives the exception to the server, which reports it. A {!Closed} of a
     different connection, for example a different client, is such an exception.
-    A [Cancelled] from a call that [f] made goes to the server as a [Failure].
     [accept] does not accept extensions.
+
+    A [Weft.Promise.Cancelled] from a promise of [f] is an exception of [f]. A
+    [Weft.Fiber.Cancelled] that does not come from a cancel of the handler goes
+    to the server as a [Failure].
 
     If the server starts to stop before the engine writes the head of the 101,
     the client gets a [503] and [f] does not run (see
@@ -138,7 +143,8 @@ val recv : t -> message
     If a cancel stops [recv] between two messages, the connection stays open. If
     the cancel stops it in the middle of a frame or a fragmented message, the
     connection closes with the code 1006. If the cancel comes after a Ping and
-    before its Pong goes, the peer gets no Pong.
+    before its Pong goes, the peer gets no Pong. If the cancel comes after the
+    Pong got the writer (see {!send}), the connection closes with the code 1006.
 
     @raise Closed
       when the peer closes the connection, or when it does not obey the
@@ -148,8 +154,14 @@ val recv : t -> message
 
 val send : t -> message -> unit
 (** [send c m] sends [m] in one frame. Many fibers can send on a connection at
-    the same time. If a cancel stops [send] in the middle of the frame, the
-    connection closes with the code 1006.
+    the same time. One fiber at a time has the writer of the connection, and the
+    others wait for it.
+
+    If a cancel stops [send] before it gets the writer, the connection stays
+    open. The writer can go to [send] when a different [send] ends, before
+    [send] continues. A cancel after that point closes the connection with the
+    code 1006. Each write of a TCP flow is a cancellation point, also before the
+    first byte of the frame.
 
     @raise Invalid_argument if [m] is a [Text] that is not valid UTF-8.
     @raise Closed if the connection is closed. *)
@@ -157,6 +169,10 @@ val send : t -> message -> unit
 val ping : t -> string -> unit
 (** [ping c data] sends a Ping with [data]. The peer sends a Pong with the same
     data, and {!recv} ignores the Pong.
+
+    If a cancel stops [ping] before it gets the writer, the connection stays
+    open. A cancel after that point closes the connection with the code 1006, as
+    for {!send}.
 
     @raise Invalid_argument if [data] has more than 125 bytes.
     @raise Closed if the connection is closed. *)
@@ -194,10 +210,10 @@ module Private : sig
 
   val of_flow :
        ?max_message:int
-    -> ?close_timeout:Affect_unix.Mtime.Span.t
-    -> ?write_timeout:Affect_unix.Mtime.Span.t
-    -> ?read_timeout:Affect_unix.Mtime.Span.t
-    -> ?idle_timeout:Affect_unix.Mtime.Span.t
+    -> ?close_timeout:Weft.Span.t
+    -> ?write_timeout:Weft.Span.t
+    -> ?read_timeout:Weft.Span.t
+    -> ?idle_timeout:Weft.Span.t
     -> Caravan.Flow.t
     -> t
   (** [of_flow flow] is a server connection on [flow], with the options of
@@ -208,12 +224,12 @@ module Private : sig
       waits to go), or [c] is closed. *)
 
   val run_handler :
-       ?stopping:unit Affect.Action.t
-    -> ?close_timeout:Affect_unix.Mtime.Span.t
+       ?stopping:unit Weft.event
+    -> ?close_timeout:Weft.Span.t
     -> (t -> unit)
     -> Caravan.Flow.t
     -> unit
   (** [run_handler ~stopping f flow] runs [f] on a server connection on [flow],
       as {!accept} does after its response. [stopping] is the stop of the
-      server, {!Affect.Action.never} by default. *)
+      server, [Weft.never] by default. *)
 end

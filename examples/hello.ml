@@ -4,8 +4,8 @@
    --data-binary 'some text' localhost:8080/echo curl -N localhost:8080/stream
    curl -i localhost:8080/slow *)
 
+open Weft
 open Caravan
-module Mtime = Affect_unix.Mtime
 
 let handler req =
   match Request.path_only req with
@@ -20,16 +20,16 @@ let handler req =
           for i = 1 to 5 do
             Body.Writer.write_string w (Printf.sprintf "event %d\n" i) ;
             Body.Writer.flush w ;
-            Mtime.wait_for Mtime.Span.(200 * ms)
+            Time.sleep Mono (Span.ms 200)
           done )
   | "/slow" ->
-      Mtime.wait_for Mtime.Span.(5 * s) ;
+      Time.sleep Mono (Span.s 5) ;
       Response.string "Sorry for the wait.\n"
   | _ ->
       Handler.not_found req
 
 let main () =
-  Server.run handler ~on_start:(fun server ->
+  Caravan_run.run handler ~on_start:(fun server ->
       Format.printf "Listening on http://%a (Ctrl-C to stop)@."
         Conn_info.pp_addr (Server.local_addr server) )
 

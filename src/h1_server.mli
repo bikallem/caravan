@@ -5,7 +5,7 @@ val limits : Config.t -> H1_parse.limits
 
 val serve : Engine.t
 (** [serve ctx flow handler] serves HTTP/1.1 requests on [flow]: one at a time,
-    kept alive and pipelined, each handled in its own asynchronous function
-    call. It returns when the connection should close: the client closed it or
-    asked to, a request was malformed, a response could not be completed, or the
-    server is stopping. *)
+    kept alive and pipelined. Each handler runs in a fiber of its own. It
+    returns when the connection must close. Examples: the client closed it or
+    asked for a close, a request was malformed, the engine could not complete a
+    response, or the server stops. *)

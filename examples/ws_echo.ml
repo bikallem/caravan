@@ -45,7 +45,7 @@ let handler req =
       Handler.not_found req
 
 let main () =
-  Server.run handler ~on_start:(fun server ->
+  Caravan_run.run handler ~on_start:(fun server ->
       Format.printf "Open http://%a/ (Ctrl-C to stop)@." Conn_info.pp_addr
         (Server.local_addr server) )
 
