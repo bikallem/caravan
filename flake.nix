@@ -52,43 +52,6 @@
                 # Not on opam yet: the package of the weft flake.
                 weft = final.callPackage weft.lib.package { };
 
-                # Not packaged in nixpkgs yet: https://ocaml.org/p/affect/latest
-                affect = final.callPackage (
-                  {
-                    lib,
-                    fetchurl,
-                    topkg,
-                    buildTopkgPackage,
-                    cmdliner,
-                    withCmdliner ? true,
-                  }:
-                  buildTopkgPackage rec {
-                    pname = "affect";
-                    version = "0.0.0";
-
-                    minimalOCamlVersion = "5.5.0";
-
-                    src = fetchurl {
-                      url = "https://erratique.ch/software/affect/releases/affect-${version}.tbz";
-                      hash = "sha512-syj2aW5gxInajMLo+tBTfKZjSjn8DF3lhA1PmFYfEQYX73m6goXuhCfdmZCMaz05EUlzWYzdxd7ZGrzOO5G5pg==";
-                    };
-
-                    propagatedBuildInputs = lib.optional withCmdliner cmdliner;
-
-                    buildPhase = ''
-                      runHook preBuild
-                      ${topkg.run} build --with-cmdliner ${lib.boolToString withCmdliner}
-                      runHook postBuild
-                    '';
-
-                    meta = {
-                      description = "Streamlined and natural concurrency model for OCaml";
-                      homepage = "https://erratique.ch/software/affect";
-                      license = lib.licenses.isc;
-                    };
-                  }
-                ) { };
-
                 # nixpkgs ships an older windtrap and no ppx_windtrap. The two
                 # packages of the windtrap flake use the OCaml of this scope.
                 windtrap = final.callPackage windtrap.lib.windtrap { };
@@ -121,11 +84,47 @@
         );
     in
     {
+      # The libraries caravan, caravan.client, caravan.websocket and
+      # caravan.run (on Linux). The source has only the files of the build,
+      # with no test directory, so the package does not run the tests. The
+      # installed http-date declares (lang dune 3.24), so caravan builds with
+      # dune 3.24 too.
       packages = forAllSystems (
-        { ocamlPackages, ... }:
         {
-          inherit (ocamlPackages) affect;
-          default = ocamlPackages.affect;
+          pkgs,
+          ocamlPackages,
+          dune_3_24,
+        }:
+        rec {
+          caravan = (ocamlPackages.buildDunePackage.override { dune_3 = dune_3_24; }) {
+            pname = "caravan";
+            version = "0.1.0-dev";
+            minimalOCamlVersion = "5.5";
+            src = pkgs.lib.fileset.toSource {
+              root = ./.;
+              fileset = pkgs.lib.fileset.unions [
+                ./dune-project
+                ./caravan.opam
+                ./src
+                ./client
+                ./websocket
+                ./run
+                ./LICENSE
+                ./README.md
+              ];
+            };
+            propagatedBuildInputs = [
+              ocamlPackages.weft
+              ocamlPackages.http-date
+            ];
+            doCheck = false;
+            meta = {
+              description = "HTTP/1.1 server, client and WebSocket for OCaml 5, built on weft";
+              homepage = "https://github.com/bikallem/caravan";
+              license = pkgs.lib.licenses.mpl20;
+            };
+          };
+          default = caravan;
         }
       );
 
@@ -144,7 +143,6 @@
               findlib
 
               # Dependencies (weft here is the flake input, so use ocamlPackages.weft)
-              affect
               ocamlPackages.weft
               http-date
 

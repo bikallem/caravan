@@ -15,14 +15,12 @@
 
 (package
  (name caravan)
- (synopsis "HTTP server built on affect, growing into a proxy")
+ (synopsis "HTTP/1.1 server, client and WebSocket built on weft")
  (description
-  "Caravan is an HTTP/1.1 server for OCaml 5 built on the affect concurrency model. It streams bodies, shuts down gracefully, and hands connections over for WebSocket and CONNECT tunnels; it is designed to grow into HTTP/2, HTTP/3 and a reverse proxy.")
+  "Caravan is an HTTP/1.1 server, client and WebSocket library for OCaml 5, built on the weft concurrency library. It streams bodies, shuts down gracefully, and gives connections to WebSocket and CONNECT tunnels. The design leaves room for HTTP/2, HTTP/3 and a reverse proxy.")
  (depends
   (ocaml
    (>= 5.5.0))
-  (affect
-   (>= 0.0.0))
   (http-date
    (>= 0.2))
   weft
