@@ -1,7 +1,7 @@
 ; The examples run in the OS world of weft. weft.linux builds only on Linux.
 
 (executables
- (names hello ws_echo fetch)
+ (names hello ws_echo fetch readme)
  (enabled_if
   (= %{system} linux))
  (libraries
@@ -11,3 +11,16 @@
   caravan.run
   weft
   weft.linux))
+
+; The first OCaml example of README.md. The rule copies it to readme.ml, so the
+; build fails if this example of the README does not compile. awk fails if
+; README.md has no OCaml example.
+
+(rule
+ (action
+  (with-stdout-to
+   readme.ml
+   (run
+    awk
+    "/^```ocaml/ { inside = 1; found = 1; next } inside && /^```/ { exit } inside; END { if (!found) exit 1 }"
+    %{dep:../README.md}))))

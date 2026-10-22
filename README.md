@@ -1,17 +1,33 @@
 # caravan
 
-An HTTP server for OCaml 5, built on
-[affect](https://erratique.ch/software/affect), a concurrency library
-with structured concurrency and cancellation. The HTTP/1.1 server and
-WebSocket are available at this time. The design leaves room for HTTP/2,
-HTTP/3, a client and a Traefik-like reverse proxy.
+An HTTP/1.1 server, client and WebSocket library for OCaml 5, built on
+[weft](https://github.com/bikallem/weft). weft is a concurrency library
+with fibers, structured concurrency, cancellation, CML events and a
+deterministic simulator. The design leaves room for HTTP/2, HTTP/3 and
+a Traefik-like reverse proxy.
 
 ```ocaml
-let () = Caravan.Server.run (fun _req -> Caravan.Response.string "Hello!\n")
+let () = Caravan_run.run (fun _req -> Caravan.Response.string "Hello!\n")
 ```
 
-> **Status:** the HTTP/1.1 server and WebSocket are complete but young,
-> and their API can change. There is no client or proxy yet.
+`Caravan_run.run` serves the handler on 127.0.0.1:8080 until the process
+gets SIGINT or SIGTERM. The build compiles this example (examples/dune).
+
+> **Status:** the HTTP/1.1 server, the client and WebSocket are complete
+> but young, and their API can change. There is no proxy yet.
+
+caravan and weft are not on opam. Get them from their repositories, or
+use the package `caravan` of the Nix flake. Then add the libraries to
+the dune stanza of your executable:
+
+```dune
+(executable
+ (name main)
+ (libraries caravan caravan.run))
+```
+
+Add `caravan.client` for the client and `caravan.websocket` for
+WebSocket.
 
 ## What the server does
 
@@ -22,11 +38,15 @@ let () = Caravan.Server.run (fun _req -> Caravan.Response.string "Hello!\n")
 - Streaming request and response bodies, with backpressure: chunked
   encoding with trailers, `Expect: 100-continue`, keep-alive and
   pipelining.
-- Header, idle, read and write timeouts; a lingering close so that
-  responses are not lost to connection resets; a cap on connections.
+- Header, idle, read and write timeouts. A lingering close, so that a
+  connection reset does not lose a response. A maximum number of
+  connections.
 - Graceful shutdown on SIGINT or SIGTERM: stop accepting, let requests
   in progress finish within a grace period, then cancel them. A second
-  signal aborts. A handler can see the stop with `Conn_info.stopping`.
+  signal aborts. A third signal gets its default action, thus it also
+  ends a handler that ignores the cancel. A handler can see the stop with
+  `Conn_info.stopping`. The library `caravan.run` does this in the OS
+  world of weft (Linux only).
 - `Response.upgrade` hands the connection over after a `101 Switching
   Protocols` or a `2xx` to `CONNECT`, the basis for WebSocket and
   tunnels.
@@ -34,7 +54,11 @@ let () = Caravan.Server.run (fun _req -> Caravan.Response.string "Hello!\n")
   started, such as an upstream request.
 
 Handlers are plain functions, `Request.t -> Response.t`, and each
-request runs in its own asynchronous call, in parallel across domains.
+request runs in its own fiber, in parallel across domains.
+
+The libraries `caravan`, `caravan.client` and `caravan.websocket` depend
+on no world of weft. They run in each world, for example the OS world
+(`Weft_linux.run`) and the simulator of weft (`Weft_sim.run`).
 
 ## WebSocket
 
@@ -77,6 +101,7 @@ The `caravan.client` library is an HTTP/1.1 client. It uses the parser
 and the writer of the server:
 
 ```ocaml
+Weft_linux.run @@ fun () ->
 Caravan_client.run @@ fun client ->
 Caravan_client.with_response client
   (Caravan.Request.make ~authority:"example.com" Caravan.Method.GET "/")
@@ -89,8 +114,8 @@ Caravan_client.with_response client
   of the body belongs to the client, not to the caller. Thus a server
   handler can forward a request and stream the two bodies at the same
   time.
-- A system thread does the DNS lookup, thus a lookup does not stop the
-  fibers of its domain.
+- `Dns.resolve` of weft does the DNS lookup on the thread pool of the
+  world, thus a lookup does not stop the fibers of its domain.
 - Time limits for the connect, the response head, each read and each
   write. One retry of an idempotent request without a body when the
   server closed an idle connection.
@@ -100,19 +125,21 @@ Caravan_client.with_response client
 ## Requirements
 
 - OCaml >= 5.5.0
-- [affect](https://ocaml.org/p/affect/latest) >= 0.0.0
+- [weft](https://github.com/bikallem/weft) (not on opam)
 - [http-date](https://ocaml.org/p/http-date/latest) >= 0.2
 - dune >= 3.20
-- For tests: [windtrap](https://github.com/invariant-hq/windtrap) and
-  ppx_windtrap >= 0.2.0. The Nix flake uses the fork
-  [bikallem/windtrap](https://github.com/bikallem/windtrap), which has
-  changes after 0.2.0.
+- For tests: windtrap and ppx_windtrap >= 0.2.0, from the fork
+  [bikallem/windtrap](https://github.com/bikallem/windtrap).
+
+The Nix flake gives all of these, at the commits that flake.nix and
+flake.lock pin.
 
 ## Development
 
-The repository includes a Nix flake that provides OCaml 5.5, dune,
-affect, weft, http-date, windtrap, ppx_windtrap, ocaml-lsp, utop,
-ocamlformat and odoc.
+The repository includes a Nix flake. Its dev shell provides OCaml 5.5,
+dune, weft, http-date, windtrap, ppx_windtrap, ocaml-lsp, utop,
+ocamlformat and odoc. `nix build` builds the caravan package (the four
+libraries, with no tests).
 
 With [direnv](https://direnv.net) and
 [nix-direnv](https://github.com/nix-community/nix-direnv) installed,
@@ -133,15 +160,21 @@ Then:
 
 ```sh
 make build      # dune build
-make test       # all test suites
+make test       # all test suites (dune test --force)
 make fmt        # format with ocamlformat (dune fmt)
-make mutate     # mutation testing across all suites, in parallel
+make mutate     # mutation testing of the suites of test/, in parallel
 make mutate MUTATE=websocket/   # only the mutants of the files under a prefix
-make coverage   # test coverage report
+make coverage   # test coverage report of all suites
 make autobahn   # the Autobahn WebSocket test suite, with podman or docker
+make conformance   # the HTTP conformance suite of cispa, with podman
 ```
 
-Try the example server, and stop it with Ctrl-C:
+The suites of test/ run in the simulator of weft, thus they use no real
+time and no real network. The suite of test/linux runs on Linux in the
+OS world of weft, with real sockets, signals and child processes.
+
+The examples run on Linux only. Try the example server, and stop it
+with Ctrl-C:
 
 ```sh
 dune exec examples/hello.exe
