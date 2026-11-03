@@ -12,17 +12,14 @@
   weft.os))
 
 ; The first OCaml example of README.md. The rule copies it to readme.ml, so the
-; build fails if this example of the README does not compile. awk fails if
-; README.md has no OCaml example.
+; build fails if this example of the README does not compile. section.awk
+; fails if README.md has no OCaml example.
 
 (rule
  (action
   (with-stdout-to
    readme.ml
-   (run
-    awk
-    "/^```ocaml/ { inside = 1; found = 1; next } inside && /^```/ { exit } inside; END { if (!found) exit 1 }"
-    %{dep:../README.md}))))
+   (run awk -v "section=" -f %{dep:section.awk} %{dep:../README.md}))))
 
 ; The example of the Testing section of README.md, as readme_testing.ml.
 
@@ -35,10 +32,7 @@
  (action
   (with-stdout-to
    readme_testing.ml
-   (run
-    awk
-    "/^## Testing/ { section = 1 } section && /^```ocaml/ { inside = 1; found = 1; next } inside && /^```/ { exit } inside; END { if (!found) exit 1 }"
-    %{dep:../README.md}))))
+   (run awk -v "section=Testing" -f %{dep:section.awk} %{dep:../README.md}))))
 
 ; The example of the Routing section of README.md, as readme_router.ml.
 
@@ -51,10 +45,7 @@
  (action
   (with-stdout-to
    readme_router.ml
-   (run
-    awk
-    "/^## Routing/ { section = 1 } section && /^```ocaml/ { inside = 1; found = 1; print \"[@@@warning \\\"-32\\\"]\"; next } inside && /^```/ { exit } inside; END { if (!found) exit 1 }"
-    %{dep:../README.md}))))
+   (run awk -v "section=Routing" -f %{dep:section.awk} %{dep:../README.md}))))
 
 ; The example of the "Middleware" section of README.md, as
 ; readme_middleware.ml.
@@ -70,7 +61,10 @@
    readme_middleware.ml
    (run
     awk
-    "/^## Middleware/ { section = 1 } section && /^```ocaml/ { inside = 1; found = 1; print \"[@@@warning \\\"-32\\\"]\"; next } inside && /^```/ { exit } inside; END { if (!found) exit 1 }"
+    -v
+    "section=Middleware"
+    -f
+    %{dep:section.awk}
     %{dep:../README.md}))))
 
 ; The example of the "Queries and forms" section of README.md, as
@@ -87,5 +81,8 @@
    readme_forms.ml
    (run
     awk
-    "/^## Queries and forms/ { section = 1 } section && /^```ocaml/ { inside = 1; found = 1; print \"[@@@warning \\\"-32\\\"]\"; next } inside && /^```/ { exit } inside; END { if (!found) exit 1 }"
+    -v
+    "section=Queries and forms"
+    -f
+    %{dep:section.awk}
     %{dep:../README.md}))))
