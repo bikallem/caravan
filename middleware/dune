@@ -1,0 +1,10 @@
+; Middleware for the requests behind a proxy, and request IDs.
+
+(library
+ (name caravan_middleware)
+ (public_name caravan.middleware)
+ (libraries caravan weft)
+ (instrumentation
+  (backend ppx_windtrap.mutate))
+ (instrumentation
+  (backend ppx_windtrap.coverage)))

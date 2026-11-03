@@ -85,10 +85,10 @@
     in
     {
       # The libraries caravan, caravan.client, caravan.websocket,
-      # caravan.router and caravan.testing. The source has only the files of
-      # the build, with no test directory, so the package does not run the
-      # tests. The installed http-date declares (lang dune 3.24), so caravan
-      # builds with dune 3.24 too.
+      # caravan.router, caravan.middleware and caravan.testing. The source has
+      # only the files of the build, with no test directory, so the package
+      # does not run the tests. The installed http-date declares (lang dune
+      # 3.24), so caravan builds with dune 3.24 too.
       packages = forAllSystems (
         {
           pkgs,
@@ -109,6 +109,7 @@
                 ./client
                 ./websocket
                 ./router
+                ./middleware
                 ./testing
                 ./LICENSE
                 ./README.md
