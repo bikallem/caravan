@@ -1,0 +1,10 @@
+; A test host: the server and the client of caravan in the simulator of weft.
+
+(library
+ (name caravan_testing)
+ (public_name caravan.testing)
+ (libraries caravan caravan.client weft weft.sim)
+ (instrumentation
+  (backend ppx_windtrap.mutate))
+ (instrumentation
+  (backend ppx_windtrap.coverage)))

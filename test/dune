@@ -1,5 +1,5 @@
 ; The suites of caravan. They run in the simulator of weft. The deps give the
-; source scan of test_core the files of the three libraries.
+; source scan of test_core the files of the four libraries.
 
 (tests
  (names
@@ -12,7 +12,8 @@
   test_server
   test_server_stateful
   test_client
-  test_websocket)
+  test_websocket
+  test_testing)
  (modules
   test_core
   test_tcp
@@ -24,6 +25,7 @@
   test_server_stateful
   test_client
   test_websocket
+  test_testing
   memory_server
   wire
   conformance_app)
@@ -31,6 +33,7 @@
   caravan
   caravan.client
   caravan.websocket
+  caravan.testing
   server_support
   sim_support
   weft
@@ -44,7 +47,8 @@
  (deps
   (glob_files ../src/*.ml)
   (glob_files ../client/*.ml)
-  (glob_files ../websocket/*.ml)))
+  (glob_files ../websocket/*.ml)
+  (glob_files ../testing/*.ml)))
 
 ; The hosts of the numeric tests of Resolver, shared by test_client and
 ; test_numeric_unix.

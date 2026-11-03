@@ -1493,9 +1493,11 @@ let accept_error_tests =
 (* The source rules. The libraries caravan, caravan.client and caravan.websocket
    must use only weft for the time, the I/O and the domains, so that they run in
    each world of weft. The scan reads the .ml files of src, client and websocket
-   as text. The guard of test/nounix links each module of the three libraries,
-   and forbids unix, threads and the worlds. The scan also forbids the parts of
-   the stdlib that the guard cannot find, for example Sys.time and Domain. *)
+   as text. It also reads caravan.testing (testing), which can also use the
+   simulator of weft (Weft_sim). The guard of test/nounix links each module of
+   the three libraries, and forbids unix, threads and the worlds. The scan also
+   forbids the parts of the stdlib that the guard cannot find, for example
+   Sys.time and Domain. *)
 
 (* The texts that the libraries must not contain. The first text is the name of
    the old effects library, in two parts, so that a search for that name in src,
@@ -1608,7 +1610,9 @@ let allowed =
        world effect, or a call into weft or into a Flow. *)
     ("client/pool.ml", "Mutex.")
   ; (* The default on_error writes to the standard error (write_error). *)
-    ("src/config.ml", "Printf.eprintf") ]
+    ("src/config.ml", "Printf.eprintf")
+  ; (* caravan.testing runs the server and the client in the simulator. *)
+    ("testing/caravan_testing.ml", "Weft_sim") ]
 
 let is_ident_char = function
   | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' | '\'' ->
@@ -1733,7 +1737,9 @@ let source_tests =
             |> List.sort compare
             |> List.map (fun file -> dir ^ "/" ^ file)
           in
-          let all = files "src" @ files "client" @ files "websocket" in
+          let all =
+            files "src" @ files "client" @ files "websocket" @ files "testing"
+          in
           List.iter
             (fun file ->
               is_true ~msg:("the scan finds " ^ file) (List.mem file all) )
@@ -1741,7 +1747,8 @@ let source_tests =
             ; "src/h1_server.ml"
             ; "src/config.ml"
             ; "client/pool.ml"
-            ; "websocket/connection.ml" ] ;
+            ; "websocket/connection.ml"
+            ; "testing/caravan_testing.ml" ] ;
           let found =
             List.concat_map
               (fun file ->
