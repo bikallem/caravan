@@ -124,8 +124,8 @@ let app =
 ## Middleware
 
 The `caravan.middleware` library has middleware for the requests that
-come through a reverse proxy, request IDs, an access log and an error
-page:
+come through a reverse proxy, request IDs, an access log, CORS and an
+error page:
 
 ```ocaml
 open Caravan_middleware
@@ -136,6 +136,10 @@ let app handler =
     ; Request_id.middleware ()
     ; Access_log.middleware
         ~log:(fun e -> print_string (Access_log.line e ^ "\n"))
+        ()
+    ; Cors.middleware
+        ~origins:(Cors.Only ["https://app.example"])
+        ~allow_headers:["content-type"]
         ()
     ; Error_page.middleware
         ~report:(fun _req e _bt -> prerr_endline (Printexc.to_string e))
@@ -158,6 +162,12 @@ let app handler =
   bytes, the duration, and if the body was complete, incomplete,
   failed, cancelled (the client left), not sent or upgraded.
   `Access_log.line` gives one line of text.
+- `Cors` answers the preflights itself, and adds the CORS fields to the
+  responses for the permitted origins (`Any`, `Only` a list, or
+  `Matching` a predicate), with a correct `Vary`. It refuses `Any` with
+  credentials. CORS is not access control: the handler runs for each
+  origin, and only the read by the page is blocked. `Cors.permits` gives
+  the same check to `Caravan_websocket.accept ~origin`.
 - `Error_page` gives a page (by default a plain 500) for an exception of
   the handler, after a call of `report`. A cancel and the error of a
   request body go to the server as before.
