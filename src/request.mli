@@ -151,6 +151,38 @@ val with_form : Form.t -> t -> t
     the field [Content-Type: application/x-www-form-urlencoded], which replaces
     the [Content-Type] fields of [r]. For a client or a test. *)
 
+val multipart :
+     ?max_parts:int
+  -> ?max_header_bytes:int
+  -> t
+  -> init:'a
+  -> ('a -> Multipart.part -> 'a)
+  -> ('a, Multipart.error) result
+(** [multipart r ~init f] is {!Multipart.fold} of the body of [r], with the
+    boundary of its [Content-Type]. It gives [Error Unsupported_media_type] if
+    [r] does not have exactly one [Content-Type] field with the media type
+    [multipart/form-data] (compared as in {!form}) and a correct boundary. Then
+    the body is not read. For example, a handler can copy each file to a store
+    and keep only the names.
+
+    @raise Invalid_argument if a limit is negative, before the other checks. *)
+
+val multipart_form :
+     ?max_parts:int
+  -> ?max_header_bytes:int
+  -> ?max_bytes:int
+  -> t
+  -> (Multipart.field list, Multipart.error) result
+(** [multipart_form r] is {!Multipart.read_all} of the body of [r], with the
+    checks of {!multipart}. Call it one time and keep the result.
+
+    @raise Invalid_argument if a limit is negative, before the other checks. *)
+
+val with_multipart : Multipart.field list -> t -> t
+(** [with_multipart l r] is [r] with the body of {!Multipart.encode}[ l], with
+    its length, and the [Content-Type] field of its boundary, which replaces the
+    [Content-Type] fields of [r]. For a client or a test. *)
+
 (** {1:attributes Attributes}
 
     Typed values that middleware attach to a request, see {{!Attrs}[Attrs]}.

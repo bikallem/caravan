@@ -958,7 +958,41 @@ let form_tests =
               equal status Status.content_too_large a.status ;
               let b = T.get t "/" in
               equal status Status.unsupported_media_type b.status ;
-              equal string a.body b.body ) ) ]
+              equal string a.body b.body ) )
+    ; test "a multipart upload streams through the server" (fun () ->
+          (* The handler counts the bytes of each part, with no copy. *)
+          let sizes req =
+            let buf = Bytes.create 4096 in
+            let rec size b n =
+              match Body.read b buf 0 4096 with 0 -> n | k -> size b (n + k)
+            in
+            match
+              Request.multipart req ~init:[] (fun acc p ->
+                  Printf.sprintf "%s:%d" (Multipart.name p)
+                    (size (Multipart.body p) 0)
+                  :: acc )
+            with
+            | Ok l ->
+                ok (String.concat " " (List.rev l))
+            | Error e ->
+                Response.string ~status:(Multipart.error_status e) ""
+          in
+          let file = String.init 102_400 (fun i -> Char.chr (i land 255)) in
+          let r =
+            T.run sizes (fun t ->
+                T.fetch t
+                  (Request.with_multipart
+                     [ {name= "a"; filename= None; content_type= None; data= "1"}
+                     ; { name= "f"
+                       ; filename= Some "f.bin"
+                       ; content_type= Some "application/octet-stream"
+                       ; data= file } ]
+                     (Request.make
+                        ~headers:(Headers.of_list [("Expect", "100-continue")])
+                        Method.POST "/" ) ) )
+          in
+          equal status Status.ok r.status ;
+          equal string "a:1 f:102400" r.body ) ]
 
 let () =
   exit

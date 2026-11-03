@@ -1912,6 +1912,730 @@ let cookie_props =
                (String.concat "; " (List.map (fun (n, v) -> n ^ "=" ^ v) l)) ) )
     ]
 
+(* Multipart *)
+
+module Mp = Multipart
+
+let mp_field =
+  Testable.make
+    ~pp:(fun ppf (f : Mp.field) ->
+      Format.fprintf ppf "{name=%S; filename=%a; content_type=%a; data=%S}"
+        f.name
+        Format.(pp_print_option pp_print_string)
+        f.filename
+        Format.(pp_print_option pp_print_string)
+        f.content_type f.data )
+    ~equal:( = )
+
+let mp_error = Testable.make ~pp:Mp.pp_error ~equal:( = )
+
+let mp_result = result (list mp_field) mp_error
+
+let field ?filename ?content_type name data : Mp.field =
+  {name; filename; content_type; data}
+
+let disp name = "Content-Disposition: form-data; name=\"" ^ name ^ "\"\r\n"
+
+(* A body with the boundary [b]: each part is a head and a content. *)
+let mp_body ?(b = "b") parts =
+  String.concat ""
+    (List.map (fun (h, d) -> "--" ^ b ^ "\r\n" ^ h ^ "\r\n" ^ d ^ "\r\n") parts)
+  ^ "--" ^ b ^ "--\r\n"
+
+let mp_read_all ?max_parts ?max_header_bytes ?max_bytes ?chunk s =
+  Mp.read_all ?max_parts ?max_header_bytes ?max_bytes ~boundary:"b"
+    (Body.of_source (chunked_reader ?chunk s))
+
+let is_malformed = function Error (Mp.Malformed _) -> true | _ -> false
+
+let malformed ?msg r = is_true ?msg (is_malformed r)
+
+let multipart_tests =
+  group "Multipart"
+    [ test "boundary" (fun () ->
+          let b70 = String.make 70 'a' in
+          List.iter
+            (fun (v, expected) ->
+              equal ~msg:v (option string) expected (Mp.boundary v) )
+            [ ("multipart/form-data; boundary=abc", Some "abc")
+            ; ("multipart/form-data; BOUNDARY = \"a b\"", Some "a b")
+            ; ("multipart/form-data; boundary=\"a\\\"b\"", None)
+            ; ("multipart/form-data; boundary=\"a\\:b\"", Some "a:b")
+            ; ("multipart/form-data; boundary=" ^ b70, Some b70)
+            ; ("multipart/form-data; boundary=" ^ b70 ^ "a", None)
+            ; ("multipart/form-data; boundary=\"a \"", None)
+            ; ("multipart/form-data; boundary=\"\"", None)
+            ; ("multipart/form-data; boundary=a@b", None)
+            ; ("multipart/form-data; boundary=a; boundary=a", None)
+            ; ("multipart/form-data; charset=x; boundary=a", Some "a")
+            ; ("multipart/form-data", None)
+            ; ("multipart/form-data; boundary", None)
+            ; ("multipart/form-data; boundary=", None)
+            ; ("multipart/form-data; boundary=\"a\\", None) ] )
+    ; test "mp_read_all of two fields and a file" (fun () ->
+          let s =
+            mp_body
+              [ (disp "user", "alice")
+              ; (disp "note", "a\r\nb")
+              ; ( "Content-Disposition: form-data; name=\"f\"; \
+                   filename=\"a.txt\"\r\n\
+                   Content-Type: text/plain\r\n"
+                , "line 1\r\nline 2\r\n" ) ]
+          in
+          equal mp_result
+            (Ok
+               [ field "user" "alice"
+               ; field "note" "a\r\nb"
+               ; field ~filename:"a.txt" ~content_type:"text/plain" "f"
+                   "line 1\r\nline 2\r\n" ] )
+            (mp_read_all s) )
+    ; test "preamble, padding and epilogue" (fun () ->
+          let s =
+            "the preamble\r\n--b \t\r\n" ^ disp "a"
+            ^ "\r\n1\r\n--b--the epilogue"
+          in
+          equal mp_result (Ok [field "a" "1"]) (mp_read_all s) ;
+          equal mp_result
+            (Ok [field "a" "1"])
+            (mp_read_all ("--b\r\n" ^ disp "a" ^ "\r\n1\r\n--b--")) ;
+          equal mp_result (Ok []) (mp_read_all "--b--\r\n") )
+    ; test "bytes that look like a delimiter stay in the content" (fun () ->
+          List.iter
+            (fun d ->
+              equal ~msg:(String.escaped d) mp_result
+                (Ok [field "a" d])
+                (mp_read_all (mp_body [(disp "a", d)])) )
+            [ "x\r\n--"
+            ; "x\r\n--c"
+            ; "x\r\n-"
+            ; "x--b"
+            ; "\r\n--B"
+            ; "\r"
+            ; "\r\n"
+            ; "" ] )
+    ; test "an empty part can have no CRLF before its delimiter" (fun () ->
+          (* RFC 2046: the CRLF of the empty line can start the delimiter. *)
+          equal mp_result
+            (Ok [field "a" ""; field "c" "X"])
+            (mp_read_all
+               ( "--b\r\n" ^ disp "a" ^ "\r\n--b\r\n" ^ disp "c"
+               ^ "\r\nX\r\n--b--\r\n" ) ) ;
+          equal mp_result
+            (Ok [field "a" ""])
+            (mp_read_all ("--b\r\n" ^ disp "a" ^ "\r\n--b--")) ;
+          (* In chunks of 1 byte. *)
+          equal mp_result
+            (Ok [field "a" ""])
+            (mp_read_all ~chunk:1 ("--b\r\n" ^ disp "a" ^ "\r\n--b--")) ;
+          malformed (mp_read_all ("--b\r\n" ^ disp "a" ^ "\r\n--bX")) ;
+          equal mp_result
+            (Ok [field "a" "--c"])
+            (mp_read_all ("--b\r\n" ^ disp "a" ^ "\r\n--c\r\n--b--")) )
+    ; test "incorrect bytes after a boundary" (fun () ->
+          malformed (mp_read_all ("--b\r\n" ^ disp "a" ^ "\r\n1\r\n--bX\r\n")) ;
+          malformed (mp_read_all ("--b\r\n" ^ disp "a" ^ "\r\n1\r\n--b-x")) ;
+          malformed (mp_read_all ("--b \tx\r\n" ^ disp "a" ^ "\r\n1\r\n--b--")) ;
+          malformed (mp_read_all ("--b\rX" ^ disp "a" ^ "\r\n1\r\n--b--")) ;
+          (* The read of the part raises. *)
+          let r =
+            Mp.fold ~boundary:"b"
+              (Body.of_string ("--b\r\n" ^ disp "a" ^ "\r\n1\r\n--bX\r\n"))
+              ~init:()
+              (fun () p ->
+                raises Body.Truncated (fun () -> Body.to_string (Mp.body p)) )
+          in
+          malformed r ;
+          (* The bytes after the boundary make a correct head. *)
+          malformed
+            (mp_read_all
+               ( "--b\r\n" ^ disp "a" ^ "\r\n1\r\n--b" ^ disp "c"
+               ^ "\r\n2\r\n--b--" ) ) )
+    ; test "parts with no filename or empty values" (fun () ->
+          equal mp_result
+            (Ok [field "a" ""; field ~filename:"" "f" "x"; field "" "y"])
+            (mp_read_all
+               (mp_body
+                  [ (disp "a", "")
+                  ; ( "Content-Disposition: form-data; name=\"f\"; \
+                       filename=\"\"\r\n"
+                    , "x" )
+                  ; (disp "", "y") ] ) ) )
+    ; test "Content-Disposition" (fun () ->
+          let one h = mp_read_all (mp_body [(h, "x")]) in
+          let named ?filename n = Ok [field ?filename n "x"] in
+          List.iter
+            (fun (h, expected) -> equal ~msg:h mp_result expected (one h))
+            [ ("Content-Disposition: Form-Data; NAME=a\r\n", named "a")
+            ; ("Content-Disposition: form-data ; name = \"a\" \r\n", named "a")
+            ; ("Content-Disposition: form-data; name=\"a\\b\"\r\n", named "a\\b")
+            ; ( "Content-Disposition: form-data; name=a; filename=\"foo\\\"\r\n"
+              , named ~filename:"foo\\" "a" )
+            ; ( "Content-Disposition: form-data; name=a; filename=\"x;y=z\"\r\n"
+              , named ~filename:"x;y=z" "a" )
+            ; ( "Content-Disposition: form-data; name=a; filename*=UTF-8''x\r\n"
+              , named "a" )
+            ; (disp "a" ^ "X-Empty:   \r\n", named "a") ] ;
+          List.iter
+            (fun h -> malformed ~msg:h (one h))
+            [ ""
+            ; "Content-Type: text/plain\r\n"
+            ; disp "a" ^ disp "a"
+            ; "Content-Disposition: attachment; name=a\r\n"
+            ; "Content-Disposition: form-data\r\n"
+            ; "Content-Disposition: form-data; name=a; name=b\r\n"
+            ; "Content-Disposition: form-data; name=a; filename=x; filename=y\r\n"
+            ; "Content-Disposition: form-data; name=\"a\r\n"
+            ; "Content-Disposition: form-data; name=a b\r\n"
+            ; "Content-Disposition: form-data; name=\r\n" ] )
+    ; test "incorrect head lines" (fun () ->
+          List.iter
+            (fun h ->
+              malformed ~msg:(String.escaped h)
+                (mp_read_all (mp_body [(h, "x")])) )
+            [ disp "a" ^ "no colon\r\n"
+            ; disp "a" ^ " X: folded\r\n"
+            ; disp "a" ^ "X: a\nY: b\r\n"
+            ; disp "a" ^ "X: a\rb\r\n"
+            ; "\n" ^ disp "a" ] ;
+          equal mp_result (Error (Mp.Malformed "not one Content-Disposition"))
+            (mp_read_all ("--b\r\n\r\n" ^ disp "a" ^ "\r\nx\r\n--b--")) )
+    ; test "a head at the limit with no end is too large" (fun () ->
+          equal mp_result (Error Mp.Header_too_large)
+            (mp_read_all ~max_header_bytes:10 "--b\r\nContent-Di") ;
+          malformed (mp_read_all ~max_header_bytes:10 "--b\r\nContent-D") )
+    ; test "max_header_bytes" (fun () ->
+          let h = disp "a" in
+          (* The head is [h] and the empty line. *)
+          let size = String.length h + 2 in
+          let s = mp_body [(h, "x")] in
+          equal mp_result
+            (Ok [field "a" "x"])
+            (mp_read_all ~max_header_bytes:size s) ;
+          equal mp_result (Error Mp.Header_too_large)
+            (mp_read_all ~max_header_bytes:(size - 1) s) ;
+          let padded = "--b  \r\n" ^ h ^ "\r\nx\r\n--b--" in
+          equal mp_result
+            (Ok [field "a" "x"])
+            (mp_read_all ~max_header_bytes:(size + 2) padded) ;
+          equal mp_result (Error Mp.Header_too_large)
+            (mp_read_all ~max_header_bytes:(size + 1) padded) ;
+          let pre n = String.make n 'p' ^ "\r\n" ^ s in
+          equal mp_result
+            (Ok [field "a" "x"])
+            (mp_read_all ~max_header_bytes:size (pre size)) ;
+          malformed (mp_read_all ~max_header_bytes:size (pre (size + 1))) )
+    ; test "the limits at their exact values" (fun () ->
+          (* The epilogue: the body ends iff it has at most max_header_bytes. *)
+          let ended k =
+            let e = ref false in
+            let s =
+              "--b\r\n" ^ disp "a" ^ "\r\nx\r\n--b--" ^ String.make k 'e'
+            in
+            let body =
+              Body.on_end
+                (fun o ~bytes:_ -> e := o = Body.Ended)
+                (Body.of_string s)
+            in
+            equal mp_result
+              (Ok [field "a" "x"])
+              (Mp.read_all ~max_header_bytes:100 ~boundary:"b" body) ;
+            !e
+          in
+          is_true ~msg:"100" (ended 100) ;
+          is_false ~msg:"101" (ended 101) ;
+          (* A preamble across many reads of a small buffer. *)
+          let pre chunk k =
+            Mp.fold ~max_header_bytes:100 ~buffer_size:14 ~boundary:"b"
+              (Body.of_source
+                 (chunked_reader ~chunk
+                    (String.make k 'p' ^ "\r\n" ^ mp_body [(disp "a", "x")]) ) )
+              ~init:[]
+              (fun acc p -> (Mp.name p, Body.to_string (Mp.body p)) :: acc)
+          in
+          List.iter
+            (fun chunk ->
+              let msg = string_of_int chunk in
+              equal ~msg (result pairs mp_error)
+                (Ok [("a", "x")])
+                (pre chunk 100) ;
+              malformed ~msg (pre chunk 101) )
+            (List.init 13 (fun i -> i + 1)) ;
+          (* Padding after a delimiter between two parts. *)
+          let pad k =
+            mp_read_all ~max_header_bytes:100
+              ( "--b\r\n" ^ disp "a" ^ "\r\nx\r\n--b" ^ String.make k ' '
+              ^ "\r\n" ^ disp "c" ^ "\r\ny\r\n--b--" )
+          in
+          equal mp_result (Error Mp.Header_too_large) (pad 101) ;
+          (* The part before the padding is complete: its read ends with no
+             error. *)
+          let got = ref "" in
+          let r =
+            Mp.fold ~max_header_bytes:100 ~boundary:"b"
+              (Body.of_string
+                 ( "--b\r\n" ^ disp "a" ^ "\r\nx\r\n--b" ^ String.make 101 ' '
+                 ^ "\r\n" ) )
+              ~init:()
+              (fun () p ->
+                got := try Body.to_string (Mp.body p) with _ -> "raised" )
+          in
+          equal string "x" !got ;
+          equal (result unit mp_error) (Error Mp.Header_too_large) r ;
+          equal mp_result (Ok [field "a" "x"; field "c" "y"]) (pad 2) ;
+          (* A limit of 0. *)
+          let parts0 s =
+            Mp.fold ~max_parts:0 ~boundary:"b" (Body.of_string s) ~init:()
+              (fun () _ -> () )
+          in
+          equal (result unit mp_error) (Ok ()) (parts0 "--b--") ;
+          equal (result unit mp_error) (Error Mp.Too_many_parts)
+            (parts0 (mp_body [(disp "a", "")])) ;
+          (* A head at max_bytes, with no data. *)
+          let h = disp "a" in
+          equal mp_result
+            (Ok [field "a" ""])
+            (mp_read_all ~max_bytes:(String.length h + 2) (mp_body [(h, "")])) )
+    ; test "no read of the body after its end (Body guards it)" (fun () ->
+          let s = "--b\r\n" ^ disp "a" ^ "\r\nx\r\n--b" in
+          let src = chunked_reader s in
+          let over = ref false in
+          let read b o l =
+            if !over then failwith "a read after the end"
+            else
+              match src b o l with
+              | 0 ->
+                  over := true ;
+                  0
+              | n ->
+                  n
+          in
+          malformed (Mp.read_all ~boundary:"b" (Body.of_source read)) )
+    ; test "the epilogue is not read to its end" (fun () ->
+          let reads = ref 0 in
+          let s = mp_body [(disp "a", "x")] in
+          let rest = String.make (1 lsl 20) 'e' in
+          let src = chunked_reader ~chunk:1024 (s ^ rest) in
+          let body = Body.of_source (fun b o l -> incr reads ; src b o l) in
+          equal mp_result (Ok [field "a" "x"]) (Mp.read_all ~boundary:"b" body) ;
+          is_true ~msg:"few reads" (!reads < 100) )
+    ; test "max_parts" (fun () ->
+          let calls = ref 0 in
+          let s n =
+            mp_body (List.init n (fun i -> (disp (string_of_int i), "x")))
+          in
+          let count n =
+            calls := 0 ;
+            Mp.fold ~max_parts:2 ~boundary:"b"
+              (Body.of_string (s n))
+              ~init:()
+              (fun () _ -> incr calls)
+          in
+          equal (result unit mp_error) (Ok ()) (count 2) ;
+          equal (result unit mp_error) (Error Mp.Too_many_parts) (count 3) ;
+          equal int 2 !calls )
+    ; test "max_bytes counts the heads and the data of all parts" (fun () ->
+          let h = disp "a" in
+          let s = mp_body [(h, "12345"); (h, "67890")] in
+          let total = 2 * (String.length h + 2 + 5) in
+          equal mp_result
+            (Ok [field "a" "12345"; field "a" "67890"])
+            (mp_read_all ~max_bytes:total s) ;
+          equal mp_result (Error Mp.Too_large)
+            (mp_read_all ~max_bytes:(total - 1) s) ;
+          let empty =
+            mp_body (List.init 1000 (fun _ -> (disp (String.make 1000 'n'), "")))
+          in
+          equal mp_result (Error Mp.Too_large)
+            (mp_read_all ~max_bytes:100_000 empty) )
+    ; test "the body ends before the close delimiter" (fun () ->
+          List.iter
+            (fun s -> malformed ~msg:(String.escaped s) (mp_read_all s))
+            [ "--b\r\n" ^ disp "a" ^ "\r\nx"
+            ; "--b\r\n" ^ disp "a" ^ "\r\nx\r\n--b"
+            ; "--b\r\n" ^ disp "a"
+            ; "only a preamble"
+            ; "" ] )
+    ; test "a copy of a part with no close delimiter fails" (fun () ->
+          let outcome = ref "" in
+          let s = "--b\r\n" ^ disp "a" ^ "\r\nsome data" in
+          let w = Body.Writer.make ~write:(fun _ _ _ -> ()) ~flush:ignore in
+          let r =
+            Mp.fold ~boundary:"b" (Body.of_string s) ~init:() (fun () p ->
+                let b =
+                  Body.on_end
+                    (fun o ~bytes:_ ->
+                      outcome :=
+                        match o with
+                        | Body.Failed _ ->
+                            "failed"
+                        | Body.Ended ->
+                            "ended"
+                        | _ ->
+                            "other" )
+                    (Mp.body p)
+                in
+                raises Body.Truncated (fun () -> Body.write_to b w) )
+          in
+          malformed r ;
+          equal string "failed" !outcome )
+    ; test "the callback can read nothing or a part of the body" (fun () ->
+          let s = mp_body [(disp "a", "0123456789"); (disp "b", "x")] in
+          let run take =
+            Mp.fold ~boundary:"b"
+              (Body.of_source (chunked_reader ~chunk:3 s))
+              ~init:[]
+              (fun acc p ->
+                let buf = Bytes.create take in
+                let rec go n =
+                  if n = take then n
+                  else
+                    match Body.read (Mp.body p) buf n (take - n) with
+                    | 0 ->
+                        n
+                    | k ->
+                        go (n + k)
+                in
+                (Mp.name p, Bytes.sub_string buf 0 (go 0)) :: acc )
+          in
+          equal (result pairs mp_error) (Ok [("b", ""); ("a", "")]) (run 0) ;
+          equal (result pairs mp_error) (Ok [("b", "x"); ("a", "012")]) (run 3) )
+    ; test "the discard finds a syntax error" (fun () ->
+          let skip s =
+            Mp.fold ~boundary:"b"
+              (Body.of_source (chunked_reader ~chunk:3 s))
+              ~init:()
+              (fun () _ -> ())
+          in
+          List.iter
+            (fun s -> malformed ~msg:(String.escaped s) (skip s))
+            [ "--b\r\n" ^ disp "a" ^ "\r\nxyz"
+            ; "--b\r\n" ^ disp "a" ^ "\r\nx\r\n--bX\r\n"
+            ; "--b\r\n" ^ disp "a" ^ "\r\nx\r\n--b" ] )
+    ; test "a hook that raises at the close keeps the exception of f" (fun () ->
+          raises Exit (fun () ->
+              Mp.fold ~boundary:"b"
+                (Body.of_string (mp_body [(disp "a", "x")]))
+                ~init:()
+                (fun () p ->
+                  ignore
+                    (Body.on_end
+                       (fun _ ~bytes:_ -> failwith "hook")
+                       (Mp.body p) ) ;
+                  raise Exit ) ) )
+    ; test "a part body is valid only in its callback" (fun () ->
+          let kept = ref None in
+          let s = mp_body [(disp "a", "x")] in
+          ignore
+            (Mp.fold ~boundary:"b" (Body.of_string s) ~init:() (fun () p ->
+                 kept := Some (Mp.body p) ) ) ;
+          raises_match is_invalid_arg (fun () ->
+              Body.read (Option.get !kept) (Bytes.create 4) 0 4 ) )
+    ; test "a read in progress at the end of the callback" (fun () ->
+          let gate = Weft.Ivar.create () in
+          let head = "--b\r\n" ^ disp "a" ^ "\r\nxyz" in
+          let first = ref true in
+          let src buf off len =
+            if !first then begin
+              first := false ;
+              Bytes.blit_string head 0 buf off (String.length head) ;
+              String.length head
+            end
+            else begin
+              Weft.sync (Weft.Ivar.read gate) ;
+              ignore len ;
+              0
+            end
+          in
+          Sim_support.run (fun _ ->
+              Weft.Fiber.scope (fun s ->
+                  raises_match is_invalid_arg (fun () ->
+                      Mp.fold ~boundary:"b" (Body.of_source src) ~init:()
+                        (fun () p ->
+                          Weft.Fiber.fork_daemon s (fun () ->
+                              ignore
+                                (Body.read (Mp.body p) (Bytes.create 4) 0 4) ) ;
+                          Weft.Fiber.yield () ) ) ;
+                  Weft.Fiber.cancel s Exit ) ) )
+    ; test "an exception of the callback goes out with no more reads" (fun () ->
+          let reads = ref 0 in
+          let s =
+            mp_body [(disp "a", String.make 10_000 'x'); (disp "b", "y")]
+          in
+          let src = chunked_reader ~chunk:100 s in
+          let body = Body.of_source (fun b o l -> incr reads ; src b o l) in
+          let kept = ref None in
+          raises Exit (fun () ->
+              Mp.fold ~boundary:"b" body ~init:() (fun () p ->
+                  kept := Some (Mp.body p) ;
+                  raise Exit ) ) ;
+          let n = !reads in
+          raises_match is_invalid_arg (fun () ->
+              Body.read (Option.get !kept) (Bytes.create 4) 0 4 ) ;
+          equal int n !reads ;
+          is_true ~msg:"no discard" (n < 10) )
+    ; test "a failure of the body is kept" (fun () ->
+          (* More content than the check of an empty part needs. *)
+          let head = "--b\r\n" ^ disp "a" ^ "\r\nxyzw" in
+          let reads = ref 0 in
+          let src buf off _ =
+            incr reads ;
+            if !reads = 1 then begin
+              Bytes.blit_string head 0 buf off (String.length head) ;
+              String.length head
+            end
+            else raise Body.Truncated
+          in
+          raises Body.Truncated (fun () ->
+              Mp.fold ~boundary:"b" (Body.of_source src) ~init:() (fun () p ->
+                  try ignore (Body.to_string (Mp.body p))
+                  with Body.Truncated -> () ) ) ;
+          equal int 2 !reads ;
+          reads := 0 ;
+          raises Body.Truncated (fun () ->
+              Mp.fold ~boundary:"b" (Body.of_source src) ~init:() (fun () _ ->
+                  () ) ) ;
+          equal int 2 !reads )
+    ; test "the parse is linear" (fun () ->
+          (* A full buffer of 1 MiB and reads of 1 byte of the part: a search
+             from the start of the buffer at each read takes minutes. *)
+          let data = String.concat "" (List.init 87_000 (fun _ -> "\r\n-")) in
+          let s = mp_body [(disp "a", data)] in
+          let t0 = Sys.time () in
+          let one = Bytes.create 1 in
+          let rec size b n =
+            match Body.read b one 0 1 with 0 -> n | k -> size b (n + k)
+          in
+          equal (result int mp_error)
+            (Ok (String.length data))
+            (Mp.fold ~buffer_size:(1 lsl 20) ~boundary:"b" (Body.of_string s)
+               ~init:0 (fun n p -> n + size (Mp.body p) 0 ) ) ;
+          let long = disp "a" ^ "X-A: " ^ String.make 16000 'a' ^ "\r\n" in
+          ( match
+              mp_read_all ~chunk:1 ~max_header_bytes:20_000
+                (mp_body [(long, "x")])
+            with
+          | Ok [_] ->
+              ()
+          | _ ->
+              fail "one field" ) ;
+          (* Heads of many fields: an append to a list for each field takes more
+             than 10 s. *)
+          let many =
+            disp "a" ^ String.concat "" (List.init 16000 (fun _ -> "a:\r\n"))
+          in
+          ( match
+              mp_read_all ~max_header_bytes:65536
+                (mp_body (List.init 40 (fun _ -> (many, ""))))
+            with
+          | Ok l ->
+              equal int 40 (List.length l)
+          | Error e ->
+              fail (Format.asprintf "%a" Mp.pp_error e) ) ;
+          (* The CPU time of the process: other processes do not change it. *)
+          is_true ~msg:"less than 5 s of CPU" (Sys.time () -. t0 < 5.) )
+    ; test "fold refuses incorrect arguments" (fun () ->
+          let f () _ = () in
+          let b () = Body.of_string "" in
+          List.iter
+            (fun (msg, g) -> raises_match ~msg is_invalid_arg g)
+            [ ( "max_parts"
+              , fun () ->
+                  ignore
+                    (Mp.fold ~max_parts:(-1) ~boundary:"b" (b ()) ~init:() f) )
+            ; ( "max_header_bytes"
+              , fun () ->
+                  ignore
+                    (Mp.fold ~max_header_bytes:(-1) ~boundary:"b" (b ())
+                       ~init:() f ) )
+            ; ( "boundary"
+              , fun () -> ignore (Mp.fold ~boundary:"" (b ()) ~init:() f) )
+            ; ( "buffer_size"
+              , fun () ->
+                  ignore
+                    (Mp.fold ~buffer_size:13 ~boundary:"b" (b ()) ~init:() f) )
+            ; ( "max_bytes"
+              , fun () ->
+                  ignore (Mp.read_all ~max_bytes:(-1) ~boundary:"b" (b ())) ) ] ;
+          equal (result unit mp_error) (Ok ())
+            (Mp.fold ~buffer_size:14 ~boundary:"b" (Body.of_string "--b--")
+               ~init:() f ) )
+    ; test "Request.multipart_form checks the Content-Type" (fun () ->
+          let req types =
+            Request.make
+              ~headers:
+                (Headers.of_list
+                   (List.map (fun v -> ("Content-Type", v)) types) )
+              ~body:(raising Exit) Method.POST "/"
+          in
+          List.iter
+            (fun types ->
+              equal ~msg:(String.concat ", " types) mp_result
+                (Error Mp.Unsupported_media_type)
+                (Request.multipart_form (req types)) ;
+              equal ~msg:(String.concat ", " types) (result unit mp_error)
+                (Error Mp.Unsupported_media_type)
+                (Request.multipart (req types) ~init:() (fun () _ -> ())) )
+            [ []
+            ; ["text/plain; boundary=b"]
+            ; ["multipart/form-data"]
+            ; [ "multipart/form-data; boundary=b"
+              ; "multipart/form-data; boundary=b" ]
+            ; ["multipart/mixed; boundary=b"] ] ;
+          (* A limit of 0 is permitted. *)
+          equal mp_result (Error Mp.Unsupported_media_type)
+            (Request.multipart_form ~max_parts:0 ~max_header_bytes:0
+               ~max_bytes:0 (req []) ) ;
+          (* The limits come before the check of the Content-Type. *)
+          List.iter
+            (fun (msg, g) -> raises_match ~msg is_invalid_arg g)
+            [ ( "max_parts"
+              , fun () ->
+                  ignore (Request.multipart_form ~max_parts:(-1) (req [])) )
+            ; ( "max_header_bytes"
+              , fun () ->
+                  ignore
+                    (Request.multipart_form ~max_header_bytes:(-1) (req [])) )
+            ; ( "max_bytes"
+              , fun () ->
+                  ignore (Request.multipart_form ~max_bytes:(-1) (req [])) )
+            ; ( "multipart max_parts"
+              , fun () ->
+                  ignore
+                    (Request.multipart ~max_parts:(-1) (req []) ~init:()
+                       (fun () _ -> () ) ) )
+            ; ( "multipart max_header_bytes"
+              , fun () ->
+                  ignore
+                    (Request.multipart ~max_header_bytes:(-1) (req []) ~init:()
+                       (fun () _ -> () ) ) ) ] ;
+          let r () =
+            Request.with_multipart
+              [ field "a" "1"
+              ; field ~filename:"x\"y" ~content_type:"image/png" "f" "\x89PNG"
+              ]
+              (Request.make Method.POST "/")
+          in
+          equal mp_result
+            (Ok
+               [ field "a" "1"
+               ; field ~filename:"x%22y" ~content_type:"image/png" "f" "\x89PNG"
+               ] )
+            (Request.multipart_form (r ())) ;
+          equal
+            (result (list string) mp_error)
+            (Ok ["a"; "f"])
+            ( Request.multipart (r ()) ~init:[] (fun acc p -> Mp.name p :: acc)
+            |> Result.map List.rev ) )
+    ; test "encode" (fun () ->
+          let b, text = Mp.encode [field "a" "x"] in
+          equal string "caravan-" b ;
+          equal string
+            "--caravan-\r\n\
+             Content-Disposition: form-data; name=\"a\"\r\n\
+             \r\n\
+             x\r\n\
+             --caravan---\r\n"
+            text ;
+          List.iter
+            (fun (data, b) ->
+              equal ~msg:(String.escaped data) string b
+                (fst (Mp.encode [field "a" data])) )
+            [ ("x caravan-0", "caravan-")
+            ; ("\r\n--caravan-", "caravan-0")
+            ; ("--caravan-0", "caravan-1")
+            ; ("--caravan-00\r\n--caravan-01", "caravan-10")
+            ; ( "--caravan-000\r\n--caravan-001\r\n--caravan-010\r\n--caravan-"
+              , "caravan-011" )
+            ; ("\r\n--caravan-" ^ String.make 62 '0', "caravan-1") ] ;
+          (* The boundary is free in the data of each field. *)
+          equal string "caravan-11"
+            (fst
+               (Mp.encode
+                  [ field "a" "--caravan-00"
+                  ; field "b" "--caravan-01\r\n--caravan-10" ] ) ) ;
+          let _, text = Mp.encode [field ~filename:"\r\n" "\"" ""] in
+          is_true
+            (String.starts_with
+               ~prefix:
+                 "--caravan-\r\n\
+                  Content-Disposition: form-data; name=\"%22\"; \
+                  filename=\"%0D%0A\"\r\n"
+               text ) ;
+          raises_match is_invalid_arg (fun () ->
+              Mp.encode [field ~content_type:"a\nb" "a" ""] ) ;
+          refuses (fun () -> Mp.encode [field "a\x01" ""]) ;
+          raises_match is_invalid_arg (fun () ->
+              Mp.encode [field ~filename:"\x7f" "a" ""] ) ;
+          equal (option mp_field)
+            (Some (field "a" "1"))
+            (Mp.find "a" [field "b" "0"; field "a" "1"; field "a" "2"]) ;
+          equal (option mp_field) None (Mp.find "c" [field "a" "1"]) )
+    ; test "error_status and pp_error" (fun () ->
+          List.iter
+            (fun (e, code, text) ->
+              equal ~msg:text status (Status.v code) (Mp.error_status e) ;
+              equal string text (Format.asprintf "%a" Mp.pp_error e) )
+            [ (Mp.Unsupported_media_type, 415, "Unsupported_media_type")
+            ; (Mp.Malformed "x", 400, "Malformed (x)")
+            ; (Mp.Too_many_parts, 413, "Too_many_parts")
+            ; (Mp.Header_too_large, 413, "Header_too_large")
+            ; (Mp.Too_large, 413, "Too_large") ] ) ]
+
+let multipart_props =
+  let byte =
+    Gen.frequency
+      [ (3, Gen.of_list ['\r'; '\n'; '-'; 'b'; '\\'; '%'; ';'; '0'])
+      ; (1, Gen.char_range '\x80' '\xff')
+      ; (2, Gen.char) ]
+  in
+  (* The pieces of a delimiter of encode, thus partial matches of it. *)
+  let piece =
+    Gen.frequency
+      [ (6, Gen.map (String.make 1) byte)
+      ; (1, Gen.of_list ["\r\n--caravan-"; "--caravan-"; "\r\n--caravan"; "1"])
+      ]
+  in
+  let data =
+    Gen.map (String.concat "") (Gen.list ~size:(Gen.int_range 0 20) piece)
+  in
+  let name_byte =
+    (* A double quote, CR and LF come back as %22, %0D and %0A, and the other
+       control characters make an incorrect field. *)
+    Gen.such_that
+      (fun c -> c <> '"' && ((c >= ' ' && c <> '\x7f') || c >= '\x80'))
+      byte
+  in
+  let name = Gen.string_of ~size:(Gen.int_range 0 6) name_byte in
+  let gen_field =
+    Gen.map
+      (fun (n, f, d) -> field ?filename:f n d)
+      (Gen.triple name (Gen.option name) data)
+  in
+  let input =
+    Gen.triple
+      (Gen.list ~size:(Gen.int_range 0 5) gen_field)
+      (Gen.int_range 1 64) Gen.bool
+  in
+  group "Multipart laws"
+    [ prop "fold inverts encode, in chunks and buffers of each size" input
+        (fun (fields, chunk, small) ->
+          let boundary, text = Mp.encode fields in
+          let buffer_size =
+            if small then (2 * (4 + String.length boundary)) + 4 else 16384
+          in
+          let got =
+            Mp.fold ~buffer_size ~boundary
+              (Body.of_source (chunked_reader ~chunk text))
+              ~init:[]
+              (fun acc p ->
+                field ?filename:(Mp.filename p)
+                  ?content_type:(Mp.content_type p) (Mp.name p)
+                  (Body.to_string (Mp.body p))
+                :: acc )
+            |> Result.map List.rev
+          in
+          equal mp_result (Ok fields) got ) ]
+
 let request_tests =
   group "Request"
     [ test "with_scheme" (fun () ->
@@ -2650,6 +3374,8 @@ let () =
        ; request_form_tests
        ; cookie_tests
        ; cookie_props
+       ; multipart_tests
+       ; multipart_props
        ; request_tests
        ; response_tests
        ; handler_tests

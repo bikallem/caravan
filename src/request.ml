@@ -88,9 +88,9 @@ let with_scheme scheme r =
 
 let is_valid_authority s = H1_parse.is_authority s
 
-(* Exactly one [Content-Type] field, and its media type, with no parameters, is
-   that of a form. *)
-let is_form headers =
+(* The value of the one [Content-Type] field of [headers], if its media type,
+   with no parameters, is [media]. *)
+let content_type media headers =
   match Headers.find_all "content-type" headers with
   | [v] ->
       let t =
@@ -100,9 +100,12 @@ let is_form headers =
         | Some i ->
             String.sub v 0 i
       in
-      String.equal (String.lowercase_ascii (String.trim t)) Form.media_type
+      if String.equal (String.lowercase_ascii (String.trim t)) media then Some v
+      else None
   | _ ->
-      false
+      None
+
+let is_form headers = Option.is_some (content_type Form.media_type headers)
 
 let form ?(max_bytes = 1_048_576) ?(max_fields = 1000) r =
   if max_bytes < 0 then invalid_arg "Request.form: max_bytes < 0" ;
@@ -126,6 +129,50 @@ let with_form f r =
   { r with
     body= Body.of_string (Form.encode f)
   ; headers= Headers.set "Content-Type" Form.media_type r.headers }
+
+let multipart_boundary r =
+  Option.bind (content_type Multipart.media_type r.headers) Multipart.boundary
+
+(* The limits are checked before the [Content-Type], as in [form]. *)
+let check_limits fn limits =
+  List.iter
+    (fun (what, v) ->
+      match v with
+      | Some n when n < 0 ->
+          invalid_arg (Printf.sprintf "Request.%s: %s < 0" fn what)
+      | Some _ | None ->
+          () )
+    limits
+
+let multipart ?max_parts ?max_header_bytes r ~init f =
+  check_limits "multipart"
+    [("max_parts", max_parts); ("max_header_bytes", max_header_bytes)] ;
+  match multipart_boundary r with
+  | None ->
+      Error Multipart.Unsupported_media_type
+  | Some boundary ->
+      Multipart.fold ?max_parts ?max_header_bytes ~boundary r.body ~init f
+
+let multipart_form ?max_parts ?max_header_bytes ?max_bytes r =
+  check_limits "multipart_form"
+    [ ("max_parts", max_parts)
+    ; ("max_header_bytes", max_header_bytes)
+    ; ("max_bytes", max_bytes) ] ;
+  match multipart_boundary r with
+  | None ->
+      Error Multipart.Unsupported_media_type
+  | Some boundary ->
+      Multipart.read_all ?max_parts ?max_header_bytes ?max_bytes ~boundary
+        r.body
+
+let with_multipart fields r =
+  let boundary, text = Multipart.encode fields in
+  { r with
+    body= Body.of_string text
+  ; headers=
+      Headers.set "Content-Type"
+        (Multipart.media_type ^ "; boundary=" ^ boundary)
+        r.headers }
 
 let with_attrs attrs r = {r with attrs}
 
