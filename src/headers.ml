@@ -19,7 +19,7 @@ let is_valid_value s =
     | _ ->
         false
   in
-  let is_ws = function ' ' | '\t' -> true | _ -> false in
+  let is_ws = Token.is_ws in
   let n = String.length s in
   String.for_all is_field_char s
   && (n = 0 || not (is_ws s.[0] || is_ws s.[n - 1]))

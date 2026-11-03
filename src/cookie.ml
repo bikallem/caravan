@@ -1,4 +1,4 @@
-let is_ws c = c = ' ' || c = '\t'
+let is_ws = Token.is_ws
 
 (* The first index of [s.[i..j-1]] that is not a space or a tab, or [j]. *)
 let rec left s i j = if i < j && is_ws s.[i] then left s (i + 1) j else i
