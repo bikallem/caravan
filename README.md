@@ -172,6 +172,44 @@ let app handler =
   the handler, after a call of `report`. A cancel and the error of a
   request body go to the server as before.
 
+## Queries and forms
+
+`Request.query_params` gives the pairs of the query, and
+`Request.form` reads an `application/x-www-form-urlencoded` body:
+
+```ocaml
+open Caravan
+
+let search req =
+  match Form.find "q" (Request.query_params req) with
+  | Some q ->
+      Response.string ("results for " ^ q ^ "\n")
+  | None ->
+      Response.string ~status:Status.bad_request "no q\n"
+
+let login req =
+  match Request.form ~max_bytes:4096 req with
+  | Ok f ->
+      let user = Option.value ~default:"" (Form.find "user" f) in
+      Response.string ("hello " ^ user ^ "\n")
+  | Error e ->
+      Response.string ~status:(Form.error_status e)
+        (Format.asprintf "%a\n" Form.pp_error e)
+```
+
+- A pair list (`Form.t`) keeps the order and the duplicates.
+  `Form.find` gives the first value, and `Form.find_all` gives all of
+  them. Names are case-sensitive.
+- The parse follows the WHATWG URL Standard: `+` is a space, and an
+  incorrect `%` stays as it is. The parse never fails.
+- `Request.form` reads the body, thus call it one time. It gives
+  `Unsupported_media_type`, `Too_large` (1 MiB by default) or
+  `Too_many_fields` (1000 by default). `Form.error_status` gives `415`
+  or `413`. A body that declares a length larger than the limit is not
+  read, thus the client gets no `100 Continue`.
+- `Request.with_form` gives a request a form body, for the client or for
+  a test.
+
 ## WebSocket
 
 The `caravan.websocket` library adds WebSocket

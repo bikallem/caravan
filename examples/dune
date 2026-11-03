@@ -72,3 +72,20 @@
     awk
     "/^## Middleware/ { section = 1 } section && /^```ocaml/ { inside = 1; found = 1; print \"[@@@warning \\\"-32\\\"]\"; next } inside && /^```/ { exit } inside; END { if (!found) exit 1 }"
     %{dep:../README.md}))))
+
+; The example of the "Queries and forms" section of README.md, as
+; readme_forms.ml.
+
+(executable
+ (name readme_forms)
+ (modules readme_forms)
+ (libraries caravan))
+
+(rule
+ (action
+  (with-stdout-to
+   readme_forms.ml
+   (run
+    awk
+    "/^## Queries and forms/ { section = 1 } section && /^```ocaml/ { inside = 1; found = 1; print \"[@@@warning \\\"-32\\\"]\"; next } inside && /^```/ { exit } inside; END { if (!found) exit 1 }"
+    %{dep:../README.md}))))
