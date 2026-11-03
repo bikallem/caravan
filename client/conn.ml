@@ -20,16 +20,17 @@ type t =
            the first release: user code cannot make the smallest
            [Clock.mono]. *) }
 
-let next_id = Atomic.make 0
-
 (* The size of the read and the write buffer of a connection. *)
 let buffer_size = 4096
 
-let make ~host ~port flow =
+(* [make ~id ~host ~port flow] is a connection. The pool gives [id], unique in
+   the pool: a counter of each pool, thus a run does not depend on the runs
+   before it. *)
+let make ~id ~host ~port flow =
   { flow
   ; host
   ; port
-  ; id= Atomic.fetch_and_add next_id 1
+  ; id
   ; read_buf= Bytes.create buffer_size
   ; write_buf= Bytes.create buffer_size
   ; released_at= None }

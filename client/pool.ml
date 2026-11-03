@@ -24,8 +24,12 @@ type t =
   ; lock: Mutex.t
   ; idle: (string * int, Conn.t list) Hashtbl.t
   ; in_use: (int, Conn.t) Hashtbl.t
+  ; next_id: int Atomic.t  (** The id of the next connection. *)
   ; mutable closed: bool }
 
+(* The tables are not randomized: with [OCAMLRUNPARAM=R], a random hash would
+   change the order of the closes of [close], thus a replay of a seed would not
+   be exact. *)
 let make ?connect config =
   let connect =
     match connect with
@@ -37,8 +41,9 @@ let make ?connect config =
   { config
   ; connect
   ; lock= Mutex.create ()
-  ; idle= Hashtbl.create 8
-  ; in_use= Hashtbl.create 8
+  ; idle= Hashtbl.create ~random:false 8
+  ; in_use= Hashtbl.create ~random:false 8
+  ; next_id= Atomic.make 0
   ; closed= false }
 
 (* The newest idle connection of [key], now in use. *)
@@ -93,7 +98,12 @@ let rec checkout ?(reuse = true) t ~host ~port =
   | Some c ->
       (c, `Reused)
   | None ->
-      let c = Conn.make ~host:(fst key) ~port (t.connect ~host ~port) in
+      let flow = t.connect ~host ~port in
+      let c =
+        Conn.make
+          ~id:(Atomic.fetch_and_add t.next_id 1)
+          ~host:(fst key) ~port flow
+      in
       let added =
         Mutex.protect t.lock (fun () ->
             if t.closed then false

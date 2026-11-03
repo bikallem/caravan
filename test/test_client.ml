@@ -90,7 +90,7 @@ let with_client_flow ?write ?on_write_timeout sim f =
       Flow.close server ;
       Flow.close client )
   @@ fun () ->
-  let conn = Conn.make ~host:"a" ~port:80 client in
+  let conn = Conn.make ~id:0 ~host:"a" ~port:80 client in
   f ~scope ~server ~writers ~conn ~taken:counted.read_bytes
 
 (* [conn_in sim f] gives [f] a connection of [with_client_flow]. *)
@@ -827,7 +827,7 @@ let exchange_tests =
           let writers = Writers.make scope in
           Writers.stop writers ;
           Writers.wait writers ;
-          let conn = Conn.make ~host:"a" ~port:80 client
+          let conn = Conn.make ~id:0 ~host:"a" ~port:80 client
           and releases = ref []
           and closes = Atomic.make 0 in
           let source =
@@ -1123,7 +1123,8 @@ let exchange_tests =
           with_client_flow sim
           @@ fun ~scope ~server ~writers ~conn ~taken:_ ->
           let flow, nones = none_counted conn.flow in
-          let conn = Conn.make ~host:"a" ~port:80 flow and releases = ref [] in
+          let conn = Conn.make ~id:0 ~host:"a" ~port:80 flow
+          and releases = ref [] in
           let r = Buf_reader.of_flow server in
           let s =
             Sim_support.call ~name:"server" scope (fun () ->
@@ -1430,7 +1431,7 @@ let exchange_tests =
           Server_support.with_flows sim
           @@ fun ~server:_ ~client ->
           let writers = Fiber.scope (fun s -> Writers.make s) in
-          let conn = Conn.make ~host:"a" ~port:80 client
+          let conn = Conn.make ~id:0 ~host:"a" ~port:80 client
           and releases = ref []
           and closes = Atomic.make 0 in
           let source =
@@ -1647,7 +1648,7 @@ let exchange_tests =
           Server_support.with_flows sim
           @@ fun ~server:_ ~client ->
           let writers = Fiber.scope (fun s -> Writers.make s) in
-          let conn = Conn.make ~host:"a" ~port:80 client
+          let conn = Conn.make ~id:0 ~host:"a" ~port:80 client
           and releases = ref [] in
           let source =
             Body.of_source ~length:3
@@ -2026,6 +2027,15 @@ let pool_tests =
             ; interval (Span.ms 0)
             ; interval (Span.ms 20)
             ; interval (Span.ms 5000) ] )
+    ; test "each pool counts its own connection ids" (fun () ->
+          (* Thus a run of the simulator does not depend on the runs before
+             it. *)
+          let a, _ = fake_pool () and b, _ = fake_pool () in
+          let ca, _ = Pool.checkout a ~host:"a" ~port:80 in
+          let ca', _ = Pool.checkout a ~host:"a" ~port:80 in
+          equal (list int) [0; 1] [ca.Conn.id; ca'.Conn.id] ;
+          let cb, _ = Pool.checkout b ~host:"a" ~port:80 in
+          equal int 0 cb.Conn.id )
     ; test "the pool keeps no empty list of a host" (fun () ->
           Sim_support.manual
           @@ fun sim ->
@@ -2215,17 +2225,21 @@ module Pool_system = struct
   (* The simulator of the program that runs. *)
   let sim : Weft_sim.t option ref = ref None
 
-  type pool = {pool: Pool.t; fakes: (int, fake) Hashtbl.t; connects: int ref}
+  type pool = {pool: Pool.t; fakes: fake list ref; connects: int ref}
 
-  let owners : (int, pool) Hashtbl.t = Hashtbl.create 64
+  (* The ids of connections are unique only in a pool: the owner of a connection
+     is found by the connection itself. [execute_pool] empties the list for each
+     program. *)
+  let owners : (Conn.t * pool) list ref = ref []
+
+  let owner (c : Conn.t) = snd (List.find (fun (c', _) -> c' == c) !owners)
 
   let make () =
-    let fakes = Hashtbl.create 8 and connects = ref 0 in
+    let fakes = ref [] and connects = ref 0 in
     let connect ~host:_ ~port:_ =
       incr connects ;
       let f = fake () in
-      (* [Conn.make] takes the next id after the connect. *)
-      Hashtbl.replace fakes (Atomic.get Conn.next_id) f ;
+      fakes := f :: !fakes ;
       f.flow
     in
     let config =
@@ -2235,15 +2249,15 @@ module Pool_system = struct
 
   let checkout p =
     let c, _ = Pool.checkout p.pool ~host:"a" ~port:80 in
-    Hashtbl.replace owners c.Conn.id p ;
+    owners := (c, p) :: List.filter (fun (c', _) -> c' != c) !owners ;
     c
 
-  let release (c : Conn.t) reusable =
-    Pool.release (Hashtbl.find owners c.id).pool c ~reusable
+  let release (c : Conn.t) reusable = Pool.release (owner c).pool c ~reusable
 
   let advance _ n = Sim_support.advance (Option.get !sim) (Span.ms n)
 
-  let fake_of (c : Conn.t) = Hashtbl.find (Hashtbl.find owners c.id).fakes c.id
+  let fake_of (c : Conn.t) =
+    List.find (fun f -> f.flow == c.flow) !((owner c).fakes)
 
   let server_close c = Atomic.set (fake_of c).server_closed true
 
@@ -2304,6 +2318,7 @@ let execute_pool p =
   Sim_support.manual
   @@ fun sim ->
   Pool_system.sim := Some sim ;
+  Pool_system.owners := [] ;
   Fun.protect
     ~finally:(fun () -> Pool_system.sim := None)
     (fun () -> Stateful.execute p)
