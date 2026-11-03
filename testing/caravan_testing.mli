@@ -33,6 +33,7 @@ val run :
   -> ?seed:int
   -> ?domains:int
   -> ?manual:bool
+  -> ?stop_on_signals:bool
   -> ?guard:Weft.Span.t
   -> Caravan.Handler.t
   -> (t -> 'a)
@@ -52,6 +53,8 @@ val run :
       [Weft_sim.run].
     - [manual] (default [false]) runs the simulator in manual mode: see
       {!section-manual}.
+    - [stop_on_signals] (default [false]) stops the server at SIGINT and
+      SIGTERM, as [Caravan.Server.run] does: see {!section-signals}.
     - [guard] limits [f] only, not the close of the client and the server after
       [f]. In auto mode it is 10 min of virtual time by default. While [f] runs
       and the client is open, the guard is then the only stop: the reaper of the
@@ -102,6 +105,39 @@ val background : t -> (unit -> 'a) -> 'a Weft.Promise.t
 
     @raise Weft.Fiber.Scope_closed after the end of the function of {!run}. *)
 
+(** {1:signals Signals}
+
+    With [run ~stop_on_signals:true], the simulator watches SIGINT and SIGTERM,
+    and a daemon fiber calls [Caravan.Server.stop_on_signals]:
+    - The first signal stops the server with [config.shutdown_grace]. The server
+      refuses new connections: a request raises a [Caravan_client.Error] (the
+      case depends on the domains and the pool). A request in progress gets the
+      grace, but the [response_timeout] of the client (30 s by default) can end
+      it first. In manual mode, only an advance, a second signal or the end of
+      {!run} ends the grace.
+    - The second signal aborts the server.
+    - The third signal ends the program.
+
+    A signal that ends the program ends the run at once: [Weft_sim.run] raises
+    [Weft_sim.Killed] from its scheduler. Thus there is no teardown: {!run} does
+    not check the errors and does not wait for the server. In {!race}, the error
+    is in {!Race_failed}.
+
+    A signal that the world does not watch gets its default action at once, as
+    in a program that does not watch it. With no [~stop_on_signals], the world
+    watches no signal. Most signals end the program, but SIGCHLD, SIGWINCH,
+    SIGCONT, SIGSTOP and SIGTSTP do nothing, and the world ignores SIGPIPE (see
+    [Weft_sim.program]).
+
+    A test that also calls [Caravan.Server.stop_on_signals (server t)] makes a
+    second watcher: each signal goes to one of the two. *)
+
+val signal : t -> Weft.Signal.t -> unit
+(** [signal t s] sends [s] to the program of the run, then lets each fiber that
+    can run, run ({!settle}). Thus after a first signal, the server has started
+    to stop: its [Caravan.Conn_info.stopping] is ready. Two calls are a first
+    and a second signal. Call it from a fiber of the run. *)
+
 (** {1:race Many seeds} *)
 
 (** A run of {!race} raised [error]. *)
@@ -118,6 +154,7 @@ val race :
   -> ?on_error:(exn -> Printexc.raw_backtrace -> unit)
   -> ?client_config:Caravan_client.Config.t
   -> ?manual:bool
+  -> ?stop_on_signals:bool
   -> ?guard:Weft.Span.t
   -> Caravan.Handler.t
   -> (t -> unit)

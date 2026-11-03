@@ -760,6 +760,161 @@ let background_tests =
               T.settle t ) ;
           is_true ~msg:"Scope_closed" (Atomic.get closed) ) ]
 
+(* The handlers of the signal tests fill [started] when they start. Each test
+   waits for it before its signal. *)
+let note_start started = ignore (Ivar.try_fill started ())
+
+(* [until_stop started req] gives "done" when the server starts to stop. *)
+let until_stop started req =
+  note_start started ;
+  sync (Conn_info.stopping (Option.get (Request.conn req))) ;
+  ok "done"
+
+(* [ignores_stop started cancelled req] waits until a cancel, also during a
+   stop. It then sets [cancelled]. *)
+let ignores_stop started cancelled req =
+  note_start started ;
+  records_cancel cancelled req
+
+(* [get_result t] is a GET of "/", with the error of the client as a value. *)
+let get_result t =
+  match T.get t "/" with
+  | r ->
+      Ok r.body
+  | exception Caravan_client.Error e ->
+      Error e
+
+let is_client_error = function Caravan_client.Error _ -> true | _ -> false
+
+let is_killed s = function Weft_sim.Killed s' -> s' = s | _ -> false
+
+let signal_tests =
+  group "Signals"
+    [ test "SIGTERM: the request in progress gets its response" (fun () ->
+          let started = Ivar.create () in
+          let r =
+            T.run ~stop_on_signals:true (until_stop started) (fun t ->
+                let p = T.background t (fun () -> T.get t "/") in
+                sync (Ivar.read started) ;
+                T.signal t Signal.SIGTERM ;
+                Promise.await p )
+          in
+          equal string "done" r.body ;
+          equal (option string) (Some "close")
+            (Headers.find "connection" r.headers) )
+    ; test "after a SIGTERM, a new request fails" (fun () ->
+          T.race ~seeds:20 ~stop_on_signals:true
+            (fun _ -> ok "")
+            (fun t ->
+              T.signal t Signal.SIGTERM ;
+              raises_match is_client_error (fun () -> ignore (T.get t "/")) ) )
+    ; test "a SIGTERM closes the idle connection of the pool" (fun () ->
+          T.race ~seeds:20 ~stop_on_signals:true
+            (fun _ -> ok "a")
+            (fun t ->
+              equal string "a" (T.get t "/").body ;
+              T.signal t Signal.SIGTERM ;
+              raises_match is_client_error (fun () -> ignore (T.get t "/")) ) )
+    ; test "manual: the grace of a SIGTERM ends at its exact time" (fun () ->
+          let config = {Config.default with shutdown_grace= Span.s 10} in
+          let cancelled = Atomic.make false and started = Ivar.create () in
+          T.run ~manual:true ~stop_on_signals:true ~config
+            (ignores_stop started cancelled) (fun t ->
+              let done_ = Ivar.create () in
+              let p =
+                T.background t (fun () ->
+                    let r = get_result t in
+                    ignore (Ivar.try_fill done_ ()) ;
+                    r )
+              in
+              sync (Ivar.read started) ;
+              let t0 = Time.now Mono in
+              T.signal t Signal.SIGTERM ;
+              T.advance_to t
+                (Option.get (Time.add Mono t0 (Span.ns (10_000_000_000 - 1)))) ;
+              is_false ~msg:"at 10 s - 1 ns" (ended done_) ;
+              T.advance t (Span.ns 1) ;
+              is_true ~msg:"at 10 s" (ended done_) ;
+              is_true ~msg:"the handler got a cancel" (Atomic.get cancelled) ;
+              is_true ~msg:"Closed" (Promise.await p = Error Closed) ;
+              equal int 0 (List.length (T.take_errors t)) ) )
+    ; test "manual: the end of the run ends the grace of a SIGTERM" (fun () ->
+          (* The handler does not see the client leave, thus only the abort at
+             the end can end it. *)
+          let config = {Config.default with cancel_on_disconnect= false} in
+          let cancelled = Atomic.make false and started = Ivar.create () in
+          T.run ~manual:true ~stop_on_signals:true ~config
+            (ignores_stop started cancelled) (fun t ->
+              ignore (T.background t (fun () -> get_result t)) ;
+              sync (Ivar.read started) ;
+              T.signal t Signal.SIGTERM ) ;
+          is_true ~msg:"the handler got a cancel" (Atomic.get cancelled) )
+    ; test "SIGINT, then SIGTERM: the second signal aborts" (fun () ->
+          let cancelled = Atomic.make false and started = Ivar.create () in
+          T.run ~manual:true ~stop_on_signals:true
+            (ignores_stop started cancelled) (fun t ->
+              let p = T.background t (fun () -> get_result t) in
+              sync (Ivar.read started) ;
+              T.signal t Signal.SIGINT ;
+              is_false ~msg:"the grace" (Atomic.get cancelled) ;
+              T.signal t Signal.SIGTERM ;
+              is_true ~msg:"the abort" (Atomic.get cancelled) ;
+              is_true ~msg:"Closed" (Promise.await p = Error Closed) ) )
+    ; test "a third signal ends the program" (fun () ->
+          (* [three_signals runner] gives [runner] a handler that is deaf to its
+             cancel, and a function that sends three SIGINTs. *)
+          let three_signals runner =
+            let started = Ivar.create () in
+            let deaf _ =
+              note_start started ;
+              on_cancel (fun () ->
+                  Fiber.shield (fun () -> Time.sleep Mono (Span.s 3600)) )
+            in
+            runner deaf (fun t ->
+                ignore (T.background t (fun () -> get_result t)) ;
+                sync (Ivar.read started) ;
+                List.iter (T.signal t) Signal.[SIGINT; SIGINT; SIGINT] )
+          in
+          raises_match (is_killed Signal.SIGINT) (fun () ->
+              three_signals (fun h f ->
+                  T.run ~manual:true ~stop_on_signals:true h f ) ) ;
+          raises_match
+            (function
+              | T.Race_failed {error; _} ->
+                  is_killed Signal.SIGINT error
+              | _ ->
+                  false )
+            (fun () ->
+              three_signals (fun h f ->
+                  T.race ~seeds:1 ~manual:true ~stop_on_signals:true h f ) ) )
+    ; test "a signal that the run does not watch ends the program" (fun () ->
+          raises_match (is_killed Signal.SIGTERM) (fun () ->
+              T.run (fun _ -> ok "") (fun t -> T.signal t Signal.SIGTERM) ) ;
+          raises_match (is_killed Signal.SIGHUP) (fun () ->
+              T.run ~stop_on_signals:true
+                (fun _ -> ok "")
+                (fun t -> T.signal t Signal.SIGHUP) ) )
+    ; test "auto: the grace ends a request that ignores the stop" (fun () ->
+          let cancelled = Atomic.make false and started = Ivar.create () in
+          let r, d =
+            T.run ~stop_on_signals:true (ignores_stop started cancelled)
+              (fun t ->
+                let p = T.background t (fun () -> get_result t) in
+                sync (Ivar.read started) ;
+                elapsed (fun () -> T.signal t Signal.SIGTERM ; Promise.await p) )
+          in
+          is_true ~msg:"Closed" (r = Error Closed) ;
+          at_least ~msg:"the grace of 10 s" (Span.s 10) d ;
+          is_true ~msg:"less than 11 s" (Span.compare d (Span.s 11) < 0) )
+    ; test "manual: a wait for nothing is a deadlock, also with signals"
+        (fun () ->
+          raises_match
+            (function Weft_sim.Deadlock _ -> true | _ -> false)
+            (fun () ->
+              T.run ~manual:true ~stop_on_signals:true
+                (fun _ -> ok "")
+                (fun _ -> sync (Ivar.read (Ivar.create ()))) ) ) ]
+
 let () =
   exit
     (Windtrap.run "testing"
@@ -769,4 +924,5 @@ let () =
        ; sim_tests
        ; race_tests
        ; manual_tests
-       ; background_tests ] )
+       ; background_tests
+       ; signal_tests ] )

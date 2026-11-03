@@ -33,6 +33,48 @@ let span_text d =
   if ns = 0L then "0 s"
   else pick [(1_000_000_000L, "s"); (1_000_000L, "ms"); (1_000L, "us")]
 
+let signal_name : Signal.t -> string = function
+  | SIGHUP ->
+      "SIGHUP"
+  | SIGINT ->
+      "SIGINT"
+  | SIGQUIT ->
+      "SIGQUIT"
+  | SIGILL ->
+      "SIGILL"
+  | SIGABRT ->
+      "SIGABRT"
+  | SIGFPE ->
+      "SIGFPE"
+  | SIGKILL ->
+      "SIGKILL"
+  | SIGSEGV ->
+      "SIGSEGV"
+  | SIGBUS ->
+      "SIGBUS"
+  | SIGPIPE ->
+      "SIGPIPE"
+  | SIGALRM ->
+      "SIGALRM"
+  | SIGTERM ->
+      "SIGTERM"
+  | SIGUSR1 ->
+      "SIGUSR1"
+  | SIGUSR2 ->
+      "SIGUSR2"
+  | SIGCHLD ->
+      "SIGCHLD"
+  | SIGCONT ->
+      "SIGCONT"
+  | SIGSTOP ->
+      "SIGSTOP"
+  | SIGTSTP ->
+      "SIGTSTP"
+  | SIGWINCH ->
+      "SIGWINCH"
+  | Other_signal n ->
+      "signal " ^ string_of_int n
+
 let () =
   Printexc.register_printer (function
     | Guard_expired d ->
@@ -59,6 +101,8 @@ let () =
         Some ("Weft_sim.Unawaited: " ^ String.concat "; " l)
     | Weft_sim.Model_error m ->
         Some ("Weft_sim.Model_error: " ^ m)
+    | Weft_sim.Killed sg ->
+        Some ("Weft_sim.Killed: " ^ signal_name sg)
     | Unchecked_errors l ->
         Some
           ( "Caravan_testing.Unchecked_errors: "
@@ -111,8 +155,8 @@ let push errors e =
 let reraise (e, bt) = Printexc.raise_with_backtrace e bt
 
 let run ?(config = Config.default) ?engine ?(on_error = fun _ _ -> ())
-    ?client_config ?(seed = 0) ?(domains = 1) ?(manual = false) ?guard handler f
-    =
+    ?client_config ?(seed = 0) ?(domains = 1) ?(manual = false)
+    ?(stop_on_signals = false) ?guard handler f =
   let errors = Atomic.make [] in
   (* The first exception of [on_error]. *)
   let failed = Atomic.make None in
@@ -145,9 +189,15 @@ let run ?(config = Config.default) ?engine ?(on_error = fun _ _ -> ())
     if manual then g (Caravan_client.make ?config:client_config sw)
     else Caravan_client.run ?config:client_config g
   in
-  Weft_sim.run ~seed ~domains ~auto:(not manual) (fun sim ->
+  let signals =
+    if stop_on_signals then [Signal.SIGINT; Signal.SIGTERM] else []
+  in
+  Weft_sim.run ~seed ~domains ~auto:(not manual) ~signals (fun sim ->
       Fiber.scope (fun sw ->
           let server = Server.start ?engine ~config sw handler in
+          if stop_on_signals then
+            Fiber.fork_daemon ~name:"caravan_testing.signals" sw (fun () ->
+                Server.stop_on_signals server ) ;
           let outcome =
             match
               with_client sw (fun client ->
@@ -177,6 +227,7 @@ let run ?(config = Config.default) ?engine ?(on_error = fun _ _ -> ())
             | exception e ->
                 Error (e, Printexc.get_raw_backtrace ())
           in
+          (* After a first signal, the abort ends the grace. *)
           Server.abort server ;
           (* The wait awaits the promise of the server, also on the error paths:
              a failed promise that no fiber awaited writes a report to the
@@ -209,7 +260,7 @@ let run ?(config = Config.default) ?engine ?(on_error = fun _ _ -> ())
                 raise (Unchecked_errors l) ) ) )
 
 let race ?(seeds = 100) ?replay ?(domains = 4) ?config ?engine ?on_error
-    ?client_config ?manual ?guard handler f =
+    ?client_config ?manual ?stop_on_signals ?guard handler f =
   if replay = None && seeds < 1 then
     invalid_arg "Caravan_testing.race: seeds < 1" ;
   if domains < 1 then invalid_arg "Caravan_testing.race: domains < 1" ;
@@ -220,7 +271,7 @@ let race ?(seeds = 100) ?replay ?(domains = 4) ?config ?engine ?on_error
     (fun seed ->
       match
         run ?config ?engine ?on_error ?client_config ~seed ~domains ?manual
-          ?guard handler f
+          ?stop_on_signals ?guard handler f
       with
       | () ->
           ()
@@ -239,6 +290,8 @@ let background t g =
 let domains t = t.domains
 
 let settle t = Weft_sim.settle t.sim
+
+let signal t s = Weft_sim.signal t.sim s ; settle t
 
 let advance_to t at =
   if not t.manual then
