@@ -83,9 +83,43 @@ let handler = Handler.compose [auth] hello
 
 `examples/middleware.ml` has a full example.
 
-The libraries `caravan`, `caravan.client` and `caravan.websocket` depend
-on no world of weft. They run in each world, for example the OS world
-(`Weft.run (module Weft_os)`) and the simulator of weft (`Weft_sim.run`).
+The libraries `caravan`, `caravan.client`, `caravan.websocket` and
+`caravan.router` depend on no world of weft. They run in each world,
+for example the OS world (`Weft.run (module Weft_os)`) and the
+simulator of weft (`Weft_sim.run`). `caravan.testing` runs only in the
+simulator.
+
+## Routing
+
+The `caravan.router` library gives a handler for each method and path
+pattern:
+
+```ocaml
+let app =
+  Caravan_router.(
+    handler
+      [ get "/" (fun _ -> Caravan.Response.string "home\n")
+      ; group "/users"
+          [ get "" (fun _ -> Caravan.Response.string "all users\n")
+          ; get "/:id" (fun req ->
+                Caravan.Response.string ("user " ^ param "id" req ^ "\n") ) ]
+      ] )
+```
+
+- A parameter `:id` matches one segment, and `**` matches the rest of
+  the path. The router decodes each segment after the split.
+- `/users` and `/users/` are different paths.
+- A literal comes before a parameter, and a parameter before `**`, also
+  when the order of the list is different.
+- The router gives `405` with `Allow`, a `204` with `Allow` to
+  `OPTIONS`, and the `GET` route to `HEAD`. It gives `400` to a path
+  with `.` or `..` segments. But a decoded value can contain `../`
+  (from `%2F`), thus a parameter or the rest is not a safe file path.
+- A group can have its own middleware. The template of the route
+  (`Caravan_router.template`) is on the request and on the response,
+  for an access log.
+
+`examples/router.ml` has a full example.
 
 ## WebSocket
 
@@ -187,7 +221,7 @@ flake.lock pin.
 
 The repository includes a Nix flake. Its dev shell provides OCaml 5.5,
 dune, weft, http-date, windtrap, ppx_windtrap, ocaml-lsp, utop,
-ocamlformat and odoc. `nix build` builds the caravan package (the three
+ocamlformat and odoc. `nix build` builds the caravan package (the five
 libraries, with no tests).
 
 With [direnv](https://direnv.net) and

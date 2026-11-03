@@ -1,9 +1,15 @@
 ; The examples run in Weft_os, the world of weft for the OS of the build.
 
 (executables
- (names hello middleware ws_echo fetch readme)
- (modules hello middleware ws_echo fetch readme)
- (libraries caravan caravan.websocket caravan.client weft weft.os))
+ (names hello middleware router ws_echo fetch readme)
+ (modules hello middleware router ws_echo fetch readme)
+ (libraries
+  caravan
+  caravan.websocket
+  caravan.client
+  caravan.router
+  weft
+  weft.os))
 
 ; The first OCaml example of README.md. The rule copies it to readme.ml, so the
 ; build fails if this example of the README does not compile. awk fails if
@@ -32,4 +38,20 @@
    (run
     awk
     "/^## Testing/ { section = 1 } section && /^```ocaml/ { inside = 1; found = 1; next } inside && /^```/ { exit } inside; END { if (!found) exit 1 }"
+    %{dep:../README.md}))))
+
+; The example of the Routing section of README.md, as readme_router.ml.
+
+(executable
+ (name readme_router)
+ (modules readme_router)
+ (libraries caravan caravan.router))
+
+(rule
+ (action
+  (with-stdout-to
+   readme_router.ml
+   (run
+    awk
+    "/^## Routing/ { section = 1 } section && /^```ocaml/ { inside = 1; found = 1; print \"[@@@warning \\\"-32\\\"]\"; next } inside && /^```/ { exit } inside; END { if (!found) exit 1 }"
     %{dep:../README.md}))))
