@@ -392,6 +392,17 @@ let date_tests =
           is_true ~msg:"same second reuses the string" (a == b) ;
           equal string (enc 1001.) (Date.of_posix (posix 1001.)) ;
           equal string (enc 1000.) (Date.of_posix (posix 1000.)) )
+    ; test "to_imf has no cache" (fun () ->
+          let a = Date.of_posix (posix 1000.) in
+          List.iter
+            (fun (t, text) -> equal string text (Date.to_imf (posix t)))
+            [ (784111777.9, "Sun, 06 Nov 1994 08:49:37 GMT")
+            ; (-1.5, "Wed, 31 Dec 1969 23:59:58 GMT")
+            ; (-9214560000., "Sat, 01 Jan 1678 00:00:00 GMT")
+            ; (9214646400., "Wed, 01 Jan 2262 00:00:00 GMT")
+            ; (-9223372036., "Tue, 21 Sep 1677 00:12:44 GMT") ] ;
+          is_true ~msg:"the cache keeps its second"
+            (a == Date.of_posix (posix 1000.5)) )
     ; test "of_posix drops the fraction of a time before 1970" (fun () ->
           equal string "Thu, 01 Jan 1970 00:00:00 GMT"
             (Date.of_posix (posix 0.5)) ;
