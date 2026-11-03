@@ -1631,6 +1631,287 @@ let request_form_tests =
             (Body.length (Request.body r)) ;
           equal form_result (Ok l) (Request.form r) ) ]
 
+(* Cookie *)
+
+(* [refuses f] makes sure that [f ()] raises [Invalid_argument]. *)
+let refuses ?msg f = raises_match ?msg is_invalid_arg (fun () -> ignore (f ()))
+
+(* RFC 6265 §4.1.1, as a list of ranges. *)
+let is_cookie_octet c =
+  let k = Char.code c in
+  k = 0x21
+  || (k >= 0x23 && k <= 0x2B)
+  || (k >= 0x2D && k <= 0x3A)
+  || (k >= 0x3C && k <= 0x5B)
+  || (k >= 0x5D && k <= 0x7E)
+
+let cookie_tests =
+  let ok ?msg c =
+    ignore (c ()) ;
+    ignore msg
+  in
+  group "Cookie"
+    [ test "parse" (fun () ->
+          List.iter
+            (fun (s, l) -> equal ~msg:s pairs l (Cookie.parse s))
+            [ ("a=1; b=2", [("a", "1"); ("b", "2")])
+            ; ("a=1;b=2", [("a", "1"); ("b", "2")])
+            ; (" a = 1 ;; b=2 ;", [("a", "1"); ("b", "2")])
+            ; ("a=1; a=2", [("a", "1"); ("a", "2")])
+            ; ("a=1, b=2", [("a", "1, b=2")])
+            ; ("a", [])
+            ; ("=x", [])
+            ; (" =x; b=2", [("b", "2")])
+            ; ("a=b=c", [("a", "b=c")])
+            ; ("a=\"q\"", [("a", "q")])
+            ; ("a=\"", [("a", "\"")])
+            ; ("a=\"\"", [("a", "")])
+            ; ("a=\"x", [("a", "\"x")])
+            ; ("a=x\"", [("a", "x\"")])
+            ; ("a= \"q\" ", [("a", "q")])
+            ; ("a=\" q \"", [("a", " q ")])
+            ; ("\ta=1\t;\tb=2", [("a", "1"); ("b", "2")])
+            ; ("a=\x0c1", [("a", "\x0c1")])
+            ; ("a=", [("a", "")])
+            ; ("", []) ] )
+    ; test "parse_set_cookie" (fun () ->
+          List.iter
+            (fun (s, p) ->
+              equal ~msg:s
+                (option (pair string string))
+                p
+                (Cookie.parse_set_cookie s) )
+            [ ("a=1; Path=/", Some ("a", "1"))
+            ; ("a", None)
+            ; ("=1; Path=/", None)
+            ; (" a = \"1\" ;x", Some ("a", "1"))
+            ; ("a=1", Some ("a", "1")) ] )
+    ; test "the defaults" (fun () ->
+          equal string "a=1; Path=/; HttpOnly; SameSite=Lax"
+            (Cookie.to_string (Cookie.make "a" "1")) )
+    ; test "all attributes, in order" (fun () ->
+          equal string
+            "a=1; Expires=Sun, 06 Nov 1994 08:49:37 GMT; Max-Age=60; \
+             Domain=example.com; Path=/x; Secure; HttpOnly; SameSite=Strict; \
+             Partitioned"
+            (Cookie.to_string
+               (Cookie.make ~expires:(posix 784111777.) ~max_age:60
+                  ~domain:"example.com" ~path:"/x" ~secure:true
+                  ~same_site:`Strict ~partitioned:true "a" "1" ) ) )
+    ; test "attributes turned off" (fun () ->
+          equal string "a=1; Path=/x; Secure; SameSite=None"
+            (Cookie.to_string
+               (Cookie.make ~http_only:false ~same_site:`None ~secure:true
+                  ~path:"/x" "a" "1" ) ) ;
+          equal string "a=1; Path=/"
+            (Cookie.to_string
+               (Cookie.make ~http_only:false ~same_site:`Unspecified "a" "1") ) )
+    ; test "the value has only cookie-octets" (fun () ->
+          for k = 0 to 255 do
+            let v = String.make 1 (Char.chr k) in
+            let msg = Printf.sprintf "byte 0x%02X" k in
+            if is_cookie_octet (Char.chr k) then
+              equal ~msg string v (Cookie.make "a" v).value
+            else refuses ~msg (fun () -> Cookie.make "a" v)
+          done ;
+          equal string "" (Cookie.make "a" "").value )
+    ; test "make refuses incorrect names and attributes" (fun () ->
+          List.iter
+            (fun (msg, f) -> refuses ~msg f)
+            [ ("a name with a space", fun () -> Cookie.make "a b" "1")
+            ; ("an empty name", fun () -> Cookie.make "" "1")
+            ; ("a name with =", fun () -> Cookie.make "a=" "1")
+            ; ("a domain with ;", fun () -> Cookie.make ~domain:"a;b" "a" "1")
+            ; ( "a domain with CR LF"
+              , fun () -> Cookie.make ~domain:"a\r\nb" "a" "1" )
+            ; ( "a domain with DEL"
+              , fun () -> Cookie.make ~domain:"a\x7f" "a" "1" )
+            ; ( "a domain with a space"
+              , fun () -> Cookie.make ~domain:"a b" "a" "1" )
+            ; ("an empty domain", fun () -> Cookie.make ~domain:"" "a" "1")
+            ; ("a domain .", fun () -> Cookie.make ~domain:"." "a" "1")
+            ; ("a domain ..", fun () -> Cookie.make ~domain:".." "a" "1")
+            ; ("a domain a..b", fun () -> Cookie.make ~domain:"a..b" "a" "1")
+            ; ("a domain a.", fun () -> Cookie.make ~domain:"a." "a" "1")
+            ; ("a path with a space", fun () -> Cookie.make ~path:"/a b" "a" "1")
+            ; ( "a path that ends with a space"
+              , fun () -> Cookie.make ~path:"/ " "a" "1" )
+            ; ("a path with no /", fun () -> Cookie.make ~path:"x" "a" "1")
+            ; ("an empty path", fun () -> Cookie.make ~path:"" "a" "1")
+            ; ("a path with ;", fun () -> Cookie.make ~path:"/a;b" "a" "1")
+            ; ("a path with DEL", fun () -> Cookie.make ~path:"/\x7f" "a" "1")
+            ; ("a path with 0x1F", fun () -> Cookie.make ~path:"/\x1f" "a" "1")
+            ; ("a path with 0x80", fun () -> Cookie.make ~path:"/\x80" "a" "1")
+            ; ("a negative max_age", fun () -> Cookie.make ~max_age:(-1) "a" "1")
+            ] ;
+          ok (fun () -> Cookie.make ~max_age:0 "a" "1") ;
+          ok (fun () -> Cookie.make ~domain:".a-b_c.example9" "a" "1") ;
+          ok (fun () -> Cookie.make ~path:"/!~" "a" "1") )
+    ; test "the limits of the sizes" (fun () ->
+          let name = "a" in
+          ok (fun () -> Cookie.make name (String.make 4095 'v')) ;
+          refuses (fun () -> Cookie.make name (String.make 4096 'v')) ;
+          ok (fun () -> Cookie.make ~domain:(String.make 1024 'd') "a" "1") ;
+          refuses (fun () -> Cookie.make ~domain:(String.make 1025 'd') "a" "1") ;
+          ok (fun () -> Cookie.make ~path:("/" ^ String.make 1023 'p') "a" "1") ;
+          refuses (fun () ->
+              Cookie.make ~path:("/" ^ String.make 1024 'p') "a" "1" ) )
+    ; test "SameSite=None, Partitioned and the prefixes need Secure" (fun () ->
+          List.iter
+            (fun (msg, f) -> refuses ~msg f)
+            [ ("SameSite=None", fun () -> Cookie.make ~same_site:`None "a" "1")
+            ; ("Partitioned", fun () -> Cookie.make ~partitioned:true "a" "1")
+            ; ("__Secure-", fun () -> Cookie.make "__Secure-a" "1")
+            ; ("__SECURE-", fun () -> Cookie.make "__SECURE-a" "1")
+            ; ( "__Host- with a domain"
+              , fun () ->
+                  Cookie.make ~secure:true ~domain:"example.com" "__Host-a" "1"
+              )
+            ; ( "__Host- with a path"
+              , fun () -> Cookie.make ~secure:true ~path:"/x" "__Host-a" "1" )
+            ; ("__Host- with no Secure", fun () -> Cookie.make "__Host-a" "1")
+            ; ("__host-", fun () -> Cookie.make "__host-a" "1")
+            ; ("only __Secure-", fun () -> Cookie.make "__Secure-" "1")
+            ; ("only __Host-", fun () -> Cookie.make "__Host-" "1") ] ;
+          equal string "__Host-a=1; Path=/; Secure; HttpOnly; SameSite=Lax"
+            (Cookie.to_string (Cookie.make ~secure:true "__Host-a" "1")) ;
+          ok (fun () -> Cookie.make ~secure:true "__Secure-a" "1") ;
+          ok (fun () -> Cookie.make "__Securea" "1") ;
+          ok (fun () -> Cookie.make "__Hos" "1") )
+    ; test "expired keeps the attributes that the user agent matches" (fun () ->
+          let c =
+            Cookie.make ~max_age:60 ~domain:"example.com" ~path:"/x"
+              ~secure:true ~partitioned:true "a" "1"
+          in
+          equal string
+            "a=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; \
+             Domain=example.com; Path=/x; Secure; HttpOnly; SameSite=Lax; \
+             Partitioned"
+            (Cookie.to_string (Cookie.expired c)) ;
+          equal string
+            "__Host-a=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; \
+             Path=/; Secure; HttpOnly; SameSite=Lax"
+            (Cookie.to_string
+               (Cookie.expired (Cookie.make ~secure:true "__Host-a" "1")) ) )
+    ; test "expired changes Expires and keeps the other attributes" (fun () ->
+          let c =
+            Cookie.make ~expires:(posix 784111777.) ~http_only:false
+              ~same_site:`None ~secure:true "a" "1"
+          in
+          equal string
+            "a=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; Path=/; \
+             Secure; SameSite=None"
+            (Cookie.to_string (Cookie.expired c)) )
+    ; test "with_value" (fun () ->
+          let c = Cookie.make ~path:"/x" ~max_age:5 "a" "1" in
+          equal string "a=2; Max-Age=5; Path=/x; HttpOnly; SameSite=Lax"
+            (Cookie.to_string (Cookie.with_value "2" c)) ;
+          refuses (fun () -> Cookie.with_value "a b" c) ;
+          refuses (fun () -> Cookie.with_value (String.make 4096 'v') c) )
+    ; test "pp hides the value" (fun () ->
+          equal string "a=<6 bytes>; Path=/; Secure; HttpOnly; SameSite=Lax"
+            (Format.asprintf "%a" Cookie.pp
+               (Cookie.make ~secure:true "a" "secret") ) )
+    ; test "Request.cookies and Request.cookie" (fun () ->
+          let r fields =
+            Request.make
+              ~headers:
+                (Headers.of_list (List.map (fun v -> ("Cookie", v)) fields))
+              Method.GET "/"
+          in
+          let two = r ["a=1; b=2"; "c=3; a=4"] in
+          equal pairs
+            [("a", "1"); ("b", "2"); ("c", "3"); ("a", "4")]
+            (Request.cookies two) ;
+          equal (option string) (Some "1") (Request.cookie "a" two) ;
+          equal (option string) (Some "3") (Request.cookie "c" two) ;
+          equal (option string) (Some "1") (Request.cookie "a" (r ["a=1; a=2"])) ;
+          equal (option string) None (Request.cookie "A" two) ;
+          List.iter
+            (fun (name, s, v) ->
+              equal ~msg:s (option string) v (Cookie.find name s) )
+            [ ("a", " a = \"1\" ; a=2", Some "1")
+            ; ("a", "ab=1; a=2", Some "2")
+            ; ("ab", "a=1; ab=2", Some "2")
+            ; ("a", "a; a=3", Some "3")
+            ; ("", "=1; a=2", None)
+            ; ("a", "b=1", None)
+            ; ("a", "", None) ] ;
+          equal pairs [] (Request.cookies (r [])) ;
+          equal (option string) None (Request.cookie "a" (r [])) )
+    ; test "Response.add_cookie adds a field for each cookie" (fun () ->
+          let r =
+            Response.string "x"
+            |> Response.add_cookie (Cookie.make "a" "1")
+            |> Response.add_cookie (Cookie.make "b" "2")
+          in
+          equal (list string)
+            [ "a=1; Path=/; HttpOnly; SameSite=Lax"
+            ; "b=2; Path=/; HttpOnly; SameSite=Lax" ]
+            (Headers.find_all "set-cookie" (Response.headers r)) ) ]
+
+let cookie_props =
+  let tchar = Gen.of_list tchars in
+  let octet = Gen.map Char.chr (Gen.int_range 0 255) in
+  let octet = Gen.such_that is_cookie_octet octet in
+  let name = Gen.string_of ~size:(Gen.int_range 1 8) tchar in
+  let value = Gen.string_of ~size:(Gen.int_range 0 8) octet in
+  let cookie =
+    let open Gen in
+    let label = string_of ~size:(int_range 1 4) (of_list ['a'; '-'; '_']) in
+    let+ n = name
+    and+ v = value
+    and+ secure = bool
+    and+ http_only = bool
+    and+ same_site = of_list [`Strict; `Lax; `None; `Unspecified]
+    and+ partitioned = bool
+    and+ max_age = option (int_range 0 1000)
+    and+ domain =
+      option
+        ( pair bool (list ~size:(int_range 1 3) label)
+        |> map (fun (dot, l) -> (if dot then "." else "") ^ String.concat "." l)
+        )
+    and+ path = string_of ~size:(int_range 0 8) (char_range '\x21' '\x7e') in
+    let path = "/" ^ String.map (function ';' -> '_' | c -> c) path in
+    (* [`None] and [partitioned] need [secure]. *)
+    let secure = secure || same_site = `None || partitioned in
+    (n, v, secure, http_only, same_site, partitioned, max_age, domain, path)
+  in
+  group "Cookie laws"
+    [ prop "to_string gives a valid field value that parse_set_cookie reads"
+        cookie
+        (fun
+          ( n
+          , v
+          , secure
+          , http_only
+          , same_site
+          , partitioned
+          , max_age
+          , domain
+          , path )
+        ->
+          (* A name with a prefix needs more attributes. *)
+          let n = "x" ^ n in
+          let c =
+            Cookie.make ?max_age ?domain ~path ~secure ~http_only ~same_site
+              ~partitioned ~expires:(posix 0.) n v
+          in
+          is_true (Headers.is_valid_value (Cookie.to_string c)) ;
+          equal
+            (option (pair string string))
+            (Some (n, v))
+            (Cookie.parse_set_cookie (Cookie.to_string c)) )
+    ; prop "parse inverts the join of valid pairs"
+        (Gen.list ~size:(Gen.int_range 0 5) (Gen.pair name value))
+        (fun l ->
+          (* A cookie-octet is not a double quote, thus no value loses
+             quotes. *)
+          equal pairs l
+            (Cookie.parse
+               (String.concat "; " (List.map (fun (n, v) -> n ^ "=" ^ v) l)) ) )
+    ]
+
 let request_tests =
   group "Request"
     [ test "with_scheme" (fun () ->
@@ -2367,6 +2648,8 @@ let () =
        ; form_tests
        ; form_props
        ; request_form_tests
+       ; cookie_tests
+       ; cookie_props
        ; request_tests
        ; response_tests
        ; handler_tests

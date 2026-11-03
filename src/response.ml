@@ -57,6 +57,9 @@ let with_status status r =
 
 let with_headers headers r = {r with headers}
 
+let add_cookie c r =
+  {r with headers= Headers.add "Set-Cookie" (Cookie.to_string c) r.headers}
+
 let with_body body r =
   match r.kind with
   | Body _ ->

@@ -65,6 +65,20 @@ val query_params : t -> Form.t
 val headers : t -> Headers.t
 (** [headers r] are the header fields of [r], as received. *)
 
+val cookies : t -> (string * string) list
+(** [cookies r] is the pairs of the [Cookie] fields of [r] ({!Cookie.parse}), in
+    the order of the fields. A user agent sends one field (RFC 6265 §5.4), and
+    HTTP/2 can split it. *)
+
+val cookie : string -> t -> string option
+(** [cookie name r] is the value of the first pair of {!cookies} with the name
+    [name], if any ({!Cookie.find}). The compare is case-sensitive.
+
+    The first pair wins, and the user agent gives the order. A cookie that a
+    sibling subdomain sets can come first (cookie tossing). For a security
+    cookie, use a name with the prefix [__Host-]: a user agent of RFC 6265bis
+    then makes sure that only this host set it. *)
+
 val body : t -> Body.t
 (** [body r] is the body of [r]. *)
 

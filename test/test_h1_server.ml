@@ -836,6 +836,24 @@ let connection_tests =
             \r\n
             no
             |} )
+    ; test "two cookies give two Set-Cookie lines" (fun () ->
+          let cookies req =
+            Response.string (Option.value ~default:"-" (Request.cookie "b" req))
+            |> Response.add_cookie (Cookie.make "a" "1")
+            |> Response.add_cookie (Cookie.make ~secure:true "b" "2")
+          in
+          expect
+            (show ~handler:cookies (get ~headers:[("Cookie", "a=1; b=2")] "/"))
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Set-Cookie: a=1; Path=/; HttpOnly; SameSite=Lax\r\n
+            Set-Cookie: b=2; Path=/; Secure; HttpOnly; SameSite=Lax\r\n
+            Content-Length: 1\r\n
+            \r\n
+            2
+            |} )
     ; test "100-continue is sent when the handler reads the body" (fun () ->
           expect
             (show

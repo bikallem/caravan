@@ -57,6 +57,12 @@ let query_params r = match query r with None -> [] | Some q -> Form.parse q
 
 let headers r = r.headers
 
+let cookies r =
+  List.concat_map Cookie.parse (Headers.find_all "cookie" r.headers)
+
+let cookie name r =
+  List.find_map (Cookie.find name) (Headers.find_all "cookie" r.headers)
+
 let body r = r.body
 
 let conn r = r.conn

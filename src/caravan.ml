@@ -7,6 +7,7 @@ module Body = Body
 module Conn_info = Conn_info
 module Attrs = Attrs
 module Form = Form
+module Cookie = Cookie
 module Request = Request
 module Response = Response
 module Handler = Handler
