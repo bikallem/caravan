@@ -680,6 +680,22 @@ let background_tests =
                     (T.background t (fun () ->
                          on_cancel (fun () -> failwith "cleanup") ) ) ;
                   T.settle t ) ) )
+    ; test "the end cuts a request body" (fun () ->
+          (* The client leaves, and the server aborts at the same time. The
+             server reports no error, for each seed. *)
+          let read_all req = ok (Body.to_string (Request.body req)) in
+          let body () =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "a" ;
+                Body.Writer.flush w ;
+                Time.sleep Mono (Span.s 3600) )
+          in
+          T.race ~seeds:50 read_all (fun t ->
+              ignore
+                (T.background t (fun () ->
+                     T.fetch t (Request.make ~body:(body ()) Method.POST "/") )
+                ) ;
+              Time.sleep Mono (Span.ms 100) ) )
     ; test "the function raises while a background request waits" (fun () ->
           let cancelled = Atomic.make false and waiting = Ivar.create () in
           let h req =

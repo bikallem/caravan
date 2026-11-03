@@ -300,6 +300,10 @@ let serve : Engine.t =
               Fiber.shield (fun () -> close_body response)
           | exception (Promise.Cancelled | Fiber.Scope_closed) ->
               ()
+          (* The client left during the request body, as on the path with no
+             cancel: not an error of the server. *)
+          | exception Body.Truncated when H1_body.failed body ->
+              ()
           | exception e ->
               report e ) ;
           Printexc.raise_with_backtrace c bt
