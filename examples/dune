@@ -2,6 +2,7 @@
 
 (executables
  (names hello middleware ws_echo fetch readme)
+ (modules hello middleware ws_echo fetch readme)
  (libraries caravan caravan.websocket caravan.client weft weft.os))
 
 ; The first OCaml example of README.md. The rule copies it to readme.ml, so the
@@ -15,4 +16,20 @@
    (run
     awk
     "/^```ocaml/ { inside = 1; found = 1; next } inside && /^```/ { exit } inside; END { if (!found) exit 1 }"
+    %{dep:../README.md}))))
+
+; The example of the Testing section of README.md, as readme_testing.ml.
+
+(executable
+ (name readme_testing)
+ (modules readme_testing)
+ (libraries caravan caravan.testing))
+
+(rule
+ (action
+  (with-stdout-to
+   readme_testing.ml
+   (run
+    awk
+    "/^## Testing/ { section = 1 } section && /^```ocaml/ { inside = 1; found = 1; next } inside && /^```/ { exit } inside; END { if (!found) exit 1 }"
     %{dep:../README.md}))))

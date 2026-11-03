@@ -149,6 +149,28 @@ Caravan_client.with_response client
 - Version 1 has no TLS, no proxy support, no redirects, no cookies and
   no content codings.
 
+## Testing
+
+The `caravan.testing` library runs a handler through the real server
+and client, in the simulator of weft. The time is virtual, thus a test
+of a 30 s timeout takes no real time, and a run is the same for a seed:
+
+```ocaml
+let () =
+  Caravan_testing.run
+    (fun _req -> Caravan.Response.string "hi")
+    (fun t ->
+      let reply = Caravan_testing.get t "/" in
+      assert (reply.body = "hi") )
+```
+
+- An error of the handler fails the run, unless the test takes it with
+  `take_errors`.
+- A guard (10 min of virtual time by default) stops a test that waits
+  for nothing.
+- `Caravan_testing.sim` gives the simulator, for latency, network faults
+  and names (`Weft_sim.set_dns`).
+
 ## Requirements
 
 - OCaml >= 5.5.0
