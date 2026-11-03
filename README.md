@@ -254,19 +254,19 @@ let () =
   Caravan_testing.race ~seeds:20 hi (fun t ->
       assert ((Caravan_testing.get t "/").body = "hi") )
 
-(* Manual time: only advance moves the time. *)
+(* Manual time: only advance moves the time. The request goes in the
+   background while the test advances the time. *)
 let () =
   let slow _req =
     Weft.Time.sleep Mono (Weft.Span.s 20) ;
     Caravan.Response.string "late"
   in
   Caravan_testing.run ~manual:true slow (fun t ->
-      Weft.Fiber.scope (fun s ->
-          let p =
-            Weft.Fiber.fork_promise s (fun () -> Caravan_testing.get t "/")
-          in
-          Caravan_testing.advance t (Weft.Span.s 20) ;
-          assert ((Weft.Promise.await p).body = "late") ) )
+      let p =
+        Caravan_testing.background t (fun () -> Caravan_testing.get t "/")
+      in
+      Caravan_testing.advance t (Weft.Span.s 20) ;
+      assert ((Weft.Promise.await p).body = "late") )
 ```
 
 - An error of the handler fails the run, unless the test takes it with
@@ -274,6 +274,9 @@ let () =
 - In auto mode, a guard (10 min of virtual time by default) stops a test
   that waits for nothing. In manual mode, such a test raises
   `Weft_sim.Deadlock`.
+- `background` runs a request (or other code) while the test continues.
+  At the end of the test, the run cancels it, as a client that leaves. A
+  failure of a background fiber must be awaited.
 - `race` runs the test for each seed and stops at the first failure.
   A replay is exact if the handler and the test keep no state from one
   run to the next.
