@@ -1490,14 +1490,14 @@ let accept_error_tests =
             |} )
     ]
 
-(* The source rules. The libraries caravan, caravan.client and caravan.websocket
-   must use only weft for the time, the I/O and the domains, so that they run in
-   each world of weft. The scan reads the .ml files of src, client and websocket
-   as text. It also reads caravan.testing (testing), which can also use the
-   simulator of weft (Weft_sim). The guard of test/nounix links each module of
-   the three libraries, and forbids unix, threads and the worlds. The scan also
-   forbids the parts of the stdlib that the guard cannot find, for example
-   Sys.time and Domain. *)
+(* The source rules. The libraries caravan, caravan.client, caravan.websocket
+   and caravan.router must use only weft for the time, the I/O and the domains,
+   so that they run in each world of weft. The scan reads the .ml files of src,
+   client, websocket and router as text. It also reads caravan.testing
+   (testing), which can also use the simulator of weft (Weft_sim). The guard of
+   test/nounix links each module of the four libraries, and forbids unix,
+   threads and the worlds. The scan also forbids the parts of the stdlib that
+   the guard cannot find, for example Sys.time and Domain. *)
 
 (* The texts that the libraries must not contain. The first text is the name of
    the old effects library, in two parts, so that a search for that name in src,
@@ -1738,7 +1738,8 @@ let source_tests =
             |> List.map (fun file -> dir ^ "/" ^ file)
           in
           let all =
-            files "src" @ files "client" @ files "websocket" @ files "testing"
+            files "src" @ files "client" @ files "websocket" @ files "router"
+            @ files "testing"
           in
           List.iter
             (fun file ->
@@ -1748,6 +1749,7 @@ let source_tests =
             ; "src/config.ml"
             ; "client/pool.ml"
             ; "websocket/connection.ml"
+            ; "router/caravan_router.ml"
             ; "testing/caravan_testing.ml" ] ;
           let found =
             List.concat_map

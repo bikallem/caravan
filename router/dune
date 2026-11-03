@@ -1,0 +1,10 @@
+; Routes: a handler for each method and path pattern.
+
+(library
+ (name caravan_router)
+ (public_name caravan.router)
+ (libraries caravan)
+ (instrumentation
+  (backend ppx_windtrap.mutate))
+ (instrumentation
+  (backend ppx_windtrap.coverage)))
