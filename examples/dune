@@ -1,7 +1,7 @@
 ; The examples run in Weft_os, the world of weft for the OS of the build.
 
 (executables
- (names hello ws_echo fetch readme)
+ (names hello middleware ws_echo fetch readme)
  (libraries caravan caravan.websocket caravan.client weft weft.os))
 
 ; The first OCaml example of README.md. The rule copies it to readme.ml, so the

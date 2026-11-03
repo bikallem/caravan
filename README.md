@@ -60,6 +60,29 @@ WebSocket.
 Handlers are plain functions, `Request.t -> Response.t`, and each
 request runs in its own fiber, in parallel across domains.
 
+A middleware is a handler that wraps another, and `Handler.compose`
+puts middleware around a handler. Typed attributes (`Attrs`) let a
+middleware give data to the handlers after it, for example the user of
+a token. A handler can also give data back to an outer middleware in
+its response, for example a route for an access log. Attributes never
+go on the wire:
+
+```ocaml
+let user : string Attrs.key = Attrs.key ~name:"user" ()
+
+let auth : Handler.middleware =
+ fun next req -> next (Request.with_attr user "ann" req)
+
+let hello req =
+  match Request.find_attr user req with
+  | Some name -> Response.string ("Hello, " ^ name ^ "!\n")
+  | None -> Response.string ~status:Status.unauthorized ""
+
+let handler = Handler.compose [auth] hello
+```
+
+`examples/middleware.ml` has a full example.
+
 The libraries `caravan`, `caravan.client` and `caravan.websocket` depend
 on no world of weft. They run in each world, for example the OS world
 (`Weft.run (module Weft_os)`) and the simulator of weft (`Weft_sim.run`).
