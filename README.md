@@ -241,18 +241,42 @@ and client, in the simulator of weft. The time is virtual, thus a test
 of a 30 s timeout takes no real time, and a run is the same for a seed:
 
 ```ocaml
+let hi _req = Caravan.Response.string "hi"
+
 let () =
-  Caravan_testing.run
-    (fun _req -> Caravan.Response.string "hi")
-    (fun t ->
+  Caravan_testing.run hi (fun t ->
       let reply = Caravan_testing.get t "/" in
       assert (reply.body = "hi") )
+
+(* One run for each seed, on 4 virtual domains. A failure tells its seed:
+   replay it with ~replay. *)
+let () =
+  Caravan_testing.race ~seeds:20 hi (fun t ->
+      assert ((Caravan_testing.get t "/").body = "hi") )
+
+(* Manual time: only advance moves the time. *)
+let () =
+  let slow _req =
+    Weft.Time.sleep Mono (Weft.Span.s 20) ;
+    Caravan.Response.string "late"
+  in
+  Caravan_testing.run ~manual:true slow (fun t ->
+      Weft.Fiber.scope (fun s ->
+          let p =
+            Weft.Fiber.fork_promise s (fun () -> Caravan_testing.get t "/")
+          in
+          Caravan_testing.advance t (Weft.Span.s 20) ;
+          assert ((Weft.Promise.await p).body = "late") ) )
 ```
 
 - An error of the handler fails the run, unless the test takes it with
   `take_errors`.
-- A guard (10 min of virtual time by default) stops a test that waits
-  for nothing.
+- In auto mode, a guard (10 min of virtual time by default) stops a test
+  that waits for nothing. In manual mode, such a test raises
+  `Weft_sim.Deadlock`.
+- `race` runs the test for each seed and stops at the first failure.
+  A replay is exact if the handler and the test keep no state from one
+  run to the next.
 - `Caravan_testing.sim` gives the simulator, for latency, network faults
   and names (`Weft_sim.set_dns`).
 

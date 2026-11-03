@@ -29,7 +29,7 @@
 (executable
  (name readme_testing)
  (modules readme_testing)
- (libraries caravan caravan.testing))
+ (libraries caravan caravan.testing weft))
 
 (rule
  (action
