@@ -55,3 +55,20 @@
     awk
     "/^## Routing/ { section = 1 } section && /^```ocaml/ { inside = 1; found = 1; print \"[@@@warning \\\"-32\\\"]\"; next } inside && /^```/ { exit } inside; END { if (!found) exit 1 }"
     %{dep:../README.md}))))
+
+; The example of the "Proxies and request IDs" section of README.md, as
+; readme_middleware.ml.
+
+(executable
+ (name readme_middleware)
+ (modules readme_middleware)
+ (libraries caravan caravan.middleware))
+
+(rule
+ (action
+  (with-stdout-to
+   readme_middleware.ml
+   (run
+    awk
+    "/^## Proxies and request IDs/ { section = 1 } section && /^```ocaml/ { inside = 1; found = 1; print \"[@@@warning \\\"-32\\\"]\"; next } inside && /^```/ { exit } inside; END { if (!found) exit 1 }"
+    %{dep:../README.md}))))

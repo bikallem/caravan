@@ -83,11 +83,11 @@ let handler = Handler.compose [auth] hello
 
 `examples/middleware.ml` has a full example.
 
-The libraries `caravan`, `caravan.client`, `caravan.websocket` and
-`caravan.router` depend on no world of weft. They run in each world,
-for example the OS world (`Weft.run (module Weft_os)`) and the
-simulator of weft (`Weft_sim.run`). `caravan.testing` runs only in the
-simulator.
+The libraries `caravan`, `caravan.client`, `caravan.websocket`,
+`caravan.router` and `caravan.middleware` depend on no world of weft.
+They run in each world, for example the OS world
+(`Weft.run (module Weft_os)`) and the simulator of weft
+(`Weft_sim.run`). `caravan.testing` runs only in the simulator.
 
 ## Routing
 
@@ -120,6 +120,32 @@ let app =
   for an access log.
 
 `examples/router.ml` has a full example.
+
+## Proxies and request IDs
+
+The `caravan.middleware` library has middleware for the requests that
+come through a reverse proxy, and for request IDs:
+
+```ocaml
+let app handler =
+  Caravan.Handler.compose
+    [ Caravan_middleware.Forwarded.middleware
+        ~trusted:(Caravan_middleware.Forwarded.trust_ips ["10.0.0.1"])
+        ()
+    ; Caravan_middleware.Request_id.middleware () ]
+    handler
+```
+
+- `Forwarded` reads `X-Forwarded-For` and `X-Forwarded-Proto` of a
+  trusted proxy, and `X-Forwarded-Host` if you turn it on. It walks the
+  elements from the right, at most `limit` hops (1 by default), thus it
+  does not read a value that a client adds before the elements of the
+  trusted proxies. `Forwarded.client` gives the client, and the request
+  gets the scheme and the authority that the proxy tells. The proxy
+  must set or overwrite each field that is on, and a bad value gives the
+  client `Unknown`, never the proxy.
+- `Request_id` keeps a clean `X-Request-Id` of the request, or makes a
+  new ID. The ID goes on the request and on the response.
 
 ## WebSocket
 
@@ -221,7 +247,7 @@ flake.lock pin.
 
 The repository includes a Nix flake. Its dev shell provides OCaml 5.5,
 dune, weft, http-date, windtrap, ppx_windtrap, ocaml-lsp, utop,
-ocamlformat and odoc. `nix build` builds the caravan package (the five
+ocamlformat and odoc. `nix build` builds the caravan package (the six
 libraries, with no tests).
 
 With [direnv](https://direnv.net) and
