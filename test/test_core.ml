@@ -989,6 +989,309 @@ let body_tests =
 
 let loopback port = Weft.Net.Tcp ("127.0.0.1", port)
 
+(* Body.on_end *)
+
+let show_outcome = Server_support.show_outcome
+
+let recorder = Server_support.on_end_log
+
+(* A sink that keeps the bytes, and raises [Exit] at the write [fail_at]. *)
+let sink ?(fail_at = 0) () =
+  let out = Buffer.create 16 and writes = ref 0 in
+  ( Body.Writer.make
+      ~write:(fun buf off len ->
+        incr writes ;
+        if !writes = fail_at then raise Exit ;
+        Buffer.add_subbytes out buf off len )
+      ~flush:ignore
+  , out )
+
+let chunks_source ?close pieces =
+  let rest = ref pieces in
+  Body.of_source ?close (fun buf off _ ->
+      match !rest with
+      | [] ->
+          0
+      | p :: tl ->
+          rest := tl ;
+          Bytes.blit_string p 0 buf off (String.length p) ;
+          String.length p )
+
+let calls = list string
+
+let on_end_tests =
+  group "Body.on_end"
+    [ test "write_to of a source" (fun () ->
+          let f, log = recorder () in
+          let w, out = sink () in
+          Body.write_to (Body.on_end f (Body.of_string "abc")) w ;
+          equal string "abc" (Buffer.contents out) ;
+          equal calls ["Ended 3"] (log ()) )
+    ; test "a producer and a sink that fails" (fun () ->
+          let f, log = recorder () in
+          let b =
+            Body.on_end f
+              (Body.of_writer ~length:5 (fun w ->
+                   Body.Writer.write_string w "ab" ;
+                   Body.Writer.write_string w "cde" ) )
+          in
+          equal (option int) (Some 5) (Body.length b) ;
+          raises Exit (fun () -> Body.write_to b (fst (sink ~fail_at:2 ()))) ;
+          equal calls ["Failed Stdlib.Exit 2"] (log ()) ;
+          let f, log = recorder () in
+          let b =
+            Body.on_end f
+              (Body.of_writer (fun w ->
+                   Body.Writer.write_string w "ab" ;
+                   Body.Writer.write_string w "cde" ) )
+          in
+          Body.write_to b (fst (sink ())) ;
+          equal calls ["Ended 5"] (log ()) )
+    ; test "a producer that raises" (fun () ->
+          let f, log = recorder () in
+          let b =
+            Body.on_end f
+              (Body.of_writer (fun w ->
+                   Body.Writer.write_string w "ab" ;
+                   raise Exit ) )
+          in
+          raises Exit (fun () -> Body.write_to b (fst (sink ()))) ;
+          equal calls ["Failed Stdlib.Exit 2"] (log ()) )
+    ; test "a source and a sink that fails at the second write" (fun () ->
+          let f, log = recorder () in
+          let b = Body.on_end f (chunks_source ["ab"; "cde"; "f"]) in
+          raises Exit (fun () -> Body.write_to b (fst (sink ~fail_at:2 ()))) ;
+          equal calls ["Failed Stdlib.Exit 2"] (log ()) )
+    ; test "read" (fun () ->
+          let f, log = recorder () in
+          let b = Body.on_end f (Body.of_string "abc") in
+          let buf = Bytes.create 8 in
+          let rec all n =
+            match Body.read b buf 0 8 with 0 -> n | k -> all (n + k)
+          in
+          equal int 3 (all 0) ;
+          equal calls ["Ended 3"] (log ()) ;
+          let f, log = recorder () in
+          let b = Body.on_end f (Body.of_string "abc") in
+          equal int 1 (Body.read b buf 0 1) ;
+          Body.close b ;
+          equal calls ["Abandoned 1"] (log ()) )
+    ; test "close with no byte" (fun () ->
+          List.iter
+            (fun b ->
+              let f, log = recorder () in
+              Body.close (Body.on_end f b) ;
+              equal calls ["Abandoned 0"] (log ()) )
+            [Body.of_string "abc"; Body.of_writer ignore; Body.empty] )
+    ; test "one call" (fun () ->
+          let f, log = recorder () in
+          let b = Body.on_end f (Body.of_string "abc") in
+          Body.write_to b (fst (sink ())) ;
+          Body.close b ;
+          Body.close b ;
+          equal calls ["Ended 3"] (log ()) ;
+          let f, log = recorder () in
+          let b = Body.on_end f (Body.of_string "abc") in
+          Body.close b ;
+          Body.close b ;
+          equal calls ["Abandoned 0"] (log ()) )
+    ; test "the trailers stay" (fun () ->
+          let t = Headers.of_list [("X-T", "1")] in
+          let f, _ = recorder () in
+          let b =
+            Body.on_end f
+              (Body.of_writer (fun w -> Body.Writer.set_trailers w t))
+          in
+          let w, _ = sink () in
+          Body.write_to b w ;
+          is_true (Headers.equal t (Body.trailers b)) ;
+          is_true (Headers.equal t (Body.Writer.trailers w)) ;
+          let b =
+            Body.on_end f
+              (Body.of_source ~trailers:(fun () -> t) (fun _ _ _ -> 0))
+          in
+          let w, _ = sink () in
+          Body.write_to b w ;
+          is_true (Headers.equal t (Body.trailers b)) ;
+          is_true (Headers.equal t (Body.Writer.trailers w)) )
+    ; test "Body.empty is shared" (fun () ->
+          let f, log = recorder () in
+          Body.write_to (Body.on_end f Body.empty) (fst (sink ())) ;
+          Body.write_to Body.empty (fst (sink ())) ;
+          Body.close Body.empty ;
+          equal calls ["Ended 0"] (log ()) ;
+          (* A hook on Body.empty that nobody consumes. *)
+          let g, glog = recorder () in
+          ignore (Body.on_end g Body.empty) ;
+          Body.write_to Body.empty (fst (sink ())) ;
+          equal calls [] (glog ()) )
+    ; test "a source whose close raises" (fun () ->
+          let f, log = recorder () in
+          let closes = ref 0 in
+          let b =
+            Body.on_end f
+              (chunks_source
+                 ~close:(fun () -> incr closes ; failwith "close")
+                 ["a"] )
+          in
+          raises (Failure "close") (fun () -> Body.close b) ;
+          equal calls ["Abandoned 0"] (log ()) ;
+          Body.close b ;
+          equal int 1 !closes ;
+          equal calls ["Abandoned 0"] (log ()) )
+    ; test "two hooks that do not raise" (fun () ->
+          let f, log = recorder () and g, glog = recorder () in
+          Body.write_to
+            (Body.of_string "ab" |> Body.on_end f |> Body.on_end g)
+            (fst (sink ())) ;
+          equal calls ["Ended 2"] (log ()) ;
+          equal calls ["Ended 2"] (glog ()) )
+    ; test "read of an empty body" (fun () ->
+          let f, log = recorder () in
+          equal int 0
+            (Body.read (Body.on_end f Body.empty) (Bytes.create 1) 0 1) ;
+          equal calls ["Ended 0"] (log ()) )
+    ; test "a read of the source that raises" (fun () ->
+          let f, log = recorder () in
+          let b = Body.on_end f (Body.of_source (fun _ _ _ -> raise Exit)) in
+          raises Exit (fun () -> ignore (Body.read b (Bytes.create 1) 0 1)) ;
+          equal calls ["Failed Stdlib.Exit 0"] (log ()) )
+    ; test "write_to of a source that was closed before on_end" (fun () ->
+          let f, log = recorder () in
+          let b = Body.of_string "ab" in
+          Body.close b ;
+          let b = Body.on_end f b in
+          raises_match is_invalid_arg (fun () ->
+              Body.write_to b (fst (sink ())) ) ;
+          equal calls [] (log ()) )
+    ; test "the close of the source and the hook raise" (fun () ->
+          let b =
+            Body.on_end
+              (fun _ ~bytes:_ -> failwith "hook")
+              (Body.of_source
+                 ~close:(fun () -> failwith "close")
+                 (fun _ _ _ -> 0) )
+          in
+          raises (Failure "close") (fun () -> Body.close b) )
+    ; test "a close from another fiber during write_to" (fun () ->
+          let f, log = recorder () in
+          let b =
+            Body.on_end f
+              (Body.of_source
+                 ~close:(fun () -> Weft.Fiber.yield ())
+                 (fun buf off _ -> Bytes.set buf off 'x' ; 1) )
+          in
+          let w =
+            Body.Writer.make ~write:(fun _ _ _ -> ()) ~flush:Weft.Fiber.yield
+          in
+          Weft_sim.run (fun _ ->
+              Weft.Fiber.scope (fun s ->
+                  let p =
+                    Weft.Fiber.fork_promise s (fun () ->
+                        try Body.write_to b w with Invalid_argument _ -> () )
+                  in
+                  Weft.Fiber.yield () ; Body.close b ; Weft.Promise.await p ) ) ;
+          match log () with
+          | [l] ->
+              is_true ~msg:l (String.starts_with ~prefix:"Abandoned" l)
+          | l ->
+              fail (String.concat "; " l) )
+    ; test "an Invalid_argument of the body is a failure" (fun () ->
+          let f, log = recorder () in
+          let b = Body.on_end f (Body.of_writer (fun _ -> invalid_arg "x")) in
+          raises (Invalid_argument "x") (fun () ->
+              Body.write_to b (fst (sink ())) ) ;
+          equal calls [{|Failed Invalid_argument("x") 0|}] (log ()) ;
+          let f, log = recorder () in
+          let b =
+            Body.on_end f (Body.of_source (fun _ _ _ -> invalid_arg "x"))
+          in
+          raises (Invalid_argument "x") (fun () ->
+              Body.write_to b (fst (sink ())) ) ;
+          equal calls [{|Failed Invalid_argument("x") 0|}] (log ()) )
+    ; test "two hooks that raise" (fun () ->
+          let raising name _ ~bytes:_ = failwith name in
+          let b =
+            Body.of_string "a"
+            |> Body.on_end (raising "first")
+            |> Body.on_end (raising "second")
+          in
+          raises (Failure "first") (fun () -> Body.write_to b (fst (sink ()))) )
+    ; test "a hook that raises on Failed" (fun () ->
+          let b =
+            Body.on_end
+              (fun _ ~bytes:_ -> failwith "hook")
+              (Body.of_writer (fun _ -> raise Exit))
+          in
+          raises Exit (fun () -> Body.write_to b (fst (sink ()))) )
+    ; test "to_string with a max" (fun () ->
+          let f, log = recorder () in
+          raises Body.Too_large (fun () ->
+              ignore
+                (Body.to_string ~max:2 (Body.on_end f (Body.of_string "abcde"))) ) ;
+          equal calls ["Failed Caravan__Body.Too_large 0"] (log ()) )
+    ; test "two hooks" (fun () ->
+          let order = ref [] in
+          let hook name how ~bytes =
+            order :=
+              Printf.sprintf "%s %s %d" name (show_outcome how) bytes :: !order ;
+            if name = "first" then failwith "first"
+          in
+          let b =
+            Body.of_string "abc"
+            |> Body.on_end (hook "first")
+            |> Body.on_end (hook "second")
+          in
+          raises (Failure "first") (fun () -> Body.write_to b (fst (sink ()))) ;
+          equal calls ["first Ended 3"; "second Ended 3"] (List.rev !order) )
+    ; test "an argument error does not run the hook" (fun () ->
+          let f, log = recorder () in
+          let b = Body.on_end f (Body.of_string "abc") in
+          raises_match is_invalid_arg (fun () ->
+              ignore (Body.read b (Bytes.create 1) 0 2) ) ;
+          let w, _ = sink () in
+          let stopped = ref None in
+          Body.write_to (Body.of_writer (fun w -> stopped := Some w)) w ;
+          raises_match is_invalid_arg (fun () ->
+              Body.write_to b (Option.get !stopped) ) ;
+          let p = Body.on_end f (Body.of_writer ignore) in
+          raises_match is_invalid_arg (fun () ->
+              ignore (Body.read p (Bytes.create 1) 0 1) ) ;
+          equal calls [] (log ()) )
+    ; test "a cancel of the producer" (fun () ->
+          let f, log = recorder () in
+          let b =
+            Body.on_end f
+              (Body.of_writer (fun _ -> Weft.Time.sleep Mono (Weft.Span.s 3600)))
+          in
+          Weft_sim.run (fun _ ->
+              Weft.Fiber.scope (fun s ->
+                  Weft.Fiber.fork_daemon s (fun () ->
+                      try Body.write_to b (fst (sink ())) with _ -> () ) ;
+                  Weft.Time.sleep Mono (Weft.Span.s 1) ) ) ;
+          match log () with
+          | [l] ->
+              is_true ~msg:l (String.starts_with ~prefix:"Failed Weft" l)
+          | l ->
+              fail (String.concat "; " l) )
+    ; test "a hook on a body that ended, closed or ran" (fun () ->
+          let f, log = recorder () in
+          let b = Body.of_string "ab" in
+          ignore (Body.to_string b) ;
+          let b = Body.on_end f b in
+          equal int 0 (Body.read b (Bytes.create 1) 0 1) ;
+          equal calls ["Ended 0"] (log ()) ;
+          let f, log = recorder () in
+          let b = Body.of_string "ab" in
+          Body.close b ;
+          Body.close (Body.on_end f b) ;
+          equal calls ["Abandoned 0"] (log ()) ;
+          let f, log = recorder () in
+          let b = Body.of_writer ignore in
+          Body.write_to b (fst (sink ())) ;
+          Body.close (Body.on_end f b) ;
+          equal calls ["Abandoned 0"] (log ()) ) ]
+
 let conn_info_tests =
   group "Conn_info"
     [ test "accessors and pp" (fun () ->
@@ -1261,7 +1564,27 @@ let body_of r =
 
 let response_tests =
   group "Response"
-    [ test "make defaults to 200" (fun () ->
+    [ test "Response.with_body" (fun () ->
+          let k : string Attrs.key = Attrs.key () in
+          let r =
+            Response.string ~status:Status.created
+              ~headers:(Headers.of_list [("X-A", "1")])
+              "old"
+            |> Response.with_attr k "v"
+          in
+          let r' = Response.with_body (Body.of_string "new") r in
+          equal status Status.created (Response.status r') ;
+          equal (option string) (Some "1")
+            (Headers.find "x-a" (Response.headers r')) ;
+          equal (option string) (Some "v") (Response.find_attr k r') ;
+          ( match Response.kind r' with
+          | Response.Body b ->
+              equal string "new" (Body.to_string b)
+          | Upgrade _ ->
+              fail "an upgrade" ) ;
+          raises_match is_invalid_arg (fun () ->
+              Response.with_body Body.empty (Response.upgrade ignore) ) )
+    ; test "make defaults to 200" (fun () ->
           let r = Response.make Body.empty in
           equal status Status.ok (Response.status r) ;
           is_true (Headers.is_empty (Response.headers r)) )
@@ -1839,6 +2162,7 @@ let () =
        ; flow_tests
        ; deadline_tests
        ; body_tests
+       ; on_end_tests
        ; conn_info_tests
        ; attrs_tests
        ; attrs_props

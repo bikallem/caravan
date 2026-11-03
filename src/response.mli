@@ -109,6 +109,12 @@ val with_status : Status.t -> t -> t
 val with_headers : Headers.t -> t -> t
 (** [with_headers h r] is [r] with headers [h]. *)
 
+val with_body : Body.t -> t -> t
+(** [with_body b r] is [r] with the body [b]. The status, the fields and the
+    attributes stay. The old body is not closed: the caller still owns it.
+
+    @raise Invalid_argument if [r] is an upgrade response. *)
+
 (** {1:attributes Attributes}
 
     Typed values that middleware attach to a response, see {{!Attrs}[Attrs]}.

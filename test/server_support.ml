@@ -5,6 +5,24 @@ open Weft
 open Caravan
 module Buf_reader = Private.Buf_reader
 
+(* [show_outcome o] is the text of the end of a body, for the tests of
+   [Body.on_end]. *)
+let show_outcome = function
+  | Body.Ended ->
+      "Ended"
+  | Failed e ->
+      "Failed " ^ Printexc.to_string e
+  | Abandoned ->
+      "Abandoned"
+
+(* [on_end_log ()] is a hook that records each call as "<outcome> <bytes>", and
+   the calls so far, in order. *)
+let on_end_log () =
+  let log = ref [] in
+  ( (fun how ~bytes ->
+      log := Printf.sprintf "%s %d" (show_outcome how) bytes :: !log )
+  , fun () -> List.rev !log )
+
 (* A numeric host, so that a client needs no DNS answer. Port 0 gets a free
    port. *)
 let loopback = Net.Tcp ("127.0.0.1", 0)

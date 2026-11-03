@@ -155,6 +155,26 @@ let error_tests =
               T.run ~on_error producer (fun t ->
                   ignore (T.request t (Request.make Method.GET "/")) ;
                   raise Not_found ) ) )
+    ; test "the hook of a request body of the client" (fun () ->
+          let f, log = Server_support.on_end_log () in
+          let echo req = ok (Body.to_string (Request.body req)) in
+          let r =
+            T.run echo (fun t ->
+                T.fetch t
+                  (Request.make
+                     ~body:(Body.on_end f (Body.of_string "abc"))
+                     Method.POST "/" ) )
+          in
+          equal string "abc" r.body ;
+          equal (list string) ["Ended 3"] (log ()) ;
+          (* A GET with an empty body sends no body: its close runs the hook. *)
+          let f, log = Server_support.on_end_log () in
+          ignore
+            (T.run echo (fun t ->
+                 T.fetch t
+                   (Request.make ~body:(Body.on_end f Body.empty) Method.GET "/") )
+            ) ;
+          equal (list string) ["Abandoned 0"] (log ()) )
     ; test "the config goes to the server" (fun () ->
           let config = {Config.default with max_body= Some 4} in
           let read req = ok (Body.to_string (Request.body req)) in

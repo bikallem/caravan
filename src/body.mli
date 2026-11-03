@@ -83,7 +83,8 @@ val of_source :
     - [trailers ()] are the trailer fields, called once when [read] returns [0].
       Defaults to no trailers.
     - [close ()] is called at most once, by {!close}, to release the source when
-      it is abandoned. Defaults to doing nothing.
+      it is abandoned. Defaults to doing nothing. It must not wait: the server
+      can call it in a shield when a connection stops.
 
     @raise Invalid_argument if [length] is negative. *)
 
@@ -141,3 +142,45 @@ val trailers : t -> Headers.t
 val close : t -> unit
 (** [close b] abandons [b]: the [close] function of a source is called, and a
     writer body's producer will not run. Closing is idempotent. *)
+
+(** {1:end The end of a body} *)
+
+(** The type for the ends of a body. *)
+type outcome =
+  | Ended
+      (** The body gave all its bytes to its consumer: {!write_to} returned, or
+          {!read} gave [0]. The consumer can still fail after it: for example
+          the server raises [Length_mismatch] for a body that is shorter than
+          its [Content-Length], or the flush of the end of a chunked body fails.
+      *)
+  | Failed of exn
+      (** The producer, a read of the source, or a write or a flush of the sink
+          raised the exception, also a cancel. *)
+  | Abandoned  (** {!close} came first, also before any byte. *)
+
+val on_end : (outcome -> bytes:int -> unit) -> t -> t
+(** [on_end f b] adds the hook [f] to [b] and gives [b]. For {!empty}, a shared
+    value, it gives a new empty body with the hook: always use the result. Call
+    it before the consumption of [b] starts.
+
+    [f how ~bytes] runs at most one time, at the end of the body. [bytes] is the
+    number of bytes that reached the consumer since [on_end]: the writes of the
+    sink of {!write_to} that returned (a later flush can still fail), or the
+    bytes that {!read} gave.
+    - An argument error, for example a bad range, a writer that stopped or a
+      writer body that was written out, raises before the end: [f] does not run.
+    - {!close} runs [f] with [Abandoned] if [f] did not run, also when another
+      fiber writes the body at the same time. For a source, it runs [f] after
+      the [close] of the source, also if that raises; then the exception of the
+      source goes on. A producer that another fiber runs can go on after it.
+    - With two [on_end] on one body, the two hooks run, the first one first.
+    - [f] must not raise. On [Failed e], an exception of [f] is dropped and [e]
+      goes on with its backtrace. On [Ended] and [Abandoned], the first
+      exception of a hook goes to the caller after each hook ran.
+
+    [f] runs in the fiber of the consumer, which can be cancelled: [f] must not
+    wait. When a connection stops, the server can run the [close] of a source
+    and [f] in a cancelled fiber or in a shield: neither must wait. On the
+    server, the hook of a response body always runs, also for [HEAD], 204 and
+    304. On the client, the hook of a request body always runs. For other
+    bodies, it runs if the user reads the body to its end or closes it. *)

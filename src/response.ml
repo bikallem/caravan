@@ -57,6 +57,13 @@ let with_status status r =
 
 let with_headers headers r = {r with headers}
 
+let with_body body r =
+  match r.kind with
+  | Body _ ->
+      {r with kind= Body body}
+  | Upgrade _ ->
+      invalid_arg "Response.with_body: an upgrade has no body"
+
 let attrs r = r.attrs
 
 let with_attrs attrs r = {r with attrs}
