@@ -1132,7 +1132,29 @@ let attrs_props =
 
 let request_tests =
   group "Request"
-    [ test "defaults" (fun () ->
+    [ test "with_scheme" (fun () ->
+          let r = Request.make Method.GET "/" in
+          equal string "https" (Request.scheme (Request.with_scheme `Https r)) ;
+          equal string "http"
+            (Request.scheme
+               (Request.with_scheme `Http (Request.with_scheme `Https r)) ) )
+    ; test "is_valid_authority" (fun () ->
+          List.iter
+            (fun (s, ok) -> equal ~msg:s bool ok (Request.is_valid_authority s))
+            [ ("a.example:80", true)
+            ; ("[::1]:8080", true)
+            ; ("a.example", true)
+            ; ("a:", true)
+            ; ("[::1]:", true)
+            ; ("a,b", true)
+            ; ("evil.com/x", false)
+            ; ("a@b", false)
+            ; ("x?y", false)
+            ; ("a b", false)
+            ; ("\xc3\xa9", false)
+            ; ("", false)
+            ; ("a:b", false) ] )
+    ; test "defaults" (fun () ->
           let r = Request.make Method.GET "/" in
           equal meth Method.GET (Request.meth r) ;
           equal version Version.Http_1_1 (Request.version r) ;

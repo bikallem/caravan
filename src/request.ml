@@ -75,6 +75,11 @@ let with_authority authority r =
   Option.iter (check "with_authority" "authority") authority ;
   {r with authority}
 
+let with_scheme scheme r =
+  {r with scheme= (match scheme with `Http -> "http" | `Https -> "https")}
+
+let is_valid_authority s = H1_parse.is_authority s
+
 let with_attrs attrs r = {r with attrs}
 
 let with_attr k v r = {r with attrs= Attrs.add k v r.attrs}

@@ -40,7 +40,8 @@ val version : t -> Version.t
 val scheme : t -> string
 (** [scheme r] is the scheme of [r], ["http"] or ["https"]. For a request
     received by a server it is the connection's scheme: a request whose target
-    names another one is refused with [421]. *)
+    names another one is refused with [421]. A middleware can change it with
+    {!with_scheme}, for example behind a proxy that ends TLS. *)
 
 val authority : t -> string option
 (** [authority r] is the [host[:port]] that [r] targets, if known. *)
@@ -81,9 +82,21 @@ val with_path : string -> t -> t
     @raise Invalid_argument as {!make} does. *)
 
 val with_authority : string option -> t -> t
-(** [with_authority a r] is [r] with authority [a].
+(** [with_authority a r] is [r] with authority [a]. It checks only the
+    characters that {!make} refuses: use {!is_valid_authority} for a value from
+    a peer.
 
     @raise Invalid_argument as {!make} does. *)
+
+val with_scheme : [`Http | `Https] -> t -> t
+(** [with_scheme s r] is [r] with the scheme [s]. *)
+
+val is_valid_authority : string -> bool
+(** [is_valid_authority s] is [true] iff [s] is [host[:port]] as the server
+    accepts it in a [Host] field: a [reg-name] or an IP literal in brackets (RFC
+    3986), then an optional [:] and zero or more digits of a port. For example
+    [a.example:80] and [[::1]:8080] are valid, and [evil.com/x], [a@b] and [x?y]
+    are not. *)
 
 (** {1:attributes Attributes}
 

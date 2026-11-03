@@ -16,6 +16,11 @@ type head =
   ; version: Version.t
   ; headers: Headers.t }
 
+val is_authority : ?port:bool -> string -> bool
+(** [is_authority ~port s] is [true] iff [s] is [host[:port]] with a non-empty
+    host: a [reg-name] or an IP literal in brackets (RFC 3986). [port] tells if
+    a non-empty port is necessary. *)
+
 val request_head : limits -> Buf_reader.t -> head
 (** [request_head limits r] parses a request line and a header section from [r].
     Up to four empty lines before the request line are skipped (RFC 9112 §2.2).
