@@ -277,6 +277,9 @@ let () =
 - `background` runs a request (or other code) while the test continues.
   At the end of the test, the run cancels it, as a client that leaves. A
   failure of a background fiber must be awaited.
+- `run ~stop_on_signals:true` stops the server at SIGINT and SIGTERM, as
+  `Server.run` does, and `signal` sends a signal. Thus a test can check a
+  graceful stop.
 - `race` runs the test for each seed and stops at the first failure.
   A replay is exact if the handler and the test keep no state from one
   run to the next.
