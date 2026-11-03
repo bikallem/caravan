@@ -86,3 +86,17 @@
     -f
     %{dep:section.awk}
     %{dep:../README.md}))))
+
+; The example of the "Cookies" section of README.md, as
+; readme_cookies.ml.
+
+(executable
+ (name readme_cookies)
+ (modules readme_cookies)
+ (libraries caravan))
+
+(rule
+ (action
+  (with-stdout-to
+   readme_cookies.ml
+   (run awk -v "section=Cookies" -f %{dep:section.awk} %{dep:../README.md}))))

@@ -210,6 +210,49 @@ let login req =
 - `Request.with_form` gives a request a form body, for the client or for
   a test.
 
+## Cookies
+
+`Request.cookie` reads a cookie of the request, and
+`Response.add_cookie` sends a `Set-Cookie` field:
+
+```ocaml
+open Caravan
+
+let theme = Cookie.make ~secure:true ~max_age:(30 * 24 * 3600) "theme" ""
+
+let show req =
+  match Request.cookie "theme" req with
+  | Some t ->
+      Response.string ("theme " ^ t ^ "\n")
+  | None ->
+      Response.string "no theme\n"
+
+let set req =
+  match Form.find "t" (Request.query_params req) with
+  | Some (("light" | "dark") as t) ->
+      Response.string "set\n"
+      |> Response.add_cookie (Cookie.with_value t theme)
+  | _ ->
+      Response.string ~status:Status.bad_request "t: light or dark\n"
+
+let clear _ =
+  Response.string "cleared\n" |> Response.add_cookie (Cookie.expired theme)
+```
+
+- `Cookie.make` validates the name, the value and the attributes. It
+  raises `Invalid_argument` for a value with a space or a `;`, for
+  `SameSite=None` with no `Secure`, or for a `__Host-` name with a
+  domain. Encode other bytes, for example with base64url.
+- The defaults are `Path=/`, `HttpOnly` and `SameSite=Lax`. A cookie
+  that a script reads needs `~http_only:false`. Use `~secure:true` in
+  production.
+- `Cookie.with_value` keeps the attributes, and `Cookie.expired` gives
+  the cookie that removes it from the user agent.
+- `Request.cookie` gives the first cookie with the name. The user agent
+  gives the order, and a sibling subdomain can set a cookie with the
+  same name: use a `__Host-` name for a security cookie.
+- `Cookie.pp` shows the length of the value, not the value.
+
 ## WebSocket
 
 The `caravan.websocket` library adds WebSocket
