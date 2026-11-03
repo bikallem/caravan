@@ -33,11 +33,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1792252316,
-        "narHash": "sha256-171BIfN9bzuFImz8Q8f3Xbyb6MXTMifGsEZ0KzUO6+U=",
+        "lastModified": 1793651569,
+        "narHash": "sha256-MtTrXApgWMrLGLXVIaZyrPtcPQM2jICvPOxmoNECZO4=",
         "owner": "bikallem",
         "repo": "weft",
-        "rev": "ae27e3d2882727f3b8e8a9165a17d33294a204c3",
+        "rev": "9cd35c77ade8957ecda6778b04996dc6bed17512",
         "type": "github"
       },
       "original": {
