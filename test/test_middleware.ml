@@ -1028,7 +1028,523 @@ let error_page_tests =
           | l ->
               fail (String.concat ";" l) ) ]
 
+(* Cors *)
+
+module C = Caravan_middleware.Cors
+
+let field name r = Headers.find name (Response.headers r)
+
+(* [cors ?meth ?fields mw h] is the response of [h] behind [mw] to a request
+   with [fields], and [true] if [h] ran. *)
+let cors ?(meth = Method.GET) ?(fields = []) mw h =
+  let ran = ref false in
+  let r =
+    mw
+      (fun req ->
+        ran := true ;
+        h req )
+      (Request.make ~headers:(Headers.of_list fields) meth "/")
+  in
+  (r, !ran)
+
+let origin o = ("Origin", o)
+
+let preflight ?(fields = []) o m =
+  [origin o; ("Access-Control-Request-Method", m)] @ fields
+
+(* [preflight_to ~fields mw o m] is the response and the run flag of a preflight
+   from the origin [o] for the method [m]. *)
+let preflight_to ?fields mw o m =
+  cors ~meth:Method.OPTIONS ~fields:(preflight ?fields o m) mw (reply "")
+
+let preflight_vary =
+  Some "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+
+let a = "https://a.example"
+
+let cors_fields r =
+  List.filter
+    (fun (n, _) ->
+      String.starts_with ~prefix:"access-control-" (String.lowercase_ascii n) )
+    (Headers.to_list (Response.headers r))
+
+(* [made mw] ignores the middleware [mw]: it is made only for its checks. *)
+let made (_ : Handler.middleware) = ()
+
+let cors_tests =
+  let any = C.middleware ~origins:C.Any () in
+  let only = C.middleware ~origins:(C.Only [a]) () in
+  group "Cors"
+    [ test "a request with no Origin" (fun () ->
+          (* With Any, a cache can give the response to a CORS fetch: it has the
+             constant fields, and no Vary. *)
+          let r, ran = cors any (reply "hi") in
+          is_true ran ;
+          equal
+            (list (pair string string))
+            [("Access-Control-Allow-Origin", "*")]
+            (cors_fields r) ;
+          equal (option string) None (field "vary" r) ;
+          let r, _ = cors only (reply "hi") in
+          equal (list (pair string string)) [] (cors_fields r) ;
+          equal (option string) (Some "Origin") (field "vary" r) )
+    ; test "Any gives *" (fun () ->
+          let r, _ = cors ~fields:[origin a] any (reply "hi") in
+          equal (option string) (Some "*")
+            (field "access-control-allow-origin" r) ;
+          equal (option string) None (field "vary" r) )
+    ; test "Only compares whole origins" (fun () ->
+          let allowed o =
+            field "access-control-allow-origin"
+              (fst (cors ~fields:[origin o] only (reply "")))
+          in
+          equal (option string) (Some "https://A.example")
+            (allowed "https://A.example") ;
+          List.iter
+            (fun o -> equal ~msg:o (option string) None (allowed o))
+            [ "https://a.example.evil.com"
+            ; "https://a.exampl"
+            ; "http://a.example"
+            ; "https://a.example:8443"
+            ; "null" ] )
+    ; test "Matching, and credentials" (fun () ->
+          let mw =
+            C.middleware
+              ~origins:(C.Matching (String.ends_with ~suffix:".example"))
+              ~credentials:true ()
+          in
+          let r, _ = cors ~fields:[origin a] mw (reply "") in
+          equal (option string) (Some a) (field "access-control-allow-origin" r) ;
+          equal (option string) (Some "true")
+            (field "access-control-allow-credentials" r) ;
+          equal (option string) (Some "Origin") (field "vary" r) ;
+          let r, _ = cors ~fields:[origin "https://b.other"] mw (reply "") in
+          equal (option string) None (field "access-control-allow-origin" r) )
+    ; test "expose_headers" (fun () ->
+          let mw =
+            C.middleware ~origins:(C.Only [a]) ~expose_headers:["X-A"; "X-B"] ()
+          in
+          let r, _ = cors ~fields:[origin a] mw (reply "") in
+          equal (option string) (Some "X-A, X-B")
+            (field "access-control-expose-headers" r) ;
+          let r, _ = preflight_to mw a "GET" in
+          equal (option string) None (field "access-control-expose-headers" r) )
+    ; test "the fields of the handler" (fun () ->
+          let h _ =
+            Response.string
+              ~headers:(Headers.of_list [("Access-Control-Allow-Origin", "*")])
+              ""
+          in
+          let r, _ = cors ~fields:[origin a] only h in
+          equal
+            (list (pair string string))
+            [("Access-Control-Allow-Origin", a)]
+            (cors_fields r) ;
+          let r, _ = cors ~fields:[origin "https://evil.example"] only h in
+          equal (list (pair string string)) [] (cors_fields r) )
+    ; test "a preflight" (fun () ->
+          let mw =
+            C.middleware ~origins:(C.Only [a])
+              ~allow_methods:Method.[GET; PUT]
+              ()
+          in
+          let r, ran = preflight_to mw a "PUT" in
+          is_false ran ;
+          equal status Status.no_content (Response.status r) ;
+          equal (option string) (Some a) (field "access-control-allow-origin" r) ;
+          equal (option string) (Some "GET, PUT")
+            (field "access-control-allow-methods" r) ;
+          equal (option string) preflight_vary (field "vary" r) )
+    ; test "refused preflights" (fun () ->
+          let mw =
+            C.middleware ~origins:(C.Only [a]) ~allow_methods:Method.[PUT] ()
+          in
+          List.iter
+            (fun (label, fields) ->
+              let r, ran = cors ~meth:Method.OPTIONS ~fields mw (reply "") in
+              is_false ~msg:label ran ;
+              equal ~msg:label status Status.no_content (Response.status r) ;
+              equal ~msg:label (list (pair string string)) [] (cors_fields r) ;
+              equal ~msg:label (option string) preflight_vary (field "vary" r) )
+            [ ("DELETE", preflight a "DELETE")
+            ; ( "a field"
+              , preflight
+                  ~fields:[("Access-Control-Request-Headers", "x-a")]
+                  a "PUT" )
+            ; ("an origin", preflight "https://evil.example" "PUT") ] )
+    ; test "the safelisted methods" (fun () ->
+          let mw =
+            C.middleware ~origins:(C.Only [a])
+              ~allow_methods:Method.[PUT]
+              ~allow_headers:["x-a"] ()
+          in
+          let r, _ =
+            preflight_to
+              ~fields:[("Access-Control-Request-Headers", "x-a")]
+              mw a "POST"
+          in
+          equal (option string) (Some a) (field "access-control-allow-origin" r) )
+    ; test "a bad Access-Control-Request-Method" (fun () ->
+          let mw =
+            C.middleware ~origins:(C.Only [a]) ~allow_methods:Method.[PATCH] ()
+          in
+          List.iter
+            (fun m ->
+              let r, _ = preflight_to mw a m in
+              equal ~msg:m (list (pair string string)) [] (cors_fields r) )
+            ["GET, PUT"; ""; "patch"] ;
+          let r, _ = preflight_to mw a "PATCH" in
+          equal (option string) (Some a) (field "access-control-allow-origin" r) )
+    ; test "Access-Control-Request-Headers" (fun () ->
+          let mw =
+            C.middleware ~origins:(C.Only [a]) ~allow_headers:["x-a"; "X-B"] ()
+          in
+          let r, _ =
+            preflight_to
+              ~fields:[("Access-Control-Request-Headers", "X-A ,, x-b")]
+              mw a "GET"
+          in
+          equal (option string) (Some "X-A, x-b")
+            (field "access-control-allow-headers" r) ;
+          let r, _ =
+            preflight_to
+              ~fields:[("Access-Control-Request-Headers", "")]
+              mw a "GET"
+          in
+          equal (option string) (Some a) (field "access-control-allow-origin" r) ;
+          equal (option string) None (field "access-control-allow-headers" r) )
+    ; test "allow_headers with *" (fun () ->
+          let mw =
+            C.middleware ~origins:(C.Only [a]) ~allow_headers:["x-a"; "*"] ()
+          in
+          let r, _ =
+            preflight_to
+              ~fields:[("Access-Control-Request-Headers", "x-z, authorization")]
+              mw a "GET"
+          in
+          equal (option string) (Some "x-z, authorization")
+            (field "access-control-allow-headers" r) )
+    ; test "max_age and preflight_status" (fun () ->
+          let mw =
+            C.middleware ~origins:(C.Only [a]) ~max_age:600
+              ~preflight_status:Status.ok ()
+          in
+          let r, _ = preflight_to mw a "GET" in
+          equal (option string) (Some "600") (field "access-control-max-age" r) ;
+          equal status Status.ok (Response.status r) )
+    ; test "an OPTIONS that is not a preflight" (fun () ->
+          let r, ran =
+            cors ~meth:Method.OPTIONS ~fields:[origin a] only (reply "o")
+          in
+          is_true ran ;
+          equal (option string) (Some a) (field "access-control-allow-origin" r) )
+    ; test "Vary" (fun () ->
+          let vary_reply v _ =
+            Response.string ~headers:(Headers.of_list [("Vary", v)]) ""
+          in
+          let vary v =
+            field "vary" (fst (cors ~fields:[origin a] only (vary_reply v)))
+          in
+          equal (option string) (Some "Accept-Encoding, Origin")
+            (vary "Accept-Encoding") ;
+          equal (option string) (Some "origin") (vary "origin") ;
+          equal (option string) (Some "*") (vary "*") ;
+          let r, _ =
+            cors ~fields:[origin a] only (vary_reply "Accept-Encoding")
+          in
+          equal int 1
+            (List.length (Headers.find_all "vary" (Response.headers r))) )
+    ; test "an upgrade and a HEAD" (fun () ->
+          let r, _ =
+            cors ~fields:[origin a] only (fun _ -> Response.upgrade ignore)
+          in
+          equal (option string) (Some a) (field "access-control-allow-origin" r) ;
+          let r, _ =
+            cors ~meth:Method.HEAD ~fields:[origin a] only (reply "x")
+          in
+          equal (option string) (Some a) (field "access-control-allow-origin" r) )
+    ; test "a page of Error_page gets the fields" (fun () ->
+          let page = P.middleware ~report:(fun _ _ _ -> ()) () in
+          let r, _ =
+            Weft_sim.run (fun _ ->
+                cors
+                  ~fields:[origin a]
+                  (fun next -> only (page next))
+                  (fun _ -> failwith "x") )
+          in
+          equal status Status.internal_server_error (Response.status r) ;
+          equal (option string) (Some a) (field "access-control-allow-origin" r) )
+    ; test "with the router" (fun () ->
+          let router =
+            Caravan_router.(
+              handler [put "/r" (reply "put"); get "/r" (reply "get")] )
+          in
+          let h =
+            Handler.compose
+              [C.middleware ~origins:(C.Only [a]) ~allow_methods:Method.[PUT] ()]
+              router
+          in
+          T.run h (fun t ->
+              let pre path =
+                T.fetch t
+                  (Request.make
+                     ~headers:(Headers.of_list (preflight a "PUT"))
+                     Method.OPTIONS path )
+              in
+              List.iter
+                (fun path ->
+                  let r = pre path in
+                  equal ~msg:path status Status.no_content r.status ;
+                  equal ~msg:path (option string) (Some a)
+                    (Headers.find "access-control-allow-origin" r.headers) ;
+                  equal ~msg:path (option string) None
+                    (Headers.find "allow" r.headers) )
+                ["/r"; "/none"] ;
+              let r =
+                T.fetch t
+                  (Request.make
+                     ~headers:(Headers.of_list [origin a])
+                     Method.GET "/r" )
+              in
+              equal string "get" r.body ;
+              equal (option string) (Some a)
+                (Headers.find "access-control-allow-origin" r.headers) ) )
+    ; test "build errors" (fun () ->
+          List.iter
+            (fun (label, f) -> raises_match ~msg:label is_invalid_arg f)
+            [ ( "Any with credentials"
+              , fun () ->
+                  made (C.middleware ~origins:C.Any ~credentials:true ()) )
+            ; ( "a slash"
+              , fun () ->
+                  made
+                    (C.middleware ~origins:(C.Only ["https://a.example/"]) ())
+              )
+            ; ( "a default port"
+              , fun () ->
+                  made
+                    (C.middleware ~origins:(C.Only ["https://a.example:443"]) ())
+              )
+            ; ( "http 80"
+              , fun () ->
+                  made
+                    (C.middleware ~origins:(C.Only ["http://a.example:80"]) ())
+              )
+            ; ("*", fun () -> made (C.middleware ~origins:(C.Only ["*"]) ()))
+            ; ( "a bad scheme"
+              , fun () ->
+                  made (C.middleware ~origins:(C.Only ["h_t://a.example"]) ())
+              )
+            ; ( "no host"
+              , fun () -> made (C.middleware ~origins:(C.Only ["http://"]) ())
+              )
+            ; ( "no host with a port"
+              , fun () ->
+                  made (C.middleware ~origins:(C.Only ["http://:8080"]) ()) )
+            ; ( "a port of 65536"
+              , fun () ->
+                  made
+                    (C.middleware ~origins:(C.Only ["https://a.example:65536"])
+                       () ) )
+            ; ( "ws"
+              , fun () ->
+                  made (C.middleware ~origins:(C.Only ["ws://a.example"]) ()) )
+            ; ( "a leading zero"
+              , fun () ->
+                  made
+                    (C.middleware ~origins:(C.Only ["https://a.example:0443"])
+                       () ) )
+            ; ( "a port too large"
+              , fun () ->
+                  made
+                    (C.middleware ~origins:(C.Only ["http://a.example:99999"])
+                       () ) )
+            ; ( "a scheme with no letter first"
+              , fun () -> made (C.middleware ~origins:(C.Only ["+x://a"]) ()) )
+            ; ( "an IPv6 that is not canonical"
+              , fun () ->
+                  made (C.middleware ~origins:(C.Only ["http://[0:0::1]"]) ())
+              )
+            ; ( "a percent"
+              , fun () ->
+                  made
+                    (C.middleware ~origins:(C.Only ["https://a%2eexample"]) ())
+              )
+            ; ( "Other \"*\" in allow_methods"
+              , fun () ->
+                  made
+                    (C.middleware ~origins:C.Any
+                       ~allow_methods:[Method.Other "*"] () ) )
+            ; ( "track in allow_methods"
+              , fun () ->
+                  made
+                    (C.middleware ~origins:C.Any
+                       ~allow_methods:[Method.Other "track"] () ) )
+            ; ( "a method that is not a token"
+              , fun () ->
+                  made
+                    (C.middleware ~origins:C.Any
+                       ~allow_methods:[Method.Other "a b"] () ) )
+            ; ( "127.1"
+              , fun () ->
+                  made (C.middleware ~origins:(C.Only ["http://127.1"]) ()) )
+            ; ( "1.2.3.256"
+              , fun () ->
+                  made (C.middleware ~origins:(C.Only ["http://1.2.3.256"]) ())
+              )
+            ; ( "0x7f.1"
+              , fun () ->
+                  made (C.middleware ~origins:(C.Only ["http://0x7f.1"]) ()) )
+            ; ( "empty labels"
+              , fun () ->
+                  made (C.middleware ~origins:(C.Only ["http://..."]) ()) )
+            ; ( "IPv4 mapped as a dotted quad"
+              , fun () ->
+                  made
+                    (C.middleware ~origins:(C.Only ["http://[::ffff:1.2.3.4]"])
+                       () ) )
+            ; ( "TRACE in allow_methods"
+              , fun () ->
+                  made
+                    (C.middleware ~origins:C.Any
+                       ~allow_methods:Method.[TRACE]
+                       () ) )
+            ; ( "no scheme"
+              , fun () -> made (C.middleware ~origins:(C.Only ["a.example"]) ())
+              )
+            ; ( "an empty port"
+              , fun () ->
+                  made
+                    (C.middleware ~origins:(C.Only ["https://a.example:"]) ())
+              )
+            ; ( "CONNECT"
+              , fun () ->
+                  made
+                    (C.middleware ~origins:C.Any
+                       ~allow_methods:Method.[CONNECT]
+                       () ) )
+            ; ( "a field"
+              , fun () ->
+                  made (C.middleware ~origins:C.Any ~allow_headers:["a b"] ())
+              )
+            ; ( "an exposed field"
+              , fun () ->
+                  made (C.middleware ~origins:C.Any ~expose_headers:["a b"] ())
+              )
+            ; ( "* exposed with credentials"
+              , fun () ->
+                  made
+                    (C.middleware ~origins:(C.Only [a]) ~credentials:true
+                       ~expose_headers:["*"] () ) )
+            ; ( "max_age"
+              , fun () -> made (C.middleware ~origins:C.Any ~max_age:(-1) ()) )
+            ; ( "preflight_status"
+              , fun () ->
+                  made
+                    (C.middleware ~origins:C.Any
+                       ~preflight_status:Status.not_found () ) ) ] ;
+          made
+            (C.middleware
+               ~origins:
+                 (C.Only
+                    [ "null"
+                    ; "http://localhost:8080"
+                    ; "https://a.example:8443"
+                    ; "http://[::1]:8080"
+                    ; "capacitor://localhost"
+                    ; "com.example.app://x"
+                    ; "http://a9.example:8089"
+                    ; "https://my-app_1.example"
+                    ; "https://a.example:65535"
+                    ; "http://127.0.0.1:3000"
+                    ; "http://localhost"
+                    ; "https://a.example."
+                    ; "http://[::ffff:7f00:1]"
+                    ; "https://xn--bcher-kva.example" ] )
+               () ) ;
+          (* 0 is a valid max_age: a browser does not keep the preflight. *)
+          made (C.middleware ~origins:C.Any ~max_age:0 ()) )
+    ; test "a star in an origin gets a hint" (fun () ->
+          raises_match
+            (function
+              | Invalid_argument m ->
+                  String.ends_with ~suffix:"use Matching for a pattern" m
+              | _ ->
+                  false )
+            (fun () ->
+              made (C.middleware ~origins:(C.Only ["https://*.example.com"]) ()) ) ;
+          raises_match
+            (function
+              | Invalid_argument m ->
+                  not (String.ends_with ~suffix:"use Matching for a pattern" m)
+              | _ ->
+                  false )
+            (fun () ->
+              made (C.middleware ~origins:(C.Only ["https://a.example/"]) ()) ) ;
+          raises_match
+            (function
+              | Invalid_argument m ->
+                  String.ends_with ~suffix:"use Any" m
+              | _ ->
+                  false )
+            (fun () -> made (C.middleware ~origins:(C.Only ["*"]) ())) )
+    ; test "credentials on a preflight" (fun () ->
+          let mw = C.middleware ~origins:(C.Only [a]) ~credentials:true () in
+          let r, _ = preflight_to mw a "GET" in
+          equal (option string) (Some "true")
+            (field "access-control-allow-credentials" r) ;
+          let r, _ = preflight_to only a "GET" in
+          equal (option string) None
+            (field "access-control-allow-credentials" r) )
+    ; test "the removal keeps the other fields" (fun () ->
+          let h _ =
+            Response.string
+              ~headers:
+                (Headers.of_list
+                   [ ("Acc", "1")
+                   ; ("X-Long-Field-Name-1", "2")
+                   ; ("Access-Control-", "3")
+                   ; ("Access-Control-Max-Age", "4") ] )
+              ""
+          in
+          let r, _ = cors ~fields:[origin "https://evil.example"] only h in
+          equal
+            (list (pair string string))
+            [("Acc", "1"); ("X-Long-Field-Name-1", "2")]
+            (List.filter
+               (fun (n, _) -> n <> "Content-Type" && n <> "Vary")
+               (Headers.to_list (Response.headers r)) ) ;
+          equal (option string) (Some "text/plain; charset=utf-8")
+            (field "content-type" r) )
+    ; test "null and an exception of Matching" (fun () ->
+          let mw = C.middleware ~origins:(C.Only ["null"]) () in
+          let r, _ = cors ~fields:[origin "null"] mw (reply "") in
+          equal (option string) (Some "null")
+            (field "access-control-allow-origin" r) ;
+          let mw =
+            C.middleware ~origins:(C.Matching (fun _ -> raise Exit)) ()
+          in
+          raises Exit (fun () -> cors ~fields:[origin a] mw (reply "")) )
+    ; test "requested names that are not tokens" (fun () ->
+          let mw = C.middleware ~origins:(C.Only [a]) ~allow_headers:["*"] () in
+          let r, _ =
+            preflight_to
+              ~fields:[("Access-Control-Request-Headers", "x a")]
+              mw a "GET"
+          in
+          equal (option string) (Some a) (field "access-control-allow-origin" r) ;
+          equal (option string) None (field "access-control-allow-headers" r) )
+    ; test "permits" (fun () ->
+          is_true (C.permits C.Any "x") ;
+          is_true (C.permits (C.Only [a]) "HTTPS://A.EXAMPLE") ;
+          is_false (C.permits (C.Only [a]) "https://b.example") ;
+          is_true (C.permits (C.Matching (fun o -> o = "x")) "x") ) ]
+
 let () =
   exit
     (Windtrap.run "middleware"
-       [forwarded_tests; request_id_tests; access_log_tests; error_page_tests] )
+       [ forwarded_tests
+       ; request_id_tests
+       ; access_log_tests
+       ; error_page_tests
+       ; cors_tests ] )

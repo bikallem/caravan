@@ -570,3 +570,314 @@ module Error_page = struct
           Printexc.raise_with_backtrace e bt
         else (report req e bt ; page req e)
 end
+
+module Cors = struct
+  type origins = Any | Only of string list | Matching of (string -> bool)
+
+  let lower = String.lowercase_ascii
+
+  let permits origins =
+    match origins with
+    | Any ->
+        fun _ -> true
+    | Only l ->
+        let l = List.map lower l in
+        fun o ->
+          let o = lower o in
+          List.exists (String.equal o) l
+    | Matching p ->
+        p
+
+  let is_digit c = c >= '0' && c <= '9'
+
+  let is_letter = function 'a' .. 'z' | 'A' .. 'Z' -> true | _ -> false
+
+  let is_scheme_char c =
+    is_letter c || is_digit c || c = '+' || c = '-' || c = '.'
+
+  let is_host_char c = is_letter c || is_digit c || c = '-' || c = '_'
+
+  (* [valid_port p] is [true] for 1 to 65535 with no leading zero. *)
+  let valid_port p =
+    p <> ""
+    && String.length p <= 5
+    && String.for_all is_digit p
+    && p.[0] <> '0'
+    && int_of_string p <= 65535
+
+  (* [valid_host h] is [true] for a name of letters, digits, '.', '-' and '_',
+     or an IPv6 literal in brackets in the form that a browser sends (RFC
+     5952). *)
+  (* [canonical g] is the text that a browser sends for the IPv6 address of the
+     groups [g]: RFC 5952, with an IPv4 address mapped to IPv6 in hexadecimal
+     (the WHATWG serializer). *)
+  let canonical = function
+    | [0; 0; 0; 0; 0; 0xffff; ab; cd] ->
+        Printf.sprintf "::ffff:%x:%x" ab cd
+    | g ->
+        Forwarded.text_of_ipv6 g
+
+  (* [valid_name h] is [true] for labels of letters, digits, '-' and '_',
+     separated by '.', with an optional '.' at the end. A name whose last label
+     is a number must be an IPv4 address in its normal form, as a browser sends
+     it (WHATWG "ends in a number"). *)
+  let valid_name h =
+    let labels = String.split_on_char '.' h in
+    let labels =
+      match List.rev labels with
+      | "" :: (_ :: _ as rest) ->
+          List.rev rest
+      | _ ->
+          labels
+    in
+    List.for_all (fun l -> l <> "" && String.for_all is_host_char l) labels
+    &&
+    let last = List.nth labels (List.length labels - 1) in
+    if
+      String.for_all is_digit last
+      || String.starts_with ~prefix:"0x" (lower last)
+    then Option.is_some (Forwarded.ipv4 h)
+    else true
+
+  (* [valid_host h] is [true] for a name ([valid_name]), or an IPv6 literal in
+     brackets as a browser sends it. *)
+  let valid_host h =
+    match Forwarded.of_value h with
+    | Forwarded.Ip _ when String.starts_with ~prefix:"[" h ->
+        let ip = String.sub h 1 (String.length h - 2) in
+        Option.map canonical (Forwarded.ipv6 ip) = Some ip
+    | _ ->
+        valid_name h
+
+  (* [valid_origin e] is [true] if [e] is ["null"], or the form of an [Origin]
+     field: [scheme "://" host [":" port]], with no default port. A browser
+     never sends an [Origin] with a ws or wss scheme. *)
+  let valid_origin e =
+    e = "null"
+    ||
+    match String.index_opt e ':' with
+    | None ->
+        false
+    | Some i -> (
+        let scheme = lower (String.sub e 0 i) in
+        let rest = String.sub e (i + 1) (String.length e - i - 1) in
+        scheme <> ""
+        && is_letter scheme.[0]
+        && String.for_all is_scheme_char scheme
+        && scheme <> "ws" && scheme <> "wss"
+        && String.starts_with ~prefix:"//" rest
+        &&
+        let authority = String.sub rest 2 (String.length rest - 2) in
+        (* The port follows the last ':' after the host (or after ']'). *)
+        let host_end =
+          match String.rindex_opt authority ':' with
+          | Some j when not (String.contains_from authority j ']') ->
+              j
+          | _ ->
+              String.length authority
+        in
+        let host = String.sub authority 0 host_end in
+        let port =
+          if host_end = String.length authority then None
+          else
+            Some
+              (String.sub authority (host_end + 1)
+                 (String.length authority - host_end - 1) )
+        in
+        valid_host host
+        &&
+        match port with
+        | None ->
+            true
+        | Some p ->
+            valid_port p
+            && not
+                 ( (scheme = "http" && p = "80")
+                 || (scheme = "https" && p = "443") ) )
+
+  let safelisted = Method.[GET; HEAD; POST]
+
+  (* [with_vary names h] is [h] with each of [names] in its [Vary] field, once,
+     compared case-insensitively. A [Vary: *] stays. *)
+  let with_vary names h =
+    let have = Headers.tokens "vary" h in
+    if List.mem "*" have then h
+    else
+      let lowered = List.map lower have in
+      let missing =
+        List.filter (fun n -> not (List.mem (lower n) lowered)) names
+      in
+      if missing = [] then h
+      else Headers.set "Vary" (String.concat ", " (have @ missing)) h
+
+  let cors_prefix = "access-control-"
+
+  (* [has_cors_prefix n i] is [true] if [n] has [cors_prefix] from [i] on,
+     case-insensitively. *)
+  let rec has_cors_prefix n i =
+    i = String.length cors_prefix
+    || Char.lowercase_ascii n.[i] = cors_prefix.[i]
+       && has_cors_prefix n (i + 1)
+
+  (* [is_cors_field n] compares the prefix case-insensitively, with no
+     allocation. *)
+  let is_cors_field n =
+    String.length n >= String.length cors_prefix && has_cors_prefix n 0
+
+  let invalid what = invalid_arg ("Caravan_middleware.Cors.middleware: " ^ what)
+
+  let preflight_vary =
+    "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+
+  let middleware ~origins ?(allow_methods = []) ?(allow_headers = [])
+      ?(expose_headers = []) ?(credentials = false) ?max_age
+      ?(preflight_status = Status.no_content) () =
+    ( match origins with
+    | Any when credentials ->
+        invalid "Any with credentials: any site could read the responses"
+    | Only l -> (
+      match List.find_opt (fun e -> not (valid_origin e)) l with
+      | Some "*" ->
+          invalid "\"*\" is not an origin: use Any"
+      | Some e when String.contains e '*' ->
+          invalid
+            (Printf.sprintf "%S is not an origin: use Matching for a pattern" e)
+      | Some e ->
+          invalid (Printf.sprintf "%S is not an origin" e)
+      | None ->
+          () )
+    | Any | Matching _ ->
+        () ) ;
+    List.iter
+      (fun m ->
+        let name = Method.to_string m in
+        if not (Headers.is_valid_name name) then
+          invalid (Printf.sprintf "%S is not a method" name) ;
+        (* The methods that a browser forbids, also in lower case, and a [*]
+           that a browser takes as a literal name with credentials. *)
+        match String.uppercase_ascii name with
+        | "CONNECT" | "TRACE" | "TRACK" | "*" ->
+            invalid (name ^ " in allow_methods")
+        | _ ->
+            () )
+      allow_methods ;
+    let check_names l =
+      List.iter
+        (fun n ->
+          if not (n = "*" || Headers.is_valid_name n) then
+            invalid (Printf.sprintf "%S is not a field name" n) )
+        l
+    in
+    check_names allow_headers ;
+    check_names expose_headers ;
+    if credentials && List.mem "*" expose_headers then
+      invalid "\"*\" in expose_headers with credentials" ;
+    ( match max_age with
+    | Some n when n < 0 ->
+        invalid "a negative max_age"
+    | _ ->
+        () ) ;
+    if Status.kind preflight_status <> `Success then
+      invalid "a preflight_status that is not 2xx" ;
+    let permitted = permits origins in
+    let any_header = List.mem "*" allow_headers in
+    let allowed_headers = List.map lower allow_headers in
+    let preflight_methods = safelisted @ allow_methods in
+    (* For [Any] (thus with no credentials), the value is the constant [*]: each
+       actual response gets it, and the response does not vary with the
+       origin. *)
+    let star =
+      match origins with Any -> true | Only _ | Matching _ -> false
+    in
+    let allow_origin o = if star then "*" else o in
+    let expose = String.concat ", " expose_headers in
+    (* The fields of a preflight that do not change. *)
+    let preflight_fields =
+      Headers.of_list
+        ( ( if allow_methods = [] then []
+            else
+              [ ( "Access-Control-Allow-Methods"
+                , String.concat ", " (List.map Method.to_string allow_methods)
+                ) ] )
+        @ ( if credentials then [("Access-Control-Allow-Credentials", "true")]
+            else [] )
+        @ ( match max_age with
+          | Some n ->
+              [("Access-Control-Max-Age", string_of_int n)]
+          | None ->
+              [] )
+        @ [("Vary", preflight_vary)] )
+    in
+    let refused_preflight = Headers.of_list [("Vary", preflight_vary)] in
+    let preflight req o =
+      let h = Request.headers req in
+      let requested = Headers.tokens "access-control-request-headers" h in
+      let method_ok =
+        match Headers.find "access-control-request-method" h with
+        | Some m when Headers.is_valid_name m ->
+            List.exists (Method.equal (Method.of_string m)) preflight_methods
+        | _ ->
+            false
+      in
+      let headers_ok =
+        List.for_all
+          (fun n -> any_header || List.mem (lower n) allowed_headers)
+          requested
+      in
+      let headers =
+        if permitted o && method_ok && headers_ok then
+          let h =
+            Headers.set "Access-Control-Allow-Origin" (allow_origin o)
+              preflight_fields
+          in
+          match List.filter Headers.is_valid_name requested with
+          | [] ->
+              h
+          | names ->
+              Headers.set "Access-Control-Allow-Headers"
+                (String.concat ", " names) h
+        else refused_preflight
+      in
+      Response.empty ~status:preflight_status ~headers ()
+    in
+    let allow o h =
+      let h = Headers.set "Access-Control-Allow-Origin" (allow_origin o) h in
+      let h =
+        if credentials then
+          Headers.set "Access-Control-Allow-Credentials" "true" h
+        else h
+      in
+      if expose_headers = [] then h
+      else Headers.set "Access-Control-Expose-Headers" expose h
+    in
+    let actual origin resp =
+      let h = Response.headers resp in
+      let h =
+        match origin with
+        | None ->
+            (* A cache can give this response to a later CORS fetch: with the
+               constant [*], it has the fields. *)
+            if star then allow "*" h else h
+        | Some o when permitted o ->
+            allow o h
+        | Some _ ->
+            (* A field of an upstream must not go to this origin. The fold reads
+               the fields of the response and removes each CORS field from the
+               result. *)
+            Headers.fold
+              (fun n _ h -> if is_cors_field n then Headers.remove n h else h)
+              h h
+      in
+      let h = if star then h else with_vary ["Origin"] h in
+      Response.with_headers h resp
+    in
+    fun next req ->
+      let h = Request.headers req in
+      match Headers.find "origin" h with
+      | Some o
+        when Method.equal (Request.meth req) Method.OPTIONS
+             && Headers.mem "access-control-request-method" h ->
+          preflight req o
+      | origin ->
+          actual origin (next req)
+end

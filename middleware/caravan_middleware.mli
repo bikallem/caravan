@@ -248,3 +248,95 @@ module Error_page : sig
   (** [plain] gives [500 Internal Server Error] with a body that does not show
       the exception. *)
 end
+
+(** Cross-origin resource sharing (the CORS protocol of the Fetch standard).
+
+    {[
+    Cors.middleware ~origins:(Cors.Only ["https://app.example"])
+      ~allow_methods:[PUT; DELETE]
+      ~allow_headers:["content-type"; "authorization"]
+      ~credentials:true ()
+    ]}
+
+    CORS is not access control. For an origin that is not permitted, the handler
+    still runs (a form POST changes state): only the read of the response by the
+    page is blocked. Same-origin POST, PUT and DELETE also send [Origin].
+
+    The order:
+    [[Forwarded; Request_id; Access_log; Cors; Error_page; authentication;
+     router]]. Thus a page gets the fields, the router does not answer a
+    preflight, and authentication is inside, because a preflight has no
+    credentials. WebSocket is outside CORS: give {!permits} to
+    [Caravan_websocket.accept ~origin]. *)
+module Cors : sig
+  (** The type for the origins that a policy permits. *)
+  type origins =
+    | Any
+        (** Each origin, with the constant [Access-Control-Allow-Origin: *] on
+            each actual response, also with no [Origin] (a cache can give that
+            response to a later CORS fetch). *)
+    | Only of string list
+        (** The origins of the list, as ["https://app.example"] or
+            ["http://localhost:8080"], compared as whole strings, ASCII
+            case-insensitively. ["null"] matches only an entry ["null"]: it is
+            the origin of sandboxed frames and files. *)
+    | Matching of (string -> bool)
+        (** The origins for which the predicate is [true]. It gets the first
+            [Origin] field as it is, also ["null"]. Its exception goes out. A
+            suffix check must have the scheme, for example
+            [String.starts_with ~prefix:"https://"] and
+            [String.ends_with ~suffix:".example.com"]. A predicate that is
+            always [true], with [credentials], lets every site read the
+            authenticated responses of a user, also a sandboxed frame with the
+            origin ["null"]. *)
+
+  val middleware :
+       origins:origins
+    -> ?allow_methods:Caravan.Method.t list
+    -> ?allow_headers:string list
+    -> ?expose_headers:string list
+    -> ?credentials:bool
+    -> ?max_age:int
+    -> ?preflight_status:Caravan.Status.t
+    -> unit
+    -> Caravan.Handler.middleware
+  (** [middleware ~origins ()] adds the CORS fields to the responses, and
+      answers the preflights.
+      - A preflight is an [OPTIONS] with [Origin] and
+        [Access-Control-Request-Method]. The middleware answers it with
+        [preflight_status] (204 by default), and the handler does not run: thus
+        the [OPTIONS] routes of the application do not get preflights. The
+        requested method is permitted if it is [GET], [HEAD] or [POST], or in
+        [allow_methods] (compared case-sensitively). Each name of
+        [Access-Control-Request-Headers] must be in [allow_headers] (compared
+        case-insensitively), or [allow_headers] has ["*"]: a JSON body needs
+        ["content-type"], and ["authorization"] must be in the list. With ["*"],
+        the middleware gives the requested names back, thus ["*"] permits
+        ["authorization"] too (unlike a literal [*] of Fetch). A refused
+        preflight gets the same status with no CORS field.
+      - An actual request with a permitted origin gets
+        [Access-Control-Allow-Origin] (the [Origin] of the request, or [*] for
+        {!Any}), [Access-Control-Allow-Credentials] (with [credentials]) and
+        [Access-Control-Expose-Headers] (with [expose_headers]). These replace
+        the fields of the handler. For an origin that is not permitted, the
+        middleware removes each [Access-Control-] field of the response. Each
+        actual response gets [Vary: Origin], except with {!Any}, where each
+        actual response has the constant fields.
+      - [max_age] is the time in seconds that a browser can keep a preflight.
+        Browsers cap it, Chromium at 7200 s.
+      - An exception of the handler goes out with no CORS field.
+
+      @raise Invalid_argument
+        for {!Any} with [credentials] (any site could read the authenticated
+        responses of a user), an entry of {!Only} that is not ["null"] or
+        [scheme://host[:port]] as a browser sends it (a host of letters, digits,
+        [.], [-] and [_] or an IPv6 literal in the form of RFC 5952, a port of 1
+        to 65535 with no leading zero and no default port, a scheme that starts
+        with a letter and is not ws or wss), [CONNECT], [TRACE], [TRACK] or [*]
+        in [allow_methods], a field name that is not a token or ["*"], ["*"] in
+        [expose_headers] with [credentials], a negative [max_age], or a
+        [preflight_status] that is not 2xx. *)
+
+  val permits : origins -> string -> bool
+  (** [permits origins o] is [true] if the [Origin] [o] is permitted. *)
+end
