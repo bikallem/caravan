@@ -95,3 +95,12 @@
  (name test_sim_support)
  (modules test_sim_support)
  (libraries sim_support windtrap unix))
+
+; The printers of caravan.testing for the exceptions of Weft_sim. The other
+; suites link sim_support, whose printers have the same format and come first,
+; thus this suite links caravan.testing and no harness.
+
+(test
+ (name test_printers)
+ (modules test_printers)
+ (libraries caravan.testing weft.sim windtrap))

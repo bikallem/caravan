@@ -32,6 +32,7 @@ val run :
   -> ?client_config:Caravan_client.Config.t
   -> ?seed:int
   -> ?domains:int
+  -> ?manual:bool
   -> ?guard:Weft.Span.t
   -> Caravan.Handler.t
   -> (t -> 'a)
@@ -39,7 +40,8 @@ val run :
 (** [run handler f] serves [handler] on [127.0.0.1:80] of a new simulator, and
     calls [f] with a client. Then it closes the client ([Caravan_client.run]
     gives request bodies its [close_grace]) and aborts the server: the handlers
-    that still run get a cancel.
+    that still run get a cancel. In manual mode, the server aborts first, then
+    the client closes with no grace (see {!section-manual}).
     - [config] is for the server ({!Caravan.Config.default} by default). [run]
       replaces its [addr], also a Unix socket address, and its [on_error].
     - [engine] is that of [Caravan.Server.start].
@@ -48,11 +50,14 @@ val run :
     - [client_config] is for the client.
     - [seed] (0 by default) and [domains] (1 by default) are those of
       [Weft_sim.run].
-    - [guard] is 10 min of virtual time by default. It limits [f] only, not the
-      close of the client and the server after [f]. While [f] runs and the
-      client is open, the guard is the only stop: the reaper of the client
-      always has a timer, thus the virtual time always moves. Thus a test that
-      waits for nothing is cancelled at the guard.
+    - [manual] (default [false]) runs the simulator in manual mode: see
+      {!section-manual}.
+    - [guard] limits [f] only, not the close of the client and the server after
+      [f]. In auto mode it is 10 min of virtual time by default. While [f] runs
+      and the client is open, the guard is then the only stop: the reaper of the
+      client always has a timer, thus the virtual time always moves. Thus a test
+      that waits for nothing is cancelled at the guard. A manual run has no
+      guard by default.
 
     Call [run] outside a weft run: it makes its own simulator. The result is the
     first of these that occurs:
@@ -67,6 +72,82 @@ val run :
 
     The exceptions of [Caravan.Server.start] (for example [Invalid_argument])
     and of [Weft_sim.run] go out unchanged. *)
+
+val seed : t -> int
+(** [seed t] is the seed of the simulator of [t]. *)
+
+val domains : t -> int
+(** [domains t] is the number of virtual domains of the simulator of [t]. *)
+
+(** {1:race Many seeds} *)
+
+(** A run of {!race} raised [error]. *)
+exception
+  Race_failed of
+    {seed: int; domains: int; error: exn; backtrace: Printexc.raw_backtrace}
+
+val race :
+     ?seeds:int
+  -> ?replay:int
+  -> ?domains:int
+  -> ?config:Caravan.Config.t
+  -> ?engine:Caravan.Engine.t
+  -> ?on_error:(exn -> Printexc.raw_backtrace -> unit)
+  -> ?client_config:Caravan_client.Config.t
+  -> ?manual:bool
+  -> ?guard:Weft.Span.t
+  -> Caravan.Handler.t
+  -> (t -> unit)
+  -> unit
+(** [race handler f] calls [run ~seed ~domains handler f] for each seed from 1
+    to [seeds] (100 by default), on [domains] virtual domains (4 by default).
+    The seed selects the order of the fibers, thus each seed can show another
+    race. With [~replay:s], it runs only the seed [s], and [seeds] has no
+    effect. The other arguments go to {!run}.
+
+    The first run that raises stops the loop: {!race} raises {!Race_failed},
+    with the backtrace of the error. Its text tells the [~replay] of that seed.
+
+    [handler] and [f] are the same values in each run. Thus a replay is exact
+    only if they keep no state from one run to the next: for example a
+    [Caravan_middleware.Request_id.middleware] value has its own counter.
+
+    @raise Invalid_argument if [seeds] or [domains] is less than 1. *)
+
+(** {1:manual Manual time}
+
+    In a manual run ([run ~manual:true]), only {!advance} and {!advance_to} move
+    the virtual time. Thus a test can check a timeout at its exact time. A wait
+    that nothing can end raises [Weft_sim.Deadlock]: the timers of the client
+    and the server do not move the time.
+
+    At the end of a manual run, the client closes with no [close_grace]: a
+    request body that still goes stops. A handler or a request body producer
+    that ignores its cancel or waits in a shield makes the end a
+    [Weft_sim.Deadlock], which then hides an exception of [f]. *)
+
+val advance : t -> Weft.Span.t -> unit
+(** [advance t d] moves the virtual time by [d], then lets the fibers that wake
+    run ({!settle}). The advance stops at each deadline on its way, for example
+    the reaper of the client each half of [idle_timeout]: an advance of days
+    takes many steps. One advance at a time, from any fiber of the function of
+    {!run}.
+
+    @raise Invalid_argument
+      if the run is not manual, if [d] is negative, after the end of the mono
+      line, or if another advance is active at the same time (with the text of
+      [Weft_sim]). *)
+
+val advance_to : t -> Weft.Clock.mono -> unit
+(** [advance_to t at] is {!advance} to the time [at].
+
+    @raise Invalid_argument
+      if the run is not manual, if [at] is in the past, or if another advance is
+      active at the same time (with the text of [Weft_sim]). *)
+
+val settle : t -> unit
+(** [settle t] lets each fiber that can run, run, with no move of the time. It
+    also works in auto mode. *)
 
 val client : t -> Caravan_client.t
 (** [client t] is the client of [t]. *)

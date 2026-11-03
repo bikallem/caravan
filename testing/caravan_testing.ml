@@ -5,11 +5,18 @@ type t =
   { sim: Weft_sim.t
   ; server: Server.t
   ; client: Caravan_client.t
-  ; errors: (exn * Printexc.raw_backtrace) list Atomic.t }
+  ; errors: (exn * Printexc.raw_backtrace) list Atomic.t
+  ; seed: int
+  ; domains: int
+  ; manual: bool }
 
 exception Guard_expired of Span.t
 
 exception Unchecked_errors of (exn * Printexc.raw_backtrace) list
+
+exception
+  Race_failed of
+    {seed: int; domains: int; error: exn; backtrace: Printexc.raw_backtrace}
 
 (* The text of a span in the largest unit that gives a whole number, for example
    "2 s" or "1 ns". *)
@@ -33,6 +40,24 @@ let () =
              "Caravan_testing.Guard_expired: the function did not end before \
               the guard of %s of virtual time"
              (span_text d) )
+    | Race_failed {seed; domains; error; _} ->
+        Some
+          (Printf.sprintf
+             "Caravan_testing.Race_failed: seed %d (%d domains), replay with \
+              ~replay:%d: %s"
+             seed domains seed (Printexc.to_string error) )
+    (* weft registers no printer for the exceptions of its simulator. The format
+       is that of the test harness of caravan. *)
+    | Weft_sim.Deadlock l ->
+        Some ("Weft_sim.Deadlock: " ^ String.concat "; " l)
+    | Weft_sim.Livelock l ->
+        Some ("Weft_sim.Livelock: " ^ String.concat "; " l)
+    | Weft_sim.Lost_wakeup l ->
+        Some ("Weft_sim.Lost_wakeup: " ^ String.concat "; " l)
+    | Weft_sim.Unawaited l ->
+        Some ("Weft_sim.Unawaited: " ^ String.concat "; " l)
+    | Weft_sim.Model_error m ->
+        Some ("Weft_sim.Model_error: " ^ m)
     | Unchecked_errors l ->
         Some
           ( "Caravan_testing.Unchecked_errors: "
@@ -82,7 +107,8 @@ let push errors e =
 let reraise (e, bt) = Printexc.raise_with_backtrace e bt
 
 let run ?(config = Config.default) ?engine ?(on_error = fun _ _ -> ())
-    ?client_config ?seed ?domains ?(guard = Span.s 600) handler f =
+    ?client_config ?(seed = 0) ?(domains = 1) ?(manual = false) ?guard handler f
+    =
   let errors = Atomic.make [] in
   (* The first exception of [on_error]. *)
   let failed = Atomic.make None in
@@ -95,21 +121,40 @@ let run ?(config = Config.default) ?engine ?(on_error = fun _ _ -> ())
       Printexc.raise_with_backtrace e' bt'
   in
   let config = {config with Config.addr; on_error= record} in
-  Weft_sim.run ?seed ?domains (fun sim ->
+  (* A manual run has no guard unless the test gives one: a wait that nothing
+     can end is a [Weft_sim.Deadlock]. *)
+  let guard =
+    match guard with None when not manual -> Some (Span.s 600) | g -> g
+  in
+  let in_guard f =
+    match guard with
+    | Some g ->
+        guarded g f
+    | None ->
+        (* An exception of [f] goes to the catch around the client. *)
+        Ok (f ())
+  in
+  (* In manual mode, the client has no grace: a wait for the grace is a wait for
+     the time, thus a deadlock. Its daemon is in [sw]: the end of [sw] cancels
+     it, and that closes the client (see [Caravan_client.make]). *)
+  let with_client sw g =
+    if manual then g (Caravan_client.make ?config:client_config sw)
+    else Caravan_client.run ?config:client_config g
+  in
+  Weft_sim.run ~seed ~domains ~auto:(not manual) (fun sim ->
       Fiber.scope (fun sw ->
           let server = Server.start ?engine ~config sw handler in
           let outcome =
             match
-              Caravan_client.run ?config:client_config (fun client ->
-                  guarded guard (fun () -> f {sim; server; client; errors}) )
+              with_client sw (fun client ->
+                  in_guard (fun () ->
+                      f {sim; server; client; errors; seed; domains; manual} ) )
             with
             | r ->
                 r
-            | ((exception e)
-               [@mutate
-                 off
-                   "guarded catches the exceptions of f, thus only a defect of \
-                    the client raises here"] ) ->
+            (* An exception of [f] with no guard (a manual run), or a defect of
+               the client. *)
+            | exception e ->
                 Error (e, Printexc.get_raw_backtrace ())
           in
           Server.abort server ;
@@ -142,6 +187,54 @@ let run ?(config = Config.default) ?engine ?(on_error = fun _ _ -> ())
                 v
             | l ->
                 raise (Unchecked_errors l) ) ) )
+
+let race ?(seeds = 100) ?replay ?(domains = 4) ?config ?engine ?on_error
+    ?client_config ?manual ?guard handler f =
+  if replay = None && seeds < 1 then
+    invalid_arg "Caravan_testing.race: seeds < 1" ;
+  if domains < 1 then invalid_arg "Caravan_testing.race: domains < 1" ;
+  let to_run =
+    match replay with Some s -> [s] | None -> List.init seeds (fun i -> i + 1)
+  in
+  List.iter
+    (fun seed ->
+      match
+        run ?config ?engine ?on_error ?client_config ~seed ~domains ?manual
+          ?guard handler f
+      with
+      | () ->
+          ()
+      | exception error ->
+          let backtrace = Printexc.get_raw_backtrace () in
+          Printexc.raise_with_backtrace
+            (Race_failed {seed; domains; error; backtrace})
+            backtrace )
+    to_run
+
+let seed t = t.seed
+
+let domains t = t.domains
+
+let settle t = Weft_sim.settle t.sim
+
+let advance_to t at =
+  if not t.manual then
+    invalid_arg "Caravan_testing.advance_to: the run is not in manual mode" ;
+  if Span.compare (Time.diff Mono at (Time.now Mono)) Span.zero < 0 then
+    invalid_arg "Caravan_testing.advance_to: a time before the time now" ;
+  Weft_sim.advance_until t.sim at ;
+  Weft_sim.settle t.sim
+
+let advance t d =
+  if not t.manual then
+    invalid_arg "Caravan_testing.advance: the run is not in manual mode" ;
+  if Span.compare d Span.zero < 0 then
+    invalid_arg "Caravan_testing.advance: a negative span" ;
+  match Time.add Mono (Time.now Mono) d with
+  | Some at ->
+      advance_to t at
+  | None ->
+      invalid_arg "Caravan_testing.advance: after the end of the mono line"
 
 let client t = t.client
 

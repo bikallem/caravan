@@ -334,6 +334,286 @@ let sim_tests =
             (List.exists (fun s -> order s <> first) (List.init 9 (( + ) 2))) )
     ]
 
+(* The handler [note] records each path in [seen]. [race] gives the same handler
+   to each seed, thus [order_of_gets] empties [seen] first. *)
+let seen : string list Atomic.t = Atomic.make []
+
+let rec push_seen p =
+  let l = Atomic.get seen in
+  if not (Atomic.compare_and_set seen l (p :: l)) then push_seen p
+
+let note req =
+  push_seen (Request.path req) ;
+  ok ""
+
+(* [order_of_gets t] starts 8 GETs at the same time, and gives the order in
+   which the handler [note] saw them. *)
+let order_of_gets t =
+  Atomic.set seen [] ;
+  Fiber.scope (fun s ->
+      List.init 8 (fun i ->
+          Fiber.fork_promise s (fun () ->
+              ignore (T.get t ("/" ^ string_of_int i)) ) )
+      |> List.iter Promise.await ) ;
+  List.rev (Atomic.get seen)
+
+let is_race_failed ~seed ~domains = function
+  | T.Race_failed r ->
+      r.seed = seed && r.domains = domains
+  | _ ->
+      false
+
+let race_tests =
+  group "race"
+    [ test "each seed, with its seed and its domains" (fun () ->
+          let runs = ref [] in
+          T.race ~seeds:5 note (fun t ->
+              runs := (T.seed t, T.domains t, order_of_gets t) :: !runs ) ;
+          let runs = List.rev !runs in
+          equal (list int) [1; 2; 3; 4; 5] (List.map (fun (s, _, _) -> s) runs) ;
+          List.iter
+            (fun (seed, domains, order) ->
+              equal int 4 domains ;
+              equal ~msg:(string_of_int seed) (list string)
+                (T.run ~seed ~domains:4 note order_of_gets)
+                order )
+            runs ;
+          (* A seed that has no effect gives one order for each seed. *)
+          is_true ~msg:"the seeds give different orders"
+            ( List.length
+                (List.sort_uniq compare (List.map (fun (_, _, o) -> o) runs))
+            > 1 ) )
+    ; test "the first failure stops the race" (fun () ->
+          let seeds = ref [] in
+          raises_match
+            (function
+              | T.Race_failed {seed= 3; domains= 4; error= Failure m; _} ->
+                  m = "seed 3"
+              | _ ->
+                  false )
+            (fun () ->
+              T.race ~seeds:10
+                (fun _ -> ok "")
+                (fun t ->
+                  seeds := T.seed t :: !seeds ;
+                  if T.seed t = 3 then failwith "seed 3" ) ) ;
+          equal (list int) [1; 2; 3] (List.rev !seeds) ;
+          (* The backtrace of the error stays. *)
+          let recording = Printexc.backtrace_status () in
+          Printexc.record_backtrace true ;
+          Fun.protect
+            ~finally:(fun () -> Printexc.record_backtrace recording)
+            (fun () ->
+              match
+                T.race ~seeds:1 (fun _ -> ok "") (fun _ -> failwith "x")
+              with
+              | () ->
+                  fail "no Race_failed"
+              | exception T.Race_failed {backtrace; _} ->
+                  is_true (Printexc.raw_backtrace_length backtrace > 0) ) )
+    ; test "replay" (fun () ->
+          let seeds = ref [] in
+          T.race ~seeds:5 ~replay:4
+            (fun _ -> ok "")
+            (fun t -> seeds := T.seed t :: !seeds) ;
+          equal (list int) [4] !seeds ;
+          (* With replay, seeds has no effect. *)
+          T.race ~seeds:0 ~replay:1 (fun _ -> ok "") ignore ;
+          raises_match (is_race_failed ~seed:4 ~domains:2) (fun () ->
+              T.race ~replay:4 ~domains:2
+                (fun _ -> ok "")
+                (fun _ -> failwith "x") ) )
+    ; test "one seed on one domain" (fun () ->
+          let runs = ref 0 in
+          T.race ~seeds:1 ~domains:1 (fun _ -> ok "") (fun _ -> incr runs) ;
+          equal int 1 !runs )
+    ; test "bad counts" (fun () ->
+          List.iter
+            (fun f ->
+              raises_match
+                (function Invalid_argument _ -> true | _ -> false)
+                f )
+            [ (fun () -> T.race ~seeds:0 (fun _ -> ok "") ignore)
+            ; (fun () -> T.race ~domains:0 (fun _ -> ok "") ignore) ] )
+    ; test "the printers" (fun () ->
+          expect
+            (Printexc.to_string
+               (T.Race_failed
+                  { seed= 17
+                  ; domains= 4
+                  ; error= Failure "x"
+                  ; backtrace= Printexc.get_callstack 0 } ) )
+          @@ __POS_OF__
+               {|Caravan_testing.Race_failed: seed 17 (4 domains), replay with ~replay:17: Failure("x")|} ;
+          (* The printers of Weft_sim are in test/test_printers.ml: this program
+             also links sim_support, whose printers come first. *)
+          () )
+    ; test "seed and domains of run" (fun () ->
+          equal (pair int int) (0, 1)
+            (T.run (fun _ -> ok "") (fun t -> (T.seed t, T.domains t))) ;
+          equal (pair int int) (9, 3)
+            (T.run ~seed:9 ~domains:3
+               (fun _ -> ok "")
+               (fun t -> (T.seed t, T.domains t)) ) ) ]
+
+(* [ended iv] is [true] once [iv] is filled. *)
+let ended iv = Option.is_some (Ivar.peek iv)
+
+let manual_tests =
+  group "Manual time"
+    [ test "a sleep of 20 s ends at 20 s" (fun () ->
+          let slow _ =
+            Time.sleep Mono (Span.s 20) ;
+            ok "late"
+          in
+          T.run ~manual:true slow (fun t ->
+              let t0 = Time.now Mono in
+              let done_ = Ivar.create () in
+              Fiber.scope (fun s ->
+                  let p =
+                    Fiber.fork_promise s (fun () ->
+                        let r = T.get t "/" in
+                        ignore (Ivar.try_fill done_ ()) ;
+                        r )
+                  in
+                  T.advance_to t
+                    (Option.get
+                       (Time.add Mono t0 (Span.ns (20_000_000_000 - 1))) ) ;
+                  is_false ~msg:"at 20 s - 1 ns" (ended done_) ;
+                  T.advance t (Span.ns 1) ;
+                  is_true ~msg:"at 20 s" (ended done_) ;
+                  equal string "late" (Promise.await p).body ) ) )
+    ; test "the 408 of a header timeout comes at 3 s" (fun () ->
+          let config = {Config.default with header_timeout= Span.s 3} in
+          T.run ~manual:true ~config
+            (fun _ -> ok "")
+            (fun t ->
+              let c = Net.connect (Server.local_addr (T.server t)) in
+              let t0 = Time.now Mono in
+              Net.write c "GET / HTTP/1.1\r\nHo" ;
+              let got = Ivar.create () in
+              Fiber.scope (fun s ->
+                  Fiber.fork_daemon s (fun () ->
+                      let buf = Bytes.create 64 in
+                      let n = Net.read c buf 0 64 in
+                      ignore (Ivar.try_fill got (Bytes.sub_string buf 0 n)) ) ;
+                  T.advance_to t
+                    (Option.get
+                       (Time.add Mono t0 (Span.ns (3_000_000_000 - 1))) ) ;
+                  is_true ~msg:"no byte before 3 s" (Ivar.peek got = None) ;
+                  T.advance t (Span.ns 1) ;
+                  match Ivar.peek got with
+                  | Some b ->
+                      is_true ~msg:b
+                        (String.starts_with ~prefix:"HTTP/1.1 408" b)
+                  | None ->
+                      fail "no 408 at 3 s" ) ;
+              Net.close c ) )
+    ; test "a wait for nothing is a deadlock" (fun () ->
+          raises_match
+            (function Weft_sim.Deadlock _ -> true | _ -> false)
+            (fun () ->
+              T.run ~manual:true
+                (fun _ -> ok "")
+                (fun _ -> sync (Ivar.read (Ivar.create ()))) ) )
+    ; test "the checks of advance" (fun () ->
+          let is_advance_error = function
+            | Invalid_argument m ->
+                String.starts_with ~prefix:"Caravan_testing.advance" m
+            | _ ->
+                false
+          in
+          T.run
+            (fun _ -> ok "")
+            (fun t ->
+              raises_match is_advance_error (fun () -> T.advance t (Span.s 1)) ;
+              raises_match is_advance_error (fun () ->
+                  T.advance_to t (Time.now Mono) ) ;
+              (* settle works in auto mode. *)
+              T.settle t ) ;
+          T.run ~manual:true
+            (fun _ -> ok "")
+            (fun t ->
+              let t0 = Time.now Mono in
+              T.advance t (Span.s 2) ;
+              raises_match is_advance_error (fun () -> T.advance_to t t0) ;
+              raises_match is_advance_error (fun () ->
+                  T.advance t (Span.s (-1)) ) ;
+              raises_match is_advance_error (fun () ->
+                  T.advance t (Span.of_ns Int64.max_int) ) ;
+              T.settle t ;
+              (* An advance of zero, and to the time now, are valid. *)
+              T.advance t Span.zero ;
+              T.advance_to t (Time.now Mono) ) ;
+          raises Exit (fun () ->
+              T.run ~manual:true (fun _ -> ok "") (fun _ -> raise Exit) ) )
+    ; test "the priority of the exceptions in a manual run" (fun () ->
+          (* The exception of on_error wins over the exception of f, as in auto
+             mode. *)
+          raises Not_found (fun () ->
+              T.run ~manual:true
+                ~on_error:(fun _ _ -> raise Not_found)
+                (fun _ -> failwith "h")
+                (fun t ->
+                  (try ignore (T.get t "/") with _ -> ()) ;
+                  raise Exit ) ) )
+    ; test "a request body that goes at the end of a manual run" (fun () ->
+          let body =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "a" ;
+                Body.Writer.flush w ;
+                Time.sleep Mono (Span.s 3600) )
+          in
+          equal string "done"
+            (T.run ~manual:true
+               (fun _ -> ok "done")
+               (fun t -> (T.fetch t (Request.make ~body Method.POST "/")).body) ) )
+    ; test "the guard of a manual run" (fun () ->
+          raises_match
+            (function
+              | T.Guard_expired d -> Span.equal d (Span.s 1) | _ -> false )
+            (fun () ->
+              T.run ~manual:true ~guard:(Span.s 1)
+                (fun _ -> ok "")
+                (fun t ->
+                  Fiber.scope (fun s ->
+                      Fiber.fork_daemon s (fun () -> T.advance t (Span.s 2)) ;
+                      sync (Ivar.read (Ivar.create ())) ) ) ) ;
+          T.run ~manual:true
+            (fun _ -> ok "")
+            (fun t -> T.advance t (Span.s 3600)) )
+    ; test "the end of a manual run cancels the handlers" (fun () ->
+          let cancelled = Atomic.make false in
+          T.run ~manual:true (sleeping_stream cancelled) (fun t ->
+              ignore (T.request t (Request.make Method.GET "/")) ) ;
+          is_true (Atomic.get cancelled) )
+    ; test "an auto run gives request bodies their grace" (fun () ->
+          let log = ref [] in
+          let body =
+            Body.on_end
+              (fun how ~bytes ->
+                log :=
+                  ( (match how with Body.Ended -> "Ended" | _ -> "other")
+                  , bytes )
+                  :: !log )
+              (Body.of_writer (fun w ->
+                   Body.Writer.write_string w "a" ;
+                   Body.Writer.flush w ;
+                   Time.sleep Mono (Span.s 1) ;
+                   Body.Writer.write_string w "b" ) )
+          in
+          ignore
+            (T.run
+               (fun _ -> ok "early")
+               (fun t -> T.fetch t (Request.make ~body Method.POST "/")) ) ;
+          equal (list (pair string int)) [("Ended", 2)] !log ) ]
+
 let () =
   exit
-    (Windtrap.run "testing" [request_tests; error_tests; end_tests; sim_tests])
+    (Windtrap.run "testing"
+       [ request_tests
+       ; error_tests
+       ; end_tests
+       ; sim_tests
+       ; race_tests
+       ; manual_tests ] )
