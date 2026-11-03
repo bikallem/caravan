@@ -100,3 +100,23 @@
   (with-stdout-to
    readme_cookies.ml
    (run awk -v "section=Cookies" -f %{dep:section.awk} %{dep:../README.md}))))
+
+; The example of the "File uploads" section of README.md, as
+; readme_uploads.ml.
+
+(executable
+ (name readme_uploads)
+ (modules readme_uploads)
+ (libraries caravan))
+
+(rule
+ (action
+  (with-stdout-to
+   readme_uploads.ml
+   (run
+    awk
+    -v
+    "section=File uploads"
+    -f
+    %{dep:section.awk}
+    %{dep:../README.md}))))

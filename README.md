@@ -253,6 +253,51 @@ let clear _ =
   same name: use a `__Host-` name for a security cookie.
 - `Cookie.pp` shows the length of the value, not the value.
 
+## File uploads
+
+`Request.multipart` streams the parts of a `multipart/form-data` body,
+and `Request.multipart_form` keeps them in memory:
+
+```ocaml
+open Caravan
+
+(* Counts the bytes of each file, with no copy in memory. *)
+let upload req =
+  let buf = Bytes.create 65536 in
+  let rec size body n =
+    match Body.read body buf 0 (Bytes.length buf) with
+    | 0 ->
+        n
+    | k ->
+        size body (n + k)
+  in
+  let count acc part =
+    match Multipart.filename part with
+    | Some _ ->
+        (Multipart.name part, size (Multipart.body part) 0) :: acc
+    | None ->
+        acc
+  in
+  match Request.multipart req ~init:[] count with
+  | Ok files ->
+      Response.string
+        (String.concat ""
+           (List.map (fun (n, s) -> Printf.sprintf "%s: %d bytes\n" n s) files) )
+  | Error e ->
+      Response.string ~status:(Multipart.error_status e)
+        (Format.asprintf "%a\n" Multipart.pp_error e)
+```
+
+- The body of a part is valid only in the callback: copy it to keep it.
+  If the request body ends before the part ends, its read raises
+  `Body.Truncated`, thus a copy does not end as if it were complete.
+- The limits are `max_parts` (1000 by default) and `max_header_bytes`
+  (16 KiB by default, for the head of each part). `multipart_form` also
+  has `max_bytes` (8 MiB by default).
+- A file name comes from the client: it is not a safe path.
+- `Request.with_multipart` gives a request a multipart body, for the
+  client or for a test.
+
 ## WebSocket
 
 The `caravan.websocket` library adds WebSocket
