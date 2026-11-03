@@ -247,6 +247,23 @@ let exchange_tests =
           equal string "hello" (Body.to_string (body resp)) ;
           await s ;
           equal (list bool) [true] (t.releases ()) )
+    ; test "attrs of a request never go on the wire" (fun () ->
+          let k : string Attrs.key = Attrs.key ~name:"k" () in
+          let sent r =
+            with_conn
+            @@ fun t ->
+            let s =
+              serve t (fun rd ->
+                  let h, b = read_request rd in
+                  respond t "HTTP/1.1 204 No Content\r\n\r\n" ;
+                  Format.asprintf "%a %s %a@.%a@.%s" Method.pp h.meth h.target
+                    Version.pp h.version Headers.pp h.headers b )
+            in
+            ignore (t.run r) ;
+            await s
+          in
+          let r () = req ~meth:Method.POST ~body:(Body.of_string "abc") "/" in
+          equal string (sent (r ())) (sent (Request.with_attr k "v" (r ()))) )
     ; test "when a connection is reusable" (fun () ->
           let case ?(meth = Method.GET) ?(headers = []) ?(read = true)
               ?(close = false) response =

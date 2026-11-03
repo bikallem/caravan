@@ -109,5 +109,25 @@ val with_status : Status.t -> t -> t
 val with_headers : Headers.t -> t -> t
 (** [with_headers h r] is [r] with headers [h]. *)
 
+(** {1:attributes Attributes}
+
+    Typed values that middleware attach to a response, see {{!Attrs}[Attrs]}.
+    They never go on the wire. *)
+
+val attrs : t -> Attrs.t
+(** [attrs r] are the attributes of [r]. A new response has no attributes. *)
+
+val with_attrs : Attrs.t -> t -> t
+(** [with_attrs m r] is [r] with the attributes [m]. *)
+
+val find_attr : 'a Attrs.key -> t -> 'a option
+(** [find_attr k r] is [Attrs.find k (attrs r)]. *)
+
+val with_attr : 'a Attrs.key -> 'a -> t -> t
+(** [with_attr k v r] is [r] with the value [v] for [k]. The other attributes
+    stay. *)
+
 val pp : Format.formatter -> t -> unit
-(** [pp] formats a response's status and headers, for inspection. *)
+(** [pp] formats a response's status, the headers and the names of the
+    attributes ({!Attrs.pp}), for inspection. It prints a line only for headers
+    or attributes that exist. *)

@@ -1,6 +1,6 @@
 type kind = Body of Body.t | Upgrade of (Flow.t -> unit)
 
-type t = {status: Status.t; headers: Headers.t; kind: kind}
+type t = {status: Status.t; headers: Headers.t; kind: kind; attrs: Attrs.t}
 
 (* A body response's status is final: 1xx are interim and the engine's to send.
    An upgrade switches protocols (101) or opens a tunnel (2xx). *)
@@ -18,7 +18,7 @@ let check_status fn status kind =
 
 let v fn status headers kind =
   check_status fn status kind ;
-  {status; headers; kind}
+  {status; headers; kind; attrs= Attrs.empty}
 
 let make ?(status = Status.ok) ?(headers = Headers.empty) body =
   v "make" status headers (Body body)
@@ -57,7 +57,17 @@ let with_status status r =
 
 let with_headers headers r = {r with headers}
 
+let attrs r = r.attrs
+
+let with_attrs attrs r = {r with attrs}
+
+let find_attr k r = Attrs.find k r.attrs
+
+let with_attr k v r = {r with attrs= Attrs.add k v r.attrs}
+
 let pp ppf r =
-  Format.fprintf ppf "@[<v>%a%s@,%a@]" Status.pp r.status
-    (match r.kind with Body _ -> "" | Upgrade _ -> " (upgrade)")
-    Headers.pp r.headers
+  let start ppf () =
+    Format.fprintf ppf "%a%s" Status.pp r.status
+      (match r.kind with Body _ -> "" | Upgrade _ -> " (upgrade)")
+  in
+  Message_pp.pp ppf start r.headers r.attrs

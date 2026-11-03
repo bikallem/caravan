@@ -6,7 +6,8 @@ type t =
   ; path: string
   ; headers: Headers.t
   ; body: Body.t
-  ; conn: Conn_info.t option }
+  ; conn: Conn_info.t option
+  ; attrs: Attrs.t }
 
 (* Characters that would corrupt a request line or a Host field. *)
 let check fn what s =
@@ -18,7 +19,15 @@ let make ?(version = Version.Http_1_1) ?(scheme = "http") ?authority
     ?(headers = Headers.empty) ?(body = Body.empty) ?conn meth path =
   check "make" "path" path ;
   Option.iter (check "make" "authority") authority ;
-  {meth; version; scheme; authority; path; headers; body; conn}
+  { meth
+  ; version
+  ; scheme
+  ; authority
+  ; path
+  ; headers
+  ; body
+  ; conn
+  ; attrs= Attrs.empty }
 
 let meth r = r.meth
 
@@ -50,6 +59,10 @@ let body r = r.body
 
 let conn r = r.conn
 
+let attrs r = r.attrs
+
+let find_attr k r = Attrs.find k r.attrs
+
 let with_headers headers r = {r with headers}
 
 let with_body body r = {r with body}
@@ -62,7 +75,14 @@ let with_authority authority r =
   Option.iter (check "with_authority" "authority") authority ;
   {r with authority}
 
+let with_attrs attrs r = {r with attrs}
+
+let with_attr k v r = {r with attrs= Attrs.add k v r.attrs}
+
 let pp ppf r =
-  Format.fprintf ppf "@[<v>%a %s://%s%s %a@,%a@]" Method.pp r.meth r.scheme
-    (Option.value ~default:"" r.authority)
-    r.path Version.pp r.version Headers.pp r.headers
+  let start ppf () =
+    Format.fprintf ppf "%a %s://%s%s %a" Method.pp r.meth r.scheme
+      (Option.value ~default:"" r.authority)
+      r.path Version.pp r.version
+  in
+  Message_pp.pp ppf start r.headers r.attrs

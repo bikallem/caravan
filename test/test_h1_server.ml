@@ -589,6 +589,18 @@ let connection_tests =
         \r\n
         GET http a.example /info?q=1 HTTP/1.1 #7 127.0.0.1:50000 -> 127.0.0.1:8080
         |} )
+    ; test "attrs never go on the wire" (fun () ->
+          let k : string Attrs.key = Attrs.key ~name:"k" () in
+          let seen = ref None in
+          let handler ~attr req =
+            seen := Some (Attrs.is_empty (Request.attrs req)) ;
+            let r = Response.string "hello" in
+            if attr then Response.with_attr k "v" r else r
+          in
+          let with_attr, _ = serve ~handler:(handler ~attr:true) (get "/") in
+          is_true ~msg:"request attrs are empty" (!seen = Some true) ;
+          let without, _ = serve ~handler:(handler ~attr:false) (get "/") in
+          equal string without with_attr )
     ; test "a connection with TLS gives the https scheme" (fun () ->
           let m = memory (get "/info") in
           let ctx =

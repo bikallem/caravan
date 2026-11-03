@@ -5,6 +5,7 @@ module Headers = Headers
 module Flow = Flow
 module Body = Body
 module Conn_info = Conn_info
+module Attrs = Attrs
 module Request = Request
 module Response = Response
 module Handler = Handler

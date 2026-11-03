@@ -1027,6 +1027,109 @@ let conn_info_tests =
           in
           is_false ready ) ]
 
+(* Attrs *)
+
+let user : string Attrs.key = Attrs.key ~name:"user" ()
+
+let route : string Attrs.key = Attrs.key ~name:"route" ()
+
+let attrs_tests =
+  group "Attrs"
+    [ test "empty has no values" (fun () ->
+          equal (option string) None (Attrs.find user Attrs.empty) ;
+          is_false (Attrs.mem user Attrs.empty) ;
+          is_true (Attrs.is_empty Attrs.empty) )
+    ; test "two keys with the same name and type are different" (fun () ->
+          let a : int Attrs.key = Attrs.key ~name:"n" () in
+          let b : int Attrs.key = Attrs.key ~name:"n" () in
+          let m = Attrs.(empty |> add a 1 |> add b 2) in
+          equal (option int) (Some 1) (Attrs.find a m) ;
+          equal (option int) (Some 2) (Attrs.find b m) ;
+          let c : int Attrs.key = Attrs.key ~name:"n" () in
+          equal (option int) None (Attrs.find c m) )
+    ; test "add replaces the value of the key" (fun () ->
+          let m = Attrs.(empty |> add user "a" |> add user "b") in
+          equal (option string) (Some "b") (Attrs.find user m) ;
+          is_true (Attrs.mem user m) ;
+          is_false (Attrs.is_empty m) )
+    ; test "remove removes only its key" (fun () ->
+          let m = Attrs.(empty |> add user "a" |> add route "/r") in
+          let m' = Attrs.remove user m in
+          equal (option string) None (Attrs.find user m') ;
+          is_false (Attrs.mem user m') ;
+          equal (option string) (Some "/r") (Attrs.find route m') ;
+          let m'' = Attrs.remove user m' in
+          equal (option string) (Some "/r") (Attrs.find route m'') ;
+          is_true (Attrs.is_empty (Attrs.remove route m'')) )
+    ; test "key_name" (fun () ->
+          equal (option string) (Some "user") (Attrs.key_name user) ;
+          equal (option string) None (Attrs.key_name (Attrs.key ())) )
+    ; test "keys made on 4 domains at the same time are different" (fun () ->
+          let n = 10_000 in
+          let make d =
+            Domain.spawn (fun () ->
+                List.init n (fun i ->
+                    ((d * n) + i, (Attrs.key () : int Attrs.key)) ) )
+          in
+          let keys = List.concat_map Domain.join (List.init 4 make) in
+          let m =
+            List.fold_left (fun m (v, k) -> Attrs.add k v m) Attrs.empty keys
+          in
+          List.iter
+            (fun (v, k) -> equal (option int) (Some v) (Attrs.find k m))
+            keys )
+    ; test "pp prints the sorted names" (fun () ->
+          let m =
+            Attrs.(empty |> add user "a" |> add (key ()) 1 |> add route "/r")
+          in
+          expect (Format.asprintf "%a" Attrs.pp m)
+          @@ __POS_OF__ {|_, route, user|} ;
+          expect (Format.asprintf "%a" Attrs.pp Attrs.empty) @@ __POS_OF__ {||} )
+    ]
+
+(* Three keys of different types with the same name. An operation is [(i, Some
+   v)], an add of a value made from [v] on key [i], or [(i, None)], a remove. *)
+let attrs_props =
+  let ki : int Attrs.key = Attrs.key ~name:"k" () in
+  let ks : string Attrs.key = Attrs.key ~name:"k" () in
+  let kb : bool Attrs.key = Attrs.key ~name:"k" () in
+  let op = Gen.pair (Gen.int_range 0 2) (Gen.option (Gen.int_range 0 99)) in
+  let apply m = function
+    | 0, Some v ->
+        Attrs.add ki v m
+    | 1, Some v ->
+        Attrs.add ks (string_of_int v) m
+    | _, Some v ->
+        Attrs.add kb (v mod 2 = 0) m
+    | 0, None ->
+        Attrs.remove ki m
+    | 1, None ->
+        Attrs.remove ks m
+    | _, None ->
+        Attrs.remove kb m
+  in
+  let model ops i =
+    List.fold_left (fun last (j, v) -> if j = i then v else last) None ops
+  in
+  group "Attrs laws"
+    [ prop "find and mem agree with a model"
+        (Gen.list ~size:(Gen.int_range 0 20) op)
+        (fun ops ->
+          let m = List.fold_left apply Attrs.empty ops in
+          equal (option int) (model ops 0) (Attrs.find ki m) ;
+          equal (option string)
+            (Option.map string_of_int (model ops 1))
+            (Attrs.find ks m) ;
+          equal (option bool)
+            (Option.map (fun v -> v mod 2 = 0) (model ops 2))
+            (Attrs.find kb m) ;
+          equal bool (model ops 0 <> None) (Attrs.mem ki m) ;
+          equal bool (model ops 1 <> None) (Attrs.mem ks m) ;
+          equal bool (model ops 2 <> None) (Attrs.mem kb m) ;
+          equal bool
+            (List.for_all (fun i -> model ops i = None) [0; 1; 2])
+            (Attrs.is_empty m) ) ]
+
 let request_tests =
   group "Request"
     [ test "defaults" (fun () ->
@@ -1086,7 +1189,44 @@ let request_tests =
           in
           expect (Format.asprintf "%a" Request.pp r)
           @@ __POS_OF__ {|GET http://example.com/a?b HTTP/1.1
-Accept: */*|} ) ]
+Accept: */*|} )
+    ; test "attrs" (fun () ->
+          let r = Request.make Method.GET "/" in
+          is_true (Attrs.is_empty (Request.attrs r)) ;
+          equal (option string) None (Request.find_attr user r) ;
+          let r = Request.with_attr user "u" r in
+          equal (option string) (Some "u") (Request.find_attr user r) ;
+          let m = Attrs.(empty |> add route "/r") in
+          let r = Request.with_attrs m r in
+          equal (option string) None (Request.find_attr user r) ;
+          equal (option string) (Some "/r") (Request.find_attr route r) ;
+          let r = Request.with_attr user "u" r in
+          equal (option string) (Some "/r") (Request.find_attr route r) )
+    ; test "each with_ keeps the attrs" (fun () ->
+          let r = Request.with_attr user "u" (Request.make Method.GET "/") in
+          List.iter
+            (fun (name, f) ->
+              equal ~msg:name (option string) (Some "u")
+                (Request.find_attr user (f r)) )
+            [ ( "with_headers"
+              , Request.with_headers (Headers.of_list [("A", "b")]) )
+            ; ("with_body", Request.with_body (Body.of_string "x"))
+            ; ("with_path", Request.with_path "/p")
+            ; ("with_authority", Request.with_authority (Some "a.example")) ] )
+    ; test "pp prints the attrs" (fun () ->
+          let r =
+            Request.make Method.GET "/"
+            |> Request.with_attr user "u"
+            |> Request.with_attr (Attrs.key ()) 1
+          in
+          expect (Format.asprintf "%a" Request.pp r)
+          @@ __POS_OF__ {|GET http:/// HTTP/1.1
+attrs: _, user|} ;
+          let r = Request.with_headers (Headers.of_list [("A", "b")]) r in
+          expect (Format.asprintf "%a" Request.pp r)
+          @@ __POS_OF__ {|GET http:/// HTTP/1.1
+A: b
+attrs: _, user|} ) ]
 
 let content_type r = Headers.find "content-type" (Response.headers r)
 
@@ -1187,7 +1327,58 @@ let response_tests =
           @@ __POS_OF__ {|200 OK
 Content-Type: text/plain; charset=utf-8|} ;
           expect (Format.asprintf "%a" Response.pp (Response.upgrade ignore))
-          @@ __POS_OF__ {|101 Switching Protocols (upgrade)|} ) ]
+          @@ __POS_OF__ {|101 Switching Protocols (upgrade)|} )
+    ; test "pp prints no line break at the end" (fun () ->
+          (* [expect] ignores blank lines at the end, thus [equal]. *)
+          equal string "101 Switching Protocols (upgrade)"
+            (Format.asprintf "%a" Response.pp (Response.upgrade ignore)) ;
+          equal string "GET http:/// HTTP/1.1"
+            (Format.asprintf "%a" Request.pp (Request.make Method.GET "/")) )
+    ; test "attrs" (fun () ->
+          let r = Response.string "x" in
+          is_true (Attrs.is_empty (Response.attrs r)) ;
+          equal (option string) None (Response.find_attr user r) ;
+          let r = Response.with_attr user "u" r in
+          equal (option string) (Some "u") (Response.find_attr user r) ;
+          let r = Response.with_attrs Attrs.(empty |> add route "/r") r in
+          equal (option string) None (Response.find_attr user r) ;
+          equal (option string) (Some "/r") (Response.find_attr route r) ;
+          let r = Response.with_attr user "u" r in
+          equal (option string) (Some "/r") (Response.find_attr route r) )
+    ; test "each with_ keeps the attrs and the kind" (fun () ->
+          let is_upgrade r =
+            match Response.kind r with
+            | Response.Upgrade _ ->
+                true
+            | Response.Body _ ->
+                false
+          in
+          List.iter
+            (fun (base, r) ->
+              let r = Response.with_attr user "u" r in
+              List.iter
+                (fun (name, f) ->
+                  let r' = f r in
+                  let msg = base ^ " " ^ name in
+                  equal ~msg (option string) (Some "u")
+                    (Response.find_attr user r') ;
+                  equal ~msg bool (is_upgrade r) (is_upgrade r') )
+                [ ("with_status", Response.with_status Status.ok)
+                ; ("with_headers", Response.with_headers Headers.empty)
+                ; ("with_attr", Response.with_attr route "/r") ] )
+            [("body", Response.string "x"); ("upgrade", Response.upgrade ignore)] )
+    ; test "pp prints the attrs" (fun () ->
+          let u = Response.with_attr user "u" (Response.upgrade ignore) in
+          expect (Format.asprintf "%a" Response.pp u)
+          @@ __POS_OF__ {|101 Switching Protocols (upgrade)
+attrs: user|} ;
+          let r = Response.with_attr route "/r" (Response.string "x") in
+          expect (Format.asprintf "%a" Response.pp r)
+          @@ __POS_OF__
+               {|200 OK
+Content-Type: text/plain; charset=utf-8
+attrs: route|} )
+    ]
 
 let handler_tests =
   group "Handler"
@@ -1211,7 +1402,30 @@ let handler_tests =
           let r =
             Handler.compose [] Handler.not_found (Request.make Method.GET "/")
           in
-          equal status Status.not_found (Response.status r) ) ]
+          equal status Status.not_found (Response.status r) )
+    ; test "attrs go in and out through middleware" (fun () ->
+          let set_user : Handler.middleware =
+           fun h req -> h (Request.with_attr user "ann" req)
+          in
+          let seen = ref None in
+          let log : Handler.middleware =
+           fun h req ->
+            let r = h req in
+            seen := Response.find_attr route r ;
+            r
+          in
+          let h req =
+            match Request.find_attr user req with
+            | Some u ->
+                Response.with_attr route "/hello" (Response.string ("hi " ^ u))
+            | None ->
+                Response.string ~status:Status.unauthorized ""
+          in
+          let r =
+            Handler.compose [log; set_user] h (Request.make Method.GET "/")
+          in
+          equal status Status.ok (Response.status r) ;
+          equal (option string) (Some "/hello") !seen ) ]
 
 (* accept(2) errors *)
 
@@ -1593,6 +1807,8 @@ let () =
        ; deadline_tests
        ; body_tests
        ; conn_info_tests
+       ; attrs_tests
+       ; attrs_props
        ; request_tests
        ; response_tests
        ; handler_tests
