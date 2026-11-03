@@ -8,7 +8,7 @@ let () =
   in
   (* The fiber code gives the result. The program prints it after the run. *)
   let result =
-    Weft_linux.run
+    Weft.run (module Weft_os)
     @@ fun () ->
     Caravan_client.run
     @@ fun client ->

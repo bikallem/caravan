@@ -40,7 +40,7 @@
  (enabled_if
   (= %{system} linux))
  (modules serve_until_signal)
- (libraries caravan caravan.run weft))
+ (libraries caravan weft weft.linux))
 
 ; The server of make conformance.
 
@@ -49,7 +49,7 @@
  (enabled_if
   (= %{system} linux))
  (modules conformance_server)
- (libraries caravan caravan.run conformance_app weft))
+ (libraries caravan conformance_app weft weft.linux))
 
 ; The server of make autobahn.
 
@@ -58,4 +58,4 @@
  (enabled_if
   (= %{system} linux))
  (modules autobahn_server)
- (libraries caravan caravan.run caravan.websocket weft))
+ (libraries caravan caravan.websocket weft weft.linux))

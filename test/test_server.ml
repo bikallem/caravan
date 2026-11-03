@@ -527,6 +527,18 @@ let with_signal_server m f =
       f server ;
       Server.wait server )
 
+(* The simulator as a world of type [Weft.OS], for the test of [Server.run]. It
+   runs in manual mode and keeps the state of the simulation in [os_sim], so
+   that the test can send a signal. *)
+let os_sim = ref None
+
+module Sim_os : Weft.OS = struct
+  let run ?slack:_ ?domains ?signals ?watchdog:_ main =
+    Weft_sim.run ~auto:false ?domains ?signals (fun sim ->
+        os_sim := Some sim ;
+        main () )
+end
+
 let signal_tests =
   group "Signals"
     [ test "SIGTERM: the request in progress finishes, then the server ends"
@@ -619,7 +631,25 @@ let signal_tests =
             (Ivar.peek m.cancelled <> None) ;
           is_true ~msg:"no response" (is_eof r) ;
           Server.wait server ;
-          Flow.close flow ) ]
+          Flow.close flow )
+    ; test "Server.run: on_start gets the server, and SIGTERM ends the run"
+        (fun () ->
+          let m = marks () in
+          let started = ref false in
+          Server.run
+            ~config:{config with shutdown_grace= Span.s 10}
+            ~engine:fake
+            ~on_start:(fun server ->
+              started := true ;
+              let flow, r = connect server in
+              Flow.write_string flow (get "/slow") ;
+              sync (Ivar.read m.started) ;
+              Weft_sim.signal (Option.get !os_sim) Signal.SIGTERM ;
+              equal string {|200 "done" close|} (read_response r) ;
+              Flow.close flow )
+            (module Sim_os)
+            (signal_handler m) ;
+          is_true ~msg:"on_start is called" !started ) ]
 
 let () =
   exit

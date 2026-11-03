@@ -1,11 +1,12 @@
 (** HTTP servers.
 
     {[
-    let () = Caravan_run.run (fun _req -> Response.string "hello\n")
+    let () = Server.run (module Weft_os) (fun _req -> Response.string "hello\n")
     ]}
 
-    [Caravan_run.run] serves until Ctrl-C. For more control, {!start} a server
-    in a [Weft.Fiber.scope] and stop it with {!shutdown}. *)
+    {!run} serves until Ctrl-C. [Weft_os] (library [weft.os]) is the world of
+    the OS that the build runs on. For more control, {!start} a server in a
+    [Weft.Fiber.scope] and stop it with {!shutdown}. *)
 
 (** The type for running servers. *)
 type t
@@ -84,9 +85,9 @@ val stop_on_signals : t -> unit
     world, each signal goes to one call only. Then the [unwatch] of one call
     makes the wait of the other call raise [Invalid_argument].
 
-    The world must watch SIGINT and SIGTERM, for example
-    [Weft_linux.run ~signals] or [Weft_sim.run ~signals]. If not, the wait
-    raises [Invalid_argument].
+    The world must watch SIGINT and SIGTERM, for example [Weft.run ~signals] or
+    [Weft_sim.run ~signals]. If not, the wait raises [Invalid_argument]. {!run}
+    does this for you.
 
     @raise Weft.Net.Error
       if the OS gives an error for a signal, for example [ENOMEM] of [signalfd].
@@ -95,6 +96,40 @@ val stop_on_signals : t -> unit
       fails, the world continues to watch the two signals. If the unwatch of
       SIGTERM fails, it continues to watch SIGTERM. A signal that the world
       watches does not get its default action. *)
+
+val run :
+     ?config:Config.t
+  -> ?engine:Engine.t
+  -> ?domains:int
+  -> ?on_start:(t -> unit)
+  -> (module Weft.OS)
+  -> Handler.t
+  -> unit
+(** [run ~config ~engine ~domains ~on_start (module O) handler] serves [handler]
+    in the world [O] until the process gets SIGINT (Ctrl-C) or SIGTERM:
+    + It calls [Weft.run ~domains ~signals:[SIGINT; SIGTERM] (module O)]. The
+      world gives the default of [domains]: for the OS worlds of weft,
+      [min 4 (Domain.recommended_domain_count ())].
+    + It {!start}s the server and calls [on_start] with it, for example to print
+      its address.
+    + It calls {!stop_on_signals} in a daemon fiber: the first signal stops the
+      server with a grace, the second signal aborts it, and a third signal gets
+      its default action.
+
+    [O] is usually [Weft_os] (library [weft.os]), the world of the OS that the
+    build runs on, or a world of one OS, for example [Weft_linux]. The Windows
+    world of weft gives Ctrl-C as SIGINT, but it never gives SIGTERM.
+
+    It returns when the server stopped. Then the world closes, and SIGINT and
+    SIGTERM get the action that they had before [run] (see the [close] of the
+    world). Call it outside fiber code.
+
+    @raise Failure if [O] is [Weft_os] on a system that has no OS world of weft.
+    @raise Weft.Net.Error
+      if the address cannot be bound, if the accept of connections failed, or
+      for an error of the OS for SIGINT or SIGTERM (see {!stop_on_signals}). An
+      error for a signal cancels the scope of the server: the requests in
+      progress get no grace. *)
 
 (**/**)
 

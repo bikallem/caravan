@@ -1279,26 +1279,26 @@ let accept_error_tests =
 (* The source rules. The libraries caravan, caravan.client and caravan.websocket
    must use only weft for the time, the I/O and the domains, so that they run in
    each world of weft. The scan reads the .ml files of src, client and websocket
-   as text. It does not read run, because caravan.run uses Weft_linux. The guard
-   of test/nounix links each module of the three libraries, and forbids unix,
-   threads and the worlds. The scan also forbids the parts of the stdlib that
-   the guard cannot find, for example Sys.time and Domain. *)
+   as text. The guard of test/nounix links each module of the three libraries,
+   and forbids unix, threads and the worlds. The scan also forbids the parts of
+   the stdlib that the guard cannot find, for example Sys.time and Domain. *)
 
 (* The texts that the libraries must not contain. The first text is the name of
    the old effects library, in two parts, so that a search for that name in src,
-   client, websocket, run, examples and test finds nothing. The other texts are
-   the worlds and the internals of weft, the OS, the time and the processes of
-   the stdlib, the stdio of the stdlib, and the locks of the stdlib. The
-   internals of weft also have the names that follow "open Weft"
-   (Private.World). clock.mli tells that Clock.to_ns and Clock.of_ns are for the
-   worlds and the scheduler only. Fiber.Mutex and Fiber.Semaphore are
-   permitted. *)
+   client, websocket, examples and test finds nothing. The other texts are the
+   worlds and the internals of weft, the OS, the time and the processes of the
+   stdlib, the stdio of the stdlib, and the locks of the stdlib. The internals
+   of weft also have the names that follow "open Weft" (Private.World).
+   clock.mli tells that Clock.to_ns and Clock.of_ns are for the worlds and the
+   scheduler only. Fiber.Mutex and Fiber.Semaphore are permitted. *)
 let forbidden =
   [ "Aff" ^ "ect"
   ; "Weft_linux"
   ; "Weft_sim"
   ; "Weft_posix"
   ; "Weft_kqueue"
+  ; "Weft_windows"
+  ; "Weft_os"
   ; "Weft.Private"
   ; "Private.run_world"
   ; "Private.scope_ctx"

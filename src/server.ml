@@ -251,3 +251,12 @@ let stop_on_signals t =
   abort t ;
   Signal.unwatch Signal.SIGINT ;
   Signal.unwatch Signal.SIGTERM
+
+let run ?config ?engine ?domains ?(on_start = ignore) os handler =
+  Weft.run ?domains ~signals:[Signal.SIGINT; Signal.SIGTERM] os (fun () ->
+      Fiber.scope (fun sw ->
+          let s = start ?config ?engine sw handler in
+          Fiber.fork_daemon ~name:"caravan.signals" sw (fun () ->
+              stop_on_signals s ) ;
+          on_start s ;
+          wait s ) )

@@ -19,4 +19,4 @@ let () =
   let config = {Config.default with addr= Weft.Net.Tcp ("127.0.0.1", 9001)} in
   (* make autobahn starts the test suite after this line. *)
   let on_start _ = print_endline "listening on port 9001" in
-  Caravan_run.run ~config ~on_start handler
+  Server.run ~config ~on_start (module Weft_linux) handler

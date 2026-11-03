@@ -29,7 +29,10 @@ let handler req =
       Handler.not_found req
 
 let main () =
-  Caravan_run.run handler ~on_start:(fun server ->
+  Server.run
+    (module Weft_os)
+    handler
+    ~on_start:(fun server ->
       Format.printf "Listening on http://%a (Ctrl-C to stop)@."
         Conn_info.pp_addr (Server.local_addr server) )
 

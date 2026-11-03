@@ -1,5 +1,5 @@
-(* Caravan_run.run for the signal tests of test_linux. It prints its port, then
-   lines that show what the handlers see, in CRLF lines.
+(* Server.run for the signal tests of test_linux. It prints its port, then lines
+   that show what the handlers see, in CRLF lines.
 
    /slow prints "started". It gives "done" when the server starts to stop, or
    "timeout" after 2 s.
@@ -54,7 +54,10 @@ let () =
   let config =
     {Config.default with addr= Net.Tcp ("127.0.0.1", 0); date_header= false}
   in
-  Caravan_run.run ~config ~domains:2 handler ~on_start:(fun server ->
+  Server.run ~config ~domains:2
+    (module Weft_linux)
+    handler
+    ~on_start:(fun server ->
       match Server.local_addr server with
       | Net.Tcp (_, port) ->
           print (string_of_int port)

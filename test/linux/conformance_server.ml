@@ -16,4 +16,6 @@ let () =
   let config = {Config.default with addr= Weft.Net.Tcp ("127.0.0.1", port)} in
   (* make conformance starts the test tool after this line. *)
   let on_start _ = print_endline "listening" in
-  Caravan_run.run ~config ~on_start (Conformance_app.handler ~fixtures:false)
+  Server.run ~config ~on_start
+    (module Weft_linux)
+    (Conformance_app.handler ~fixtures:false)

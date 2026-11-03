@@ -1,16 +1,8 @@
-; The examples run in the OS world of weft. weft.linux builds only on Linux.
+; The examples run in Weft_os, the world of weft for the OS of the build.
 
 (executables
  (names hello ws_echo fetch readme)
- (enabled_if
-  (= %{system} linux))
- (libraries
-  caravan
-  caravan.websocket
-  caravan.client
-  caravan.run
-  weft
-  weft.linux))
+ (libraries caravan caravan.websocket caravan.client weft weft.os))
 
 ; The first OCaml example of README.md. The rule copies it to readme.ml, so the
 ; build fails if this example of the README does not compile. awk fails if

@@ -2,6 +2,7 @@
 ; caravan.websocket depends on unix, on threads or on a world of weft. Thus
 ; the three libraries run in each world. weft.linux and weft.kqueue depend on
 ; weft.posix, thus the forbidden weft.posix also forbids these two worlds.
+; weft.os selects a world of the OS, or no world on another system.
 ; -linkall links each module of the three libraries, thus a module that no
 ; other module uses also gets the check. nounix.ml is empty. The windtrap
 ; suites link unix, thus the guard is a separate executable with no test
@@ -11,4 +12,4 @@
  (name nounix)
  (libraries caravan caravan.client caravan.websocket)
  (link_flags (-linkall))
- (forbidden_libraries unix threads.posix weft.posix weft.sim))
+ (forbidden_libraries unix threads.posix weft.posix weft.sim weft.os))

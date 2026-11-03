@@ -1,7 +1,7 @@
 (** An HTTP/1.1 client for caravan servers and programs.
 
     {[
-    Weft_linux.run
+    Weft.run (module Weft_os)
     @@ fun () ->
     Caravan_client.run
     @@ fun client ->
@@ -92,7 +92,7 @@ val make : ?config:Config.t -> Weft.Fiber.scope -> t
 
     Make one client for a program, outside the handlers of a server. A program
     that runs a server and a client makes the two in one [Fiber.scope] inside
-    [Weft_linux.run]. [Caravan_run.run] gives no scope to [on_start].
+    [Weft.run]. [Caravan.Server.run] gives no scope to [on_start].
 
     @raise Weft.Fiber.Scope_closed if [sw] ended or is cancelled. *)
 

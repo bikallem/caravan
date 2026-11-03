@@ -7,11 +7,16 @@ deterministic simulator. The design leaves room for HTTP/2, HTTP/3 and
 a Traefik-like reverse proxy.
 
 ```ocaml
-let () = Caravan_run.run (fun _req -> Caravan.Response.string "Hello!\n")
+let () =
+  Caravan.Server.run (module Weft_os) (fun _req ->
+      Caravan.Response.string "Hello!\n" )
 ```
 
-`Caravan_run.run` serves the handler on 127.0.0.1:8080 until the process
-gets SIGINT or SIGTERM. The build compiles this example (examples/dune).
+`Caravan.Server.run` serves the handler on 127.0.0.1:8080 until the
+process gets SIGINT or SIGTERM. `Weft_os` (library `weft.os`) is the
+world of weft for the OS of the build: Linux, macOS, FreeBSD or Windows.
+On another system, `Weft_os.run` raises `Failure`. The build compiles
+this example (examples/dune).
 
 > **Status:** the HTTP/1.1 server, the client and WebSocket are complete
 > but young, and their API can change. There is no proxy yet.
@@ -23,7 +28,7 @@ the dune stanza of your executable:
 ```dune
 (executable
  (name main)
- (libraries caravan caravan.run))
+ (libraries caravan weft weft.os))
 ```
 
 Add `caravan.client` for the client and `caravan.websocket` for
@@ -45,8 +50,7 @@ WebSocket.
   in progress finish within a grace period, then cancel them. A second
   signal aborts. A third signal gets its default action, thus it also
   ends a handler that ignores the cancel. A handler can see the stop with
-  `Conn_info.stopping`. The library `caravan.run` does this in the OS
-  world of weft (Linux only).
+  `Conn_info.stopping`. `Server.run` does this in an OS world of weft.
 - `Response.upgrade` hands the connection over after a `101 Switching
   Protocols` or a `2xx` to `CONNECT`, the basis for WebSocket and
   tunnels.
@@ -58,7 +62,7 @@ request runs in its own fiber, in parallel across domains.
 
 The libraries `caravan`, `caravan.client` and `caravan.websocket` depend
 on no world of weft. They run in each world, for example the OS world
-(`Weft_linux.run`) and the simulator of weft (`Weft_sim.run`).
+(`Weft.run (module Weft_os)`) and the simulator of weft (`Weft_sim.run`).
 
 ## WebSocket
 
@@ -101,7 +105,7 @@ The `caravan.client` library is an HTTP/1.1 client. It uses the parser
 and the writer of the server:
 
 ```ocaml
-Weft_linux.run @@ fun () ->
+Weft.run (module Weft_os) @@ fun () ->
 Caravan_client.run @@ fun client ->
 Caravan_client.with_response client
   (Caravan.Request.make ~authority:"example.com" Caravan.Method.GET "/")
@@ -138,7 +142,7 @@ flake.lock pin.
 
 The repository includes a Nix flake. Its dev shell provides OCaml 5.5,
 dune, weft, http-date, windtrap, ppx_windtrap, ocaml-lsp, utop,
-ocamlformat and odoc. `nix build` builds the caravan package (the four
+ocamlformat and odoc. `nix build` builds the caravan package (the three
 libraries, with no tests).
 
 With [direnv](https://direnv.net) and
@@ -173,8 +177,8 @@ The suites of test/ run in the simulator of weft, thus they use no real
 time and no real network. The suite of test/linux runs on Linux in the
 OS world of weft, with real sockets, signals and child processes.
 
-The examples run on Linux only. Try the example server, and stop it
-with Ctrl-C:
+The examples use `Weft_os`, but we test them only on Linux. Try the
+example server, and stop it with Ctrl-C:
 
 ```sh
 dune exec examples/hello.exe

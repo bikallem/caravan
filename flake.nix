@@ -84,11 +84,10 @@
         );
     in
     {
-      # The libraries caravan, caravan.client, caravan.websocket and
-      # caravan.run (on Linux). The source has only the files of the build,
-      # with no test directory, so the package does not run the tests. The
-      # installed http-date declares (lang dune 3.24), so caravan builds with
-      # dune 3.24 too.
+      # The libraries caravan, caravan.client and caravan.websocket. The
+      # source has only the files of the build, with no test directory, so
+      # the package does not run the tests. The installed http-date declares
+      # (lang dune 3.24), so caravan builds with dune 3.24 too.
       packages = forAllSystems (
         {
           pkgs,
@@ -108,7 +107,6 @@
                 ./src
                 ./client
                 ./websocket
-                ./run
                 ./LICENSE
                 ./README.md
               ];

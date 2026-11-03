@@ -1,5 +1,6 @@
 (** Caravan, an HTTP server built on weft. Code that uses caravan runs in a weft
-    world: [Weft_sim] in tests, [Caravan_run] or [Weft_linux] in production. *)
+    world: [Weft_sim] in tests, [Weft_os] or [Weft_linux] in production, for
+    example with [Server.run]. *)
 
 (** {1:core Core types} *)
 

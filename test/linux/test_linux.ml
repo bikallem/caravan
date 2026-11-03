@@ -219,7 +219,7 @@ let client_fds ~domains () =
           | exception Caravan_client.Error (Connect _) ->
               () ) )
 
-(* 5 and 6. Caravan_run.run in a child process *)
+(* 5 and 6. Server.run in a child process *)
 
 (* The child program, serve_until_signal.exe. The rule of test/linux/dune gives
    its path. *)
@@ -654,9 +654,9 @@ let tests =
   ; ( "4. a client GET, a connect failure and the end of the client leave no \
        socket fd"
     , client_fds )
-  ; ( "5. Caravan_run.run: SIGTERM ends the request in progress, then exit 0"
+  ; ( "5. Server.run: SIGTERM ends the request in progress, then exit 0"
     , sigterm_ends_request )
-  ; ( "6. Caravan_run.run: a third SIGINT ends a server with a deaf handler"
+  ; ( "6. Server.run: a third SIGINT ends a server with a deaf handler"
     , third_sigint )
   ; ( "7. linger, then close, gives the peer the end of the stream"
     , linger_then_close )
