@@ -103,11 +103,31 @@ module Forwarded = struct
             else run := (-1, 0) )
           a ;
         let start, len = !best in
-        let hex i = Printf.sprintf "%x" a.(i) in
-        let part lo hi =
-          String.concat ":" (List.init (hi - lo) (fun k -> hex (lo + k)))
+        let b = Buffer.create 39 in
+        (* The hexadecimal digits of a group, with no leading zero. *)
+        let hex x =
+          let digits = "0123456789abcdef" in
+          let rec go shift started =
+            if shift >= 0 then (
+              let d = (x lsr shift) land 0xf in
+              if started || d <> 0 || shift = 0 then
+                Buffer.add_char b digits.[d] ;
+              go (shift - 4) (started || d <> 0) )
+          in
+          go 12 false
         in
-        if len < 2 then part 0 8 else part 0 start ^ "::" ^ part (start + len) 8
+        let part lo hi =
+          for i = lo to hi - 1 do
+            if i > lo then Buffer.add_char b ':' ;
+            hex a.(i)
+          done
+        in
+        if len < 2 then part 0 8
+        else (
+          part 0 start ;
+          Buffer.add_string b "::" ;
+          part (start + len) 8 ) ;
+        Buffer.contents b
 
   (* [normal ip] is the normal form of an address: RFC 5952 for IPv6, and the
      text of the octets for IPv4. A text that is not an address only goes to
@@ -345,4 +365,208 @@ module Request_id = struct
       Response.with_headers (Headers.set field id (Response.headers resp)) resp
 
   let find req = Request.find_attr id_key req
+end
+
+module Cancel = Private.Cancel
+module H1_error = Private.H1_error
+
+(* [watch_request req] is [req] with a hook on its request body, and a flag that
+   becomes [true] when a read of that body raises [H1_error.E] or
+   [Body.Truncated]: the condition of [H1_body.failed] in the server. A failure
+   of a sink, for example [Body.Too_large] of [to_string], does not count. *)
+let watch_request req =
+  let failed = Atomic.make false in
+  let hook how ~bytes:_ =
+    match how with
+    | Body.Failed (H1_error.E _ | Body.Truncated) ->
+        Atomic.set failed true
+    | _ ->
+        ()
+  in
+  (Request.with_body (Body.on_end hook (Request.body req)) req, failed)
+
+(* [request_body_error failed e] is [true] if [e] is the error of a request body
+   that failed. The server then sends the answer of that error (for example
+   413), or nothing for a body that was cut short, and reports nothing. *)
+let request_body_error failed = function
+  | H1_error.E _ | Body.Truncated ->
+      Atomic.get failed
+  | _ ->
+      false
+
+module Access_log = struct
+  type outcome =
+    | Complete
+    | Incomplete
+    | Failed of exn
+    | Cancelled
+    | Not_sent
+    | Upgraded
+
+  type entry =
+    { start: Weft.Clock.posix
+    ; duration: Weft.Span.t
+    ; meth: Method.t
+    ; target: string
+    ; version: Version.t
+    ; client: Forwarded.node option
+    ; request_id: string option
+    ; route: string option
+    ; status: Status.t option
+    ; bytes: int
+    ; outcome: outcome }
+
+  (* The responses that the server sends with no body: the framings [No_body]
+     and [Length_only]. *)
+  let has_no_body meth status =
+    Method.equal meth Method.HEAD
+    || match Status.code status with 204 | 205 | 304 -> true | _ -> false
+
+  let middleware ?(route = fun _ -> None) ~log () next req =
+    let start = Weft.Time.now Posix and t0 = Weft.Time.now Mono in
+    let req, request_failed = watch_request req in
+    let meth = Request.meth req in
+    let connect = Method.equal meth Method.CONNECT in
+    let emit ~route ~status ~bytes outcome =
+      let entry =
+        { start
+        ; duration= Weft.Time.diff Mono (Weft.Time.now Mono) t0
+        ; meth
+        ; target=
+            ( if connect then Option.value ~default:"" (Request.authority req)
+              else Request.path req )
+        ; version= Request.version req
+        ; client= Forwarded.client req
+        ; request_id= Request_id.find req
+        ; route
+        ; status
+        ; bytes
+        ; outcome }
+      in
+      (* A cancel of the fiber does not stop [log]. Its exception never changes
+         the response or the exception of the handler. *)
+      Weft.Fiber.shield (fun () -> try log entry with _ -> ())
+    in
+    (* [failure e] is the status and the outcome of an exception [e] of the
+       handler or of the body. *)
+    let failure ~status e =
+      if Cancel.is_cancelled () then (None, Cancelled)
+      else if request_body_error request_failed e then
+        match e with
+        | H1_error.E err ->
+            (Some (H1_error.status err), Failed e)
+        | _ ->
+            (* The server takes a request body that was cut short as a client
+               that left, and sends nothing. *)
+            (None, Cancelled)
+      else (status, Failed e)
+    in
+    match next req with
+    | resp -> (
+        let status = Response.status resp in
+        let route = try route resp with _ -> None in
+        match Response.kind resp with
+        | Response.Upgrade _ ->
+            emit ~route ~status:(Some status) ~bytes:0 Upgraded ;
+            resp
+        | Response.Body b ->
+            (* The server refuses a 2xx body to CONNECT, and sends 500. *)
+            let refused = connect && Status.kind status = `Success in
+            let length = Body.length b in
+            let hook how ~bytes =
+              let status, outcome =
+                match how with
+                | _ when refused ->
+                    (Some Status.internal_server_error, Not_sent)
+                | Body.Abandoned ->
+                    ( Some status
+                    , if has_no_body meth status then Complete else Not_sent )
+                | Ended -> (
+                  match length with
+                  | Some n when bytes < n ->
+                      (Some status, Incomplete)
+                  | _ ->
+                      (Some status, Complete) )
+                | Failed Flow.Closed ->
+                    (Some status, Cancelled)
+                | Failed e ->
+                    (* After the first byte, the head went with the status of
+                       the handler. *)
+                    let status', outcome = failure ~status:(Some status) e in
+                    ((if bytes > 0 then Some status else status'), outcome)
+              in
+              emit ~route ~status ~bytes outcome
+            in
+            Response.with_body (Body.on_end hook b) resp )
+    | exception e ->
+        let bt = Printexc.get_raw_backtrace () in
+        let status, outcome =
+          failure ~status:(Some Status.internal_server_error) e
+        in
+        emit ~route:None ~status ~bytes:0 outcome ;
+        Printexc.raise_with_backtrace e bt
+
+  (* [quote s] is [s], or [s] as an OCaml string if it has a byte outside 0x21
+     to 0x7E, a '"' or a '\\', or if it is empty or "-". Thus a line is one
+     line, and "-" is only a value that is not known. *)
+  let quote s =
+    if
+      s <> "" && s <> "-"
+      && String.for_all
+           (fun c -> c > ' ' && c < '\x7f' && c <> '"' && c <> '\\')
+           s
+    then s
+    else Printf.sprintf "%S" s
+
+  let or_dash f = function Some x -> f x | None -> "-"
+
+  let line e =
+    let client = function
+      | Forwarded.Ip a ->
+          a
+      | Unix ->
+          "unix"
+      | Unknown ->
+          "unknown"
+    in
+    let ms = Int64.to_float (Weft.Span.to_ns e.duration) /. 1e6 in
+    let outcome =
+      match e.outcome with
+      | Complete ->
+          ""
+      | Incomplete ->
+          " incomplete"
+      | Failed x ->
+          " failed " ^ quote (Printexc.to_string x)
+      | Cancelled ->
+          " cancelled"
+      | Not_sent ->
+          " not-sent"
+      | Upgraded ->
+          " upgraded"
+    in
+    Printf.sprintf "%s %s \"%s %s %s\" %s %d %.3fms %s%s"
+      (or_dash client e.client)
+      (or_dash quote e.request_id)
+      (Method.to_string e.meth) (quote e.target)
+      (Version.to_string e.version)
+      (or_dash (fun s -> string_of_int (Status.code s)) e.status)
+      e.bytes ms (or_dash quote e.route) outcome
+end
+
+module Error_page = struct
+  let plain _ _ =
+    Response.string ~status:Status.internal_server_error
+      "Internal Server Error\n"
+
+  let middleware ~report ?(page = plain) () next req =
+    let req, request_failed = watch_request req in
+    match next req with
+    | resp ->
+        resp
+    | exception e ->
+        let bt = Printexc.get_raw_backtrace () in
+        if Cancel.is_cancelled () || request_body_error request_failed e then
+          Printexc.raise_with_backtrace e bt
+        else (report req e bt ; page req e)
 end

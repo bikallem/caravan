@@ -8,6 +8,8 @@ module F = Caravan_middleware.Forwarded
 module Id = Caravan_middleware.Request_id
 module T = Caravan_testing
 
+let status = Testable.make ~pp:Status.pp ~equal:Status.equal
+
 let is_invalid_arg = function Invalid_argument _ -> true | _ -> false
 
 let show_node = function
@@ -355,4 +357,678 @@ let request_id_tests =
           in
           equal int 100 (List.length (List.sort_uniq compare bodies)) ) ]
 
-let () = exit (Windtrap.run "middleware" [forwarded_tests; request_id_tests])
+(* Access_log and Error_page *)
+
+module L = Caravan_middleware.Access_log
+module P = Caravan_middleware.Error_page
+
+let show_outcome = function
+  | L.Complete ->
+      "Complete"
+  | Incomplete ->
+      "Incomplete"
+  | Failed e ->
+      "Failed " ^ Printexc.to_string e
+  | Cancelled ->
+      "Cancelled"
+  | Not_sent ->
+      "Not_sent"
+  | Upgraded ->
+      "Upgraded"
+
+(* [show e] is the status, the bytes and the outcome of [e]. *)
+let show (e : L.entry) =
+  Printf.sprintf "%s %d %s"
+    (Option.fold ~none:"-"
+       ~some:(fun s -> string_of_int (Status.code s))
+       e.status )
+    e.bytes (show_outcome e.outcome)
+
+(* [logger ()] is a [log] that keeps the entries, and fills [logged] at each
+   entry. *)
+type logger =
+  {log: L.entry -> unit; entries: unit -> L.entry list; logged: unit Weft.Ivar.t}
+
+let logger () =
+  let all = Atomic.make [] and logged = Weft.Ivar.create () in
+  let rec push e =
+    let l = Atomic.get all in
+    if not (Atomic.compare_and_set all l (e :: l)) then push e
+  in
+  { log=
+      (fun e ->
+        push e ;
+        ignore (Weft.Ivar.try_fill logged ()) )
+  ; entries= (fun () -> List.rev (Atomic.get all))
+  ; logged }
+
+let shown l = List.map show (l.entries ())
+
+let with_log ?(outer = []) ?(inner = []) l handler =
+  Handler.compose (outer @ [L.middleware ~log:l.log ()] @ inner) handler
+
+let reply s _ = Response.string s
+
+(* The client error of a response that the server cuts short. *)
+let tolerant f = try ignore (f ()) with Caravan_client.Error _ -> ()
+
+let failed_with prefix = function
+  | [e] ->
+      String.starts_with ~prefix e
+  | _ ->
+      false
+
+let errors_are names t =
+  equal (list string) names
+    (List.map (fun (e, _) -> Printexc.to_string e) (T.take_errors t))
+
+(* [waits ~cleanup waiting] is a handler that fills [waiting], then sleeps for 1
+   h. With [cleanup], a cancel of the sleep raises [Failure cleanup]. *)
+let waits ?cleanup waiting _ =
+  ignore (Weft.Ivar.try_fill waiting ()) ;
+  match Weft.Time.sleep Mono (Weft.Span.s 3600) with
+  | () ->
+      Response.empty ()
+  | exception (Weft.Fiber.Cancelled _ as e) -> (
+    match cleanup with Some m -> failwith m | None -> raise e )
+
+(* [leave_after waiting t] starts a request ([T.get t "/"] by default), waits
+   for [waiting], then cancels the request: the client closes the connection. *)
+let leave_after ?(request = fun t -> ignore (T.get t "/")) waiting t =
+  Weft.Fiber.scope (fun s ->
+      let p = Weft.Fiber.fork_promise s (fun () -> request t) in
+      Weft.sync (Weft.Ivar.read waiting) ;
+      Weft.Promise.cancel p )
+
+(* A POST with a chunked body of 10 bytes, more than [max_body = 4]. *)
+let too_large () =
+  Request.make
+    ~body:(Body.of_writer (fun w -> Body.Writer.write_string w "0123456789"))
+    Method.POST "/"
+
+let small_body = {Config.default with max_body= Some 4}
+
+let access_log_tests =
+  group "Access_log"
+    [ test "a GET" (fun () ->
+          let l = logger () in
+          let slow _ =
+            Weft.Time.sleep Mono (Weft.Span.s 2) ;
+            Response.string "hello"
+          in
+          ignore (T.run (with_log l slow) (fun t -> T.get t "/a?q=1")) ;
+          match l.entries () with
+          | [e] ->
+              equal string "200 5 Complete" (show e) ;
+              equal string "/a?q=1" e.target ;
+              is_true (Weft.Span.compare e.duration (Weft.Span.s 2) >= 0)
+          | _ ->
+              fail "one entry" )
+    ; test "a POST that reads its body" (fun () ->
+          let l = logger () in
+          let echo req = Response.string (Body.to_string (Request.body req)) in
+          ignore
+            (T.run (with_log l echo) (fun t ->
+                 T.fetch t
+                   (Request.make ~body:(Body.of_string "abc") Method.POST "/") )
+            ) ;
+          equal (list string) ["200 3 Complete"] (shown l) )
+    ; test "a response that an outer middleware drops" (fun () ->
+          let l = logger () in
+          let drop : Handler.middleware =
+           fun next req ->
+            ( match Response.kind (next req) with
+            | Response.Body b ->
+                Body.close b
+            | Upgrade _ ->
+                () ) ;
+            Response.string "other"
+          in
+          ignore
+            (T.run
+               (with_log ~outer:[drop] l (reply "hi"))
+               (fun t -> T.get t "/") ) ;
+          equal (list string) ["200 0 Not_sent"] (shown l) )
+    ; test "a body that the stop of the server cancels" (fun () ->
+          let l = logger () in
+          let h _ =
+            Response.stream (fun w ->
+                Body.Writer.write_string w "x" ;
+                Body.Writer.flush w ;
+                Weft.Time.sleep Mono (Weft.Span.s 3600) )
+          in
+          T.run (with_log l h) (fun t ->
+              ignore (T.request t (Request.make Method.GET "/")) ) ;
+          match l.entries () with
+          | [e] ->
+              equal string "Cancelled" (show_outcome e.outcome)
+          | _ ->
+              fail "one entry" )
+    ; test "a request body that is too large after the head" (fun () ->
+          let l = logger () in
+          let config = {Config.default with max_body= Some 12} in
+          let h req = Response.make (Request.body req) in
+          T.run ~config (with_log l h) (fun t ->
+              tolerant (fun () ->
+                  T.fetch t
+                    (Request.make
+                       ~body:
+                         (Body.of_writer (fun w ->
+                              Body.Writer.write_string w "ab" ;
+                              Body.Writer.flush w ;
+                              Weft.Time.sleep Mono (Weft.Span.ms 10) ;
+                              Body.Writer.write_string w "cdefgh" ) )
+                       Method.POST "/" ) ) ) ;
+          is_true
+            ~msg:(String.concat ";" (shown l))
+            (failed_with "200 2 Failed" (shown l)) )
+    ; test "a response that streams a request body that is cut short" (fun () ->
+          let l = logger () in
+          let req =
+            Request.make
+              ~body:(Body.of_source (fun _ _ _ -> raise Body.Truncated))
+              Method.POST "/"
+          in
+          Weft_sim.run (fun _ ->
+              let r =
+                L.middleware ~log:l.log ()
+                  (fun req -> Response.make (Request.body req))
+                  req
+              in
+              match Response.kind r with
+              | Response.Body b ->
+                  raises Body.Truncated (fun () -> ignore (Body.to_string b))
+              | Upgrade _ ->
+                  fail "an upgrade" ) ;
+          (* No byte went: the server sends nothing. *)
+          equal (list string) ["- 0 Cancelled"] (shown l) )
+    ; test "a request body that is truncated" (fun () ->
+          let l = logger () and seen = ref 0 in
+          let req () =
+            Request.make
+              ~body:(Body.of_source (fun _ _ _ -> raise Body.Truncated))
+              Method.POST "/"
+          in
+          let read req = Response.string (Body.to_string (Request.body req)) in
+          Weft_sim.run (fun _ ->
+              raises Body.Truncated (fun () ->
+                  L.middleware ~log:l.log () read (req ()) ) ;
+              raises Body.Truncated (fun () ->
+                  P.middleware ~report:(fun _ _ _ -> incr seen) () read (req ()) ) ) ;
+          equal (list string) ["- 0 Cancelled"] (shown l) ;
+          equal int 0 !seen )
+    ; test "responses with no body" (fun () ->
+          let l = logger () in
+          let h req =
+            match Request.path req with
+            | "/204" ->
+                Response.string ~status:Status.no_content "x"
+            | "/205" ->
+                Response.string ~status:(Status.v 205) "x"
+            | "/304" ->
+                Response.string ~status:Status.not_modified "x"
+            | _ ->
+                Response.string "hello"
+          in
+          T.run (with_log l h) (fun t ->
+              ignore (T.fetch t (Request.make Method.HEAD "/")) ;
+              List.iter (fun p -> ignore (T.get t p)) ["/204"; "/205"; "/304"] ) ;
+          equal (list string)
+            [ "200 0 Complete"
+            ; "204 0 Complete"
+            ; "205 0 Complete"
+            ; "304 0 Complete" ]
+            (shown l) )
+    ; test "a 2xx body to CONNECT" (fun () ->
+          let l = logger () in
+          let h req =
+            match Headers.find "x-status" (Request.headers req) with
+            | Some "204" ->
+                Response.string ~status:Status.no_content "x"
+            | _ ->
+                Response.string "x"
+          in
+          T.run (with_log l h) (fun t ->
+              List.iter
+                (fun st ->
+                  tolerant (fun () ->
+                      T.fetch t
+                        (Request.make ~authority:"127.0.0.1:80"
+                           ~headers:(Headers.of_list [("X-Status", st)])
+                           Method.CONNECT "" ) ) )
+                ["200"; "204"] ;
+              equal int 2 (List.length (T.take_errors t)) ) ;
+          equal (list string) ["500 0 Not_sent"; "500 0 Not_sent"] (shown l) )
+    ; test "a body shorter than its length" (fun () ->
+          let l = logger () in
+          let h _ =
+            Response.stream ~length:5 (fun w ->
+                Body.Writer.write_string w "abc" )
+          in
+          T.run (with_log l h) (fun t ->
+              tolerant (fun () -> T.get t "/") ;
+              errors_are
+                ["response body length differs from its Content-Length"]
+                t ) ;
+          equal (list string) ["200 3 Incomplete"] (shown l) )
+    ; test "a streamed body that raises" (fun () ->
+          let l = logger () in
+          let h _ =
+            Response.stream (fun w ->
+                Body.Writer.write_string w "abc" ;
+                Body.Writer.flush w ;
+                failwith "body" )
+          in
+          T.run (with_log l h) (fun t ->
+              tolerant (fun () -> T.get t "/") ;
+              errors_are [{|Failure("body")|}] t ) ;
+          equal (list string) [{|200 3 Failed Failure("body")|}] (shown l) ;
+          (* Before the first byte, the server sends its 500, but the entry has
+             the status of the handler. *)
+          let l = logger () in
+          T.run
+            (with_log l (fun _ -> Response.stream (fun _ -> failwith "early")))
+            (fun t ->
+              equal status Status.internal_server_error (T.get t "/").status ;
+              errors_are [{|Failure("early")|}] t ) ;
+          equal (list string) [{|200 0 Failed Failure("early")|}] (shown l) )
+    ; test "a handler that raises" (fun () ->
+          let l = logger () in
+          let r =
+            T.run
+              (with_log l (fun _ -> failwith "x"))
+              (fun t ->
+                let r = T.get t "/" in
+                errors_are [{|Failure("x")|}] t ;
+                r )
+          in
+          equal status Status.internal_server_error r.status ;
+          equal (list string) [{|500 0 Failed Failure("x")|}] (shown l) )
+    ; test "a request body that is too large" (fun () ->
+          let l = logger () in
+          let config = small_body in
+          let h req = Response.string (Body.to_string (Request.body req)) in
+          let r =
+            T.run ~config (with_log l h) (fun t -> T.fetch t (too_large ()))
+          in
+          equal status Status.content_too_large r.status ;
+          is_true
+            ~msg:(String.concat ";" (shown l))
+            (failed_with "413 0 Failed" (shown l)) )
+    ; test "Body.Truncated of the handler, with a fine request body" (fun () ->
+          let l = logger () in
+          T.run
+            (with_log l (fun _ -> raise Body.Truncated))
+            (fun t ->
+              equal status Status.internal_server_error (T.get t "/").status ;
+              errors_are ["Caravan__Body.Truncated"] t ) ;
+          is_true (failed_with "500 0 Failed" (shown l)) )
+    ; test "the client leaves before the response" (fun () ->
+          let l = logger () and waiting = Weft.Ivar.create () in
+          T.run
+            (with_log l (waits waiting))
+            (fun t ->
+              leave_after waiting t ;
+              Weft.sync (Weft.Ivar.read l.logged) ;
+              errors_are [] t ) ;
+          equal (list string) ["- 0 Cancelled"] (shown l) )
+    ; test "the client leaves during the body" (fun () ->
+          let l = logger () in
+          let started = Weft.Ivar.create () in
+          let h _ =
+            Response.stream (fun w ->
+                let rec loop () =
+                  Body.Writer.write_string w "x" ;
+                  Body.Writer.flush w ;
+                  ignore (Weft.Ivar.try_fill started ()) ;
+                  Weft.Time.sleep Mono (Weft.Span.ms 10) ;
+                  loop ()
+                in
+                loop () )
+          in
+          T.run (with_log l h) (fun t ->
+              leave_after started t ~request:(fun t ->
+                  T.with_response t (Request.make Method.GET "/") (fun _ ->
+                      Weft.Time.sleep Mono (Weft.Span.s 3600) ) ) ;
+              Weft.sync (Weft.Ivar.read l.logged) ;
+              errors_are [] t ) ;
+          match l.entries () with
+          | [e] ->
+              equal (option int) (Some 200) (Option.map Status.code e.status) ;
+              equal string "Cancelled" (show_outcome e.outcome)
+          | _ ->
+              fail "one entry" )
+    ; test "the cancel of a child scope of the handler is a failure" (fun () ->
+          let l = logger () in
+          let h _ =
+            Weft.Fiber.scope (fun s ->
+                Weft.Fiber.cancel s Exit ;
+                Weft.Fiber.yield () ;
+                Response.empty () )
+          in
+          T.run (with_log l h) (fun t ->
+              equal status Status.internal_server_error (T.get t "/").status ;
+              equal int 1 (List.length (T.take_errors t)) ) ;
+          is_true (failed_with "500 0 Failed" (shown l)) )
+    ; test "a cleanup that raises after the client left" (fun () ->
+          let l = logger () and waiting = Weft.Ivar.create () in
+          T.run
+            (with_log l (waits ~cleanup:"cleanup" waiting))
+            (fun t ->
+              leave_after waiting t ;
+              Weft.sync (Weft.Ivar.read l.logged) ;
+              errors_are [{|Failure("cleanup")|}] t ) ;
+          equal (list string) ["- 0 Cancelled"] (shown l) )
+    ; test "upgrades" (fun () ->
+          let l = logger () in
+          ignore
+            (Weft_sim.run (fun _ ->
+                 L.middleware ~log:l.log ()
+                   (fun _ -> Response.upgrade ignore)
+                   (Request.make Method.GET "/") ) ) ;
+          T.run
+            (with_log l (fun _ -> Response.upgrade ignore))
+            (fun t ->
+              equal status Status.internal_server_error (T.get t "/").status ;
+              equal int 1 (List.length (T.take_errors t)) ) ;
+          equal (list string) ["101 0 Upgraded"; "101 0 Upgraded"] (shown l) )
+    ; test "log runs in a shield" (fun () ->
+          let l = logger () and waiting = Weft.Ivar.create () in
+          let log e =
+            Weft.Time.sleep Mono Weft.Span.zero ;
+            l.log e
+          in
+          T.run
+            (Handler.compose [L.middleware ~log ()] (waits waiting))
+            (fun t ->
+              leave_after waiting t ;
+              Weft.sync (Weft.Ivar.read l.logged) ) ;
+          equal (list string) ["- 0 Cancelled"] (shown l) )
+    ; test "a route that raises" (fun () ->
+          let l = logger () and closes = ref 0 in
+          let h _ =
+            Response.make
+              (Body.of_source ~close:(fun () -> incr closes) (fun _ _ _ -> 0))
+          in
+          let mw =
+            L.middleware ~route:(fun _ -> failwith "route") ~log:l.log ()
+          in
+          ignore (T.run (Handler.compose [mw] h) (fun t -> T.get t "/")) ;
+          equal (list string) ["200 0 Complete"] (shown l) ;
+          equal int 1 !closes ;
+          match l.entries () with
+          | [e] ->
+              equal (option string) None e.route
+          | _ ->
+              fail "one entry" )
+    ; test "a sink failure of the handler is not a request body error"
+        (fun () ->
+          let l = logger () in
+          let h req =
+            match Body.to_string ~max:1 (Request.body req) with
+            | _ ->
+                Response.empty ()
+            | exception Body.Too_large ->
+                raise Body.Truncated
+          in
+          T.run (with_log l h) (fun t ->
+              equal status Status.internal_server_error
+                (T.fetch t
+                   (Request.make ~body:(Body.of_string "hello") Method.POST "/") )
+                  .status ;
+              errors_are ["Caravan__Body.Truncated"] t ) ;
+          is_true (failed_with "500 0 Failed" (shown l)) )
+    ; test "a response that streams a request body that is too large" (fun () ->
+          let l = logger () in
+          let h req = Response.make (Request.body req) in
+          T.run ~config:small_body (with_log l h) (fun t ->
+              tolerant (fun () -> T.fetch t (too_large ())) ) ;
+          is_true
+            ~msg:(String.concat ";" (shown l))
+            (failed_with "413 " (shown l)) )
+    ; test "an exception of log is dropped" (fun () ->
+          let h =
+            Handler.compose
+              [L.middleware ~log:(fun _ -> failwith "log") ()]
+              (reply "hi")
+          in
+          let r = T.run h (fun t -> T.get t "/") in
+          equal string "hi" r.body )
+    ; test "the client, the request ID and the route" (fun () ->
+          let l = logger () in
+          let trusted = function F.Ip "client" -> true | _ -> false in
+          let router =
+            Caravan_router.(handler [get "/users/:id" (reply "u")])
+          in
+          let h =
+            Handler.compose
+              [ F.middleware ~trusted ()
+              ; Id.middleware ()
+              ; L.middleware
+                  ~route:(Response.find_attr Caravan_router.template)
+                  ~log:l.log () ]
+              router
+          in
+          T.run h (fun t ->
+              ignore
+                (T.fetch t
+                   (Request.make
+                      ~headers:(Headers.of_list [(xff, "1.2.3.4")])
+                      Method.GET "/users/7" ) ) ) ;
+          match l.entries () with
+          | [e] ->
+              equal string "Ip 1.2.3.4"
+                (Option.fold ~none:"-" ~some:show_node e.client) ;
+              equal (option string) (Some "0") e.request_id ;
+              equal (option string) (Some "/users/:id") e.route
+          | _ ->
+              fail "one entry" )
+    ; test "line" (fun () ->
+          let e =
+            { L.start= Weft.Time.posix_of_unix_s 0.
+            ; duration= Weft.Span.us 1500
+            ; meth= Method.GET
+            ; target= "/a?b=c"
+            ; version= Version.Http_1_1
+            ; client= Some (F.Ip "1.2.3.4")
+            ; request_id= Some "7"
+            ; route= Some "/a"
+            ; status= Some Status.ok
+            ; bytes= 5
+            ; outcome= Complete }
+          in
+          expect
+            (String.concat "\n"
+               [ L.line e
+               ; L.line
+                   { e with
+                     client= None
+                   ; request_id= None
+                   ; route= None
+                   ; status= None
+                   ; outcome= Cancelled }
+               ; L.line {e with outcome= Failed (Failure "a\nb")}
+               ; L.line
+                   { e with
+                     meth= Method.CONNECT
+                   ; target= "t.example:443"
+                   ; outcome= Not_sent }
+               ; L.line {e with target= "/a\"b"; client= Some F.Unix}
+               ; L.line
+                   { e with
+                     client= Some F.Unknown
+                   ; route= Some "a b"
+                   ; outcome= Incomplete }
+               ; L.line {e with route= Some "\x7f"; outcome= Upgraded} ] )
+          @@ __POS_OF__
+               {|1.2.3.4 7 "GET /a?b=c HTTP/1.1" 200 5 1.500ms /a
+- - "GET /a?b=c HTTP/1.1" - 5 1.500ms - cancelled
+1.2.3.4 7 "GET /a?b=c HTTP/1.1" 200 5 1.500ms /a failed "Failure(\"a\\nb\")"
+1.2.3.4 7 "CONNECT t.example:443 HTTP/1.1" 200 5 1.500ms /a not-sent
+unix 7 "GET "/a\"b" HTTP/1.1" 200 5 1.500ms /a
+unknown 7 "GET /a?b=c HTTP/1.1" 200 5 1.500ms "a b" incomplete
+1.2.3.4 7 "GET /a?b=c HTTP/1.1" 200 5 1.500ms "\127" upgraded|} )
+    ; test "an outer middleware reads the template" (fun () ->
+          let seen = ref None in
+          let outer : Handler.middleware =
+           fun next req ->
+            let r = next req in
+            seen := Response.find_attr Caravan_router.template r ;
+            r
+          in
+          let l = logger () in
+          let router = Caravan_router.(handler [get "/u/:id" (reply "u")]) in
+          ignore
+            (T.run (with_log ~outer:[outer] l router) (fun t -> T.get t "/u/1")) ;
+          equal (option string) (Some "/u/:id") !seen ) ]
+
+let error_page_tests =
+  let reports () =
+    let seen = ref [] in
+    ( (fun _ e bt ->
+        seen :=
+          (Printexc.to_string e, Printexc.raw_backtrace_length bt) :: !seen )
+    , seen )
+  in
+  let page _ e =
+    Response.string ~status:Status.service_unavailable
+      ("page " ^ Printexc.to_string e)
+  in
+  group "Error_page"
+    [ test "a handler that raises gets the page" (fun () ->
+          let report, seen = reports () in
+          let h =
+            Handler.compose
+              [P.middleware ~report ~page ()]
+              (fun _ -> failwith "x")
+          in
+          let r = T.run h (fun t -> T.get t "/") in
+          equal status Status.service_unavailable r.status ;
+          equal string {|page Failure("x")|} r.body ;
+          equal (list string) [{|Failure("x")|}] (List.map fst !seen) )
+    ; test "plain does not show the exception" (fun () ->
+          let report, _ = reports () in
+          let h =
+            Handler.compose
+              [P.middleware ~report ()]
+              (fun _ -> failwith "secret")
+          in
+          let r = T.run h (fun t -> T.get t "/") in
+          equal status Status.internal_server_error r.status ;
+          equal string "Internal Server Error\n" r.body )
+    ; test "page raises" (fun () ->
+          let report, _ = reports () in
+          let page _ _ = failwith "page" in
+          let h =
+            Handler.compose
+              [P.middleware ~report ~page ()]
+              (fun _ -> failwith "x")
+          in
+          T.run h (fun t ->
+              equal status Status.internal_server_error (T.get t "/").status ;
+              errors_are [{|Failure("page")|}] t ) )
+    ; test "an exception of a body is not a page" (fun () ->
+          let report, seen = reports () in
+          let h =
+            Handler.compose
+              [P.middleware ~report ~page ()]
+              (fun _ -> Response.stream (fun _ -> failwith "body"))
+          in
+          T.run h (fun t ->
+              equal status Status.internal_server_error (T.get t "/").status ;
+              errors_are [{|Failure("body")|}] t ) ;
+          equal int 0 (List.length !seen) )
+    ; test "a request body that is too large is not a page" (fun () ->
+          let report, seen = reports () in
+          let config = small_body in
+          let h =
+            Handler.compose
+              [P.middleware ~report ~page ()]
+              (fun req -> Response.string (Body.to_string (Request.body req)))
+          in
+          let r = T.run ~config h (fun t -> T.fetch t (too_large ())) in
+          equal status Status.content_too_large r.status ;
+          equal int 0 (List.length !seen) )
+    ; test "cancels are not a page" (fun () ->
+          let report, seen = reports () in
+          let waiting = Weft.Ivar.create () and l = logger () in
+          T.run
+            (Handler.compose
+               [L.middleware ~log:l.log (); P.middleware ~report ~page ()]
+               (waits ~cleanup:"cleanup" waiting) )
+            (fun t ->
+              leave_after waiting t ;
+              Weft.sync (Weft.Ivar.read l.logged) ;
+              errors_are [{|Failure("cleanup")|}] t ) ;
+          equal int 0 (List.length !seen) )
+    ; test "the cancel of a child scope gets a page" (fun () ->
+          let report, seen = reports () in
+          let h =
+            Handler.compose
+              [P.middleware ~report ~page ()]
+              (fun _ ->
+                Weft.Fiber.scope (fun s ->
+                    Weft.Fiber.cancel s Exit ;
+                    Weft.Fiber.yield () ;
+                    Response.empty () ) )
+          in
+          let r = T.run h (fun t -> T.get t "/") in
+          equal status Status.service_unavailable r.status ;
+          equal int 1 (List.length !seen) )
+    ; test "Body.Truncated of the handler gets a page" (fun () ->
+          let report, seen = reports () in
+          let h =
+            Handler.compose
+              [P.middleware ~report ~page ()]
+              (fun _ -> raise Body.Truncated)
+          in
+          let r = T.run h (fun t -> T.get t "/") in
+          equal status Status.service_unavailable r.status ;
+          equal int 1 (List.length !seen) )
+    ; test "report raises" (fun () ->
+          let report _ _ _ = failwith "report" in
+          let h =
+            Handler.compose
+              [P.middleware ~report ~page ()]
+              (fun _ -> failwith "x")
+          in
+          T.run h (fun t ->
+              equal status Status.internal_server_error (T.get t "/").status ;
+              errors_are [{|Failure("report")|}] t ) )
+    ; test "the page keeps the connection" (fun () ->
+          let report, _ = reports () in
+          let h req =
+            if Request.path req = "/fail" then failwith "x"
+            else
+              Response.string
+                (string_of_int (Conn_info.id (Option.get (Request.conn req))))
+          in
+          let a, b =
+            T.run
+              (Handler.compose [P.middleware ~report ~page ()] h)
+              (fun t ->
+                let a = (T.get t "/").body in
+                ignore (T.get t "/fail") ;
+                (a, (T.get t "/").body) )
+          in
+          equal string a b )
+    ; test "the access log sees the page" (fun () ->
+          let report, _ = reports () and l = logger () in
+          let h =
+            Handler.compose
+              [L.middleware ~log:l.log (); P.middleware ~report ~page ()]
+              (fun _ -> failwith "x")
+          in
+          ignore (T.run h (fun t -> T.get t "/")) ;
+          match shown l with
+          | [s] ->
+              is_true ~msg:s
+                ( String.starts_with ~prefix:"503 " s
+                && String.ends_with ~suffix:" Complete" s )
+          | l ->
+              fail (String.concat ";" l) ) ]
+
+let () =
+  exit
+    (Windtrap.run "middleware"
+       [forwarded_tests; request_id_tests; access_log_tests; error_page_tests] )

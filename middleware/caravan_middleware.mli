@@ -124,3 +124,127 @@ module Request_id : sig
   val find : Caravan.Request.t -> string option
   (** [find req] is the ID that the middleware gave to [req]. *)
 end
+
+(** An entry for each request, at the end of its response.
+
+    Put the middleware after {!Forwarded} and {!Request_id}, and before
+    {!Error_page} and the router, so that the entry has the client, the ID and
+    the status of an error page:
+    {[
+    Caravan.Handler.compose
+      [ Forwarded.middleware ~trusted ()
+      ; Request_id.middleware ()
+      ; Access_log.middleware
+          ~route:(Caravan.Response.find_attr Caravan_router.template)
+          ~log:(fun e -> print_string (Access_log.line e ^ "\n"))
+          ()
+      ; Error_page.middleware ~report () ]
+      router
+    ]}
+    It must be outside each middleware that changes the method or the body. It
+    needs a fiber, as each handler of the server has. *)
+module Access_log : sig
+  (** The type for the ends of a request. *)
+  type outcome =
+    | Complete
+        (** The server got the whole body, or the response has no body (HEAD,
+            204, 205, 304). A failure of the last flush after it is not seen.
+            Thus a response with no body is [Complete] also when the client left
+            before its head. *)
+    | Incomplete
+        (** The body was shorter than its length. The server then raises
+            [Length_mismatch]. *)
+    | Failed of exn
+        (** The handler or the body raised. For a handler, the server sends 500,
+            or the answer for a request body that failed. *)
+    | Cancelled
+        (** The client left (also during the body, also with a request body that
+            was cut short) or the server stopped. An exception of a cleanup
+            after it is not in the entry: the server reports it. *)
+    | Not_sent
+        (** The server did not send the body, for example a 2xx body to
+            [CONNECT], which it refuses with 500. *)
+    | Upgraded
+        (** The handler gave an upgrade. The server can still refuse it (500,
+            503). *)
+
+  (** The type for entries. *)
+  type entry =
+    { start: Weft.Clock.posix  (** When the middleware got the request. *)
+    ; duration: Weft.Span.t
+          (** From [start] to the end: the end of the body, the return of a
+              handler with an upgrade (not the end of the tunnel), or its
+              exception. *)
+    ; meth: Caravan.Method.t
+    ; target: string  (** The path and query, or the authority of [CONNECT]. *)
+    ; version: Caravan.Version.t
+    ; client: Forwarded.node option  (** {!Forwarded.client}. *)
+    ; request_id: string option  (** {!Request_id.find}. *)
+    ; route: string option
+          (** The [route] of the response, [None] for an exception. *)
+    ; status: Caravan.Status.t option
+          (** The status that the client is expected to get:
+              - The status of the response of the handler.
+              - 500 for a handler that raised.
+              - The status of the error of a request body that failed, for
+                example 413, also when the response streams that body, but only
+                before the first byte of the body: after it, the client has the
+                status of the handler.
+              - [None] when the server sends nothing. A body that fails before
+                its head gets the 500 of the server, but the entry has the
+                status of the handler. *)
+    ; bytes: int
+          (** The bytes of the body that the server accepted, with no chunk
+              framing. *)
+    ; outcome: outcome }
+
+  val middleware :
+       ?route:(Caravan.Response.t -> string option)
+    -> log:(entry -> unit)
+    -> unit
+    -> Caravan.Handler.middleware
+  (** [middleware ~route ~log ()] calls [log] one time for each request that
+      reaches it, if the server or an outer middleware consumes or closes the
+      response body. The server answers some requests before the handler, for
+      example 400, a 413 for a [Content-Length] that is too large, or 431: these
+      have no entry. [route] reads the response, for example the template of the
+      router; it gives [None] by default, and an exception of [route] gives
+      [None].
+
+      [log] runs in a shield, also in a cancelled fiber, and on many domains at
+      the same time. It must end quickly: a stop of the server waits for it. An
+      exception of [log] is dropped. *)
+
+  val line : entry -> string
+  (** [line e] is one line of text: the client, the request ID, then the method,
+      the target and the version between double quotes, the status, the bytes,
+      the duration as [<ms>ms] and the route, then the outcome if it is not
+      [Complete]. A value that is not known is [-]. A text with a byte outside
+      0x21 to 0x7E, a double quote or a backslash, and an empty text or [-], is
+      an OCaml string literal. *)
+end
+
+(** A page for an exception of a handler, in place of the 500 of the server. *)
+module Error_page : sig
+  val middleware :
+       report:(Caravan.Request.t -> exn -> Printexc.raw_backtrace -> unit)
+    -> ?page:(Caravan.Request.t -> exn -> Caravan.Response.t)
+    -> unit
+    -> Caravan.Handler.middleware
+  (** [middleware ~report ~page ()] calls [report req e bt], then gives
+      [page req e] (default {!plain}), when the handler raises [e].
+      - [report] is necessary: the server does not see the exception.
+      - A cancel, and the error of a request body that failed (for example a
+        body that is too large), go to the server as before, with no report and
+        no page.
+      - An exception of [report] or [page] goes to the server (500 and
+        [on_error]).
+      - An exception of a response body is not a page: it goes to the server.
+      - The page keeps the connection, while the 500 of the server closes it.
+
+      It needs a fiber, as each handler of the server has. *)
+
+  val plain : Caravan.Request.t -> exn -> Caravan.Response.t
+  (** [plain] gives [500 Internal Server Error] with a body that does not show
+      the exception. *)
+end
