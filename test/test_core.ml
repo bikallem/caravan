@@ -1433,6 +1433,83 @@ let attrs_props =
             (List.for_all (fun i -> model ops i = None) [0; 1; 2])
             (Attrs.is_empty m) ) ]
 
+let pairs = list (pair string string)
+
+let form_tests =
+  group "Form"
+    [ test "parse splits on & and on the first =" (fun () ->
+          List.iter
+            (fun (s, l) -> equal ~msg:s pairs l (Form.parse s))
+            [ ("a=1&a=2&&b", [("a", "1"); ("a", "2"); ("b", "")])
+            ; ("a+b=c%20d", [("a b", "c d")])
+            ; ("%2B=%zz", [("+", "%zz")])
+            ; ("=x", [("", "x")])
+            ; ("a=b=c", [("a", "b=c")])
+            ; ("a&b=c", [("a", ""); ("b", "c")])
+            ; ("%26=%3D", [("&", "=")])
+            ; ("&&", [])
+            ; ("=", [("", "")])
+            ; ("", []) ] )
+    ; test "parse keeps an incorrect %" (fun () ->
+          List.iter
+            (fun (v, expected) ->
+              equal ~msg:v pairs [("a", expected)] (Form.parse ("a=" ^ v)) )
+            [ ("%", "%")
+            ; ("%4", "%4")
+            ; ("%4g", "%4g")
+            ; ("%g4", "%g4")
+            ; ("%41", "A")
+            ; ("%c3%A9", "\xc3\xa9")
+            ; ("%00", "\x00")
+            ; ("%%41", "%A")
+            ; ("x%", "x%")
+            ; ("x%4", "x%4") ] ;
+          equal pairs [("A", "1")] (Form.parse "%41=1") ;
+          equal pairs [("%4", "1")] (Form.parse "%4=1") )
+    ; test "parse changes + before the decode" (fun () ->
+          equal pairs [("a b", " c ")] (Form.parse "a+b=+c+") ;
+          equal pairs [("+", "+")] (Form.parse "%2B=%2b") )
+    ; test "encode" (fun () ->
+          equal string "a+b=*-._%7E%21" (Form.encode [("a b", "*-._~!")]) ;
+          equal string "a=1&b=" (Form.encode [("a", "1"); ("b", "")]) ;
+          equal string "=" (Form.encode [("", "")]) ;
+          equal string "%26%3D%2B%25=%C3%A9%00"
+            (Form.encode [("&=+%", "\xc3\xa9\x00")]) ;
+          equal string "" (Form.encode []) )
+    ; test "find, find_all and mem" (fun () ->
+          let l = [("a", "1"); ("b", ""); ("a", "2")] in
+          equal (option string) (Some "1") (Form.find "a" l) ;
+          equal (list string) ["1"; "2"] (Form.find_all "a" l) ;
+          is_true (Form.mem "b" l) ;
+          equal (option string) None (Form.find "A" l) ;
+          equal (list string) [] (Form.find_all "A" l) ;
+          is_false (Form.mem "A" l) )
+    ; test "error_status and pp_error" (fun () ->
+          List.iter
+            (fun (e, code, name) ->
+              equal ~msg:name status (Status.v code) (Form.error_status e) ;
+              equal string name (Format.asprintf "%a" Form.pp_error e) )
+            [ (Form.Unsupported_media_type, 415, "Unsupported_media_type")
+            ; (Form.Too_large, 413, "Too_large")
+            ; (Form.Too_many_fields, 413, "Too_many_fields") ] ) ]
+
+(* The generator puts the bytes with a role in the format in most strings. *)
+let form_props =
+  let byte =
+    Gen.frequency
+      [ (3, Gen.of_list ['&'; '='; '+'; '%'; ' '])
+      ; (1, Gen.char_range '\x80' '\xff')
+      ; (2, Gen.char) ]
+  in
+  let text = Gen.string_of ~size:(Gen.int_range 0 6) byte in
+  group "Form laws"
+    [ prop "parse inverts encode"
+        (Gen.list ~size:(Gen.int_range 0 6) (Gen.pair text text))
+        (fun l -> equal pairs l (Form.parse (Form.encode l)))
+    ; prop "count is the length of parse"
+        (Gen.string_of ~size:(Gen.int_range 0 12) byte)
+        (fun s -> equal int (List.length (Form.parse s)) (Form.count s)) ]
+
 let request_tests =
   group "Request"
     [ test "with_scheme" (fun () ->
@@ -2166,6 +2243,8 @@ let () =
        ; conn_info_tests
        ; attrs_tests
        ; attrs_props
+       ; form_tests
+       ; form_props
        ; request_tests
        ; response_tests
        ; handler_tests
