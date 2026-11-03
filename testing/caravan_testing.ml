@@ -8,7 +8,8 @@ type t =
   ; errors: (exn * Printexc.raw_backtrace) list Atomic.t
   ; seed: int
   ; domains: int
-  ; manual: bool }
+  ; manual: bool
+  ; background: Fiber.scope }
 
 exception Guard_expired of Span.t
 
@@ -72,6 +73,9 @@ let addr = Net.Tcp (host, 80)
 
 (* The reason of the cancel of the guard. *)
 exception Guard_cancel
+
+(* The reason of the cancel of the background fibers at the end of [f]. *)
+exception Background_end
 
 (* [guarded guard f] runs [f] in a scope with a daemon that cancels the scope at
    the deadline. The virtual time at the end of [f] decides the result, not the
@@ -147,8 +151,24 @@ let run ?(config = Config.default) ?engine ?(on_error = fun _ _ -> ())
           let outcome =
             match
               with_client sw (fun client ->
-                  in_guard (fun () ->
-                      f {sim; server; client; errors; seed; domains; manual} ) )
+                  (* The background scope is outside the guard, thus the guard
+                     measures only [f]. When [f] raises with no guard,
+                     [Fiber.scope] cancels the fibers of the scope. *)
+                  Fiber.scope (fun background ->
+                      let r =
+                        in_guard (fun () ->
+                            f
+                              { sim
+                              ; server
+                              ; client
+                              ; errors
+                              ; seed
+                              ; domains
+                              ; manual
+                              ; background } )
+                      in
+                      Fiber.cancel background Background_end ;
+                      r ) )
             with
             | r ->
                 r
@@ -212,6 +232,9 @@ let race ?(seeds = 100) ?replay ?(domains = 4) ?config ?engine ?on_error
     to_run
 
 let seed t = t.seed
+
+let background t g =
+  Fiber.fork_promise ~name:"caravan_testing.background" t.background g
 
 let domains t = t.domains
 

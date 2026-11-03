@@ -293,10 +293,9 @@ let sim_tests =
             T.run ~domains:4
               (fun _ -> ok "")
               (fun t ->
-                Fiber.scope (fun s ->
-                    List.init 20 (fun _ ->
-                        Fiber.fork_promise s (fun () -> (T.get t "/").status) )
-                    |> List.map Promise.await ) )
+                List.init 20 (fun _ ->
+                    T.background t (fun () -> (T.get t "/").status) )
+                |> List.map Promise.await )
           in
           equal int 20 (List.length codes) ;
           is_true (List.for_all (Status.equal Status.ok) codes) )
@@ -321,11 +320,10 @@ let sim_tests =
               push () ; ok ""
             in
             T.run ~seed ~domains:4 note (fun t ->
-                Fiber.scope (fun s ->
-                    List.init 8 (fun i ->
-                        Fiber.fork_promise s (fun () ->
-                            ignore (T.get t ("/" ^ string_of_int i)) ) )
-                    |> List.iter Promise.await ) ) ;
+                List.init 8 (fun i ->
+                    T.background t (fun () ->
+                        ignore (T.get t ("/" ^ string_of_int i)) ) )
+                |> List.iter Promise.await ) ;
             Atomic.get seen
           in
           let first = order 1 in
@@ -350,11 +348,9 @@ let note req =
    which the handler [note] saw them. *)
 let order_of_gets t =
   Atomic.set seen [] ;
-  Fiber.scope (fun s ->
-      List.init 8 (fun i ->
-          Fiber.fork_promise s (fun () ->
-              ignore (T.get t ("/" ^ string_of_int i)) ) )
-      |> List.iter Promise.await ) ;
+  List.init 8 (fun i ->
+      T.background t (fun () -> ignore (T.get t ("/" ^ string_of_int i))) )
+  |> List.iter Promise.await ;
   List.rev (Atomic.get seen)
 
 let is_race_failed ~seed ~domains = function
@@ -469,20 +465,18 @@ let manual_tests =
           T.run ~manual:true slow (fun t ->
               let t0 = Time.now Mono in
               let done_ = Ivar.create () in
-              Fiber.scope (fun s ->
-                  let p =
-                    Fiber.fork_promise s (fun () ->
-                        let r = T.get t "/" in
-                        ignore (Ivar.try_fill done_ ()) ;
-                        r )
-                  in
-                  T.advance_to t
-                    (Option.get
-                       (Time.add Mono t0 (Span.ns (20_000_000_000 - 1))) ) ;
-                  is_false ~msg:"at 20 s - 1 ns" (ended done_) ;
-                  T.advance t (Span.ns 1) ;
-                  is_true ~msg:"at 20 s" (ended done_) ;
-                  equal string "late" (Promise.await p).body ) ) )
+              let p =
+                T.background t (fun () ->
+                    let r = T.get t "/" in
+                    ignore (Ivar.try_fill done_ ()) ;
+                    r )
+              in
+              T.advance_to t
+                (Option.get (Time.add Mono t0 (Span.ns (20_000_000_000 - 1)))) ;
+              is_false ~msg:"at 20 s - 1 ns" (ended done_) ;
+              T.advance t (Span.ns 1) ;
+              is_true ~msg:"at 20 s" (ended done_) ;
+              equal string "late" (Promise.await p).body ) )
     ; test "the 408 of a header timeout comes at 3 s" (fun () ->
           let config = {Config.default with header_timeout= Span.s 3} in
           T.run ~manual:true ~config
@@ -608,6 +602,148 @@ let manual_tests =
                (fun t -> T.fetch t (Request.make ~body Method.POST "/")) ) ;
           equal (list (pair string int)) [("Ended", 2)] !log ) ]
 
+(* [on_cancel k] waits on an Ivar that nothing fills. At a cancel, it calls [k],
+   then raises the cancel again. *)
+let on_cancel k =
+  try sync (Ivar.read (Ivar.create ()))
+  with Fiber.Cancelled _ as e -> k () ; raise e
+
+(* [records_cancel cancelled _] is a handler that waits until a cancel, and then
+   sets [cancelled]. *)
+let records_cancel cancelled _ = on_cancel (fun () -> Atomic.set cancelled true)
+
+let is_unawaited = function Weft_sim.Unawaited _ -> true | _ -> false
+
+let background_tests =
+  group "background"
+    [ test "a background GET while the function does another GET" (fun () ->
+          let echo req = ok (Request.path req) in
+          let a, b =
+            T.run echo (fun t ->
+                let p = T.background t (fun () -> (T.get t "/a").body) in
+                let b = (T.get t "/b").body in
+                (Promise.await p, b) )
+          in
+          equal (pair string string) ("/a", "/b") (a, b) )
+    ; test "the end of the function cancels a background request" (fun () ->
+          (* In manual mode, a background fiber that the end does not cancel is
+             a deadlock. *)
+          let cancelled = Atomic.make false in
+          T.run ~manual:true (records_cancel cancelled) (fun t ->
+              ignore (T.background t (fun () -> T.get t "/")) ;
+              T.settle t ) ;
+          is_true ~msg:"the handler got a cancel" (Atomic.get cancelled) )
+    ; test "the cancel at the end comes before the close of the client"
+        (fun () ->
+          (* If the client closed first, the request would fail, and the run
+             would raise Weft_sim.Unawaited. Each seed gives one cancel. *)
+          let cancels = Atomic.make 0 in
+          T.race ~seeds:20
+            (fun _ -> on_cancel (fun () -> Atomic.incr cancels))
+            (fun t ->
+              ignore (T.background t (fun () -> T.get t "/")) ;
+              Time.sleep Mono (Span.ms 100) ) ;
+          equal int 20 (Atomic.get cancels) )
+    ; test "a failure that no fiber awaits" (fun () ->
+          let f t =
+            ignore (T.background t (fun () -> failwith "x")) ;
+            T.settle t
+          in
+          raises_match is_unawaited (fun () -> T.run (fun _ -> ok "") f) ;
+          raises_match
+            (function
+              | T.Race_failed {error= Weft_sim.Unawaited _; _} ->
+                  true
+              | _ ->
+                  false )
+            (fun () -> T.race ~seeds:1 (fun _ -> ok "") f) )
+    ; test "a failure that the function awaits" (fun () ->
+          let m =
+            T.run
+              (fun _ -> ok "")
+              (fun t ->
+                match
+                  Promise.await (T.background t (fun () -> failwith "x"))
+                with
+                | () ->
+                    "no failure"
+                | exception Failure m ->
+                    m )
+          in
+          equal string "x" m )
+    ; test "a fiber that raises after its cancel" (fun () ->
+          raises_match is_unawaited (fun () ->
+              T.run
+                (fun _ -> ok "")
+                (fun t ->
+                  ignore
+                    (T.background t (fun () ->
+                         on_cancel (fun () -> failwith "cleanup") ) ) ;
+                  T.settle t ) ) )
+    ; test "the function raises while a background request waits" (fun () ->
+          let cancelled = Atomic.make false and waiting = Ivar.create () in
+          let h req =
+            ignore (Ivar.try_fill waiting ()) ;
+            records_cancel cancelled req
+          in
+          raises Exit (fun () ->
+              T.run h (fun t ->
+                  ignore (T.background t (fun () -> T.get t "/")) ;
+                  sync (Ivar.read waiting) ;
+                  raise Exit ) ) ;
+          is_true ~msg:"the handler got a cancel" (Atomic.get cancelled) )
+    ; test "the guard expires while a background request waits" (fun () ->
+          let cancelled = Atomic.make false in
+          raises_match
+            (function T.Guard_expired _ -> true | _ -> false)
+            (fun () ->
+              T.run ~guard:(Span.s 1) (records_cancel cancelled) (fun t ->
+                  ignore (T.background t (fun () -> T.get t "/")) ;
+                  Time.sleep Mono (Span.s 2) ) ) ;
+          is_true ~msg:"the handler got a cancel" (Atomic.get cancelled) )
+    ; test "the guard measures only the function" (fun () ->
+          (* The background fiber ends 1 s after its cancel, after the guard. *)
+          let v =
+            T.run ~guard:(Span.s 2)
+              (fun _ -> ok "")
+              (fun t ->
+                ignore
+                  (T.background t (fun () ->
+                       on_cancel (fun () ->
+                           Fiber.shield (fun () -> Time.sleep Mono (Span.s 1)) ) )
+                  ) ;
+                Time.sleep Mono (Span.ms 1500) ;
+                "f" )
+          in
+          equal string "f" v )
+    ; test "a background GET in manual time" (fun () ->
+          let slow _ =
+            Time.sleep Mono (Span.s 20) ;
+            ok "late"
+          in
+          let body =
+            T.run ~manual:true slow (fun t ->
+                let p = T.background t (fun () -> T.get t "/") in
+                T.advance t (Span.s 20) ;
+                (Promise.await p).body )
+          in
+          equal string "late" body )
+    ; test "background after the end of the function" (fun () ->
+          let closed = Atomic.make false in
+          T.run
+            (fun _ -> ok "")
+            (fun t ->
+              ignore
+                (T.background t (fun () ->
+                     on_cancel (fun () ->
+                         match T.background t ignore with
+                         | _ ->
+                             ()
+                         | exception Fiber.Scope_closed ->
+                             Atomic.set closed true ) ) ) ;
+              T.settle t ) ;
+          is_true ~msg:"Scope_closed" (Atomic.get closed) ) ]
+
 let () =
   exit
     (Windtrap.run "testing"
@@ -616,4 +752,5 @@ let () =
        ; end_tests
        ; sim_tests
        ; race_tests
-       ; manual_tests ] )
+       ; manual_tests
+       ; background_tests ] )

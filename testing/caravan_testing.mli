@@ -59,6 +59,8 @@ val run :
       that waits for nothing is cancelled at the guard. A manual run has no
       guard by default.
 
+    Before it closes the client, [run] cancels the fibers of {!background}.
+
     Call [run] outside a weft run: it makes its own simulator. The result is the
     first of these that occurs:
     + An exception of [on_error]. It cancels all connections of the server, thus
@@ -78,6 +80,27 @@ val seed : t -> int
 
 val domains : t -> int
 (** [domains t] is the number of virtual domains of the simulator of [t]. *)
+
+(** {1:background Background fibers} *)
+
+val background : t -> (unit -> 'a) -> 'a Weft.Promise.t
+(** [background t g] runs [g] in a new fiber, while the function of {!run}
+    continues. A failure of a background fiber must be awaited. If not, the run
+    raises [Weft_sim.Unawaited] (in {!race}, in {!Race_failed}).
+
+    The end of the function of {!run} cancels the background fibers: a return,
+    an exception or the end of the guard. Then [run] waits for their end. A
+    request in the background is cancelled as a client that leaves: the client
+    closes the connection, and the handler gets a cancel.
+    - The cancel is not a failure. But a fiber that raises another exception
+      after its cancel, for example a [Failure] in a cleanup, fails. If no fiber
+      awaits it, the run raises [Weft_sim.Unawaited].
+    - weft checks a promise when the GC finalizes it. Thus the run never reports
+      a promise that the test keeps, for example in the value of the function.
+    - A background fiber that ignores its cancel or waits in a shield keeps the
+      end of the run. In manual mode, that is a [Weft_sim.Deadlock].
+
+    @raise Weft.Fiber.Scope_closed after the end of the function of {!run}. *)
 
 (** {1:race Many seeds} *)
 

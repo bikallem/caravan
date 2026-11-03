@@ -350,10 +350,9 @@ let request_id_tests =
           in
           let bodies =
             T.run ~domains:4 handler (fun t ->
-                Weft.Fiber.scope (fun s ->
-                    List.init 100 (fun _ ->
-                        Weft.Fiber.fork_promise s (fun () -> (T.get t "/").body) )
-                    |> List.map Weft.Promise.await ) )
+                List.init 100 (fun _ ->
+                    T.background t (fun () -> (T.get t "/").body) )
+                |> List.map Weft.Promise.await )
           in
           equal int 100 (List.length (List.sort_uniq compare bodies)) ) ]
 
@@ -433,12 +432,13 @@ let waits ?cleanup waiting _ =
     match cleanup with Some m -> failwith m | None -> raise e )
 
 (* [leave_after waiting t] starts a request ([T.get t "/"] by default), waits
-   for [waiting], then cancels the request: the client closes the connection. *)
+   for [waiting], then cancels the request and waits for its end: the client
+   closes the connection. *)
 let leave_after ?(request = fun t -> ignore (T.get t "/")) waiting t =
-  Weft.Fiber.scope (fun s ->
-      let p = Weft.Fiber.fork_promise s (fun () -> request t) in
-      Weft.sync (Weft.Ivar.read waiting) ;
-      Weft.Promise.cancel p )
+  let p = T.background t (fun () -> request t) in
+  Weft.sync (Weft.Ivar.read waiting) ;
+  Weft.Promise.cancel p ;
+  try Weft.Promise.await p with Weft.Promise.Cancelled -> ()
 
 (* A POST with a chunked body of 10 bytes, more than [max_body = 4]. *)
 let too_large () =
