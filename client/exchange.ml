@@ -36,18 +36,7 @@ let writer_error (e, bt) =
   | e ->
       Printexc.raise_with_backtrace e bt
 
-(* Runs [f], then closes [body]. An exception of [f] has priority over an
-   exception of the close. Unlike Stdlib.Fun.protect, no exception gets the
-   Finally_raised wrapper: a Cancelled of the close stays Cancelled, and the
-   caller gets the exception of the user. *)
-let closing body f =
-  match f () with
-  | v ->
-      Body.close body ; v
-  | exception e ->
-      let bt = Printexc.get_raw_backtrace () in
-      (try Body.close body with _ -> ()) ;
-      Printexc.raise_with_backtrace e bt
+let closing = H1_write.closing
 
 let closes (h : H1_parse.response_head) =
   h.version = Version.Http_1_0

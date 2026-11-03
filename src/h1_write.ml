@@ -231,8 +231,37 @@ let () =
     | (_ [@mutate off "Printexc skips a printer that raises"]) ->
         None )
 
+let closing b f =
+  match f () with
+  | v ->
+      Body.close b ; v
+  | exception e ->
+      let bt = Printexc.get_raw_backtrace () in
+      (try Body.close b with _ -> ()) ;
+      Printexc.raise_with_backtrace e bt
+
+(* [closing_body b f] is [closing b f], but an exception of the close after a
+   success of [f] gets the [Finally_raised] wrapper, except the cancel of the
+   fiber. Thus the server reports it as an error: a [Flow.Closed] of the close
+   of a source (an upstream, for example) is not a close of the connection of
+   the client. *)
+let closing_body b f =
+  match f () with
+  | v -> (
+    match Body.close b with
+    | () ->
+        v
+    | exception e ->
+        let bt = Printexc.get_raw_backtrace () in
+        if Cancel.is_own e then Printexc.raise_with_backtrace e bt
+        else Printexc.raise_with_backtrace (Fun.Finally_raised e) bt )
+  | exception e ->
+      let bt = Printexc.get_raw_backtrace () in
+      (try Body.close b with _ -> ()) ;
+      Printexc.raise_with_backtrace e bt
+
 let body ?(before = ignore) w framing b =
-  Fun.protect ~finally:(fun () -> Body.close b)
+  closing_body b
   @@ fun () ->
   let started = ref false in
   let start () =

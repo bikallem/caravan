@@ -93,6 +93,14 @@ val request_head : Buf_writer.t -> framing -> Request.t -> unit
     [Content-Length]. The response is broken: the connection must close. *)
 exception Length_mismatch
 
+val closing : Body.t -> (unit -> 'a) -> 'a
+(** [closing b f] runs [f], then closes [b]. An exception of [f] has priority
+    over an exception of the close, and no exception gets the [Finally_raised]
+    wrapper of [Fun.protect]: thus a cancel stays a cancel. The client uses it.
+    {!body} closes as [closing], but an exception of the close after a body that
+    succeeded gets the [Finally_raised] wrapper (not a cancel of the fiber),
+    thus the server reports it. *)
+
 val body : ?before:(unit -> unit) -> Buf_writer.t -> framing -> Body.t -> unit
 (** [body ~before w framing b] writes [b] to [w] as [framing] says, and flushes
     [w]. [before ()] runs once, just before the first byte or flush of the body

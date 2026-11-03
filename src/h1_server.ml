@@ -285,9 +285,19 @@ let serve : Engine.t =
              handler. A Fiber.Cancelled is a failure: weft gives it only for a
              scope that the handler cancelled. *)
           let bt = Printexc.get_raw_backtrace () in
+          (* A handler that catches its cancel can give a response: close its
+             body, in the shield. There, a cancel can come only from another
+             scope, thus it is a failure to report. *)
+          let close_body response =
+            match Response.kind response with
+            | Response.Body b -> (
+              try Body.close b with e -> report e )
+            | Response.Upgrade _ ->
+                ()
+          in
           ( match Fiber.shield (fun () -> Promise.await p) with
-          | _ ->
-              ()
+          | response ->
+              Fiber.shield (fun () -> close_body response)
           | exception (Promise.Cancelled | Fiber.Scope_closed) ->
               ()
           | exception e ->
@@ -333,9 +343,11 @@ let serve : Engine.t =
                      head response ) ;
                 switch f ) )
         (* RFC 9110 §9.3.6: a 2xx to CONNECT opens a tunnel. *)
-        | Response.Body _
+        | Response.Body b
           when Method.equal head.meth Method.CONNECT
                && Status.kind (Response.status response) = `Success ->
+            (* Close the body first, thus its hook runs before the 500. *)
+            (try Body.close b with e when not (is_fatal e) -> report e) ;
             report
               (Failure "a 2xx response to CONNECT must be a Response.upgrade") ;
             fail_500 head

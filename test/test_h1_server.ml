@@ -2654,6 +2654,147 @@ let handler_error_tests =
             |} )
     ]
 
+(* Body.on_end through the engine *)
+
+let on_end_tests =
+  (* [record log] is a hook that adds each call to [log], the last call
+     first. *)
+  let record log how ~bytes =
+    log :=
+      Printf.sprintf "%s %d" (Server_support.show_outcome how) bytes :: !log
+  in
+  group "Body.on_end"
+    [ test "a GET and a HEAD" (fun () ->
+          let log = ref [] in
+          let handler _ =
+            Response.make (Body.on_end (record log) (Body.of_string "hello"))
+          in
+          ignore (serve ~handler (get "/")) ;
+          ignore (serve ~handler "HEAD / HTTP/1.1\r\nHost: a.example\r\n\r\n") ;
+          equal (list string) ["Ended 5"; "Abandoned 0"] (List.rev !log) )
+    ; test "a Flow.Closed of the close of a source is an error" (fun () ->
+          let handler _ =
+            Response.make
+              (Body.of_source ~length:2
+                 ~close:(fun () -> raise Flow.Closed)
+                 (let sent = ref false in
+                  fun buf off _ ->
+                    if !sent then 0
+                    else (
+                      sent := true ;
+                      Bytes.blit_string "hi" 0 buf off 2 ;
+                      2 ) ) )
+          in
+          let out, errors = serve ~handler (get "/" ^ get "/") in
+          is_true ~msg:out (String.ends_with ~suffix:"hi[FIN]" out) ;
+          equal int 1 (List.length errors) ;
+          is_true ~msg:(String.concat ";" errors)
+            (List.for_all
+               (fun e -> String.starts_with ~prefix:"Fun.Finally_raised" e)
+               errors ) )
+    ; test "a 204 and a 304" (fun () ->
+          let log = ref [] in
+          let handler req =
+            let status =
+              if Request.path req = "/204" then Status.no_content
+              else Status.not_modified
+            in
+            Response.make ~status
+              (Body.on_end (record log) (Body.of_string "x"))
+          in
+          ignore (serve ~handler (get "/204")) ;
+          ignore (serve ~handler (get "/304")) ;
+          equal (list string) ["Abandoned 0"; "Abandoned 0"] !log )
+    ; test "a 2xx body to CONNECT is closed" (fun () ->
+          let log = ref [] in
+          let handler _ =
+            Response.make (Body.on_end (record log) (Body.of_string "x"))
+          in
+          let out =
+            show ~handler
+              "CONNECT plain.example:443 HTTP/1.1\r\n\
+               Host: plain.example:443\r\n\
+               \r\n"
+          in
+          is_true ~msg:out
+            (String.ends_with
+               ~suffix:
+                 {|! Failure("a 2xx response to CONNECT must be a Response.upgrade")|}
+               out ) ;
+          equal (list string) ["Abandoned 0"] !log )
+    ; test "a close that raises for CONNECT is reported" (fun () ->
+          let handler _ =
+            Response.make
+              (Body.of_source
+                 ~close:(fun () -> failwith "close")
+                 (fun _ _ _ -> 0) )
+          in
+          let _, errors =
+            serve ~handler
+              "CONNECT plain.example:443 HTTP/1.1\r\n\
+               Host: plain.example:443\r\n\
+               \r\n"
+          in
+          equal (list string)
+            [ {|Failure("close")|}
+            ; {|Failure("a 2xx response to CONNECT must be a Response.upgrade")|}
+            ]
+            errors )
+    ; test "an upgrade of a handler that catches its cancel" (fun () ->
+          let holding = Ivar.create () in
+          let handler _ =
+            ignore (Ivar.try_fill holding ()) ;
+            try
+              Time.sleep Mono (Span.s 3600) ;
+              Response.empty ()
+            with Fiber.Cancelled _ -> Response.upgrade ignore
+          in
+          let _, errors =
+            serve ~handler ~cancel_on:(fun () -> Ivar.read holding) (get "/")
+          in
+          equal (list string) [] errors )
+    ; test "the body of a handler that catches its cancel is closed" (fun () ->
+          let log = ref [] and closes = ref 0 in
+          let holding = Ivar.create () in
+          let handler _ =
+            ignore (Ivar.try_fill holding ()) ;
+            try
+              Time.sleep Mono (Span.s 3600) ;
+              Response.empty ()
+            with Fiber.Cancelled _ ->
+              Response.make
+                (Body.on_end (record log)
+                   (Body.of_source
+                      ~close:(fun () -> incr closes)
+                      (fun _ _ _ -> 0) ) )
+          in
+          let _, errors =
+            serve ~handler ~cancel_on:(fun () -> Ivar.read holding) (get "/")
+          in
+          equal (list string) [] errors ;
+          equal (list string) ["Abandoned 0"] !log ;
+          equal int 1 !closes )
+    ; test "a close that raises in the cancel path is reported" (fun () ->
+          let holding = Ivar.create () in
+          let handler _ =
+            ignore (Ivar.try_fill holding ()) ;
+            try
+              Time.sleep Mono (Span.s 3600) ;
+              Response.empty ()
+            with Fiber.Cancelled _ ->
+              Response.make
+                (Body.of_source
+                   ~close:(fun () ->
+                     (* Outside the shield, this sleep raises the cancel. *)
+                     Time.sleep Mono (Span.ms 1) ;
+                     failwith "close" )
+                   (fun _ _ _ -> 0) )
+          in
+          let _, errors =
+            serve ~handler ~cancel_on:(fun () -> Ivar.read holding) (get "/")
+          in
+          equal (list string) [{|Failure("close")|}] errors ) ]
+
 (* The engine on a Tcp flow: the deadlines and the timeouts of each phase, and a
    failed body. H is the header timeout, R is the read timeout, I is the idle
    timeout, W is the write timeout and L is the linger timeout. H is
@@ -2909,4 +3050,5 @@ let () =
        ; smuggling_tests
        ; race_tests
        ; handler_error_tests
+       ; on_end_tests
        ; tcp_tests ] )

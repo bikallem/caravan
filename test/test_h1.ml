@@ -2290,6 +2290,15 @@ let response_body_tests =
 
             -- head
             |} )
+    ; test "an exception of the body wins over an exception of the close"
+        (fun () ->
+          let cancel = Weft.Fiber.Cancelled Exit in
+          let b =
+            Body.of_source
+              ~close:(fun () -> failwith "close")
+              (fun _ _ _ -> raise cancel)
+          in
+          raises cancel (fun () -> ignore (write_body Chunked b)) )
     ; test "Content-Length mismatches" (fun () ->
           raises H1_write.Length_mismatch (fun () ->
               write_body (Length 6) (Body.of_string "hello") ) ;
