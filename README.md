@@ -170,7 +170,6 @@ make mutate     # mutation testing of the suites of test/, in parallel
 make mutate MUTATE=websocket/   # only the mutants of the files under a prefix
 make coverage   # test coverage report of all suites
 make autobahn   # the Autobahn WebSocket test suite, with podman or docker
-make conformance   # the HTTP conformance suite of cispa, with podman
 ```
 
 The suites of test/ run in the simulator of weft, thus they use no real

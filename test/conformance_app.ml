@@ -103,7 +103,7 @@ let fixture req =
   | _ ->
       None
 
-let handler ~fixtures req =
+let handler req =
   match Request.meth req with
   | Method.Other _ ->
       Response.string ~status:Status.not_implemented "not implemented"
@@ -115,7 +115,7 @@ let handler ~fixtures req =
   | GET | HEAD | OPTIONS -> (
       if Request.path_only req = "/" then root req
       else
-        match if fixtures then fixture req else None with
+        match fixture req with
         | Some r ->
             r
         | None ->

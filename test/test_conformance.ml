@@ -28,11 +28,9 @@ let expected_errors =
          "Response.upgrade: 101 to a protocol that the request did not offer: \
           other/1" ) ]
 
-let serve ?(fixtures = true) inputs =
+let serve inputs =
   errors := [] ;
-  let outs =
-    Memory_server.serve ~config (Conformance_app.handler ~fixtures) inputs
-  in
+  let outs = Memory_server.serve ~config Conformance_app.handler inputs in
   ( match List.filter (fun e -> not (List.mem e expected_errors)) !errors with
   | [] ->
       ()
@@ -40,7 +38,7 @@ let serve ?(fixtures = true) inputs =
       failf "the server reported: %s" (String.concat "; " (List.rev es)) ) ;
   outs
 
-let serve_one ?fixtures input = List.hd (serve ?fixtures [input])
+let serve_one input = List.hd (serve [input])
 
 let request ?(v = "HTTP/1.1") ?(headers = []) meth path =
   Printf.sprintf "%s %s %s\r\nHost: localhost:8080\r\n%s\r\n" meth path v
@@ -297,8 +295,8 @@ let memory_server_tests =
                ["GET"; "HEAD"] outs ) ) ]
 
 (* One line for each request: what the application gives. *)
-let app ?fixtures requests =
-  let outs = serve ?fixtures (List.map snd requests) in
+let app requests =
+  let outs = serve (List.map snd requests) in
   String.concat "\n"
     (List.map2
        (fun (meth, input) out ->
@@ -417,13 +415,7 @@ let app_tests =
             GET /missing HTTP/1.1 => HTTP/1.1 404 Not Found | Date, Content-Type: text/plain; charset=utf-8, Content-Length: 9 | length 9 "not found"
             rest ""
             |} )
-    ; test "without fixtures, the fixture paths are not found" (fun () ->
-          equal string "HTTP/1.1 404 Not Found"
-            (Wire.final
-               (Result.get_ok
-                  (Wire.parse ~meth:"GET"
-                     (serve_one ~fixtures:false (request "GET" "/fixture/fail")) ) ) )
-              .status_line ) ]
+    ]
 
 (* The DIRECT rules of upstream: each rule sends its own request over TCP, not
    through the proxy. Upstream sends each to the base URL and to a random
@@ -913,6 +905,11 @@ let list_of element s =
     (fun e -> e <> "" && element e)
     (List.map String.trim (String.split_on_char ',' s))
 
+(* Allow = #method (RFC 9110 10.2.1). An empty value is valid: the resource
+   permits no method. A sender must not send an empty element (RFC 9110
+   5.6.1.1). *)
+let is_allow s = String.trim s = "" || list_of is_token s
+
 let is_transfer_coding c =
   match token_at c 0 with Some i -> params ~bws:true c i | None -> false
 
@@ -1063,6 +1060,15 @@ let grammar_tests =
           equal (list string) []
             (List.filter (fun s -> not (is_media_type s)) valid) ;
           equal (list string) [] (List.filter is_media_type invalid) )
+    ; test "Allow (RFC 9110 10.2.1, 5.6.1)" (fun () ->
+          (* The first valid and the first invalid value are the fixtures of
+             upstream. *)
+          let valid = ["GET, HEAD, PUT"; ""; " "; "GET"; "GET,HEAD"]
+          and invalid =
+            ["GET; HEAD; PUT"; "GET, "; "GET,, HEAD"; ", GET"; "G T"]
+          in
+          equal (list string) [] (List.filter (fun s -> not (is_allow s)) valid) ;
+          equal (list string) [] (List.filter is_allow invalid) )
     ; test "transfer-coding (RFC 9112 7)" (fun () ->
           let valid = ["chunked"; "gzip, chunked"; "x ; a = b"; "x;a=\"q\""]
           and invalid = ["chunked;"; "chunked, "; "x; a"; ", chunked"] in
@@ -1306,6 +1312,39 @@ let probe_tests =
                 "Upgrade %s, Connection %s"
                 (Option.value (Wire.find "Upgrade" r) ~default:"none")
                 (String.concat ", " (Wire.find_all "Connection" r)) ) )
+    ; test
+        "allow_grammar: Allow is #method (RFC 9110 10.2.1, an application rule)"
+        (fun () ->
+          rule ~applies:(with_field "Allow")
+            ~must:["TRACE set 1 /"; "OPTIONS set 1 /"] (fun _ _ r ->
+              let es = Wire.find_all "Allow" r in
+              check (List.for_all is_allow es) "Allow %s"
+                (String.concat ", " es) ) )
+    ; test
+        "code_405_allow: a 405 has Allow with a method (RFC 9110 15.5.6, an \
+         application rule)" (fun () ->
+          (* RFC 9110 10.2.1 permits an empty Allow, for example on a 405 for a
+             resource with each method disabled. The test follows upstream and
+             refuses it, because the application always permits GET. *)
+          rule ~applies:(is_status [405])
+            ~must:["TRACE set 1 /"; "POST set 1 random"] (fun _ _ r ->
+              check
+                (elements (Wire.find_all "Allow" r) <> [])
+                "Allow %s"
+                (String.concat ", " (Wire.find_all "Allow" r)) ) )
+    ; test
+        "post_invalid_response_codes: no 206, 304 or 416 to POST (RFC 9110 \
+         9.3.3, an application rule)" (fun () ->
+          (* Sets 3, 5 and 7 send Range, If-None-Match and If-Range. The
+             application gives 405 to each POST before it examines these fields,
+             so the sets do not change the status at this time. They stay so
+             that a change of the application gets the check. *)
+          rule
+            ~applies:(fun p _ -> p.meth = "POST")
+            ~must:
+              ["POST set 1 /"; "POST set 3 /"; "POST set 5 /"; "POST set 7 /"]
+            (fun _ _ r ->
+              check (not (List.mem r.code [206; 304; 416])) "status %d" r.code ) )
     ; test
         "field syntax: each name is a token and no value has NUL, CR or LF \
          (RFC 9110 5.1, 5.5)" (fun () ->

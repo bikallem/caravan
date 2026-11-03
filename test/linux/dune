@@ -42,15 +42,6 @@
  (modules serve_until_signal)
  (libraries caravan weft weft.linux))
 
-; The server of make conformance.
-
-(executable
- (name conformance_server)
- (enabled_if
-  (= %{system} linux))
- (modules conformance_server)
- (libraries caravan conformance_app weft weft.linux))
-
 ; The server of make autobahn.
 
 (executable

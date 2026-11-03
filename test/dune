@@ -25,12 +25,12 @@
   test_client
   test_websocket
   memory_server
-  wire)
+  wire
+  conformance_app)
  (libraries
   caravan
   caravan.client
   caravan.websocket
-  conformance_app
   server_support
   sim_support
   weft
@@ -61,14 +61,6 @@
  (name test_numeric_unix)
  (modules test_numeric_unix)
  (libraries caravan.client numeric_hosts windtrap unix))
-
-; The application of the conformance tests, shared by test_conformance and
-; conformance_server (make conformance).
-
-(library
- (name conformance_app)
- (modules conformance_app)
- (libraries caravan))
 
 ; The helpers of the caravan tests on the simulator: the core helpers and the
 ; server helpers.
