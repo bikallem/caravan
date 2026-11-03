@@ -121,18 +121,25 @@ let app =
 
 `examples/router.ml` has a full example.
 
-## Proxies and request IDs
+## Middleware
 
 The `caravan.middleware` library has middleware for the requests that
-come through a reverse proxy, and for request IDs:
+come through a reverse proxy, request IDs, an access log and an error
+page:
 
 ```ocaml
+open Caravan_middleware
+
 let app handler =
   Caravan.Handler.compose
-    [ Caravan_middleware.Forwarded.middleware
-        ~trusted:(Caravan_middleware.Forwarded.trust_ips ["10.0.0.1"])
+    [ Forwarded.middleware ~trusted:(Forwarded.trust_ips ["10.0.0.1"]) ()
+    ; Request_id.middleware ()
+    ; Access_log.middleware
+        ~log:(fun e -> print_string (Access_log.line e ^ "\n"))
         ()
-    ; Caravan_middleware.Request_id.middleware () ]
+    ; Error_page.middleware
+        ~report:(fun _req e _bt -> prerr_endline (Printexc.to_string e))
+        () ]
     handler
 ```
 
@@ -146,6 +153,14 @@ let app handler =
   client `Unknown`, never the proxy.
 - `Request_id` keeps a clean `X-Request-Id` of the request, or makes a
   new ID. The ID goes on the request and on the response.
+- `Access_log` gives one entry for each request at the end of its
+  response: the client, the request ID, the route, the status, the
+  bytes, the duration, and if the body was complete, incomplete,
+  failed, cancelled (the client left), not sent or upgraded.
+  `Access_log.line` gives one line of text.
+- `Error_page` gives a page (by default a plain 500) for an exception of
+  the handler, after a call of `report`. A cancel and the error of a
+  request body go to the server as before.
 
 ## WebSocket
 
