@@ -915,6 +915,51 @@ let signal_tests =
                 (fun _ -> ok "")
                 (fun _ -> sync (Ivar.read (Ivar.create ()))) ) ) ]
 
+(* The forms on the wire: the parse of a form body that the client sends, and
+   the drain after a form that is too large. *)
+let form_tests =
+  let conn_id req =
+    string_of_int (Conn_info.id (Option.get (Request.conn req)))
+  in
+  group "Forms"
+    [ test "a form of with_form reaches the handler" (fun () ->
+          let l = [("a b", "&=+%"); ("a", ""); ("", "\xc3\xa9")] in
+          let echo req =
+            match Request.form req with
+            | Ok l ->
+                ok (Form.encode l)
+            | Error e ->
+                Response.string ~status:(Form.error_status e) ""
+          in
+          let r =
+            T.run echo (fun t ->
+                T.fetch t (Request.with_form l (Request.make Method.POST "/")) )
+          in
+          equal status Status.ok r.status ;
+          equal (list (pair string string)) l (Form.parse r.body) )
+    ; test "a 413 of a chunked form keeps the connection" (fun () ->
+          let handler req =
+            match Request.form ~max_bytes:10 req with
+            | Ok _ ->
+                ok (conn_id req)
+            | Error e ->
+                Response.string ~status:(Form.error_status e) (conn_id req)
+          in
+          let chunked s =
+            Body.of_writer (fun w -> Body.Writer.write_string w s)
+          in
+          T.race ~seeds:20 handler (fun t ->
+              let post () =
+                Request.make
+                  ~headers:(Headers.of_list [("Content-Type", Form.media_type)])
+                  ~body:(chunked "a=123456789") Method.POST "/"
+              in
+              let a = T.fetch t (post ()) in
+              equal status Status.content_too_large a.status ;
+              let b = T.get t "/" in
+              equal status Status.unsupported_media_type b.status ;
+              equal string a.body b.body ) ) ]
+
 let () =
   exit
     (Windtrap.run "testing"
@@ -925,4 +970,5 @@ let () =
        ; race_tests
        ; manual_tests
        ; background_tests
-       ; signal_tests ] )
+       ; signal_tests
+       ; form_tests ] )

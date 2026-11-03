@@ -1435,6 +1435,23 @@ let attrs_props =
 
 let pairs = list (pair string string)
 
+(* [source ?length s] is a body that gives [s] in one chunk, with no declared
+   length if [length] is not given. *)
+let source ?length s = Body.of_source ?length (chunked_reader s)
+
+(* A body that raises [e] at its first read. *)
+let raising ?length e = Body.of_source ?length (fun _ _ _ -> raise e)
+
+(* A POST with a [Content-Type] field for each value of [types]. *)
+let form_request ?(types = [Form.media_type]) body =
+  Request.make
+    ~headers:(Headers.of_list (List.map (fun v -> ("Content-Type", v)) types))
+    ~body Method.POST "/"
+
+let form_error = Testable.make ~pp:Form.pp_error ~equal:( = )
+
+let form_result = result pairs form_error
+
 let form_tests =
   group "Form"
     [ test "parse splits on & and on the first =" (fun () ->
@@ -1509,6 +1526,99 @@ let form_props =
     ; prop "count is the length of parse"
         (Gen.string_of ~size:(Gen.int_range 0 12) byte)
         (fun s -> equal int (List.length (Form.parse s)) (Form.count s)) ]
+
+let request_form_tests =
+  group "Request forms"
+    [ test "query_params" (fun () ->
+          List.iter
+            (fun (path, l) ->
+              equal ~msg:path pairs l
+                (Request.query_params (Request.make Method.GET path)) )
+            [ ("/a", [])
+            ; ("/a?", [])
+            ; ("/a?x=1&x=2", [("x", "1"); ("x", "2")])
+            ; ("/a?q=b%3Fc?d", [("q", "b?c?d")]) ] )
+    ; test "form checks the Content-Type" (fun () ->
+          List.iter
+            (fun (types, expected) ->
+              equal ~msg:(String.concat ", " types) form_result expected
+                (Request.form (form_request ~types (Body.of_string "a=1"))) )
+            [ ([Form.media_type], Ok [("a", "1")])
+            ; ( ["Application/X-WWW-Form-Urlencoded; charset=utf-8"]
+              , Ok [("a", "1")] )
+            ; (["application/x-www-form-urlencoded ;"], Ok [("a", "1")])
+            ; (["application/x-www-form-urlencoded\t;x=1"], Ok [("a", "1")])
+            ; ( ["application/x-www-form-urlencoded; charset=\"a;b\""]
+              , Ok [("a", "1")] )
+            ; (["text/plain"], Error Form.Unsupported_media_type)
+            ; ( ["application/x-www-form-urlencodedx"]
+              , Error Form.Unsupported_media_type )
+            ; ( ["x-application/x-www-form-urlencoded"]
+              , Error Form.Unsupported_media_type )
+            ; ([], Error Form.Unsupported_media_type)
+            ; ( [Form.media_type; Form.media_type]
+              , Error Form.Unsupported_media_type ) ] )
+    ; test "form with no Content-Type does not read the body" (fun () ->
+          equal form_result (Error Form.Unsupported_media_type)
+            (Request.form (form_request ~types:[] (raising Exit))) ;
+          List.iter
+            (fun types ->
+              equal ~msg:(String.concat ", " types) form_result
+                (Error Form.Unsupported_media_type)
+                (Request.form (form_request ~types (raising Exit))) )
+            [[]; ["text/plain"]; [Form.media_type; Form.media_type]] ;
+          equal form_result (Error Form.Unsupported_media_type)
+            (Request.form (form_request ~types:[] Body.empty)) )
+    ; test "max_bytes in a chunk" (fun () ->
+          equal form_result
+            (Ok [("a", "12345678")])
+            (Request.form ~max_bytes:10 (form_request (source "a=12345678"))) ;
+          equal form_result (Error Form.Too_large)
+            (Request.form ~max_bytes:10 (form_request (source "a=123456789"))) )
+    ; test "max_bytes and a declared length" (fun () ->
+          equal form_result (Error Form.Too_large)
+            (Request.form ~max_bytes:10
+               (form_request (raising ~length:11 Exit)) ) ;
+          equal form_result
+            (Ok [("a", "12345678")])
+            (Request.form ~max_bytes:10
+               (form_request (source ~length:10 "a=12345678")) ) )
+    ; test "max_bytes 0" (fun () ->
+          equal form_result (Ok [])
+            (Request.form ~max_bytes:0 (form_request Body.empty)) ;
+          equal form_result (Error Form.Too_large)
+            (Request.form ~max_bytes:0 (form_request (source "a"))) )
+    ; test "max_fields counts the non-empty sequences" (fun () ->
+          List.iter
+            (fun (s, expected) ->
+              equal ~msg:s form_result expected
+                (Request.form ~max_fields:2 (form_request (Body.of_string s))) )
+            [ ("a&b", Ok [("a", ""); ("b", "")])
+            ; ("a&&b&", Ok [("a", ""); ("b", "")])
+            ; ("a&b&c", Error Form.Too_many_fields) ] ;
+          equal form_result (Ok [])
+            (Request.form ~max_fields:0 (form_request (Body.of_string "&&"))) )
+    ; test "form lets an exception of the body go out" (fun () ->
+          raises Body.Truncated (fun () ->
+              ignore (Request.form (form_request (raising Body.Truncated))) ) )
+    ; test "form refuses a negative limit" (fun () ->
+          let r = form_request Body.empty in
+          raises_match is_invalid_arg (fun () ->
+              ignore (Request.form ~max_bytes:(-1) r) ) ;
+          raises_match is_invalid_arg (fun () ->
+              ignore (Request.form ~max_fields:(-1) r) ) )
+    ; test "with_form" (fun () ->
+          let l = [("a b", "&"); ("c", "")] in
+          let r =
+            Request.with_form l
+              (form_request ~types:["text/plain"; "text/html"] (raising Exit))
+          in
+          equal (list string) [Form.media_type]
+            (Headers.find_all "content-type" (Request.headers r)) ;
+          equal (option int)
+            (Some (String.length (Form.encode l)))
+            (Body.length (Request.body r)) ;
+          equal form_result (Ok l) (Request.form r) ) ]
 
 let request_tests =
   group "Request"
@@ -2245,6 +2355,7 @@ let () =
        ; attrs_props
        ; form_tests
        ; form_props
+       ; request_form_tests
        ; request_tests
        ; response_tests
        ; handler_tests

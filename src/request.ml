@@ -53,6 +53,8 @@ let query r =
   | Some i ->
       Some (String.sub r.path (i + 1) (String.length r.path - i - 1))
 
+let query_params r = match query r with None -> [] | Some q -> Form.parse q
+
 let headers r = r.headers
 
 let body r = r.body
@@ -79,6 +81,45 @@ let with_scheme scheme r =
   {r with scheme= (match scheme with `Http -> "http" | `Https -> "https")}
 
 let is_valid_authority s = H1_parse.is_authority s
+
+(* Exactly one [Content-Type] field, and its media type, with no parameters, is
+   that of a form. *)
+let is_form headers =
+  match Headers.find_all "content-type" headers with
+  | [v] ->
+      let t =
+        match String.index_opt v ';' with
+        | None ->
+            v
+        | Some i ->
+            String.sub v 0 i
+      in
+      String.equal (String.lowercase_ascii (String.trim t)) Form.media_type
+  | _ ->
+      false
+
+let form ?(max_bytes = 1_048_576) ?(max_fields = 1000) r =
+  if max_bytes < 0 then invalid_arg "Request.form: max_bytes < 0" ;
+  if max_fields < 0 then invalid_arg "Request.form: max_fields < 0" ;
+  if not (is_form r.headers) then Error Form.Unsupported_media_type
+  else
+    match Body.length r.body with
+    (* No read, thus no 100 Continue. *)
+    | Some n when n > max_bytes ->
+        Error Form.Too_large
+    | _ -> (
+      match Body.to_string ~max:max_bytes r.body with
+      | exception Body.Too_large ->
+          Error Form.Too_large
+      | s when Form.count s > max_fields ->
+          Error Form.Too_many_fields
+      | s ->
+          Ok (Form.parse s) )
+
+let with_form f r =
+  { r with
+    body= Body.of_string (Form.encode f)
+  ; headers= Headers.set "Content-Type" Form.media_type r.headers }
 
 let with_attrs attrs r = {r with attrs}
 

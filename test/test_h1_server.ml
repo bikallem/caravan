@@ -786,6 +786,56 @@ let connection_tests =
             Content Too Large
             [FIN]
             |} )
+    ; test "a form larger than its limit gets no 100 Continue" (fun () ->
+          let form req =
+            match Request.form ~max_bytes:4 req with
+            | Ok _ ->
+                Response.string "ok"
+            | Error e ->
+                Response.string ~status:(Form.error_status e) "too large"
+          in
+          expect
+            (show ~handler:form
+               ( post
+                   ~headers:
+                     [ ("Expect", "100-continue")
+                     ; ("Content-Type", Form.media_type) ]
+                   "/" "a=123"
+               ^ get "/" ) )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 413 Content Too Large\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 9\r\n
+            Connection: close\r\n
+            \r\n
+            too large[FIN]
+            |} )
+    ; test "a form larger than its limit with no Expect keeps the connection"
+        (fun () ->
+          let form req =
+            match Request.form ~max_bytes:4 req with
+            | Ok _ ->
+                Response.string "ok"
+            | Error e ->
+                Response.string ~status:(Form.error_status e) "no"
+          in
+          expect
+            (show ~handler:form
+               ( post ~headers:[("Content-Type", Form.media_type)] "/" "a=123"
+               ^ get "/" ) )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 413 Content Too Large\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 2\r\n
+            \r\n
+            noHTTP/1.1 415 Unsupported Media Type\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 2\r\n
+            \r\n
+            no
+            |} )
     ; test "100-continue is sent when the handler reads the body" (fun () ->
           expect
             (show

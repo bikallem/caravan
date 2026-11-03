@@ -56,6 +56,12 @@ val query : t -> string option
 (** [query r] is the query of [r], the part after the first ['?'], if any. It is
     [Some ""] for ["/a?"]. *)
 
+val query_params : t -> Form.t
+(** [query_params r] is [Form.parse] of the {!query} of [r], or [[]] if [r] has
+    no query. For example, the pairs of ["/a?x=1&x=2"] are
+    [[("x", "1"); ("x", "2")]]. It has no limit of its own: the limits of the
+    server on the head of a request also limit the query. *)
+
 val headers : t -> Headers.t
 (** [headers r] are the header fields of [r], as received. *)
 
@@ -97,6 +103,39 @@ val is_valid_authority : string -> bool
     3986), then an optional [:] and zero or more digits of a port. For example
     [a.example:80] and [[::1]:8080] are valid, and [evil.com/x], [a@b] and [x?y]
     are not. *)
+
+(** {1:forms Forms} *)
+
+val form : ?max_bytes:int -> ?max_fields:int -> t -> (Form.t, Form.error) result
+(** [form ~max_bytes ~max_fields r] reads the body of [r] and gives its
+    [application/x-www-form-urlencoded] pairs ({!Form.parse}). Call it one time
+    and keep the result: [form] reads the body, thus a second call does not give
+    the pairs again.
+
+    - [Error Unsupported_media_type] if [r] does not have exactly one
+      [Content-Type] field, or if its media type is not {!Form.media_type}. The
+      media type is the part before the first [;], with no white space at the
+      two ends. The compare ignores the case of the ASCII letters. The
+      parameters, for example [charset], have no effect. Thus a request with no
+      [Content-Type] gives this error, also with an empty body. The body is not
+      read.
+    - [Error Too_large] if the body has more than [max_bytes] bytes (default 1
+      MiB, 1048576). If the body declares a larger length, [form] does not read
+      it: thus the server sends no [100 Continue] to a request that expects it,
+      and closes the connection after the response. The server discards the rest
+      of a body as for each handler (see [Config.max_drain]).
+    - [Error Too_many_fields] if the body has more than [max_fields] pairs
+      (default 1000).
+
+    {!Form.error_status} gives the status of a response for an error. The other
+    exceptions of the body, for example {!Body.Truncated}, go out of [form].
+
+    @raise Invalid_argument if [max_bytes] or [max_fields] is negative. *)
+
+val with_form : Form.t -> t -> t
+(** [with_form l r] is [r] with the body [Form.encode l], with its length, and
+    the field [Content-Type: application/x-www-form-urlencoded], which replaces
+    the [Content-Type] fields of [r]. For a client or a test. *)
 
 (** {1:attributes Attributes}
 
