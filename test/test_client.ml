@@ -2325,11 +2325,12 @@ let execute_pool p =
 
 let pool_stateful =
   group "Pool model"
-    [ test ~tags:["prop"; "stateful"] "the pool behaves like a model" (fun () ->
-          Windtrap.Private.Run.property ~count:300 ~summary:Stateful.summary
-            ~prints_run:true
-            (Stateful.program ~steps:30 pool_commands)
-            execute_pool ) ]
+    [ tag "prop" @@ tag "stateful"
+      @@ test "the pool behaves like a model" (fun () ->
+          ignore
+          @@ Windtrap.Private.Run.property ~count:300
+               (Stateful.program ~steps:30 pool_commands) (fun p ->
+                 ignore (execute_pool p) ) ) ]
 
 (* The public API *)
 

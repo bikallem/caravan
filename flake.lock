@@ -53,11 +53,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1792258151,
-        "narHash": "sha256-YqsNQ0durA+2qvZuzhoU+T1DvIP9gHj/h4pNa4nNheQ=",
+        "lastModified": 1793764126,
+        "narHash": "sha256-mvLyZEB8J+GKgEFTUnTeiLUG8KY5S9B3o2QQRpXtv10=",
         "owner": "bikallem",
         "repo": "windtrap",
-        "rev": "de08917609100fa04668e0fb6189691ae7840214",
+        "rev": "a851bdaad59fedbf86b3117aab502865ccc2b18c",
         "type": "github"
       },
       "original": {

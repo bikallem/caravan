@@ -229,16 +229,18 @@ let execute p =
 
 (* A property over the programs. It keeps these parts of [stateful] of windtrap:
    the tags "prop" and "stateful", a failure that prints the record of the run
-   of the program with [summary] as its one-line form, and the check "never
-   called" of each command (with [calls]). [stateful] itself runs each program
-   in the fiber of the test, thus it cannot give each program a new run. *)
+   of the program (Stateful.execute raises Property.Run_failure with it), and
+   the check "never called" of each command (with [calls]). [stateful] itself
+   runs each program in the fiber of the test, thus it cannot give each program
+   a new run. *)
 let stateful_tests =
   group "HTTP/1.1 connections"
-    [ test ~tags:["prop"; "stateful"] "behave like the model" (fun () ->
-          Windtrap.Private.Run.property ~count ~summary:Stateful.summary
-            ~prints_run:true
-            (Stateful.program ~steps:25 commands)
-            execute ;
+    [ tag "prop" @@ tag "stateful"
+      @@ test "behave like the model" (fun () ->
+          ignore
+          @@ Windtrap.Private.Run.property ~count
+               (Stateful.program ~steps:25 commands) (fun p ->
+                 ignore (execute p) ) ;
           match List.filter (fun (_, n) -> Atomic.get n = 0) calls with
           | [] ->
               ()
