@@ -1080,54 +1080,70 @@ module Rate_limit = struct
         (Headers.of_list [("Retry-After", string_of_int (seconds_up wait))])
       "Too Many Requests\n"
 
-  let middleware ?(key = client_key)
-      ?(max_keys =
-        (100_000 [@mutate off "a size: a test would make 100_000 keys"]))
-      ?(deny = too_many) ~burst ~every () =
-    let bad m =
-      invalid_arg ("Caravan_middleware.Rate_limit.middleware: " ^ m)
-    in
-    if burst < 1 then bad "burst is less than 1" ;
-    if max_keys < 1 then bad "max_keys is less than 1" ;
-    let every_ns = Weft.Span.to_ns every in
-    if every_ns <= 0L then bad "every is not positive" ;
-    (* The times stay far from max_int: [tat] is at most the time plus [burst *
-       every]. *)
-    if Int64.of_int burst > Int64.div (Int64.of_int (max_int / 4)) every_ns then
-      bad "burst * every is too large" ;
-    let every = Int64.to_int every_ns in
-    (* GCRA: a key has [tat], the time at which its bucket is full. A request is
-       refused if [tat] is more than [tolerance] after the time. *)
-    let tolerance = (burst - 1) * every in
-    let table : (string, int) Hashtbl.t =
-      Hashtbl.create ~random:(true [@mutate off "the seed is not visible"]) 1024
-    in
-    let lock = Weft.Fiber.Mutex.create () in
-    (* The times are ns from the mono time of the first request. *)
-    let origin = Atomic.make None in
-    let now () =
-      let t = Weft.Time.now Mono in
-      ( match Atomic.get origin with
+  module Limiter = struct
+    type t =
+      { every: int  (** ns *)
+      ; tolerance: int
+      ; max_keys: int
+      ; table: (string, int) Hashtbl.t
+      ; lock: Weft.Fiber.Mutex.t
+      ; origin: Weft.Clock.mono option Atomic.t }
+
+    (* [create ~fn] is [make]; [fn] is the name of the function for the
+       messages. *)
+    let create ~fn
+        ?(max_keys =
+          (100_000 [@mutate off "a size: a test would make 100_000 keys"]))
+        ~burst ~every () =
+      let bad m =
+        invalid_arg (Printf.sprintf "Caravan_middleware.Rate_limit.%s: %s" fn m)
+      in
+      if burst < 1 then bad "burst is less than 1" ;
+      if max_keys < 1 then bad "max_keys is less than 1" ;
+      let every_ns = Weft.Span.to_ns every in
+      if every_ns <= 0L then bad "every is not positive" ;
+      (* The times stay far from max_int: [tat] is at most the time plus [burst
+       * every]. *)
+      if Int64.of_int burst > Int64.div (Int64.of_int (max_int / 4)) every_ns
+      then bad "burst * every is too large" ;
+      let every = Int64.to_int every_ns in
+      (* GCRA: a key has [tat], the time at which its bucket is full. A take is
+         refused if [tat] is more than [tolerance] after the time. *)
+      { every
+      ; tolerance= (burst - 1) * every
+      ; max_keys
+      ; table=
+          Hashtbl.create ~random:(true [@mutate off "the seed is not visible"])
+            1024
+      ; lock= Weft.Fiber.Mutex.create ()
+      ; origin= Atomic.make None }
+
+    let make = create ~fn:"Limiter.make"
+
+    (* The times are ns from the mono time of the first take. *)
+    let now t =
+      let n = Weft.Time.now Mono in
+      ( match Atomic.get t.origin with
       | None ->
-          ignore (Atomic.compare_and_set origin None (Some t))
+          ignore (Atomic.compare_and_set t.origin None (Some n))
       | Some _ ->
           () ) ;
       Int64.to_int
         (Weft.Span.to_ns
-           (Weft.Time.diff Mono t (Option.get (Atomic.get origin))) )
-    in
-    (* [evict now] removes at least half of the buckets: the nearest to full,
+           (Weft.Time.diff Mono n (Option.get (Atomic.get t.origin))) )
+
+    (* [evict t now] removes at least half of the buckets: the nearest to full,
        thus the full ones first (a full bucket is the same as no bucket). A
        first pass with no allocation removes the full ones. Else a sort of an
        int array finds the cut. The work serves many later inserts. *)
-    let evict now =
+    let evict t now =
       Hashtbl.filter_map_inplace
         (fun _ tat -> if tat <= now then None else Some tat)
-        table [@mutate off "a fast first pass: the cut removes the same"] ;
-      let excess = Hashtbl.length table - (max_keys / 2) in
+        t.table [@mutate off "a fast first pass: the cut removes the same"] ;
+      let excess = Hashtbl.length t.table - (t.max_keys / 2) in
       if excess > 0 then (
         let tats =
-          Array.make (Hashtbl.length table)
+          Array.make (Hashtbl.length t.table)
             (0 [@mutate off "each cell is written next"])
         in
         let i = ref 0 in
@@ -1135,46 +1151,51 @@ module Rate_limit = struct
           (fun _ tat ->
             tats.(!i) <- tat ;
             incr i )
-          table ;
+          t.table ;
         Array.sort Int.compare tats ;
         let cut = tats.(excess - 1) in
         Hashtbl.filter_map_inplace
           (fun _ tat -> if tat <= cut then None else Some tat)
-          table )
-    in
-    (* [take k now] is the wait of a refusal, or [None]. *)
-    let take k now =
-      Weft.Fiber.Mutex.lock lock ;
-      Fun.protect
-        ~finally:(fun () -> Weft.Fiber.Mutex.unlock lock)
-        (fun () ->
-          let tat =
-            match Hashtbl.find_opt table k with
-            | Some tat ->
-                tat
-            | None ->
-                if Hashtbl.length table >= max_keys then evict now ;
-                now
-          in
-          let t = max tat now in
-          if t - now > tolerance then Some (t - now - tolerance)
-          else (
-            Hashtbl.replace table k (t + every) ;
-            None ) )
-    in
+          t.table )
+
+    let take t k =
+      (* The time before the lock: a read of the clock can switch the fiber. *)
+      let now = now t in
+      Weft.Fiber.Mutex.lock t.lock ;
+      let wait =
+        Fun.protect
+          ~finally:(fun () -> Weft.Fiber.Mutex.unlock t.lock)
+          (fun () ->
+            let tat =
+              match Hashtbl.find_opt t.table k with
+              | Some tat ->
+                  tat
+              | None ->
+                  if Hashtbl.length t.table >= t.max_keys then evict t now ;
+                  now
+            in
+            let tat = max tat now in
+            if tat - now > t.tolerance then Some (tat - now - t.tolerance)
+            else (
+              Hashtbl.replace t.table k (tat + t.every) ;
+              None ) )
+      in
+      Option.map (fun w -> Weft.Span.of_ns (Int64.of_int w)) wait
+  end
+
+  let middleware ?(key = client_key) ?max_keys ?(deny = too_many) ~burst ~every
+      () =
+    let limiter = Limiter.create ~fn:"middleware" ?max_keys ~burst ~every () in
     fun next req ->
       match key req with
       | None ->
           next req
       | Some k -> (
-          (* The time before the lock: a read of the clock can switch the
-             fiber. *)
-          let now = now () in
-          match take k now with
-          | None ->
-              next req
-          | Some wait ->
-              deny ~retry_after:(Weft.Span.of_ns (Int64.of_int wait)) req )
+        match Limiter.take limiter k with
+        | None ->
+            next req
+        | Some retry_after ->
+            deny ~retry_after req )
 end
 
 module Concurrency_limit = struct

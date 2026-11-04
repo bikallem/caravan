@@ -2024,7 +2024,38 @@ let refused s = (429, Some s)
 
 let rate_limit_tests =
   group "Rate_limit"
-    [ test "a burst, then a refusal" (fun () ->
+    [ test "Limiter.take gives the wait of a refusal" (fun () ->
+          Sim_support.run ~guard:(Weft.Span.s 60) (fun _ ->
+              let module L = Caravan_middleware.Rate_limit.Limiter in
+              let l = L.make ~burst:2 ~every:(Weft.Span.s 1) () in
+              let take k = Option.map Weft.Span.to_ns (L.take l k) in
+              equal (option int64) None (take "a") ;
+              equal (option int64) None (take "a") ;
+              equal (option int64) (Some 1_000_000_000L) (take "a") ;
+              equal (option int64) ~msg:"an other key" None (take "b") ;
+              Weft.Time.sleep Mono (Weft.Span.ms 400) ;
+              equal (option int64) (Some 600_000_000L) (take "a") ;
+              Weft.Time.sleep Mono (Weft.Span.ms 600) ;
+              equal (option int64) None (take "a") ;
+              equal (option int64) (Some 1_000_000_000L) (take "a") ) )
+    ; test "Limiter.make refuses bad arguments" (fun () ->
+          let module L = Caravan_middleware.Rate_limit.Limiter in
+          List.iter
+            (fun (label, f) ->
+              raises_match ~msg:label
+                (function
+                  | Invalid_argument m ->
+                      String.starts_with
+                        ~prefix:"Caravan_middleware.Rate_limit.Limiter.make: " m
+                  | _ ->
+                      false )
+                (fun () -> ignore (f () : L.t)) )
+            [ ("burst", fun () -> L.make ~burst:0 ~every:(Weft.Span.s 1) ())
+            ; ( "max_keys"
+              , fun () -> L.make ~max_keys:0 ~burst:1 ~every:(Weft.Span.s 1) ()
+              )
+            ; ("every", fun () -> L.make ~burst:1 ~every:Weft.Span.zero ()) ] )
+    ; test "a burst, then a refusal" (fun () ->
           Sim_support.run ~guard:(Weft.Span.s 60) (fun _ ->
               let h = limited ~burst:3 ~every:1. () in
               List.iter (fun _ -> equal outcome ok (hit h ())) [1; 2; 3] ;

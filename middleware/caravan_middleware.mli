@@ -500,6 +500,27 @@ module Rate_limit : sig
       also be too coarse: with a NAT64 prefix ([64:ff9b::/96]), all the IPv4
       clients share one /64. For these networks, give a [key]. *)
 
+  (** The buckets of {!middleware}, for any key: for example an email address
+      ([Caravan_auth.Code]). *)
+  module Limiter : sig
+    type t
+
+    val make : ?max_keys:int -> burst:int -> every:Weft.Span.t -> unit -> t
+    (** [make ~burst ~every ()] gives each key a bucket of [burst] tokens, with
+        one new token each [every], as {!middleware} does. The table has at most
+        [max_keys] (default 100_000) keys, with the eviction of {!middleware}.
+        Keep a key short, or use a hash of it: the table keeps each key. The
+        buckets are in the memory of the process.
+
+        @raise Invalid_argument as {!middleware}. *)
+
+    val take : t -> string -> Weft.Span.t option
+    (** [take t key] takes a token of the bucket of [key]: [None] if the bucket
+        had one, else [Some wait], the time until the next token. The bucket
+        does not change on [Some]. The lock of the buckets is a
+        {!Weft.Fiber.Mutex}: [take] is a cancellation point. *)
+  end
+
   val middleware :
        ?key:(Caravan.Request.t -> string option)
     -> ?max_keys:int
