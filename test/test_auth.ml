@@ -3675,6 +3675,618 @@ let code_tests =
               Time.sleep Mono (Span.s 60) ;
               equal string "Expired" (enter app j code) ) ) ]
 
+(* {1 The parsers of passkeys} *)
+
+module Cbor = Caravan_auth.Private.Cbor
+module W = Caravan_auth.Private.Webauthn
+
+let of_hex h =
+  String.init
+    (String.length h / 2)
+    (fun i -> Char.chr (int_of_string ("0x" ^ String.sub h (2 * i) 2)))
+
+(* A CBOR encoder for the tests. *)
+type cb =
+  [ `Int of int
+  | `Bytes of string
+  | `Text of string
+  | `Array of cb list
+  | `Map of (cb * cb) list
+  | `Bool of bool
+  | `Null ]
+
+let rec cbor (v : cb) =
+  let head major n =
+    let b = String.make 1 in
+    let c x = b (Char.chr x) in
+    if n < 24 then c ((major lsl 5) lor n)
+    else if n < 256 then c ((major lsl 5) lor 24) ^ c n
+    else if n < 65536 then
+      c ((major lsl 5) lor 25) ^ c (n lsr 8) ^ c (n land 255)
+    else if n < 1 lsl 32 then
+      c ((major lsl 5) lor 26)
+      ^ String.init 4 (fun i -> Char.chr ((n lsr (8 * (3 - i))) land 255))
+    else
+      c ((major lsl 5) lor 27)
+      ^ String.init 8 (fun i -> Char.chr ((n lsr (8 * (7 - i))) land 255))
+  in
+  match v with
+  | `Int i when i >= 0 ->
+      head 0 i
+  | `Int i ->
+      head 1 (-1 - i)
+  | `Bytes b ->
+      head 2 (String.length b) ^ b
+  | `Text t ->
+      head 3 (String.length t) ^ t
+  | `Array l ->
+      head 4 (List.length l) ^ String.concat "" (List.map cbor l)
+  | `Map l ->
+      head 5 (List.length l)
+      ^ String.concat "" (List.map (fun (k, v) -> cbor k ^ cbor v) l)
+  | `Bool false ->
+      "\xf4"
+  | `Bool true ->
+      "\xf5"
+  | `Null ->
+      "\xf6"
+
+let rec show_cbor = function
+  | Cbor.Int i ->
+      string_of_int i
+  | Bytes b ->
+      Printf.sprintf "h'%s'"
+        (String.concat ""
+           (List.map
+              (fun c -> Printf.sprintf "%02x" (Char.code c))
+              (List.of_seq (String.to_seq b)) ) )
+  | Text t ->
+      Printf.sprintf "%S" t
+  | Array l ->
+      "[" ^ String.concat ", " (List.map show_cbor l) ^ "]"
+  | Map l ->
+      "{"
+      ^ String.concat ", "
+          (List.map (fun (k, v) -> show_cbor k ^ ": " ^ show_cbor v) l)
+      ^ "}"
+  | Bool b ->
+      string_of_bool b
+  | Null ->
+      "null"
+
+let decode_hex h =
+  match Cbor.decode_all (of_hex h) with
+  | Ok v ->
+      show_cbor v
+  | Error e ->
+      "Error: " ^ e
+
+(* The COSE keys of the RFC keys of the JWT tests. *)
+let cose_ec ?(alg = -7) ?(crv = 1) ?(x = unb64 rfc_ec_x)
+    ?(y = `Bytes (unb64 rfc_ec_y)) () =
+  cbor
+    (`Map
+       [ (`Int 1, `Int 2)
+       ; (`Int 3, `Int alg)
+       ; (`Int (-1), `Int crv)
+       ; (`Int (-2), `Bytes x)
+       ; (`Int (-3), y) ] )
+
+let cose_ed ?(alg = -8) () =
+  cbor
+    (`Map
+       [ (`Int 1, `Int 1)
+       ; (`Int 3, `Int alg)
+       ; (`Int (-1), `Int 6)
+       ; (`Int (-2), `Bytes (unb64 rfc_ed_x)) ] )
+
+let cose_rsa ?(alg = -257) ?(n = unb64 rfc_rsa_n) ?(e = "\x01\x00\x01")
+    ?(more = []) () =
+  cbor
+    (`Map
+       ( [ (`Int 1, `Int 3)
+         ; (`Int 3, `Int alg)
+         ; (`Int (-1), `Bytes n)
+         ; (`Int (-2), `Bytes e) ]
+       @ more ) )
+
+(* The bytes of a big-endian number. *)
+let bytes_of_z z =
+  let bits = Z.to_bits z in
+  let n = String.length bits in
+  let s = String.init n (fun i -> bits.[n - 1 - i]) in
+  let rec strip s =
+    if String.length s > 1 && s.[0] = '\x00' then
+      strip (String.sub s 1 (String.length s - 1))
+    else s
+  in
+  strip s
+
+let key_result s =
+  match Caravan_auth.Private.key_of_cose s with
+  | Ok (k, alg) ->
+      Format.asprintf "%d %s" alg
+        ( match J.Key.alg k with
+        | ES256 ->
+            "ES256"
+        | EdDSA ->
+            "EdDSA"
+        | RS256 ->
+            "RS256"
+        | HS256 ->
+            "HS256" )
+  | Error e ->
+      "Error: " ^ e
+
+(* A DER INTEGER of the bytes [v]. *)
+let der_int v = "\x02" ^ String.make 1 (Char.chr (String.length v)) ^ v
+
+let der_seq parts =
+  let body = String.concat "" parts in
+  "\x30" ^ String.make 1 (Char.chr (String.length body)) ^ body
+
+(* Authenticator data: [flags], [count], and the parts after them. *)
+let auth_data ?(rp = "0123456789abcdef0123456789ABCDEF") ~flags ?(count = 0)
+    rest =
+  rp
+  ^ String.make 1 (Char.chr flags)
+  ^ String.init 4 (fun i -> Char.chr ((count lsr (8 * (3 - i))) land 255))
+  ^ rest
+
+let attested ?(id = "cred") key =
+  "0123456789abcdef"
+  ^ String.init 2 (fun i ->
+      Char.chr ((String.length id lsr (8 * (1 - i))) land 255) )
+  ^ id ^ key
+
+let parse_result s =
+  match W.parse_auth_data s with
+  | Ok d ->
+      Printf.sprintf "flags=%02x count=%d attested=%s ext=%b" d.flags
+        d.sign_count
+        ( match d.attested with
+        | Some a when a.aaguid <> "0123456789abcdef" ->
+            "bad aaguid"
+        | Some a ->
+            a.credential_id ^ "/" ^ string_of_int (String.length a.public_key)
+        | None ->
+            "none" )
+        (Option.is_some d.extensions)
+      ^
+      if d.rp_id_hash <> "0123456789abcdef0123456789ABCDEF" then " bad rp"
+      else ""
+  | Error e ->
+      "Error: " ^ e
+
+let passkey_parser_tests =
+  group "Passkeys: the parsers"
+    [ test "CBOR: the vectors of RFC 8949 Appendix A" (fun () ->
+          List.iter
+            (fun (h, expected) -> equal string ~msg:h expected (decode_hex h))
+            [ ("00", "0")
+            ; ("01", "1")
+            ; ("0a", "10")
+            ; ("17", "23")
+            ; ("1818", "24")
+            ; ("1819", "25")
+            ; ("1864", "100")
+            ; ("1903e8", "1000")
+            ; ("1a000f4240", "1000000")
+            ; ("1b000000e8d4a51000", "1000000000000")
+            ; ("20", "-1")
+            ; ("29", "-10")
+            ; ("3863", "-100")
+            ; ("3903e7", "-1000")
+            ; ("40", "h''")
+            ; ("4401020304", "h'01020304'")
+            ; ("60", {|""|})
+            ; ("6161", {|"a"|})
+            ; ("6449455446", {|"IETF"|})
+            ; ("62225c", {|"\"\\"|})
+            ; ("62c3bc", {|"\195\188"|})
+            ; ("63e6b0b4", {|"\230\176\180"|})
+            ; ("64f0908591", {|"\240\144\133\145"|})
+            ; ("80", "[]")
+            ; ("83010203", "[1, 2, 3]")
+            ; ("8301820203820405", "[1, [2, 3], [4, 5]]")
+            ; ( "98190102030405060708090a0b0c0d0e0f101112131415161718181819"
+              , "["
+                ^ String.concat ", "
+                    (List.init 25 (fun i -> string_of_int (i + 1)))
+                ^ "]" )
+            ; ("a0", "{}")
+            ; ("a201020304", "{1: 2, 3: 4}")
+            ; ("a26161016162820203", {|{"a": 1, "b": [2, 3]}|})
+            ; ("826161a161626163", {|["a", {"b": "c"}]|})
+            ; ("f4", "false")
+            ; ("f5", "true")
+            ; ("f6", "null") (* Refused. *)
+            ; ("1bffffffffffffffff", "Error: an integer out of range")
+            ; ("3bffffffffffffffff", "Error: an integer out of range")
+            ; ("c11a514b67b0", "Error: a tag")
+            ; ("f7", "Error: a float or a simple value")
+            ; ("f0", "Error: a float or a simple value")
+            ; ("f8ff", "Error: a float or a simple value")
+            ; ("f90000", "Error: a float or a simple value")
+            ; ("fb3ff199999999999a", "Error: a float or a simple value")
+            ; ("5f42010243030405ff", "Error: an indefinite length")
+            ; ("9fff", "Error: an indefinite length")
+            ; ("1c", "Error: a reserved additional information")
+            ; ("1d", "Error: a reserved additional information")
+            ; ("1e", "Error: a reserved additional information") ] )
+    ; test "CBOR: the limits of an OCaml int" (fun () ->
+          List.iter
+            (fun (h, expected) -> equal string ~msg:h expected (decode_hex h))
+            [ ("1b3fffffffffffffff", string_of_int max_int)
+            ; ("3b3fffffffffffffff", string_of_int min_int)
+            ; ("1b4000000000000000", "Error: an integer out of range")
+            ; ("1b8000000000000000", "Error: an integer out of range")
+            ; ("3b4000000000000000", "Error: an integer out of range") ] )
+    ; test "CBOR: bad input gives an error, not an exception" (fun () ->
+          List.iter
+            (fun (h, expected) -> equal string ~msg:h expected (decode_hex h))
+            [ ("", "Error: the input ends")
+            ; ("19", "Error: the input ends")
+            ; ("1a0000", "Error: the input ends")
+            ; ("5bffffffffffffffff", "Error: an integer out of range")
+            ; ("5b3fffffffffffffff", "Error: a length over the input")
+            ; ("5a00010000", "Error: a length over the input")
+            ; ("4201", "Error: a length over the input")
+            ; ("83", "Error: a length over the input")
+            ; ("8301", "Error: a length over the input")
+            ; ("a1", "Error: a length over the input")
+            ; ("a10102a1", "Error: bytes after the item")
+            ; ("a201020103", "Error: two equal keys in a map")
+            ; ("a2616101616101", "Error: two equal keys in a map")
+            ; ("a1400102", "Error: a map key that is not an integer or a text")
+            ; ("a1f401", "Error: a map key that is not an integer or a text")
+            ; ("62c328", "Error: a text that is not UTF-8")
+            ; ("0001", "Error: bytes after the item")
+            ; ("a2010203", "Error: a length over the input")
+            ; ("62c080", "Error: a text that is not UTF-8")
+            ; ("63eda080", "Error: a text that is not UTF-8") ] ;
+          equal string "Error: a negative position"
+            ( match Cbor.decode "\x01" (-1) with
+            | Ok _ ->
+                "Ok"
+            | Error e ->
+                "Error: " ^ e ) ;
+          (* The key of a map at level 16 is at level 17. *)
+          equal string "Error: too deep"
+            (decode_hex
+               (String.concat "" (List.init 15 (fun _ -> "a100")) ^ "a18000") ) ;
+          (* Maps count too: 16 maps and a leaf. *)
+          equal string "Error: too deep"
+            (decode_hex
+               (String.concat "" (List.init 16 (fun _ -> "a100")) ^ "00") ) ;
+          is_true
+            (Result.is_ok
+               (Cbor.decode_all
+                  (of_hex
+                     (String.concat "" (List.init 15 (fun _ -> "a100")) ^ "00") ) ) ) ;
+          (* 16 arrays and a leaf: 17 levels. *)
+          equal string "Error: too deep"
+            (decode_hex
+               (String.concat "" (List.init 15 (fun _ -> "81")) ^ "8100") ) ;
+          (* 15 arrays and a leaf: 16 levels. *)
+          equal string
+            (String.make 15 '[' ^ "0" ^ String.make 15 ']')
+            (String.concat ""
+               (String.split_on_char ' '
+                  (decode_hex
+                     (String.concat "" (List.init 14 (fun _ -> "81")) ^ "8100") ) ) ) ;
+          (* A map of 65 pairs. *)
+          equal string "Error: a map with too many pairs"
+            (decode_hex
+               ( "b841"
+               ^ String.concat ""
+                   (List.init 65 (fun i -> Printf.sprintf "18%02x00" i)) ) ) ;
+          is_true
+            (Result.is_ok
+               (Cbor.decode_all
+                  (of_hex
+                     ( "b840"
+                     ^ String.concat ""
+                         (List.init 64 (fun i -> Printf.sprintf "18%02x00" i))
+                     ) ) ) ) )
+    ; test "CBOR: decode gives the position after the item" (fun () ->
+          let pos h at =
+            match Cbor.decode (of_hex h) at with
+            | Ok (v, i) ->
+                Printf.sprintf "%s at %d" (show_cbor v) i
+            | Error e ->
+                e
+          in
+          equal string "1 at 2" (pos "ff0102ff" 1) ;
+          equal string "2 at 3" (pos "ff0102" 2) ;
+          equal string "{1: 2} at 4" (pos "ffa10102ff" 1) ;
+          equal string "the input ends" (pos "ff01" 2) )
+    ; test "COSE: the three key types" (fun () ->
+          equal string "-7 ES256" (key_result (cose_ec ())) ;
+          equal string "-9 ES256" (key_result (cose_ec ~alg:(-9) ())) ;
+          equal string "-8 EdDSA" (key_result (cose_ed ())) ;
+          equal string "-19 EdDSA" (key_result (cose_ed ~alg:(-19) ())) ;
+          equal string "-257 RS256" (key_result (cose_rsa ())) ;
+          (* -13 is not a private part of an RSA key. *)
+          equal string "-257 RS256"
+            (key_result (cose_rsa ~more:[(`Int (-13), `Bytes "x")] ())) ;
+          (* An int key and a text key of the same digits. *)
+          is_true
+            (Result.is_ok
+               (Cbor.decode_all
+                  (cbor (`Map [(`Int 1, `Int 0); (`Text "1", `Int 0)])) ) ) )
+    ; test "COSE: bad keys" (fun () ->
+          List.iter
+            (fun (label, k, expected) ->
+              equal string ~msg:label ("Error: " ^ expected) (key_result k) )
+            [ ( "EC2 with EdDSA"
+              , cose_ec ~alg:(-8) ()
+              , "an alg that is not ES256 for an EC2 key" )
+            ; ( "EC2 with RS256"
+              , cose_ec ~alg:(-257) ()
+              , "an alg that is not ES256 for an EC2 key" )
+            ; ( "OKP with ES256"
+              , cose_ed ~alg:(-7) ()
+              , "an alg that is not EdDSA for an OKP key" )
+            ; ( "RSA with PS256"
+              , cose_rsa ~alg:(-37) ()
+              , "an alg that is not RS256 for an RSA key" )
+            ; ("P-384", cose_ec ~crv:2 (), "a curve that is not P-256")
+            ; ( "short x"
+              , cose_ec ~x:(String.make 31 'x') ()
+              , "x does not have 32 bytes" )
+            ; ("boolean y", cose_ec ~y:(`Bool true) (), "no y byte string")
+            ; ( "not on the curve"
+              , cose_ec ~x:(String.make 32 '\x01') ()
+              , "the point is not on P-256" )
+            ; ( "RSA 1024"
+              , cose_rsa
+                  ~n:
+                    (bytes_of_z
+                       (Mirage_crypto_pk.Rsa.pub_of_priv
+                          (Mirage_crypto_pk.Rsa.generate ~bits:1024 ()) )
+                         .n )
+                  ()
+              , "not an RSA key of 2048 to 8192 bits" )
+            ; ( "RSA over 8192 bits"
+              , cose_rsa ~n:("\x01" ^ String.make 1023 '\x00' ^ "\x01") ()
+              , "not an RSA key of 2048 to 8192 bits" )
+            ; ( "RSA e of 33 bits"
+              , cose_rsa ~e:"\x01\x00\x00\x00\x01" ()
+              , "not an RSA key of 2048 to 8192 bits" )
+            ; ("RSA e of 0", cose_rsa ~e:"\x00" (), "not an RSA key")
+            ; ( "RSA with d"
+              , cose_rsa ~more:[(`Int (-3), `Bytes "d")] ()
+              , "a private key" )
+            ; ( "RSA with qInv"
+              , cose_rsa ~more:[(`Int (-8), `Bytes "q")] ()
+              , "a private key" )
+            ; ( "RSA with t of other primes"
+              , cose_rsa ~more:[(`Int (-12), `Bytes "t")] ()
+              , "a private key" )
+            ; ( "a private key"
+              , cbor
+                  (`Map
+                     [ (`Int 1, `Int 1)
+                     ; (`Int 3, `Int (-8))
+                     ; (`Int (-1), `Int 6)
+                     ; (`Int (-2), `Bytes (unb64 rfc_ed_x))
+                     ; (`Int (-4), `Bytes (String.make 32 'd')) ] )
+              , "a private key" )
+            ; ( "alg as a text"
+              , cbor (`Map [(`Int 1, `Int 2); (`Int 3, `Text "ES256")])
+              , "no alg" )
+            ; ( "x of 33 bytes"
+              , cose_ec ~x:(String.make 33 'x') ()
+              , "x does not have 32 bytes" )
+            ; ( "y of 33 bytes"
+              , cose_ec ~y:(`Bytes (String.make 33 'y')) ()
+              , "y does not have 32 bytes" )
+            ; ( "no crv"
+              , cbor (`Map [(`Int 1, `Int 2); (`Int 3, `Int (-7))])
+              , "no crv" )
+            ; ( "no n"
+              , cbor (`Map [(`Int 1, `Int 3); (`Int 3, `Int (-257))])
+              , "no n byte string" )
+            ; ( "no e"
+              , cbor
+                  (`Map
+                     [ (`Int 1, `Int 3)
+                     ; (`Int 3, `Int (-257))
+                     ; (`Int (-1), `Bytes (unb64 rfc_rsa_n)) ] )
+              , "no e byte string" )
+            ; ( "no alg"
+              , cbor (`Map [(`Int 1, `Int 2); (`Int (-1), `Int 1)])
+              , "no alg" )
+            ; ( "kty 4"
+              , cbor (`Map [(`Int 1, `Int 4); (`Int 3, `Int (-7))])
+              , "a key type that is not EC2, OKP or RSA" )
+            ; ("not a map", cbor (`Array []), "the key is not a map")
+            ; ("trailing bytes", cose_ed () ^ "\x00", "bytes after the item")
+            ; ( "OKP crv X25519"
+              , cbor
+                  (`Map
+                     [ (`Int 1, `Int 1)
+                     ; (`Int 3, `Int (-8))
+                     ; (`Int (-1), `Int 4)
+                     ; (`Int (-2), `Bytes (unb64 rfc_ed_x)) ] )
+              , "a curve that is not Ed25519" ) ] )
+    ; test "DER: r and s" (fun () ->
+          let r = String.make 32 '\x7f'
+          and s = "\x00" ^ String.make 31 '\x01' in
+          let show = function
+            | Some (r, s) ->
+                Printf.sprintf "%d/%d %C%C" (String.length r) (String.length s)
+                  r.[0] s.[31]
+            | None ->
+                "None"
+          in
+          equal string {|32/32 '\127''\001'|}
+            (show
+               (W.der_signature
+                  (der_seq [der_int r; der_int (String.sub s 1 31)]) ) ) ;
+          (* A high first byte needs a 0 before it. *)
+          equal string {|32/32 '\255''\001'|}
+            (show
+               (W.der_signature
+                  (der_seq
+                     [der_int ("\x00" ^ String.make 32 '\xff'); der_int "\x01"] ) ) ) ;
+          (* 0x00 0x80 is the shortest form of 128. *)
+          equal string {|32/32 '\000''\001'|}
+            (show
+               (W.der_signature (der_seq [der_int "\x00\x80"; der_int "\x01"])) ) ;
+          List.iter
+            (fun (label, d) ->
+              equal string ~msg:label "None" (show (W.der_signature d)) )
+            [ ("negative", der_seq [der_int "\xff"; der_int "\x01"])
+            ; ("not the shortest", der_seq [der_int "\x00\x01"; der_int "\x01"])
+            ; ("zero", der_seq [der_int "\x00"; der_int "\x01"])
+            ; ("zero s at the end", der_seq [der_int "\x01"; der_int "\x00"])
+            ; ("0x80 is negative", der_seq [der_int "\x80"; der_int "\x01"])
+            ; ("empty", der_seq [der_int ""; der_int "\x01"])
+            ; ( "33 bytes of value"
+              , der_seq
+                  [der_int ("\x01" ^ String.make 32 '\x01'); der_int "\x01"] )
+            ; ( "34 bytes"
+              , der_seq
+                  [der_int ("\x00\x00" ^ String.make 32 '\xff'); der_int "\x01"]
+              )
+            ; ("trailing", der_seq [der_int "\x01"; der_int "\x01"] ^ "\x00")
+            ; ( "inner trailing"
+              , der_seq [der_int "\x01"; der_int "\x01"; "\x00"] )
+            ; ("one integer", der_seq [der_int "\x01"])
+            ; ("not a sequence", "\x31\x06" ^ der_int "\x01" ^ der_int "\x01")
+            ; ("long form", "\x30\x81\x06" ^ der_int "\x01" ^ der_int "\x01")
+            ; ("short", "\x30")
+            ; ("a bad length", "\x30\x07" ^ der_int "\x01" ^ der_int "\x01")
+            ; ("not an integer", der_seq ["\x04\x01\x01"; der_int "\x01"])
+            ; ("an integer over the end", der_seq ["\x02\x05\x01"]) ] )
+    ; test "DER: a signature of mirage-crypto verifies" (fun () ->
+          let data = "authenticator data and the hash" in
+          let r, s =
+            Mirage_crypto_ec.P256.Dsa.sign ~key:ec_priv (sha256 data)
+          in
+          let int v =
+            let v =
+              let rec strip v =
+                if String.length v > 1 && v.[0] = '\x00' then
+                  strip (String.sub v 1 (String.length v - 1))
+                else v
+              in
+              strip v
+            in
+            der_int (if Char.code v.[0] >= 0x80 then "\x00" ^ v else v)
+          in
+          let signature = der_seq [int r; int s] in
+          let key =
+            fst (Result.get_ok (Caravan_auth.Private.key_of_cose (cose_ec ())))
+          in
+          is_true (Caravan_auth.Private.verify key ~data ~signature) ;
+          is_false ~msg:"other data"
+            (Caravan_auth.Private.verify key ~data:"x" ~signature) ;
+          is_false ~msg:"raw r||s"
+            (Caravan_auth.Private.verify key ~data ~signature:(r ^ s)) ;
+          let ed =
+            fst (Result.get_ok (Caravan_auth.Private.key_of_cose (cose_ed ())))
+          in
+          is_true
+            (Caravan_auth.Private.verify ed ~data
+               ~signature:(Mirage_crypto_ec.Ed25519.sign ~key:ed_priv data) ) ;
+          let rsa =
+            fst (Result.get_ok (Caravan_auth.Private.key_of_cose (cose_rsa ())))
+          in
+          is_true
+            (Caravan_auth.Private.verify rsa ~data
+               ~signature:
+                 (Mirage_crypto_pk.Rsa.PKCS1.sign ~hash:`SHA256 ~key:rsa_priv
+                    (`Message data) ) ) )
+    ; test "authenticator data" (fun () ->
+          let key = cose_ed () in
+          List.iter
+            (fun (label, d, expected) ->
+              equal string ~msg:label expected (parse_result d) )
+            [ ( "no AT"
+              , auth_data ~flags:0x05 ~count:7 ""
+              , "flags=05 count=7 attested=none ext=false" )
+            ; ( "count u32"
+              , auth_data ~flags:0x01 ~count:0xFFFFFFFF ""
+              , "flags=01 count=4294967295 attested=none ext=false" )
+            ; ( "AT"
+              , auth_data ~flags:0x45 (attested key)
+              , Printf.sprintf "flags=45 count=0 attested=cred/%d ext=false"
+                  (String.length key) )
+            ; ( "AT and ED"
+              , auth_data ~flags:0xC5
+                  (attested key ^ cbor (`Map [(`Text "x", `Int 1)]))
+              , Printf.sprintf "flags=c5 count=0 attested=cred/%d ext=true"
+                  (String.length key) )
+            ; ( "ED"
+              , auth_data ~flags:0x81 (cbor (`Map []))
+              , "flags=81 count=0 attested=none ext=true" )
+            ; ( "BE and BS"
+              , auth_data ~flags:0x19 ""
+              , "flags=19 count=0 attested=none ext=false" )
+            ; ( "36 bytes"
+              , String.sub (auth_data ~flags:1 "") 0 36
+              , "Error: the authenticator data has less than 37 bytes" )
+            ; ( "trailing"
+              , auth_data ~flags:0x01 "\x00"
+              , "Error: bytes after the authenticator data" )
+            ; ( "AT, trailing"
+              , auth_data ~flags:0x45 (attested key ^ "\x00")
+              , "Error: bytes after the authenticator data" )
+            ; ( "BS with no BE"
+              , auth_data ~flags:0x11 ""
+              , "Error: the flag BS with no flag BE" )
+            ; ( "AT, short"
+              , auth_data ~flags:0x41 (String.make 17 'g')
+              , "Error: no attested credential data" )
+            ; ( "AT, empty id"
+              , auth_data ~flags:0x41 (attested ~id:"" key)
+              , "Error: a credential ID of a bad length" )
+            ; ( "AT, id 1024"
+              , auth_data ~flags:0x41 (attested ~id:(String.make 1024 'i') key)
+              , "Error: a credential ID of a bad length" )
+            ; ( "AT, 18 bytes"
+              , auth_data ~flags:0x41 (String.make 16 'g' ^ "\x00\x00")
+              , "Error: a credential ID of a bad length" )
+            ; ( "AT, an id to the end"
+              , auth_data ~flags:0x41 (String.make 16 'g' ^ "\x00\x03" ^ "abc")
+              , "Error: the credential public key: the input ends" )
+            ; ( "AT, id over the end"
+              , auth_data ~flags:0x41 (String.make 16 'g' ^ "\x00\x10" ^ "abc")
+              , "Error: a credential ID of a bad length" )
+            ; ( "AT, bad key"
+              , auth_data ~flags:0x41 (attested "\x9f")
+              , "Error: the credential public key: an indefinite length" )
+            ; ( "ED, not a map"
+              , auth_data ~flags:0x81 (cbor (`Array []))
+              , "Error: the extensions are not a map" )
+            ; ( "ED, bad"
+              , auth_data ~flags:0x81 "\x9f"
+              , "Error: the extensions: an indefinite length" )
+            ; ( "ED, no bytes"
+              , auth_data ~flags:0x81 ""
+              , "Error: the extensions: the input ends" ) ] ;
+          equal string ~msg:"id 1023"
+            (Printf.sprintf "flags=41 count=0 attested=%s/%d ext=false"
+               (String.make 1023 'i') (String.length key) )
+            (parse_result
+               (auth_data ~flags:0x41 (attested ~id:(String.make 1023 'i') key)) ) ;
+          match W.parse_auth_data (auth_data ~flags:0x1D "") with
+          | Ok d -> (
+              equal (list bool) [true; true; true; true]
+                [W.up d; W.uv d; W.be d; W.bs d] ;
+              match W.parse_auth_data (auth_data ~flags:0x00 "") with
+              | Ok d ->
+                  equal (list bool)
+                    [false; false; false; false]
+                    [W.up d; W.uv d; W.be d; W.bs d]
+              | Error _ ->
+                  fail "flags 0" )
+          | Error _ ->
+              fail "flags" ) ]
+
 let () =
   Mirage_crypto_rng.set_default_generator
     (Mirage_crypto_rng.create ~seed:"caravan auth tests"
@@ -3694,4 +4306,5 @@ let () =
        ; session_tests
        ; oidc_tests
        ; flow_tests
-       ; code_tests ] )
+       ; code_tests
+       ; passkey_parser_tests ] )

@@ -942,3 +942,15 @@ module Code : sig
 
       @raise Invalid_argument as {!Caravan_session.set}. *)
 end
+
+(**/**)
+
+(** Internal: for the tests. *)
+module Private : sig
+  module Cbor = Cbor
+  module Webauthn = Webauthn
+
+  val key_of_cose : string -> (Jwt.Key.t * int, string) result
+
+  val verify : Jwt.Key.t -> data:string -> signature:string -> bool
+end

@@ -2091,3 +2091,65 @@ module Code = struct
                   Caravan_session.Private.set t.key (encode {e with left}) req ;
                 Error (Wrong {address; left}) )
 end
+
+(* {1 Passkeys} *)
+
+(* The keys and the signatures of WebAuthn, with the keys of [Jwt]. *)
+module Passkey_key = struct
+  (* [of_cose bytes] is the key of the COSE key [bytes] (a point on P-256, an
+     Ed25519 key, or an RSA key that [Jwt.Key.rsa_ok] accepts) and its COSE
+     alg. *)
+  let of_cose bytes =
+    let ( let* ) = Result.bind in
+    let* c = Cbor.decode_all bytes in
+    let* cose = Webauthn.cose_key c in
+    let* material, alg =
+      match cose with
+      | Webauthn.Ec2 {alg; x; y} -> (
+        match Mirage_crypto_ec.P256.Dsa.pub_of_octets ("\x04" ^ x ^ y) with
+        | Ok p ->
+            Ok (Jwt.P256 p, alg)
+        | Error _ ->
+            Error "the point is not on P-256" )
+      | Okp {alg; x} -> (
+        match Mirage_crypto_ec.Ed25519.pub_of_octets x with
+        | Ok p ->
+            Ok (Jwt.Ed25519 p, alg)
+        | Error _ ->
+            Error "not an Ed25519 key" )
+      | Rsa {alg; n; e} -> (
+        match
+          Mirage_crypto_pk.Rsa.pub ~e:(Jwt.Key.z_of_bytes e)
+            ~n:(Jwt.Key.z_of_bytes n)
+        with
+        | Ok p when Jwt.Key.rsa_ok p ->
+            Ok (Jwt.Rsa p, alg)
+        | Ok _ ->
+            Error "not an RSA key of 2048 to 8192 bits"
+        | Error _ ->
+            Error "not an RSA key" )
+    in
+    Ok ({Jwt.Key.kid= None; material}, alg)
+
+  (* [verify key ~data ~signature]: an ES256 signature is in DER (WebAuthn
+     §6.5.5), the others are as in JWS. *)
+  let verify (key : Jwt.Key.t) ~data ~signature =
+    match key.material with
+    | Jwt.P256 p -> (
+      match Webauthn.der_signature signature with
+      | Some rs ->
+          Mirage_crypto_ec.P256.Dsa.verify ~key:p rs (sha256 data)
+      | None ->
+          false )
+    | _ ->
+        Jwt.signs key data (lazy (sha256 data)) signature
+end
+
+module Private = struct
+  module Cbor = Cbor
+  module Webauthn = Webauthn
+
+  let key_of_cose = Passkey_key.of_cose
+
+  let verify = Passkey_key.verify
+end
