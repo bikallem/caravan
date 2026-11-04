@@ -126,7 +126,7 @@ let app =
 
 The `caravan.middleware` library has middleware for the requests that
 come through a reverse proxy, request IDs, an access log, CORS, an
-error page, the HTTPS redirect and HSTS:
+error page, the HTTPS redirect, HSTS and a protection against CSRF:
 
 ```ocaml
 open Caravan_middleware
@@ -146,6 +146,9 @@ let app handler =
         ()
     ; Error_page.middleware
         ~report:(fun _req e _bt -> prerr_endline (Printexc.to_string e))
+        ()
+    ; Cross_origin.middleware
+        ~trusted_origins:["https://app.example"]
         () ]
     handler
 ```
@@ -180,11 +183,20 @@ let app handler =
 - `Hsts` adds `Strict-Transport-Security` (365 days by default) to the
   responses of `https` requests, but not for `localhost` (also
   `*.localhost`), `127.0.0.1` and `[::1]`.
+- `Cross_origin` refuses (403) a request with a method other than GET,
+  HEAD and OPTIONS that a browser sends from another origin, as
+  `CrossOriginProtection` of Go 1.25. It reads `Sec-Fetch-Site`, or else
+  `Origin`, and needs no token. A `same-site` request is refused too:
+  thus a page of `https://app.example.com` that sends a POST to
+  `api.example.com` needs `https://app.example.com` in
+  `trusted_origins`. Put the CORS origins with credentials there too.
+  `exempt` lets a path, for example a webhook, take cross-origin POSTs.
 - The order: `Forwarded` first (it gives the scheme of the client), then
   `Request_id` and `Access_log` (so that each redirect has a log entry),
-  then `Hsts`, `Https_redirect`, `Cors` and `Error_page`. A middleware
-  that changes the path goes after `Https_redirect`, so that the
-  redirect keeps the path of the client.
+  then `Hsts`, `Https_redirect`, `Cors`, `Error_page` and
+  `Cross_origin` (a refusal gets its CORS fields), then the sessions
+  and the router. A middleware that changes the path goes after
+  `Https_redirect`, so that the redirect keeps the path of the client.
 
 ## Queries and forms
 
