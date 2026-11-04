@@ -227,3 +227,23 @@
     -f
     %{dep:section.awk}
     %{dep:../README.md}))))
+
+; The example of the "Compression" section of README.md, as
+; readme_compress.ml.
+
+(executable
+ (name readme_compress)
+ (modules readme_compress)
+ (libraries caravan caravan.compress caravan.static))
+
+(rule
+ (action
+  (with-stdout-to
+   readme_compress.ml
+   (run
+    awk
+    -v
+    "section=Compression"
+    -f
+    %{dep:section.awk}
+    %{dep:../README.md}))))

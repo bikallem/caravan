@@ -497,6 +497,38 @@ let app =
   2020 can send it from another site (a login CSRF).
 - After a login, redirect only to `Caravan_auth.return_path`.
 
+## Compression
+
+The optional `caravan.compress` library compresses the responses with
+gzip or deflate, with the pure OCaml library decompress:
+
+```ocaml
+let app handler =
+  Caravan.Handler.compose
+    [ Caravan_compress.middleware ~level:6 ()
+    ; Caravan_static.middleware ~root:"/srv/www" () ]
+    handler
+```
+
+- The coding comes from `Accept-Encoding` (gzip on a tie). A response
+  that depends on it gets `Vary: Accept-Encoding`.
+- Only text types (`text/*` except `text/event-stream`, JSON,
+  JavaScript, XML, SVG) with a known length of 2 KiB to 8 MiB are
+  compressed. A stream is not: decompress cannot flush a part of a
+  stream. `~streams:true` compresses streams too, but the client then
+  gets the bytes in large blocks.
+- A compressed response loses `Content-Length` and `Accept-Ranges`, and
+  its ETag becomes weak (`W/"t"`, or `W/"t-deflate"` for deflate). The
+  304 of `caravan.static` gets the same ETag. `If-Match` never matches a weak ETag: give the routes that use
+  it the attribute, with
+  `Caravan.Response.with_attr Caravan_compress.skip ()`.
+- Each compressed response costs about 770 KiB of memory and 0.1 to
+  0.2 ms while it goes out. At most 64 run at the same time
+  (`max_active`): the other responses go out with no compression.
+- BREACH: do not compress a page with a secret and text of the client.
+- For pure OCaml, add `checkseum.ocaml` to the libraries of your
+  executable: the default checksums of decompress have C code.
+
 ## File uploads
 
 `Request.multipart` streams the parts of a `multipart/form-data` body,
