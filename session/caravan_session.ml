@@ -36,16 +36,26 @@ module Signed = struct
 
   let check fn purpose =
     if String.contains purpose '\000' then
-      invalid_arg ("Caravan_session.Signed." ^ fn ^ ": a NUL byte in purpose")
+      invalid_arg ("Caravan_session.Signed." ^ fn ^ ": a NUL byte in purpose") ;
+    if String.starts_with ~prefix:"caravan." purpose then
+      invalid_arg
+        ( "Caravan_session.Signed." ^ fn
+        ^ ": the purposes caravan.* are reserved" )
 
-  let mac ~purpose key value =
-    b64_encode
-      Digestif.SHA256.(
-        to_raw_string (hmac_string ~key (purpose ^ "\000" ^ value)) )
+  (* [raw_mac ~purpose key value] is the 32 bytes of the HMAC. A purpose has no
+     NUL, thus the input of the HMAC gives the purpose and the value back. *)
+  let raw_mac ~purpose key value =
+    Digestif.SHA256.(to_raw_string (hmac_string ~key (purpose ^ "\000" ^ value)))
+
+  let mac ~purpose key value = b64_encode (raw_mac ~purpose key value)
+
+  (* [sign_reserved] is [sign] with no check of the purpose, for the purposes of
+     this library. *)
+  let sign_reserved ~purpose key value = value ^ "." ^ mac ~purpose key value
 
   let sign ~purpose key value =
     check "sign" purpose ;
-    value ^ "." ^ mac ~purpose key value
+    sign_reserved ~purpose key value
 
   (* [verify_first ~purpose keys s] is the value of [s], and [true] if the first
      key signed it. A MAC text of another length costs no HMAC. The compare of
@@ -306,11 +316,15 @@ type state =
         (** The stored ID that a [renew] ended: the new session exists only if
             this ID still existed in the store. *)
   ; cleared: bool  (** [clear] ended the session. *)
+  ; no_store: bool  (** [Csrf.token] gave a token: the response is private. *)
   ; frozen: bool  (** The response is out: no more change. *) }
 
-let attr : state Atomic.t Attrs.key = Attrs.key ~name:"session" ()
+(* The session of a request, and the keys of the middleware. *)
+type session = {state: state Atomic.t; keys: Key.t list}
 
-let session fn req =
+let attr : session Attrs.key = Attrs.key ~name:"session" ()
+
+let session_of fn req =
   match Request.find_attr attr req with
   | Some s ->
       s
@@ -318,6 +332,8 @@ let session fn req =
       invalid_arg
         ( "Caravan_session." ^ fn
         ^ ": the request did not go through the middleware" )
+
+let state_of fn req = (session_of fn req).state
 
 (* [modify fn s f] changes the state with [f] in a CAS loop: a handler can fork
    fibers on other domains. [f] gives [None] for no change. [modify] gives the
@@ -333,7 +349,7 @@ let rec modify fn s f =
           ("Caravan_session." ^ fn ^ ": the response of the request is out") ;
       if Atomic.compare_and_set s st st' then st' else modify fn s f
 
-let change fn req f = ignore (modify fn (session fn req) f)
+let change fn req f = ignore (modify fn (state_of fn req) f)
 
 let new_id () = b64_encode (Mirage_crypto_rng.generate 32)
 
@@ -353,7 +369,7 @@ let retire st =
   | _ ->
       st.old
 
-let find name req = Smap.find_opt name (Atomic.get (session "find" req)).data
+let find name req = Smap.find_opt name (Atomic.get (state_of "find" req)).data
 
 let set name value req =
   change "set" req (fun st ->
@@ -410,7 +426,7 @@ let clear req =
 
 let id req =
   let st =
-    modify "id" (session "id" req) (fun st ->
+    modify "id" (state_of "id" req) (fun st ->
         match st.id with Some _ -> None | None -> Some (fresh st) )
   in
   (* [fresh] gives an ID. *)
@@ -470,6 +486,7 @@ let middleware ?(cookie = "__Host-session") ?(idle = Span.s 1800)
     ; old= []
     ; parent= None
     ; cleared= false
+    ; no_store= false
     ; frozen= false }
   in
   (* [load now value] is the state of the cookie [value], and the expiry of the
@@ -528,18 +545,18 @@ let middleware ?(cookie = "__Host-session") ?(idle = Span.s 1800)
         | _ ->
             true )
   in
-  let with_cookie c r =
-    let r = Response.add_cookie c r in
+  let no_store r =
     Response.with_headers
       (Headers.set "Cache-Control" "no-store" (Response.headers r))
       r
   in
+  let with_cookie c r = no_store (Response.add_cookie c r) in
   fun next req ->
     let now = Time.now Posix in
     let value = Request.cookie cookie req in
     let st, loaded = load now value in
     let s = Atomic.make st in
-    let response = next (Request.with_attr attr s req) in
+    let response = next (Request.with_attr attr {state= s; keys} req) in
     (* After the response, no change: a stream producer, an upgrade or a
        background fiber gets Invalid_argument. *)
     let rec freeze () =
@@ -554,15 +571,120 @@ let middleware ?(cookie = "__Host-session") ?(idle = Span.s 1800)
         with_cookie (Cookie.expired template) response
       else response
     in
-    match st.id with
-    | Some (id, (Fresh | Stored_old_key)) when kept ->
-        with_cookie
-          (Cookie.with_value (Signed.sign ~purpose (List.hd keys) id) template)
+    let response =
+      match st.id with
+      | Some (id, (Fresh | Stored_old_key)) when kept ->
+          with_cookie
+            (Cookie.with_value
+               (Signed.sign_reserved ~purpose (List.hd keys) id)
+               template )
+            response
+      | Some _ when kept ->
           response
-    | Some _ when kept ->
-        response
-    | Some _ ->
-        (* A renew after the end of the session: as a clear. *)
-        expire ()
-    | None ->
-        if st.cleared then expire () else response
+      | Some _ ->
+          (* A renew after the end of the session: as a clear. *)
+          expire ()
+      | None ->
+          if st.cleared then expire () else response
+    in
+    (* A page with a token of the session must not go to another user. *)
+    if st.no_store then no_store response else response
+
+(* {1 CSRF tokens} *)
+
+module Csrf = struct
+  let purpose = "caravan.csrf"
+
+  (* A token is a pad of 32 bytes and the secret xor the pad, in base64url. *)
+  let length = 86
+
+  let xor a b =
+    String.init (String.length a) (fun i ->
+        Char.chr (Char.code a.[i] lxor Char.code b.[i]) )
+
+  (* [secret key id] is the secret of the session [id]. *)
+  let secret key id = Signed.raw_mac ~purpose key id
+
+  let token req =
+    let {state; keys} = session_of "Csrf.token" req in
+    (* A change each time: after the response, [modify] raises. *)
+    let st =
+      modify "Csrf.token" state (fun st ->
+          Some {(fresh st) with no_store= true} )
+    in
+    (* [fresh] gives an ID. *)
+    let id = fst (Option.get st.id) in
+    let pad = Mirage_crypto_rng.generate 32 in
+    b64_encode (pad ^ xor pad (secret (List.hd keys) id))
+
+  let check t req =
+    let {state; keys} = session_of "Csrf.check" req in
+    match (Atomic.get state).id with
+    | Some (id, _) when String.length t = length -> (
+      (* A canonical text of 86 characters is 64 bytes. *)
+      match b64_decode t with
+      | Some raw ->
+          let s = xor (String.sub raw 0 32) (String.sub raw 32 32) in
+          List.exists (fun key -> Eqaf.equal (secret key id) s) keys
+      | None ->
+          false )
+    | _ ->
+        false
+
+  let forbidden _ = Response.string ~status:Status.forbidden "Forbidden\n"
+
+  let middleware ?(header = "X-CSRF-Token") ?(field = "_csrf")
+      ?(max_bytes = 1_048_576) ?(exempt = fun _ -> false) ?(deny = forbidden) ()
+      =
+    let bad m = invalid_arg ("Caravan_session.Csrf.middleware: " ^ m) in
+    if not (Caravan.Private.Token.is_token header) then
+      bad "the header is not a field name" ;
+    if field = "" then bad "the field is empty" ;
+    if max_bytes < 0 then bad "a negative max_bytes" ;
+    fun next req ->
+      (* For each method: a wrong order of the middleware shows on a GET. *)
+      let {state; _} = session_of "Csrf.middleware" req in
+      match Request.meth req with
+      | Method.GET | Method.HEAD | Method.OPTIONS ->
+          next req
+      | _ when exempt req ->
+          next req
+      | _ when Option.is_none (Atomic.get state).id ->
+          (* No session, thus no token: no read of the body. *)
+          deny req
+      | _ -> (
+          let h = Request.headers req in
+          match Headers.find header h with
+          | Some t ->
+              if check t req then next req else deny req
+          | None -> (
+            match
+              Caravan.Private.Form_body.text ~max_bytes h (Request.body req)
+            with
+            | Error Form.Unsupported_media_type ->
+                deny req
+            | Error e ->
+                let status = Form.error_status e in
+                Response.string ~status (Status.reason status ^ "\n")
+            | Ok text ->
+                (* The next handler, or [deny], gets the same bytes, read. *)
+                let h =
+                  h
+                  |> Headers.remove "Transfer-Encoding"
+                  |> Headers.remove "Expect"
+                  |> Headers.set "Content-Length"
+                       (string_of_int (String.length text))
+                in
+                let req =
+                  Request.with_headers h
+                    (Request.with_body (Body.of_string text) req)
+                in
+                let good =
+                  match Form.find_text field text with
+                  | Some t ->
+                      check t req
+                  | None ->
+                      false
+                in
+                if good then next req else deny req ) )
+end

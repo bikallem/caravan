@@ -149,6 +149,20 @@ let mw ?(keys = [key1]) ?idle ?absolute store =
 (* An ID of 43 characters, as the middleware makes, that no store has. *)
 let planted_id = String.make 43 'p'
 
+(* {1 Forged values} *)
+
+let b64 = Caravan.Private.Base64.encode ~url:true ~pad:false
+
+let unb64 s = Option.get (Caravan.Private.Base64.decode ~url:true ~pad:false s)
+
+let hmac key s = Digestif.SHA256.(to_raw_string (hmac_string ~key s))
+
+(* The bytes of [key1]. *)
+let key1_bytes = String.make 32 'a'
+
+(* [forge id] is the value of a session cookie for [id], signed with [key1]. *)
+let forge id = id ^ "." ^ b64 (hmac key1_bytes ("caravan.session\000" ^ id))
+
 (* {1 Signed values} *)
 
 let signed_tests =
@@ -229,6 +243,15 @@ let signed_tests =
               "Pv__MDEyMzQ1Njc4OTAxMjM0NTY3ODl4eXp3-AABAgN"
             ; (* 4 bits after the last byte (2 characters at the end). *)
               "-_-_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh" ] )
+    ; test "the purposes caravan.* are reserved" (fun () ->
+          raises_match is_invalid (fun () ->
+              ignore (M.Signed.sign ~purpose:"caravan.session" key1 "v") ) ;
+          raises_match is_invalid (fun () ->
+              ignore (M.Signed.verify ~purpose:"caravan.csrf" [key1] "v.x") ) ;
+          let s = M.Signed.sign ~purpose:"caravan" key1 "v" in
+          equal (option string) (Some "v")
+            (M.Signed.verify ~purpose:"caravan" [key1] s) ;
+          ignore (M.Signed.sign ~purpose:"caravanx.a" key1 "v") )
     ; test "a purpose with NUL is refused" (fun () ->
           raises_match is_invalid (fun () ->
               ignore (M.Signed.sign ~purpose:"a\000b" key1 "v") ) ;
@@ -320,9 +343,7 @@ let session_tests =
               (* No Set-Cookie for a bad cookie, or for a signed ID of no
                  session. *)
               equal (list string) [] (set_cookies r) ;
-              let planted =
-                M.Signed.sign ~purpose:"caravan.session" key1 planted_id
-              in
+              let planted = forge planted_id in
               equal (list string) [] (set_cookies (h (req ~cookie:planted "/"))) ;
               (* A signed ID that the store does not have: a login gets a new ID
                  (no fixation). *)
@@ -710,7 +731,7 @@ let session_tests =
               let store, _, table = counting () in
               let h = mw store app in
               let id = String.make 43 'c' in
-              let cookie = M.Signed.sign ~purpose:"caravan.session" key1 id in
+              let cookie = forge id in
               let key = Digestif.SHA256.(to_hex (digest_string id)) in
               let far = Time.posix_of_unix_s (t0 +. 1000.) in
               let ns = "1750000000000000000" in
@@ -1027,6 +1048,548 @@ let data_tests =
                    in
                    equal string expected (body (h (req ~cookie "/"))) ) ) ) ]
 
+(* {1 CSRF tokens} *)
+
+let xor a b =
+  String.init (String.length a) (fun i ->
+      Char.chr (Char.code a.[i] lxor Char.code b.[i]) )
+
+(* [unmask t] is the secret of the token [t]. *)
+let unmask t =
+  let r = unb64 t in
+  xor (String.sub r 0 32) (String.sub r 32 32)
+
+(* [token_of ~key ~purpose cookie] is a token made by hand for the session of
+   [cookie], with the raw key [key], and a pad of zeros. *)
+let token_of ~key ~purpose cookie =
+  let id = List.hd (String.split_on_char '.' cookie) in
+  b64 (String.make 32 '\000' ^ hmac key (purpose ^ "\000" ^ id))
+
+(* [plant table id] puts an empty session [id] in the table of a counting
+   store. *)
+let plant table id =
+  Hashtbl.replace table
+    Digestif.SHA256.(to_hex (digest_string id))
+    ("11750000000000000000\n", Time.posix_of_unix_s (t0 +. 1000.))
+
+(* [request ?cookie ?fields ?body meth path] is a request with the session
+   cookie [cookie] and the fields [fields]. *)
+let request ?cookie ?(fields = []) ?body meth path =
+  let fields =
+    match cookie with
+    | Some v ->
+        ("Cookie", cookie_name ^ "=" ^ v) :: fields
+    | None ->
+        fields
+  in
+  Request.make ~headers:(Headers.of_list fields) ?body meth path
+
+let code r = Status.code (Response.status r)
+
+let cache_control r = Headers.find "cache-control" (Response.headers r)
+
+let form_type = ("Content-Type", "application/x-www-form-urlencoded")
+
+(* A GET gives a token, another method gives "ok" and the body. *)
+let token_app req =
+  match Request.meth req with
+  | Method.GET ->
+      Response.string (M.Csrf.token req)
+  | _ ->
+      Response.string ("ok " ^ Body.to_string (Request.body req))
+
+(* [csrf ?csrf ?keys store] is the session middleware on [store], then [csrf]
+   (default [M.Csrf.middleware ()]), then [token_app]. *)
+let csrf ?(csrf = M.Csrf.middleware ()) ?keys store =
+  mw ?keys store (csrf token_app)
+
+(* [login h] is the cookie and a token of a new session of [h]. *)
+let login h =
+  let r = h (request Method.GET "/") in
+  (Option.get (cookie_of r), body r)
+
+(* [post ?cookie ?token ?fields ?text h] is the status of a POST to [h], with
+   the token [token] in the header X-CSRF-Token, and the body [text]. *)
+let post ?cookie ?token ?(fields = []) ?text h =
+  let fields =
+    match token with Some t -> ("X-CSRF-Token", t) :: fields | None -> fields
+  in
+  let body = Option.map Body.of_string text in
+  code (h (request ?cookie ~fields ?body Method.POST "/"))
+
+let csrf_tests =
+  group "Csrf"
+    [ test "a token, and its check in the same request" (fun () ->
+          sim (fun _ ->
+              let store, c, _ = counting () in
+              let t1 = ref "" and t2 = ref "" in
+              let r =
+                mw store
+                  (fun req ->
+                    t1 := M.Csrf.token req ;
+                    t2 := M.Csrf.token req ;
+                    is_true ~msg:"t1" (M.Csrf.check !t1 req) ;
+                    is_true ~msg:"t2" (M.Csrf.check !t2 req) ;
+                    Response.string "" )
+                  (request Method.GET "/")
+              in
+              equal int 86 (String.length !t1) ;
+              equal int 64 (String.length (unb64 !t1)) ;
+              is_true ~msg:"two texts" (!t1 <> !t2) ;
+              equal string (unmask !t1) (unmask !t2) ;
+              (* A new session: its cookie, its write, and no cache. *)
+              is_some (cookie_of r) ;
+              equal int 1 c.creates ;
+              equal (option string) (Some "no-store") (cache_control r) ) )
+    ; test "the secret is the HMAC of the ID" (fun () ->
+          sim (fun _ ->
+              let store, c, table = counting () in
+              plant table planted_id ;
+              let r =
+                mw store token_app
+                  (request ~cookie:(forge planted_id) Method.GET "/")
+              in
+              (* Python: hmac.new(b"a" * 32, b"caravan.csrf\0" + b"p" * 43,
+                 sha256), in base64url. *)
+              equal string "QLEGjeCI_HhcPFvWcrlAFIz35f9zNtL5JlTGG6hcKdM"
+                (b64 (unmask (body r))) ;
+              (* A session that exists: no cookie and no write, but no cache:
+                 the page has the token of the user. *)
+              equal (list string) [] (set_cookies r) ;
+              equal int 0 (writes c) ;
+              equal (option string) (Some "no-store") (cache_control r) ;
+              let r =
+                mw store
+                  (fun _ -> Response.string "")
+                  (request ~cookie:(forge planted_id) Method.GET "/")
+              in
+              equal (option string) None (cache_control r) ) )
+    ; test "a token is good in its session only" (fun () ->
+          sim (fun _ ->
+              let store, _, _ = counting () in
+              let h = csrf store in
+              let cookie, t = login h in
+              equal int 200 (post ~cookie ~token:t h) ;
+              let other, t' = login h in
+              equal int 403 (post ~cookie:other ~token:t h) ;
+              equal int 200 (post ~cookie:other ~token:t' h) ;
+              (* No session: no token is good. *)
+              equal int 403 (post ~token:t h) ) )
+    ; test "check with no session makes no session" (fun () ->
+          sim (fun _ ->
+              let store, c, _ = counting () in
+              let r =
+                mw store
+                  (fun req ->
+                    is_false (M.Csrf.check (String.make 86 'A') req) ;
+                    Response.string "" )
+                  (request Method.GET "/")
+              in
+              equal (list string) [] (set_cookies r) ;
+              equal (option string) None (cache_control r) ;
+              equal int 0 (writes c + c.finds) ) )
+    ; test "renew ends the tokens" (fun () ->
+          sim (fun _ ->
+              let store, _, table = counting () in
+              plant table planted_id ;
+              let old = ref "" and fresh = ref "" in
+              let r =
+                mw store
+                  (fun req ->
+                    old := M.Csrf.token req ;
+                    M.renew req ;
+                    is_false ~msg:"old" (M.Csrf.check !old req) ;
+                    fresh := M.Csrf.token req ;
+                    is_true ~msg:"fresh" (M.Csrf.check !fresh req) ;
+                    Response.string "" )
+                  (request ~cookie:(forge planted_id) Method.GET "/")
+              in
+              let cookie = Option.get (cookie_of r) in
+              let h = csrf store in
+              equal int 200 (post ~cookie ~token:!fresh h) ;
+              equal int 403 (post ~cookie ~token:!old h) ) )
+    ; test "clear ends the tokens, and a later token makes a session" (fun () ->
+          sim (fun _ ->
+              let store, _, table = counting () in
+              plant table planted_id ;
+              let old = ref "" and fresh = ref "" in
+              let r =
+                mw store
+                  (fun req ->
+                    old := M.Csrf.token req ;
+                    M.clear req ;
+                    is_false ~msg:"old" (M.Csrf.check !old req) ;
+                    fresh := M.Csrf.token req ;
+                    is_true ~msg:"fresh" (M.Csrf.check !fresh req) ;
+                    Response.string "" )
+                  (request ~cookie:(forge planted_id) Method.GET "/")
+              in
+              let cookie = Option.get (cookie_of r) in
+              is_false ~msg:"a new ID"
+                (String.starts_with ~prefix:planted_id cookie) ;
+              equal int 200 (post ~cookie ~token:!fresh (csrf store)) ) )
+    ; test "token uses the first key" (fun () ->
+          sim (fun _ ->
+              let store, _, table = counting () in
+              plant table planted_id ;
+              let r =
+                mw ~keys:[key2; key1] store token_app
+                  (request ~cookie:(forge planted_id) Method.GET "/")
+              in
+              equal string
+                (hmac (String.make 32 'b') ("caravan.csrf\000" ^ planted_id))
+                (unmask (body r)) ) )
+    ; test "the keys of a rotation" (fun () ->
+          sim (fun _ ->
+              let store, _, _ = counting () in
+              let cookie, t = login (csrf ~keys:[key1] store) in
+              let post keys token = post ~cookie ~token (csrf ~keys store) in
+              equal int 200 (post [key2; key1] t) ;
+              (* A token of a key that is not in the list. *)
+              equal int 403
+                (post [key2; key1]
+                   (token_of ~key:(String.make 32 'c') ~purpose:"caravan.csrf"
+                      cookie ) ) ;
+              (* A token made by hand with key1 is good. *)
+              equal int 200
+                (post [key1]
+                   (token_of ~key:key1_bytes ~purpose:"caravan.csrf" cookie) ) ;
+              (* The purpose of the session cookie is not that of a token. *)
+              equal int 403
+                (post [key1]
+                   (token_of ~key:key1_bytes ~purpose:"caravan.session" cookie) ) ) )
+    ; test "bad texts" (fun () ->
+          sim (fun _ ->
+              let store, _, _ = counting () in
+              let h = csrf store in
+              let cookie, t = login h in
+              let flip i =
+                String.mapi
+                  (fun j ch ->
+                    if i = j then if ch = 'A' then 'B' else 'A' else ch )
+                  t
+              in
+              (* The last character has 2 bits of data and 4 zero bits: it is
+                 one of A, Q, g and w. The next character is not canonical. *)
+              let noncanonical =
+                String.sub t 0 85
+                ^ String.make 1 (Char.chr (Char.code t.[85] + 1))
+              in
+              List.iter
+                (fun (label, v) ->
+                  equal ~msg:label int 403 (post ~cookie ~token:v h) )
+                [ ("85", String.sub t 0 85)
+                ; ("87", t ^ "A")
+                ; ("pad", String.sub t 0 84 ^ "==")
+                ; ("noncanonical", noncanonical)
+                ; ("a bit of the pad", flip 3)
+                ; ("a bit of the masked part", flip 60)
+                ; ("not base64url", String.sub t 0 85 ^ "+")
+                ; ("empty", "") ] ;
+              equal int 200 (post ~cookie ~token:t h) ) )
+    ; test "token after the response raises" (fun () ->
+          sim (fun _ ->
+              let store, _, table = counting () in
+              plant table planted_id ;
+              List.iter
+                (fun cookie ->
+                  let raised = ref false in
+                  let r =
+                    mw store
+                      (fun req ->
+                        (* A second token after the response raises too. *)
+                        if Option.is_some cookie then ignore (M.Csrf.token req) ;
+                        Response.stream (fun _ ->
+                            try ignore (M.Csrf.token req)
+                            with Invalid_argument _ -> raised := true ) )
+                      (request ?cookie Method.GET "/")
+                  in
+                  ignore (body r) ;
+                  is_true !raised )
+                [None; Some (forge planted_id)] ) )
+    ; test "bad setup" (fun () ->
+          List.iter
+            (fun (label, f) ->
+              raises_match ~msg:label is_invalid (fun () -> made (f ())) )
+            [ ("header a b", fun () -> M.Csrf.middleware ~header:"a b" ())
+            ; ("header empty", fun () -> M.Csrf.middleware ~header:"" ())
+            ; ("field", fun () -> M.Csrf.middleware ~field:"" ())
+            ; ("max_bytes", fun () -> M.Csrf.middleware ~max_bytes:(-1) ()) ] ;
+          made (M.Csrf.middleware ~max_bytes:0 ()) )
+    ; test "no session middleware raises, also on a GET" (fun () ->
+          List.iter
+            (fun m ->
+              raises_match is_invalid (fun () ->
+                  ignore (M.Csrf.middleware () token_app (request m "/")) ) )
+            Method.[GET; POST] ;
+          raises_match is_invalid (fun () ->
+              ignore (M.Csrf.token (request Method.GET "/")) ) ;
+          raises_match is_invalid (fun () ->
+              ignore (M.Csrf.check "x" (request Method.GET "/")) ) )
+    ; test "the methods" (fun () ->
+          sim (fun _ ->
+              let store, _, _ = counting () in
+              let h = csrf store in
+              let cookie, _ = login h in
+              List.iter
+                (fun m ->
+                  equal ~msg:(Method.to_string m) int 200
+                    (code (h (request ~cookie m "/"))) )
+                Method.[GET; HEAD; OPTIONS] ;
+              List.iter
+                (fun m ->
+                  equal ~msg:(Method.to_string m) int 403
+                    (code (h (request ~cookie m "/"))) )
+                Method.[POST; PUT; DELETE; PATCH; TRACE; Other "GET"] ;
+              let r = h (request ~cookie Method.POST "/") in
+              equal string "Forbidden\n" (body r) ) )
+    ; test "the header" (fun () ->
+          sim (fun _ ->
+              let store, _, _ = counting () in
+              let h = csrf store in
+              let cookie, t = login h in
+              (* The body is not read: the handler gets the JSON. *)
+              let json = {|{"a":1}|} in
+              let r =
+                h
+                  (request ~cookie
+                     ~fields:
+                       [ ("X-CSRF-Token", t)
+                       ; ("Content-Type", "application/json") ]
+                     ~body:(Body.of_string json) Method.POST "/" )
+              in
+              equal string ("ok " ^ json) (body r) ;
+              (* A bad header does not fall to a good form field. *)
+              let text = "_csrf=" ^ t in
+              List.iter
+                (fun v ->
+                  equal ~msg:v int 403
+                    (post ~cookie ~token:v ~fields:[form_type] ~text h) )
+                ["bad"; ""] ;
+              (* The first field decides. *)
+              equal int 200
+                (post ~cookie ~token:t ~fields:[("X-CSRF-Token", "bad")] h) ;
+              equal int 200 (post ~cookie ~fields:[form_type] ~text h) ) )
+    ; test "a form" (fun () ->
+          sim (fun _ ->
+              let store, _, _ = counting () in
+              let seen = ref [] in
+              let field name hs = (name, Headers.find name hs) in
+              let h =
+                mw store
+                  (M.Csrf.middleware () (fun req ->
+                       match Request.meth req with
+                       | Method.GET ->
+                           Response.string (M.Csrf.token req)
+                       | _ ->
+                           let hs = Request.headers req in
+                           seen :=
+                             [ field "content-length" hs
+                             ; field "transfer-encoding" hs
+                             ; field "expect" hs
+                             ; field "content-type" hs ] ;
+                           Response.string
+                             ( match Request.form req with
+                             | Ok p ->
+                                 Form.encode p
+                             | Error _ ->
+                                 "error" ) ) )
+              in
+              let cookie, t = login h in
+              let text = "a=x/y~z&_csrf=" ^ t ^ "&b=%2F" in
+              let ct = "Application/X-WWW-Form-URLencoded ; charset=utf-8" in
+              let r =
+                h
+                  (request ~cookie
+                     ~fields:
+                       [ ("Content-Type", ct)
+                       ; ("Transfer-Encoding", "chunked")
+                       ; ("Expect", "100-continue") ]
+                     ~body:(Body.of_string text) Method.POST "/" )
+              in
+              equal int 200 (code r) ;
+              equal
+                (list (pair string (option string)))
+                [ ("content-length", Some (string_of_int (String.length text)))
+                ; ("transfer-encoding", None)
+                ; ("expect", None)
+                ; ("content-type", Some ct) ]
+                !seen ;
+              equal string
+                (Form.encode [("a", "x/y~z"); ("_csrf", t); ("b", "/")])
+                (body r) ;
+              (* The same bytes go to the handler. *)
+              let r =
+                csrf store
+                  (request ~cookie ~fields:[form_type]
+                     ~body:(Body.of_string text) Method.POST "/" )
+              in
+              equal string ("ok " ^ text) (body r) ) )
+    ; test "a form with no good token" (fun () ->
+          sim (fun _ ->
+              let store, _, _ = counting () in
+              let h = csrf store in
+              let cookie, t = login h in
+              List.iter
+                (fun text ->
+                  equal ~msg:text int 403
+                    (post ~cookie ~fields:[form_type] ~text h) )
+                ["a=1"; "_csrf=bad"; "_csrf=bad&_csrf=" ^ t; "_CSRF=" ^ t; ""] ;
+              let text = "_csrf=" ^ t in
+              List.iter
+                (fun (label, fields) ->
+                  equal ~msg:label int 403 (post ~cookie ~fields ~text h) )
+                [ ("two types", [form_type; form_type])
+                ; ("an empty type", [("Content-Type", "")])
+                ; ("no type", [])
+                ; ("json", [("Content-Type", "application/json")])
+                ; ( "multipart"
+                  , [("Content-Type", "multipart/form-data; boundary=x")] ) ] ;
+              equal int 200 (post ~cookie ~fields:[form_type] ~text h) ;
+              (* An encoded name matches too. *)
+              equal int 200
+                (post ~cookie ~fields:[form_type] ~text:("%5Fcsrf=" ^ t) h) ) )
+    ; test "deny gets the form" (fun () ->
+          sim (fun _ ->
+              let store, _, _ = counting () in
+              let csrf =
+                M.Csrf.middleware
+                  ~deny:(fun req ->
+                    Response.string ~status:Status.forbidden
+                      ( match Request.form req with
+                      | Ok p ->
+                          Form.encode p
+                      | Error _ ->
+                          "error" ) )
+                  ()
+              in
+              let h = mw store (csrf token_app) in
+              let cookie, _ = login h in
+              let r =
+                h
+                  (request ~cookie ~fields:[form_type]
+                     ~body:(Body.of_string "a=1&_csrf=bad")
+                     Method.POST "/" )
+              in
+              equal string "a=1&_csrf=bad" (body r) ) )
+    ; test "the size of a form" (fun () ->
+          sim (fun _ ->
+              let store, _, _ = counting () in
+              let h = csrf store in
+              let cookie, t = login h in
+              let good = "_csrf=" ^ t in
+              let n = String.length good in
+              let post csrf body =
+                code
+                  (mw store (csrf token_app)
+                     (request ~cookie ~fields:[form_type] ~body Method.POST "/") )
+              in
+              equal int 200
+                (post (M.Csrf.middleware ~max_bytes:n ()) (Body.of_string good)) ;
+              equal int 413
+                (post
+                   (M.Csrf.middleware ~max_bytes:(n - 1) ())
+                   (Body.of_string good) ) ;
+              (* A declared length over the limit: no read. *)
+              let read = ref false in
+              let source =
+                Body.of_source ~length:(n + 1) (fun _ _ _ ->
+                    read := true ;
+                    0 )
+              in
+              equal int 413 (post (M.Csrf.middleware ~max_bytes:n ()) source) ;
+              is_false ~msg:"no read" !read ;
+              let r =
+                mw store
+                  (M.Csrf.middleware ~max_bytes:(n - 1) () token_app)
+                  (request ~cookie ~fields:[form_type]
+                     ~body:(Body.of_string good) Method.POST "/" )
+              in
+              equal string "Content Too Large\n" (body r) ;
+              (* The default: 1 MiB. [pad size] is a form of [size] bytes. *)
+              let pad size = good ^ "&p=" ^ String.make (size - n - 3) 'x' in
+              let default = M.Csrf.middleware () in
+              equal int 200 (post default (Body.of_string (pad 1_048_576))) ;
+              equal int 413 (post default (Body.of_string (pad 1_048_577))) ) )
+    ; test "no session: no read of the body" (fun () ->
+          sim (fun _ ->
+              let store, _, _ = counting () in
+              let read = ref false in
+              let source =
+                Body.of_source (fun _ _ _ ->
+                    read := true ;
+                    0 )
+              in
+              let r =
+                csrf store
+                  (request ~fields:[form_type] ~body:source Method.POST "/")
+              in
+              equal int 403 (code r) ;
+              is_false ~msg:"no read" !read ) )
+    ; test "the options" (fun () ->
+          sim (fun _ ->
+              let store, _, _ = counting () in
+              let cookie, t = login (csrf store) in
+              let h =
+                csrf
+                  ~csrf:(M.Csrf.middleware ~header:"X-Token" ~field:"t" ())
+                  store
+              in
+              equal int 200 (post ~cookie ~fields:[("X-Token", t)] h) ;
+              equal int 403 (post ~cookie ~token:t h) ;
+              equal int 200
+                (post ~cookie ~fields:[form_type] ~text:("t=" ^ t) h) ;
+              equal int 403
+                (post ~cookie ~fields:[form_type] ~text:("_csrf=" ^ t) h) ) )
+    ; test "exempt and deny" (fun () ->
+          sim (fun _ ->
+              let store, _, _ = counting () in
+              let csrf =
+                M.Csrf.middleware
+                  ~exempt:(fun r -> Request.path_only r = "/login")
+                  ~deny:(fun _ -> Response.string ~status:Status.not_found "")
+                  ()
+              in
+              let h = mw store (csrf token_app) in
+              (* A login form with no session. *)
+              equal int 200 (code (h (request Method.POST "/login?x=1"))) ;
+              equal int 404 (code (h (request Method.POST "/other"))) ;
+              (* exempt runs on each POST, before the check. deny runs only on a
+                 refusal. Neither runs on a GET. *)
+              let csrf =
+                M.Csrf.middleware
+                  ~exempt:(fun _ -> failwith "exempt")
+                  ~deny:(fun _ -> failwith "deny")
+                  ()
+              in
+              let h = mw store (csrf token_app) in
+              let cookie, t = login h in
+              equal int 200 (code (h (request ~cookie Method.GET "/"))) ;
+              raises_match
+                (function Failure m -> m = "exempt" | _ -> false)
+                (fun () -> ignore (post ~cookie ~token:t h)) ;
+              let csrf =
+                M.Csrf.middleware ~deny:(fun _ -> failwith "deny") ()
+              in
+              let h = mw store (csrf token_app) in
+              equal int 200 (post ~cookie ~token:t h) ;
+              raises_match
+                (function Failure m -> m = "deny" | _ -> false)
+                (fun () -> ignore (post ~cookie h)) ) )
+    ; test "an exception of the body goes out" (fun () ->
+          sim (fun _ ->
+              let store, _, _ = counting () in
+              let h = csrf store in
+              let cookie, _ = login h in
+              let source = Body.of_source (fun _ _ _ -> failwith "body") in
+              raises_match
+                (function Failure m -> m = "body" | _ -> false)
+                (fun () ->
+                  ignore
+                    (h
+                       (request ~cookie ~fields:[form_type] ~body:source
+                          Method.POST "/" ) ) ) ) ) ]
+
 let wire_tests =
   group "On the wire"
     [ test "a login and a later request through the server" (fun () ->
@@ -1041,9 +1604,44 @@ let wire_tests =
                     (Headers.of_list [("Cookie", cookie_name ^ "=" ^ cookie)])
                   t "/"
               in
-              equal string "ada -" r.body ) ) ]
+              equal string "ada -" r.body ) )
+    ; test "Cross_origin, the session and Csrf through the server" (fun () ->
+          seed () ;
+          let app =
+            Handler.compose
+              [ Caravan_middleware.Cross_origin.middleware ()
+              ; mw (M.memory_store ())
+              ; M.Csrf.middleware () ]
+              token_app
+          in
+          Caravan_testing.run app (fun t ->
+              let r = Caravan_testing.get t "/" in
+              let cookie = Option.get (session_cookie r.headers) in
+              let token = r.body in
+              let post fields text =
+                (Caravan_testing.fetch t
+                   (Request.make
+                      ~headers:
+                        (Headers.of_list
+                           ( ("Cookie", cookie_name ^ "=" ^ cookie)
+                           :: form_type :: fields ) )
+                      ~body:(Body.of_string text) Method.POST "/" ) )
+                  .status
+              in
+              let same = [("Sec-Fetch-Site", "same-origin")] in
+              equal int 200 (Status.code (post same ("_csrf=" ^ token))) ;
+              equal int 403 (Status.code (post same "a=1")) ;
+              equal int 403
+                (Status.code
+                   (post [("Sec-Fetch-Site", "cross-site")] ("_csrf=" ^ token)) ) ) )
+    ]
 
 let () =
   exit
     (Windtrap.run "session"
-       [signed_tests; session_tests; memory_tests; data_tests; wire_tests] )
+       [ signed_tests
+       ; session_tests
+       ; memory_tests
+       ; data_tests
+       ; csrf_tests
+       ; wire_tests ] )

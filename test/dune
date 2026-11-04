@@ -148,6 +148,7 @@
  (libraries
   caravan
   caravan.session
+  caravan.middleware
   caravan.testing
   sim_support
   weft

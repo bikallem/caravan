@@ -69,7 +69,9 @@ module Signed : sig
   (** [sign ~purpose key value] is [value] with its signature. [purpose] stops
       the use of a signature for another purpose.
 
-      @raise Invalid_argument if [purpose] has a NUL byte. *)
+      @raise Invalid_argument
+        if [purpose] has a NUL byte, or starts with ["caravan."]: the session
+        cookies and the CSRF tokens use these purposes. *)
 
   val verify : purpose:string -> Key.t list -> string -> string option
   (** [verify ~purpose keys s] is the value of [s] if a key of [keys] signed it
@@ -77,7 +79,8 @@ module Signed : sig
       The compare is constant time, and only the exact text of the MAC is
       accepted.
 
-      @raise Invalid_argument if [purpose] has a NUL byte. *)
+      @raise Invalid_argument
+        if [purpose] has a NUL byte, or starts with ["caravan."]. *)
 end
 
 (** {1:stores Stores} *)
@@ -136,7 +139,8 @@ val middleware :
     - A cookie with a bad signature, or with the ID of no session, gives no
       session. A cookie of another length than a signed ID costs no HMAC, and a
       bad signature costs no read of the store. The purpose of the signature of
-      the cookie is ["caravan.session"]: do not sign other values with it.
+      the cookie is ["caravan.session"]: {!Signed} refuses the purposes
+      [caravan.*].
     - [idle] (default 30 min) and [absolute] (default 8 h, from the creation)
       end a session.
     - [secure] (default [true]) and [same_site] (default [`Lax]) are those of
@@ -147,7 +151,8 @@ val middleware :
       new or changed data, and sets the cookie for a new ID ({!set} with no
       session, {!renew}, {!id}), for a cookie that an old key signed, and an
       expired cookie after {!clear}. A response with a session cookie gets
-      [Cache-Control: no-store] in place of its own field.
+      [Cache-Control: no-store] in place of its own field, and a response after
+      {!Csrf.token} too.
     - A handler that raises: no write, and the exception goes on.
 
     @raise Invalid_argument
@@ -187,3 +192,104 @@ val clear : Caravan.Request.t -> unit
 val id : Caravan.Request.t -> string
 (** [id req] is the ID of the session. With no session, it makes an empty
     session with a new ID, for example for a CSRF token. *)
+
+(** {1:csrf CSRF tokens}
+
+    Tokens against CSRF, bound to the session. They add depth to
+    [Caravan_middleware.Cross_origin], which stops the cross-origin requests of
+    browsers since 2020 with no token. The tokens also stop the older browsers.
+
+    {[
+    let app =
+      Caravan.Handler.compose
+        [ Caravan_middleware.Cross_origin.middleware ()
+        ; Caravan_session.middleware ~keys:[key] ~store ()
+        ; Caravan_session.Csrf.middleware () ]
+        (fun req ->
+          match Caravan.Request.meth req with
+          | GET ->
+              Caravan.Response.string
+                ~headers:
+                  (Caravan.Headers.of_list [("Content-Type", "text/html")])
+                ( "<form method=post><input type=hidden name=_csrf value=\""
+                ^ Caravan_session.Csrf.token req
+                ^ "\"><button>Send</button></form>" )
+          | _ ->
+              Caravan.Response.string "sent" )
+    ]}
+
+    Use the middleware only for the routes of the cookie sessions, for example
+    in a group of the router: a JSON API with a bearer token needs no token
+    against CSRF. Do not exempt a request because it has an [Authorization]
+    field: a browser sends cached Basic credentials with a cross-site form.
+
+    A session cookie with no [__Host-] prefix lets a host of a sibling domain
+    plant its own session and its own token: a login CSRF (see {!middleware}).
+*)
+module Csrf : sig
+  val token : Caravan.Request.t -> string
+  (** [token req] is a token for the session of [req]: 86 characters of
+      base64url. With no session, it makes one (as {!id}). Each call gives a new
+      text of the same secret (a random mask: BREACH cannot find the secret in a
+      compressed page). The response gets [Cache-Control: no-store].
+
+      The secret is the HMAC-SHA256 of the session ID with the first key. Thus
+      {!renew} (a login) and {!clear} end the tokens of the session: the pages
+      of other tabs need a reload. In a request, call [token] after {!renew}. A
+      page gives the token to its scripts, for example in a [<meta>] tag: the
+      scripts send it in the header of {!middleware}.
+
+      @raise Invalid_argument
+        after the response, also for a session that exists, and if [req] did not
+        go through {!Caravan_session.middleware}. *)
+
+  val check : string -> Caravan.Request.t -> bool
+  (** [check t req] is [true] if [t] is a token of the session of [req], made
+      with a key of the middleware (the old keys of a rotation too). With no
+      session, it is [false] and makes no session. The compare is constant time.
+
+      @raise Invalid_argument
+        if [req] did not go through {!Caravan_session.middleware}. *)
+
+  val middleware :
+       ?header:string
+    -> ?field:string
+    -> ?max_bytes:int
+    -> ?exempt:(Caravan.Request.t -> bool)
+    -> ?deny:Caravan.Handler.t
+    -> unit
+    -> Caravan.Handler.middleware
+  (** [middleware ()] checks the token of each request with a method other than
+      [GET], [HEAD] and [OPTIONS]. Put it after {!Caravan_session.middleware}.
+      In this order:
+      + [exempt req] is [true]: the next handler. Unlike [Cross_origin],
+        [exempt] runs before the check.
+      + The request has no session: [deny req], with no read of the body.
+      + The first field [header] (default [X-CSRF-Token]) is there: {!check}
+        decides. A bad value gives [deny req], also with a good form field.
+      + The body is a form (the [Content-Type] rule of {!Caravan.Request.form})
+        of at most [max_bytes] (default 1 MiB): the first pair [field] (default
+        [_csrf]) decides ({!Caravan.Form.find_text}). A larger form gets
+        [413 Content Too Large]. The next handler, or [deny], gets the same
+        bytes, with [Content-Length], and with no [Transfer-Encoding] and no
+        [Expect]. The request trailers do not stay. Its {!Caravan.Request.form}
+        gives the pairs, also the pair [field], with its own limits.
+      + Else (another body, for example JSON or [multipart/form-data]):
+        [deny req]. Send the token in [header], or exempt the path and call
+        {!check} in the handler before any change of state: the parts of a
+        multipart body come in the order of the client.
+
+      [deny] (default [403 Forbidden]) and [exempt] run only on a request with a
+      method other than [GET], [HEAD] and [OPTIONS]. Their exceptions, and an
+      exception of the body read, go out.
+
+      A form for anonymous users, for example a login form, needs a session for
+      its token. A {!memory_store} then keeps a session for each visitor. Exempt
+      that form, and keep [Cross_origin] for it:
+      [~exempt:(fun r -> Caravan.Request.path_only r = "/login")].
+
+      @raise Invalid_argument
+        if [header] is not a field name, [field] is empty, or [max_bytes] is
+        negative. Each request raises it if it did not go through
+        {!Caravan_session.middleware}. *)
+end
