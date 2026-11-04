@@ -1788,6 +1788,212 @@ let hsts_tests =
             | Response.Body _ ->
                 false ) ) ]
 
+module X = Caravan_middleware.Cross_origin
+
+(* [xo ?mw ?meth ?scheme ?authority fields] is the status of the response of
+   [mw] (default [X.middleware ()]) for a request with the header fields
+   [fields], and [true] if the handler ran. The authority is [example.com] by
+   default. *)
+let xo ?(mw = X.middleware ()) ?(meth = Method.POST) ?(scheme = "http")
+    ?(authority = Some "example.com") fields =
+  let ran = ref false in
+  let r =
+    mw
+      (fun _ ->
+        ran := true ;
+        Response.string "ok" )
+      (Request.make ~scheme ?authority ~headers:(Headers.of_list fields) meth
+         "/form" )
+  in
+  (Status.code (Response.status r), !ran)
+
+let passed = (200, true)
+
+let refused = (403, false)
+
+let outcome = Testable.(pair int bool)
+
+let sfs v = ("Sec-Fetch-Site", v)
+
+let origin v = ("Origin", v)
+
+let cross_origin_tests =
+  group "Cross_origin"
+    [ test "a cross-site POST is refused" (fun () ->
+          equal outcome refused (xo [sfs "cross-site"]) ;
+          let r =
+            X.middleware () (reply "ok")
+              (Request.make ~authority:"example.com"
+                 ~headers:(Headers.of_list [sfs "cross-site"])
+                 Method.POST "/" )
+          in
+          equal string "Forbidden\n"
+            ( match Response.kind r with
+            | Response.Body b ->
+                Body.to_string b
+            | Response.Upgrade _ ->
+                "an upgrade" ) )
+    ; test "same-origin and none pass" (fun () ->
+          equal outcome passed (xo [sfs "same-origin"]) ;
+          equal outcome passed (xo [sfs "none"]) )
+    ; test "same-site, an unknown value and an empty value are refused"
+        (fun () ->
+          List.iter
+            (fun v -> equal ~msg:v outcome refused (xo [sfs v]))
+            ["same-site"; "foo"; ""; "Same-Origin"; "NONE"] )
+    ; test "the safe methods pass, the others are checked" (fun () ->
+          List.iter
+            (fun m ->
+              equal ~msg:(Method.to_string m) outcome passed
+                (xo ~meth:m [sfs "cross-site"]) )
+            Method.[GET; HEAD; OPTIONS] ;
+          List.iter
+            (fun m ->
+              equal ~msg:(Method.to_string m) outcome refused
+                (xo ~meth:m [sfs "cross-site"]) )
+            Method.[PUT; DELETE; PATCH; TRACE; Other "PURGE"; Other "GET"] )
+    ; test "no Sec-Fetch-Site and no Origin pass" (fun () ->
+          equal outcome passed (xo []) ;
+          equal outcome passed (xo ~authority:None []) )
+    ; test "an Origin of the authority passes" (fun () ->
+          equal outcome passed (xo [origin "https://example.com"]) ;
+          equal outcome passed
+            (xo ~authority:(Some "EXAMPLE.com") [origin "https://Example.COM"]) ;
+          equal outcome passed
+            (xo ~authority:(Some "example.com:8080")
+               [origin "http://example.com:8080"] ) ;
+          equal outcome passed
+            (xo ~authority:(Some "[::1]:8080") [origin "http://[::1]:8080"]) )
+    ; test "the scheme is not compared" (fun () ->
+          equal outcome passed
+            (xo ~scheme:"https" [origin "http://example.com"]) ;
+          equal outcome passed (xo ~scheme:"http" [origin "x://example.com"]) )
+    ; test "an Origin of another authority is refused" (fun () ->
+          List.iter
+            (fun o -> equal ~msg:o outcome refused (xo [origin o]))
+            [ "https://evil.com"
+            ; "https://evil-example.com"
+            ; "https://example.com.evil.com"
+            ; "https://example.co"
+            ; "https://evil.com/https://example.com"
+            ; "https://example.com:8443"
+            ; "https://example.com/"
+            ; "https:/example.com"
+            ; "https:/xexample.com"
+            ; "https://example.org"
+            ; "https://exbmple.com"
+            ; "https:abexample.com"
+            ; "https:/"
+            ; "https:"
+            ; "https:xxexample.com"
+            ; "https:example.com"
+            ; "://example.com"
+            ; "example.com"
+            ; "null"
+            ; "" ] ;
+          equal outcome refused
+            (xo ~authority:(Some "example.com:443")
+               [origin "https://example.com"] ) ;
+          List.iter
+            (fun o ->
+              equal ~msg:o outcome refused (xo ~authority:None [origin o]) ;
+              equal ~msg:o outcome refused (xo ~authority:(Some "") [origin o]) )
+            ["https://"; "null"; ""] )
+    ; test "Sec-Fetch-Site decides when it is there" (fun () ->
+          equal outcome passed
+            (xo [sfs "same-origin"; origin "https://evil.com"]) ;
+          equal outcome refused
+            (xo [sfs "cross-site"; origin "https://example.com"]) ;
+          equal outcome refused
+            (xo [sfs "same-site"; origin "https://example.com"]) )
+    ; test "the first field decides" (fun () ->
+          equal outcome passed (xo [sfs "same-origin"; sfs "cross-site"]) ;
+          equal outcome refused (xo [sfs "cross-site"; sfs "same-origin"]) ;
+          equal outcome passed
+            (xo [origin "https://example.com"; origin "https://evil.com"]) ;
+          equal outcome refused
+            (xo [origin "https://evil.com"; origin "https://example.com"]) )
+    ; test "the trusted origins" (fun () ->
+          let mw = X.middleware ~trusted_origins:["https://App.example"] () in
+          equal outcome passed
+            (xo ~mw [sfs "cross-site"; origin "https://app.example"]) ;
+          equal outcome passed
+            (xo ~mw [sfs "same-site"; origin "HTTPS://APP.EXAMPLE"]) ;
+          equal outcome refused
+            (xo ~mw [sfs "cross-site"; origin "https://other.example"]) ;
+          equal outcome refused (xo ~mw [sfs "cross-site"]) ;
+          equal outcome passed (xo ~mw [origin "https://app.example"]) ;
+          equal outcome refused (xo ~mw [origin "https://other.example"]) )
+    ; test "exempt" (fun () ->
+          let mw =
+            X.middleware ~exempt:(fun r -> Request.path_only r = "/form") ()
+          in
+          equal outcome passed (xo ~mw [sfs "cross-site"]) ;
+          equal outcome passed (xo ~mw [origin "https://evil.com"]) ;
+          let mw = X.middleware ~exempt:(fun _ -> false) () in
+          equal outcome refused (xo ~mw [sfs "cross-site"]) )
+    ; test "deny" (fun () ->
+          let mw =
+            X.middleware
+              ~deny:(fun r ->
+                Response.string ~status:Status.bad_request (Request.path_only r) )
+              ()
+          in
+          equal outcome (400, false) (xo ~mw [sfs "cross-site"]) )
+    ; test "exempt and deny run only on a refusal" (fun () ->
+          let mw =
+            X.middleware
+              ~exempt:(fun _ -> failwith "exempt")
+              ~deny:(fun _ -> failwith "deny")
+              ()
+          in
+          equal outcome passed (xo ~mw ~meth:Method.GET [sfs "cross-site"]) ;
+          equal outcome passed (xo ~mw [sfs "same-origin"]) ;
+          equal outcome passed (xo ~mw [origin "https://example.com"]) ;
+          equal outcome passed (xo ~mw []) ;
+          raises_match
+            (function Failure m -> m = "exempt" | _ -> false)
+            (fun () -> ignore (xo ~mw [sfs "cross-site"])) ;
+          let mw = X.middleware ~deny:(fun _ -> failwith "deny") () in
+          raises_match
+            (function Failure m -> m = "deny" | _ -> false)
+            (fun () -> ignore (xo ~mw [sfs "cross-site"])) )
+    ; test "bad trusted origins" (fun () ->
+          List.iter
+            (fun e ->
+              raises_match ~msg:e is_invalid_arg (fun () ->
+                  made (X.middleware ~trusted_origins:[e] ()) ) )
+            [ "null"
+            ; "*"
+            ; "https://a.example/x"
+            ; "app.example"
+            ; "https://a.example:443"
+            ; "https://a.example:99999999999999999999"
+            ; "" ] ;
+          made
+            (X.middleware
+               ~trusted_origins:["https://a.example"; "http://[::1]:8080"]
+               () ) )
+    ; test "on the wire" (fun () ->
+          let app =
+            Handler.compose
+              [X.middleware ()]
+              (fun req -> Response.string (Body.to_string (Request.body req)))
+          in
+          T.run app (fun t ->
+              let post fields =
+                T.fetch t
+                  (Request.make ~headers:(Headers.of_list fields)
+                     ~body:(Body.of_string "a=1") Method.POST "/form" )
+              in
+              equal status Status.forbidden (post [sfs "cross-site"]).status ;
+              equal status Status.forbidden
+                (post [sfs "cross-site"; ("Expect", "100-continue")]).status ;
+              let r = post [sfs "same-origin"] in
+              equal status Status.ok r.status ;
+              equal string "a=1" r.body ;
+              equal status Status.ok (T.get t "/").status ) ) ]
+
 let () =
   exit
     (Windtrap.run "middleware"
@@ -1797,4 +2003,5 @@ let () =
        ; error_page_tests
        ; cors_tests
        ; https_redirect_tests
-       ; hsts_tests ] )
+       ; hsts_tests
+       ; cross_origin_tests ] )

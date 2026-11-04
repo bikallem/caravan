@@ -998,3 +998,58 @@ module Hsts = struct
           (Headers.add "Strict-Transport-Security" value (Response.headers r))
           r
 end
+
+module Cross_origin = struct
+  let forbidden _ = Response.string ~status:Status.forbidden "Forbidden\n"
+
+  (* [same_host origin authority] is [true] if [origin] is [scheme "://" a],
+     with a scheme that is not empty, where [a] is [authority] with no case. *)
+  let same_host origin = function
+    | Some a when a <> "" -> (
+      match String.index_opt origin ':' with
+      | Some i when i > 0 ->
+          let rest = String.length origin - i - 3 in
+          rest = String.length a
+          && String.sub origin i 3 = "://"
+          && String.lowercase_ascii (String.sub origin (i + 3) rest)
+             = String.lowercase_ascii a
+      | _ ->
+          false )
+    | _ ->
+        false
+
+  let middleware ?(trusted_origins = []) ?(exempt = fun _ -> false)
+      ?(deny = forbidden) () =
+    List.iter
+      (fun e ->
+        if e = "null" || not (Cors.valid_origin e) then
+          invalid_arg
+            (Printf.sprintf
+               "Caravan_middleware.Cross_origin.middleware: %S is not an origin"
+               e ) )
+      trusted_origins ;
+    let trusted = Cors.permits (Cors.Only trusted_origins) in
+    (* Examined only on a refusal, as Go does. *)
+    let excepted req origin =
+      exempt req || match origin with Some o -> trusted o | None -> false
+    in
+    let pass req =
+      match Request.meth req with
+      | Method.GET | Method.HEAD | Method.OPTIONS ->
+          true
+      | _ -> (
+          let h = Request.headers req in
+          match Headers.find "sec-fetch-site" h with
+          | Some ("same-origin" | "none") ->
+              true
+          | Some _ ->
+              excepted req (Headers.find "origin" h)
+          | None -> (
+            match Headers.find "origin" h with
+            | None ->
+                true
+            | Some o as origin ->
+                same_host o (Request.authority req) || excepted req origin ) )
+    in
+    fun next req -> if pass req then next req else deny req
+end

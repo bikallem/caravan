@@ -417,3 +417,67 @@ module Hsts : sig
         rules of hstspreload.org), or if an entry of [exclude_hosts] has a port.
   *)
 end
+
+(** A refusal of the cross-origin requests of a browser with an unsafe method: a
+    protection against CSRF that needs no token. It is the algorithm of
+    [CrossOriginProtection] of Go 1.25. All browsers since 2023 send
+    [Sec-Fetch-Site], and older browsers send [Origin] on a POST.
+
+    Put it after {!Forwarded}, {!Cors} and {!Error_page}, and before the session
+    middleware and the router: a refused request then gets its CORS fields, its
+    log entry and no session. Behind a proxy that changes the [Host] field, use
+    {!Forwarded} with [~host:true].
+
+    The limits:
+    - A WebSocket upgrade is a GET, thus it passes: examine its [Origin] in the
+      upgrade, for example with {!Cors.permits}.
+    - DNS rebinding gives the name of the attacker in [Host] and in [Origin]:
+      put a host filter before this middleware.
+    - A browser older than 2020 can send no [Sec-Fetch-Site] and no [Origin] on
+      a form POST: the [SameSite] attribute of the session cookie and the CSRF
+      tokens of [caravan.session] stop it.
+    - The default ports are compared as text: with no [Sec-Fetch-Site],
+      [Host: example.com:443] and [Origin: https://example.com] do not match. *)
+module Cross_origin : sig
+  val middleware :
+       ?trusted_origins:string list
+    -> ?exempt:(Caravan.Request.t -> bool)
+    -> ?deny:Caravan.Handler.t
+    -> unit
+    -> Caravan.Handler.middleware
+  (** [middleware ~trusted_origins ~exempt ~deny ()] gives a request to the next
+      handler if one of these is true, in this order. If not, the response is
+      [deny req] (default [403 Forbidden]).
+      + The method is [GET], [HEAD] or [OPTIONS]. A preflight is an [OPTIONS].
+      + The first [Sec-Fetch-Site] field is [same-origin] or [none] (the user
+        started the request), case-sensitive. Another value, also [same-site]
+        and an empty value (Go takes it as no field), goes to step 5.
+      + There is no [Sec-Fetch-Site] and no [Origin] field: the client is not a
+        browser, or an old browser sent a same-origin request.
+      + There is no [Sec-Fetch-Site], and the first [Origin] field is
+        [scheme://authority] for the authority of the request
+        ({!Caravan.Request.authority}), ASCII case-insensitive. A request with
+        no authority or an empty authority, and an empty [Origin] value (Go
+        takes it as no field), go to step 5. The middleware does not compare the
+        scheme: behind a proxy that ends TLS, the scheme of the request is
+        [http]. HSTS stops a request from [http] to [https].
+      + [exempt req] is [true], or the first [Origin] field is in
+        [trusted_origins], ASCII case-insensitive.
+
+      [same-site] is refused: another party can control a sibling subdomain.
+      Thus a page of [https://app.example.com] that sends a POST to
+      [api.example.com] needs [~trusted_origins:["https://app.example.com"]].
+      Put the origins of {!Cors} with credentials in [trusted_origins] too.
+
+      [exempt] is for paths that take cross-origin POSTs, for example a webhook.
+      Compare the path with no query, and a prefix only with a [/] at its end:
+      [~exempt:(fun r -> Caravan.Request.path_only r = "/webhook")].
+
+      The middleware does not read the body. [exempt] and [deny] run only for a
+      request that steps 1 to 4 refuse. Their exceptions go out.
+
+      @raise Invalid_argument
+        if an entry of [trusted_origins] is ["null"] or is not
+        [scheme://host[:port]] as a browser sends it (the rules of
+        {!Cors.Only}). *)
+end
