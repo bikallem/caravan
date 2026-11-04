@@ -130,6 +130,8 @@ val file :
     - [content_type] is the value of [Content-Type] (default {!val-content_type}
       of [path]).
     - [cache_control] is the value of [Cache-Control], if any, also on a 304.
+    - The response of a 304 has the [Content-Type] and the [Content-Length] of
+      the file, for a middleware: the engine does not send them.
 
     The response has [X-Content-Type-Options: nosniff]. If [path] is not a
     regular file, or if the OS refuses the open (for example [EACCES]), the

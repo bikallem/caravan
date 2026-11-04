@@ -510,7 +510,13 @@ let serve ~fields fd (st : File.stat) req =
       in
       if failed then respond Status.precondition_failed []
       else if not_modified then
-        respond Status.not_modified (("ETag", etag) :: cache)
+        (* The engine does not send the Content-Type and the Content-Length of a
+           304: they are for a middleware that decides with them, for example
+           the compression. *)
+        respond Status.not_modified
+          ( ("Content-Type", content_type)
+          :: ("Content-Length", string_of_int st.size)
+          :: ("ETag", etag) :: cache )
       else
         let entity =
           [ ("Content-Type", content_type)
