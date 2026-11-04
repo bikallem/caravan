@@ -1,6 +1,7 @@
 open Weft
 open Caravan
 module Cancel = Caravan.Private.Cancel
+module Base64 = Caravan.Private.Base64
 
 let guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -168,7 +169,6 @@ let accept ?(protocols = []) ?origin ?max_message ?close_timeout ?write_timeout
 
 module Private = struct
   module Sha1 = Sha1
-  module Base64 = Base64
   module Frame = Frame
   module Utf8 = Utf8
 

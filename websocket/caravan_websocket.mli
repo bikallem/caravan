@@ -204,7 +204,6 @@ val close : ?code:int -> ?reason:string -> t -> unit
 (** Internal modules, exposed for tests. Not part of the public API. *)
 module Private : sig
   module Sha1 = Sha1
-  module Base64 = Base64
   module Frame = Frame
   module Utf8 = Utf8
 

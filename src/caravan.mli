@@ -32,6 +32,7 @@ module Server = Server
 module Private : sig
   module Date = Date
   module Percent = Percent
+  module Base64 = Base64
   module Token = Token
   module Deadline = Deadline
   module Cancel = Cancel
