@@ -39,14 +39,19 @@
   (tls
    (and
     :with-test
-    (>= 2.1))))
+    (>= 2.1)))
+  (digestif :with-test)
+  (eqaf :with-test))
  (depopts
   ; caravan.tls
   (tls
    (>= 2.1))
   x509
   domain-name
-  mirage-crypto-rng)
+  mirage-crypto-rng
+  ; caravan.session
+  digestif
+  eqaf)
  (conflicts
   (tls
    (< 2.1))))

@@ -20,12 +20,16 @@ depends: [
   "mirage-crypto-ec" {with-test}
   "ptime" {with-test}
   "tls" {with-test & >= "2.1"}
+  "digestif" {with-test}
+  "eqaf" {with-test}
 ]
 depopts: [
   "tls" {>= "2.1"}
   "x509"
   "domain-name"
   "mirage-crypto-rng"
+  "digestif"
+  "eqaf"
 ]
 conflicts: [
   "tls" {< "2.1"}

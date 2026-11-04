@@ -1,5 +1,5 @@
 ; The suites of caravan. They run in the simulator of weft. The deps give the
-; source scan of test_core the files of the eight libraries.
+; source scan of test_core the files of the nine libraries.
 
 (tests
  (names
@@ -61,7 +61,8 @@
   (glob_files ../router/*.ml)
   (glob_files ../middleware/*.ml)
   (glob_files ../static/*.ml)
-  (glob_files ../tls/*.ml)))
+  (glob_files ../tls/*.ml)
+  (glob_files ../session/*.ml)))
 
 ; The hosts of the numeric tests of Resolver, shared by test_client and
 ; test_numeric_unix.
@@ -138,3 +139,19 @@
   mirage-crypto-rng
   mirage-crypto-ec
   ptime))
+
+; The suite of caravan.session.
+
+(test
+ (name test_session)
+ (modules test_session)
+ (libraries
+  caravan
+  caravan.session
+  caravan.testing
+  sim_support
+  weft
+  weft.sim
+  windtrap
+  digestif
+  mirage-crypto-rng))

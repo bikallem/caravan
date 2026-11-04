@@ -1,0 +1,12 @@
+; Sessions and signed values. Optional: dune builds it only if digestif and
+; mirage-crypto-rng are installed.
+
+(library
+ (name caravan_session)
+ (public_name caravan.session)
+ (optional)
+ (libraries caravan weft digestif eqaf mirage-crypto-rng)
+ (instrumentation
+  (backend ppx_windtrap.mutate))
+ (instrumentation
+  (backend ppx_windtrap.coverage)))

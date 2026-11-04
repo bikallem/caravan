@@ -112,6 +112,7 @@
                 ./middleware
                 ./static
                 ./tls
+                ./session
                 ./testing
                 ./LICENSE
                 ./README.md
@@ -124,6 +125,10 @@
               ocamlPackages.tls
               ocamlPackages.x509
               ocamlPackages.domain-name
+              # caravan.session, an optional library.
+              ocamlPackages.digestif
+              ocamlPackages.eqaf
+              ocamlPackages.mirage-crypto-rng
             ];
             doCheck = false;
             meta = {
@@ -162,6 +167,8 @@
               mirage-crypto-rng
               mirage-crypto-ec
               ptime
+              digestif
+              eqaf
 
               # Test dependencies (windtrap here is the flake input, so use
               # ocamlPackages.windtrap)
