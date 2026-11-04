@@ -3349,14 +3349,22 @@ let code_app codes =
 (* A browser of the code tests: its cookie. *)
 type jar = {mutable jar: string option}
 
-(* [call app j path] is the body of the response of [app] to a GET of [path],
-   with the cookie of [j]. *)
-let call app j path =
+(* [call ?body app j path] is the body of the response of [app] to a GET of
+   [path], or a POST of [body], with the cookie of [j]. *)
+let call ?body app j path =
   let headers =
     Caravan.Headers.of_list
       (Option.fold ~none:[] ~some:(fun c -> [("Cookie", c)]) j.jar)
   in
-  let resp = app (Caravan.Request.make ~headers Caravan.Method.GET path) in
+  let resp =
+    match body with
+    | None ->
+        app (Caravan.Request.make ~headers Caravan.Method.GET path)
+    | Some b ->
+        app
+          (Caravan.Request.make ~headers ~body:(Body.of_string b)
+             Caravan.Method.POST path )
+  in
   j.jar <- keep_cookie j.jar resp ;
   match Caravan.Response.kind resp with
   | Caravan.Response.Body b ->
@@ -4287,6 +4295,745 @@ let passkey_parser_tests =
           | Error _ ->
               fail "flags" ) ]
 
+(* {1 Passkeys} *)
+
+module Pk = Caravan_auth.Passkey
+
+let b64u = B64.encode ~url:true ~pad:false
+
+(* The value of the string member [name] in a JSON text (the options), with no
+   JSON parser in the tests. *)
+let json_string name text =
+  let key = Printf.sprintf "%S:\"" name in
+  let rec find i =
+    if i + String.length key > String.length text then fail ("no " ^ name)
+    else if String.sub text i (String.length key) = key then
+      i + String.length key
+    else find (i + 1)
+  in
+  let start = find 0 in
+  String.sub text start (String.index_from text start '"' - start)
+
+(* The DER form of r and s. *)
+let der_of_rs r s =
+  let int v =
+    let rec strip v =
+      if String.length v > 1 && v.[0] = '\x00' then
+        strip (String.sub v 1 (String.length v - 1))
+      else v
+    in
+    let v = strip v in
+    der_int (if Char.code v.[0] >= 0x80 then "\x00" ^ v else v)
+  in
+  der_seq [int r; int s]
+
+(* A software authenticator: a key, its COSE form, and a signer. *)
+type soft = {cose: string; sign: string -> string; cred: string}
+
+let soft_es =
+  { cose= cose_ec ()
+  ; sign=
+      (fun data ->
+        let r, s = Mirage_crypto_ec.P256.Dsa.sign ~key:ec_priv (sha256 data) in
+        der_of_rs r s )
+  ; cred= "credential-es256" }
+
+let soft_ed =
+  { cose= cose_ed ()
+  ; sign= (fun data -> Mirage_crypto_ec.Ed25519.sign ~key:ed_priv data)
+  ; cred= "credential-eddsa" }
+
+let soft_rs =
+  { cose= cose_rsa ()
+  ; sign=
+      (fun data ->
+        Mirage_crypto_pk.Rsa.PKCS1.sign ~hash:`SHA256 ~key:rsa_priv
+          (`Message data) )
+  ; cred= "credential-rs256" }
+
+let pk_rp_id = "example.com"
+
+let pk_origin = "https://example.com"
+
+let client_json ?(origin = pk_origin) ?(extra = "") ~typ challenge =
+  Printf.sprintf {|{"type":%S,"challenge":%S,"origin":%S%s}|} typ challenge
+    origin extra
+
+(* [registration () soft ~challenge] is the JSON of a create response. *)
+let registration ?(flags = 0x45) ?(count = 0) ?(origin = pk_origin) ?extra
+    ?(typ = "webauthn.create") ?(rp = pk_rp_id) ?(fmt = `Text "none")
+    ?(stmt = `Map []) ?id ?raw ?cose ?data ?att ?(transports = {|["internal"]|})
+    () soft ~challenge =
+  let cred = soft.cred in
+  let data =
+    match data with
+    | Some d ->
+        d
+    | None ->
+        auth_data ~rp:(sha256 rp) ~flags ~count
+          (attested ~id:cred (Option.value cose ~default:soft.cose))
+  in
+  let att =
+    match att with
+    | Some a ->
+        a
+    | None ->
+        cbor
+          (`Map
+             [ (`Text "fmt", fmt)
+             ; (`Text "attStmt", stmt)
+             ; (`Text "authData", `Bytes data) ] )
+  in
+  Printf.sprintf
+    {|{"id":%S,"rawId":%S,"type":"public-key","response":{"clientDataJSON":%S,"attestationObject":%S,"transports":%s}}|}
+    (b64u (Option.value id ~default:cred))
+    (b64u (Option.value raw ~default:cred))
+    (b64u (client_json ~origin ?extra ~typ challenge))
+    (b64u att) transports
+
+(* [assertion () soft ~challenge] is the JSON of a get response. *)
+let assertion ?(flags = 0x01) ?(count = 0) ?(origin = pk_origin) ?extra
+    ?(typ = "webauthn.get") ?(rp = pk_rp_id) ?(user = Some "user-1") ?sign
+    ?handle_json () soft ~challenge =
+  let data = auth_data ~rp:(sha256 rp) ~flags ~count "" in
+  let cd = client_json ~origin ?extra ~typ challenge in
+  let signature = (Option.value sign ~default:soft.sign) (data ^ sha256 cd) in
+  Printf.sprintf
+    {|{"id":%S,"rawId":%S,"type":"public-key","response":{"clientDataJSON":%S,"authenticatorData":%S,"signature":%S%s}}|}
+    (b64u soft.cred) (b64u soft.cred) (b64u cd) (b64u data) (b64u signature)
+    ( match (handle_json, user) with
+    | Some j, _ ->
+        j
+    | None, Some u ->
+        Printf.sprintf {|,"userHandle":%S|} (b64u u)
+    | None, None ->
+        "" )
+
+(* The application of the passkey tests, called as a function. The credentials
+   are in [store]. *)
+let pk_app ?(rp = Pk.rp ~id:pk_rp_id ~name:"Example" ~origins:[pk_origin]) store
+    =
+  let text = Caravan.Response.string in
+  let q req n =
+    Option.value ~default:""
+      (Caravan.Form.find n (Caravan.Request.query_params req))
+  in
+  let opt req n = Caravan.Form.find n (Caravan.Request.query_params req) in
+  let verification req =
+    match opt req "uv" with Some "required" -> Some `Required | _ -> None
+  in
+  let routes req =
+    let body () = Body.to_string (Caravan.Request.body req) in
+    match Caravan.Request.path_only req with
+    | "/reg-options" ->
+        text
+          (Pk.creation_options ?verification:(verification req)
+             ?exclude:(Option.map (fun e -> [e]) (opt req "exclude"))
+             rp req ~user_id:(q req "user") ~user_name:"ada" ~display_name:"Ada" )
+    | "/register" -> (
+      match Pk.register rp req ~registered:(Hashtbl.mem store) (body ()) with
+      | Ok (c : Pk.credential) ->
+          Hashtbl.replace store c.id c.stored ;
+          text
+            (Printf.sprintf "ok %d %s %b %b %b %s" c.stored.sign_count
+               c.stored.user_handle c.user_verified c.stored.backup_eligible
+               c.backed_up
+               (String.concat "," c.transports) )
+      | Error e ->
+          text (Format.asprintf "%a" Pk.pp_error e) )
+    | "/req-options" ->
+        let timeout =
+          Option.map (fun t -> Span.s (int_of_string t)) (opt req "timeout")
+        in
+        text
+          (Pk.request_options ?timeout ?verification:(verification req)
+             ?allow:(Option.map (fun a -> [a]) (opt req "allow"))
+             ?user:(opt req "user") rp req )
+    | "/authenticate" -> (
+      match
+        Pk.authenticate rp req ~lookup:(Hashtbl.find_opt store) (body ())
+      with
+      | Ok a ->
+          ( match Hashtbl.find_opt store a.credential_id with
+          | Some st ->
+              Hashtbl.replace store a.credential_id
+                {st with sign_count= a.sign_count}
+          | None ->
+              () ) ;
+          text
+            (Printf.sprintf "ok %s %d %b %b %b" a.user_handle a.sign_count
+               a.user_verified a.backed_up a.cloned )
+      | Error e ->
+          text (Format.asprintf "%a" Pk.pp_error e) )
+    | "/inject" ->
+        Caravan_auth.Private.passkey_ceremony req
+          ~create:(q req "kind" = "create")
+          ~challenge:
+            (Option.get (B64.decode ~url:true ~pad:false (q req "challenge")))
+          ~uv:(q req "uv" = "1")
+          ?user:(opt req "user") () ;
+        text ""
+    | _ ->
+        text ""
+  in
+  Caravan.Handler.compose
+    [ Caravan_session.middleware
+        ~keys:[Caravan_session.Key.generate ()]
+        ~store:(Caravan_session.memory_store ())
+        () ]
+    routes
+
+let post app j path body = call ~body app j path
+
+(* A browser, its application and its store. *)
+type pk =
+  {app: Caravan.Handler.t; jar: jar; store: (string, Pk.stored) Hashtbl.t}
+
+let with_pk ?rp f =
+  Sim_support.run ~guard:(Span.s 3600) (fun sim ->
+      Weft_sim.set_posix sim (Time.posix_of_unix_s oidc_t0) ;
+      let store = Hashtbl.create 8 in
+      f {app= pk_app ?rp store; jar= {jar= None}; store} )
+
+let reg_challenge ?(uv = "") t =
+  json_string "challenge" (call t.app t.jar ("/reg-options?user=user-1" ^ uv))
+
+let req_challenge ?(query = "") t =
+  json_string "challenge" (call t.app t.jar ("/req-options" ^ query))
+
+let register_with t ?(soft = soft_es) ?(uv = "") build =
+  post t.app t.jar "/register" (build soft ~challenge:(reg_challenge ~uv t))
+
+let sign_in_with t ?(soft = soft_es) ?(query = "") build =
+  post t.app t.jar "/authenticate"
+    (build soft ~challenge:(req_challenge ~query t))
+
+let passkey_tests =
+  group "Passkeys"
+    [ test "rp checks the RP ID and the origins" (fun () ->
+          let ok id origins = ignore (Pk.rp ~id ~name:"n" ~origins : Pk.rp) in
+          let at id = ["https://" ^ id] in
+          let long n =
+            String.concat "."
+              [ String.make 63 'a'
+              ; String.make 63 'a'
+              ; String.make 63 'a'
+              ; String.make n 'a' ]
+          in
+          ok "example.com"
+            ["https://example.com"; "https://login.example.com:8443"] ;
+          ok "login.example.com" ["https://login.example.com:9999"] ;
+          ok "localhost"
+            ["http://localhost"; "http://localhost:5000"; "https://localhost"] ;
+          ok "a-1.example"
+            ["https://a-1.example:1"; "https://x.a-1.example:65535"] ;
+          (* The bounds of the characters and of the lengths. *)
+          List.iter
+            (fun id -> ok id (at id))
+            [ "a.za"
+            ; "z09.az"
+            ; "x.9a"
+            ; "x.9z"
+            ; String.make 63 'a' ^ ".com"
+            ; long 61 ] ;
+          List.iter
+            (fun (label, id, origins) ->
+              raises_match ~msg:label
+                (function
+                  | Invalid_argument m ->
+                      String.starts_with ~prefix:"Caravan_auth.Passkey.rp: " m
+                  | _ ->
+                      false )
+                (fun () -> ok id origins) )
+            [ ("uppercase id", "Example.com", at "Example.com")
+            ; ("IP", "127.0.0.1", at "127.0.0.1")
+            ; ("last label of digits", "x.09", at "x.09")
+            ; ("empty label", "example..com", at "example..com")
+            ; ("dash", "-example.com", at "-example.com")
+            ; ("dash at the end", "example-.com", at "example-.com")
+            ; ( "long label"
+              , String.make 64 'a' ^ ".com"
+              , at (String.make 64 'a' ^ ".com") )
+            ; ("long id", long 62, at (long 62))
+            ; ("underscore", "a_b.com", at "a_b.com")
+            ; ("slash", "a/b.com", at "a/b.com")
+            ; ("brace", "a{b.com", at "a{b.com")
+            ; ("no origin", "example.com", [])
+            ; ("http", "example.com", ["http://example.com"])
+            ; (":443", "example.com", ["https://example.com:443"])
+            ; ("path", "example.com", ["https://example.com/"])
+            ; ("uppercase origin", "example.com", ["https://Example.com"])
+            ; ("evilexample", "example.com", ["https://evilexample.com"])
+            ; ("other domain", "example.com", ["https://example.org"])
+            ; ("port 0", "example.com", ["https://example.com:0"])
+            ; ("port 65536", "example.com", ["https://example.com:65536"])
+            ; ("port 08443", "example.com", ["https://example.com:08443"])
+            ; ("port 123456", "example.com", ["https://example.com:123456"])
+            ; ("port with a letter", "example.com", ["https://example.com:8a43"])
+            ; ("port with a colon", "example.com", ["https://example.com:8:4"])
+            ; ("empty port", "example.com", ["https://example.com:"])
+            ; ( "localhost for an other id"
+              , "example.com"
+              , ["http://localhost:5000"] )
+            ; ("http://localhost:80", "localhost", ["http://localhost:80"])
+            ; ("http other host", "localhost", ["http://example.localhost"])
+            ; ("ftp", "example.com", ["ftp://example.com"]) ] ;
+          raises_match
+            (function
+              | Invalid_argument m ->
+                  String.starts_with ~prefix:"Caravan_auth.Passkey.rp: " m
+              | _ ->
+                  false )
+            (fun () ->
+              ignore (Pk.rp ~id:"example.com" ~name:"" ~origins:[pk_origin]) ) )
+    ; test "rp: the message of a bad RP ID" (fun () ->
+          raises
+            (Invalid_argument
+               "Caravan_auth.Passkey.rp: the RP ID is not a lowercase domain" )
+            (fun () ->
+              ignore
+                (Pk.rp ~id:"Example.com" ~name:"n"
+                   ~origins:["https://Example.com"] ) ) )
+    ; test "the options" (fun () ->
+          with_pk (fun t ->
+              let o = call t.app t.jar "/reg-options?user=user-1" in
+              is_true ~msg:o
+                (contains o
+                   {|"rp":{"id":"example.com","name":"Example"},"user":{"id":"dXNlci0x","name":"ada","displayName":"Ada"}|} ) ;
+              equal int 43 (String.length (json_string "challenge" o)) ;
+              List.iter
+                (fun part -> is_true ~msg:part (contains o part))
+                [ {|"pubKeyCredParams":[{"type":"public-key","alg":-8},{"type":"public-key","alg":-7},{"type":"public-key","alg":-257}]|}
+                ; {|"timeout":300000|}
+                ; {|"excludeCredentials":[]|}
+                ; {|"authenticatorSelection":{"residentKey":"required","userVerification":"preferred","requireResidentKey":true}|}
+                ; {|"attestation":"none"|} ] ;
+              (* The bounds of the user ID and of the timeout. *)
+              ignore
+                (json_string "challenge"
+                   (call t.app t.jar "/reg-options?user=u") ) ;
+              ignore
+                (json_string "challenge"
+                   (call t.app t.jar
+                      ("/reg-options?user=" ^ String.make 64 'u') ) ) ;
+              List.iter
+                (fun s ->
+                  is_true ~msg:s
+                    (contains
+                       (call t.app t.jar ("/req-options?timeout=" ^ s))
+                       ({|"timeout":|} ^ s ^ "000") ) )
+                ["30"; "600"] ;
+              let o = call t.app t.jar "/req-options?uv=required" in
+              equal int 43 (String.length (json_string "challenge" o)) ;
+              List.iter
+                (fun part -> is_true ~msg:part (contains o part))
+                [ {|"rpId":"example.com"|}
+                ; {|"allowCredentials":[]|}
+                ; {|"userVerification":"required"|}
+                ; {|"timeout":300000|} ] ) )
+    ; test "a registration and sign-ins with each algorithm" (fun () ->
+          List.iter
+            (fun soft ->
+              with_pk (fun t ->
+                  equal string ~msg:soft.cred
+                    "ok 0 user-1 false false false internal"
+                    (register_with t ~soft (registration ~flags:0x41 ())) ;
+                  equal string "ok user-1 1 false false false"
+                    (sign_in_with t ~soft (assertion ~count:1 ())) ;
+                  equal string "ok user-1 2 true false false"
+                    (sign_in_with t ~soft (assertion ~flags:0x05 ~count:2 ())) ) )
+            [soft_es; soft_ed; soft_rs] )
+    ; test "a challenge works one time, and a failure uses it up" (fun () ->
+          with_pk (fun t ->
+              let challenge = reg_challenge t in
+              let r = registration () soft_es ~challenge in
+              equal string "ok 0 user-1 true false false internal"
+                (post t.app t.jar "/register" r) ;
+              equal string "No_ceremony" (post t.app t.jar "/register" r) ;
+              let challenge = reg_challenge t in
+              equal string {|Bad_origin "https://evil.example"|}
+                (post t.app t.jar "/register"
+                   (registration ~origin:"https://evil.example" () soft_ed
+                      ~challenge ) ) ;
+              equal string "No_ceremony"
+                (post t.app t.jar "/register"
+                   (registration () soft_ed ~challenge) ) ) )
+    ; test "a challenge expires" (fun () ->
+          with_pk (fun t ->
+              let challenge = reg_challenge t in
+              Time.sleep Mono (Span.s 300) ;
+              equal string "Expired"
+                (post t.app t.jar "/register"
+                   (registration () soft_es ~challenge) ) ) )
+    ; test "the session keeps 4 ceremonies" (fun () ->
+          with_pk (fun t ->
+              let cs = List.init 5 (fun _ -> reg_challenge t) in
+              equal string "No_ceremony"
+                (post t.app t.jar "/register"
+                   (registration () soft_es ~challenge:(List.nth cs 0)) ) ;
+              equal string "ok 0 user-1 true false false internal"
+                (post t.app t.jar "/register"
+                   (registration () soft_es ~challenge:(List.nth cs 1)) ) ) )
+    ; test "registration checks" (fun () ->
+          with_pk (fun t ->
+              List.iter
+                (fun (label, build, expected) ->
+                  equal string ~msg:label expected (register_with t build) )
+                [ ( "type"
+                  , registration ~typ:"webauthn.get" ()
+                  , {|Bad_response "the client data type is webauthn.get"|} )
+                ; ( "crossOrigin"
+                  , registration ~extra:{|,"crossOrigin":true|} ()
+                  , {|Bad_response "crossOrigin is not false"|} )
+                ; ( "crossOrigin text"
+                  , registration ~extra:{|,"crossOrigin":"false"|} ()
+                  , {|Bad_response "crossOrigin is not false"|} )
+                ; ( "topOrigin"
+                  , registration ~extra:{|,"topOrigin":"https://example.com"|}
+                      ()
+                  , {|Bad_response "the client data has a topOrigin"|} )
+                ; ("RP ID", registration ~rp:"example.org" (), "Bad_rp_id")
+                ; ("UP", registration ~flags:0x44 (), "Not_present")
+                ; ( "id and rawId"
+                  , registration ~id:"other" ()
+                  , {|Bad_response "id and rawId are different"|} )
+                ; ( "id of the data"
+                  , registration ~id:"other" ~raw:"other" ()
+                  , {|Bad_response "the credential ID is not that of the response"|}
+                  )
+                ; ( "none with a statement"
+                  , registration ~stmt:(`Map [(`Text "x", `Int 1)]) ()
+                  , {|Bad_response "a none attestation with a statement"|} )
+                ; ( "fmt not a text"
+                  , registration ~fmt:(`Int 1) ()
+                  , {|Bad_response "no fmt text or no attStmt map"|} )
+                ; ( "alg -9"
+                  , registration ~cose:(cose_ec ~alg:(-9) ()) ()
+                  , {|Unsupported "an alg that the options did not ask"|} )
+                ; ( "bad key"
+                  , registration ~cose:(cose_ec ~crv:2 ()) ()
+                  , {|Unsupported "a curve that is not P-256"|} )
+                ; ( "transports"
+                  , registration
+                      ~transports:{|["a","b","c","d","e","f","g","h","i"]|} ()
+                  , {|Bad_response "bad transports"|} )
+                ; ( "transport too long"
+                  , registration
+                      ~transports:(Printf.sprintf "[%S]" (String.make 33 't'))
+                      ()
+                  , {|Bad_response "bad transports"|} )
+                ; ( "no AT"
+                  , registration
+                      ~data:(auth_data ~rp:(sha256 pk_rp_id) ~flags:0x05 "")
+                      ()
+                  , {|Bad_response "no attested credential data"|} )
+                ; ( "attestation not a map"
+                  , registration ~att:(cbor (`Array [])) ()
+                  , {|Bad_response "the attestation object is not a map"|} )
+                ; ( "attestation not CBOR"
+                  , registration ~att:"\x9f" ()
+                  , {|Bad_response "the attestation object: an indefinite length"|}
+                  )
+                ; ( "no authData"
+                  , registration
+                      ~att:
+                        (cbor
+                           (`Map
+                              [ (`Text "fmt", `Text "none")
+                              ; (`Text "attStmt", `Map []) ] ) )
+                      ()
+                  , {|Bad_response "no authData"|} )
+                ; ( "transports not a list"
+                  , registration ~transports:{|"usb"|} ()
+                  , {|Bad_response "bad transports"|} )
+                ; ( "packed is not verified"
+                  , registration ~fmt:(`Text "packed")
+                      ~stmt:(`Map [(`Text "alg", `Int (-7))])
+                      ()
+                  , "ok 0 user-1 true false false internal" ) ] ;
+              (* 8 transports of 32 bytes. *)
+              let eight =
+                "["
+                ^ String.concat ","
+                    (List.init 8 (fun i ->
+                         Printf.sprintf "%S"
+                           (String.make 31 't' ^ string_of_int i) ) )
+                ^ "]"
+              in
+              is_true
+                (String.starts_with ~prefix:"ok "
+                   (register_with t ~soft:soft_rs
+                      (registration ~transports:eight ()) ) ) ;
+              (* A registered ID. *)
+              equal string "ok 0 user-1 true false false internal"
+                (register_with t ~soft:soft_ed (registration ())) ;
+              equal string "Registered"
+                (register_with t ~soft:soft_ed (registration ())) ;
+              equal string "Not_verified"
+                (register_with t ~uv:"&uv=required"
+                   (registration ~flags:0x41 ()) ) ) )
+    ; test "bad JSON" (fun () ->
+          with_pk (fun t ->
+              ignore (reg_challenge t) ;
+              List.iter
+                (fun (body, expected) ->
+                  equal string ~msg:body expected
+                    (post t.app t.jar "/register" body) )
+                [ ("x", {|Bad_response "not JSON"|})
+                ; ("[]", {|Bad_response "the credential is not an object"|})
+                ; ({|{"id":"!"}|}, {|Bad_response "id is not base64url"|})
+                ; ( {|{"id":"YQ","rawId":"YQ","type":"x"}|}
+                  , {|Bad_response "the type is not public-key"|} )
+                ; ( {|{"id":"YQ","rawId":"YQ","type":"public-key"}|}
+                  , {|Bad_response "no response"|} )
+                ; ( {|{"id":"YQ","rawId":"YQ","type":"public-key","response":{"clientDataJSON":"eA"}}|}
+                  , {|Bad_response "clientDataJSON: not JSON"|} )
+                ; ( String.make 65537 ' '
+                  , {|Bad_response "the response is too large"|} )
+                ; ( "[]" ^ String.make 65534 ' '
+                  , {|Bad_response "the credential is not an object"|} ) ] ) )
+    ; test "sign-in checks" (fun () ->
+          with_pk (fun t ->
+              ignore (register_with t (registration ())) ;
+              List.iter
+                (fun (label, query, build, expected) ->
+                  equal string ~msg:label expected (sign_in_with t ~query build) )
+                [ ( "signature"
+                  , ""
+                  , assertion ~sign:(fun _ -> der_of_rs "\x01" "\x01") ()
+                  , "Bad_signature" )
+                ; ("RP ID", "", assertion ~rp:"example.org" (), "Bad_rp_id")
+                ; ("UP", "", assertion ~flags:0x00 (), "Not_present")
+                ; ("UV", "?uv=required", assertion (), "Not_verified")
+                ; ( "type"
+                  , ""
+                  , assertion ~typ:"webauthn.create" ()
+                  , {|Bad_response "the client data type is webauthn.create"|}
+                  )
+                ; ("BE", "", assertion ~flags:0x09 (), "Bad_backup")
+                ; ( "tampered user handle"
+                  , ""
+                  , assertion ~user:(Some "user-2") ()
+                  , "Wrong_user" )
+                ; ( "no user handle, discoverable"
+                  , ""
+                  , assertion ~user:None ()
+                  , {|Bad_response "no userHandle for a discoverable credential"|}
+                  )
+                ; ( "no user handle, known user"
+                  , "?user=user-1"
+                  , assertion ~user:None ()
+                  , "ok user-1 0 false false false" )
+                ; ( "userHandle not base64url"
+                  , ""
+                  , assertion ~handle_json:{|,"userHandle":"!"|} ()
+                  , {|Bad_response "userHandle is not base64url"|} )
+                ; ( "userHandle not a string"
+                  , ""
+                  , assertion ~handle_json:{|,"userHandle":1|} ()
+                  , {|Bad_response "userHandle is not a string"|} )
+                ; ( "userHandle null, discoverable"
+                  , ""
+                  , assertion ~handle_json:{|,"userHandle":null|} ()
+                  , {|Bad_response "no userHandle for a discoverable credential"|}
+                  )
+                ; ( "userHandle null, known user"
+                  , "?user=user-1"
+                  , assertion ~handle_json:{|,"userHandle":null|} ()
+                  , "ok user-1 0 false false false" )
+                ; ("an other user", "?user=user-2", assertion (), "Wrong_user")
+                ] ;
+              equal string "Unknown_credential"
+                (sign_in_with t ~soft:soft_ed (assertion ())) ) )
+    ; test "a response needs a ceremony of its kind" (fun () ->
+          with_pk (fun t ->
+              ignore (register_with t (registration ())) ;
+              (* A get response with the challenge of a creation. *)
+              equal string "No_ceremony"
+                (post t.app t.jar "/authenticate"
+                   (assertion () soft_es ~challenge:(reg_challenge t)) ) ;
+              (* A create response with the challenge of a sign-in. *)
+              equal string "No_ceremony"
+                (post t.app t.jar "/register"
+                   (registration () soft_ed ~challenge:(req_challenge t)) ) ) )
+    ; test "exclude and allow go to the browser" (fun () ->
+          with_pk (fun t ->
+              let item = {|[{"type":"public-key","id":"aWQ"}]|} in
+              is_true
+                (contains
+                   (call t.app t.jar "/reg-options?user=u&exclude=id")
+                   ({|"excludeCredentials":|} ^ item) ) ;
+              is_true
+                (contains
+                   (call t.app t.jar "/req-options?user=u&allow=id")
+                   ({|"allowCredentials":|} ^ item) ) ) )
+    ; test "allow needs a user" (fun () ->
+          let rp = Pk.rp ~id:pk_rp_id ~name:"E" ~origins:[pk_origin] in
+          raises_match
+            (function
+              | Invalid_argument m ->
+                  String.starts_with
+                    ~prefix:"Caravan_auth.Passkey.request_options: allow" m
+              | _ ->
+                  false )
+            (fun () ->
+              ignore
+                (Pk.request_options ~allow:["id"] rp
+                   (Caravan.Request.make Caravan.Method.GET "/") ) ) )
+    ; test "the counter and cloned" (fun () ->
+          let run ~stored ~next =
+            with_pk (fun t ->
+                ignore (register_with t (registration ~count:stored ())) ;
+                sign_in_with t (assertion ~count:next ()) )
+          in
+          equal string "ok user-1 0 false false false" (run ~stored:0 ~next:0) ;
+          equal string "ok user-1 5 false false true" (run ~stored:5 ~next:0) ;
+          equal string "ok user-1 5 false false true" (run ~stored:5 ~next:5) ;
+          equal string "ok user-1 6 false false false" (run ~stored:5 ~next:6) )
+    ; test "backup flags" (fun () ->
+          with_pk (fun t ->
+              equal string "ok 0 user-1 true true true internal"
+                (register_with t (registration ~flags:0x5D ())) ;
+              equal string "ok user-1 0 false true false"
+                (sign_in_with t (assertion ~flags:0x19 ())) ;
+              equal string "Bad_backup"
+                (sign_in_with t (assertion ~flags:0x01 ())) ) )
+    ; test "the vectors of py_webauthn" (fun () ->
+          (* From the tests of py_webauthn (Duo Security, BSD-3-Clause):
+             responses of real authenticators, for the RP ID localhost and the
+             origin http://localhost:5000. *)
+          let rp =
+            Pk.rp ~id:"localhost" ~name:"L" ~origins:["http://localhost:5000"]
+          in
+          let inject t ~kind ~challenge ?(uv = false) ?user () =
+            ignore
+              (call t.app t.jar
+                 ( "/inject?"
+                 ^ Caravan.Form.encode
+                     ( [ ("kind", kind)
+                       ; ("challenge", challenge)
+                       ; ("uv", if uv then "1" else "0") ]
+                     @ match user with Some u -> [("user", u)] | None -> [] ) ) )
+          in
+          (* A registration with the attestation none. *)
+          with_pk ~rp (fun t ->
+              inject t ~kind:"create" ~user:"user-1"
+                ~challenge:
+                  "TwN7n4WTyGKLc4ZY-qGsFqKnHM4nglqsyV0ICJlN2TO9XiRyFtrkaDwUvsql-gkLJXP6fnF1MlrZ53Mm4R7Cvw"
+                () ;
+              (* The transports of this response are not in [response]: an old
+                 form. *)
+              equal string "ok 23 user-1 true false false "
+                (post t.app t.jar "/register"
+                   {|{"id":"9y1xA8Tmg1FEmT-c7_fvWZ_uoTuoih3OvR45_oAK-cwHWhAbXrl2q62iLVTjiyEZ7O7n-CROOY494k7Q3xrs_w","rawId":"9y1xA8Tmg1FEmT-c7_fvWZ_uoTuoih3OvR45_oAK-cwHWhAbXrl2q62iLVTjiyEZ7O7n-CROOY494k7Q3xrs_w","response":{"attestationObject":"o2NmbXRkbm9uZWdhdHRTdG10oGhhdXRoRGF0YVjESZYN5YgOjGh0NBcPZHZgW4_krrmihjLHmVzzuoMdl2NFAAAAFwAAAAAAAAAAAAAAAAAAAAAAQPctcQPE5oNRRJk_nO_371mf7qE7qIodzr0eOf6ACvnMB1oQG165dqutoi1U44shGezu5_gkTjmOPeJO0N8a7P-lAQIDJiABIVggSFbUJF-42Ug3pdM8rDRFu_N5oiVEysPDB6n66r_7dZAiWCDUVnB39FlGypL-qAoIO9xWHtJygo2jfDmHl-_eKFRLDA","clientDataJSON":"eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiVHdON240V1R5R0tMYzRaWS1xR3NGcUtuSE00bmdscXN5VjBJQ0psTjJUTzlYaVJ5RnRya2FEd1V2c3FsLWdrTEpYUDZmbkYxTWxyWjUzTW00UjdDdnciLCJvcmlnaW4iOiJodHRwOi8vbG9jYWxob3N0OjUwMDAiLCJjcm9zc09yaWdpbiI6ZmFsc2V9"},"type":"public-key","clientExtensionResults":{},"transports":["nfc","usb"]}|} ) ;
+              match
+                Hashtbl.find_opt t.store
+                  (unb64
+                     "9y1xA8Tmg1FEmT-c7_fvWZ_uoTuoih3OvR45_oAK-cwHWhAbXrl2q62iLVTjiyEZ7O7n-CROOY494k7Q3xrs_w" )
+              with
+              | Some st ->
+                  equal string
+                    "pQECAyYgASFYIEhW1CRfuNlIN6XTPKw0RbvzeaIlRMrDwwep-uq_-3WQIlgg1FZwd_RZRsqS_qgKCDvcVh7ScoKNo3w5h5fv3ihUSww"
+                    (b64u st.public_key)
+              | None ->
+                  fail "stored" ) ;
+          (* Sign-ins: ES256, RSA (with a user handle and UV), Ed25519. *)
+          let sign_in ~id ~key ~count ~handle ?user ?(uv = false) ~challenge
+              body =
+            with_pk ~rp (fun t ->
+                Hashtbl.replace t.store (unb64 id)
+                  { Pk.public_key= unb64 key
+                  ; sign_count= count
+                  ; user_handle= handle
+                  ; backup_eligible= false } ;
+                inject t ~kind:"get" ~challenge ~uv ?user () ;
+                post t.app t.jar "/authenticate" body )
+          in
+          equal string "ok user-1 78 false false false"
+            (sign_in
+               ~id:
+                 "EDx9FfAbp4obx6oll2oC4-CZuDidRVV4gZhxC529ytlnqHyqCStDUwfNdm1SNHAe3X5KvueWQdAX3x9R1a2b9Q"
+               ~key:
+                 "pQECAyYgASFYIIeDTe-gN8A-zQclHoRnGFWN8ehM1b7yAsa8I8KIvmplIlgg4nFGT5px8o6gpPZZhO01wdy9crDSA_Ngtkx0vGpvPHI"
+               ~count:77 ~handle:"user-1" ~user:"user-1"
+               ~challenge:
+                 "xi30GPGAFYRxVDpY1sM10DaLzVQG66nv-_7RUazH0vI2YvG8LYgDEnvN5fZZNVuvEDuMi9te3VLqb42N0fkLGA"
+               {|{"id":"EDx9FfAbp4obx6oll2oC4-CZuDidRVV4gZhxC529ytlnqHyqCStDUwfNdm1SNHAe3X5KvueWQdAX3x9R1a2b9Q","rawId":"EDx9FfAbp4obx6oll2oC4-CZuDidRVV4gZhxC529ytlnqHyqCStDUwfNdm1SNHAe3X5KvueWQdAX3x9R1a2b9Q","response":{"authenticatorData":"SZYN5YgOjGh0NBcPZHZgW4_krrmihjLHmVzzuoMdl2MBAAAATg","clientDataJSON":"eyJjaGFsbGVuZ2UiOiJ4aTMwR1BHQUZZUnhWRHBZMXNNMTBEYUx6VlFHNjZudi1fN1JVYXpIMHZJMll2RzhMWWdERW52TjVmWlpOVnV2RUR1TWk5dGUzVkxxYjQyTjBma0xHQSIsImNsaWVudEV4dGVuc2lvbnMiOnt9LCJoYXNoQWxnb3JpdGhtIjoiU0hBLTI1NiIsIm9yaWdpbiI6Imh0dHA6Ly9sb2NhbGhvc3Q6NTAwMCIsInR5cGUiOiJ3ZWJhdXRobi5nZXQifQ","signature":"MEUCIGisVZOBapCWbnJJvjelIzwpixxIwkjCCb5aCHafQu68AiEA88v-2pJNNApPFwAKFiNuf82-2hBxYW5kGwVweeoxCwo"},"type":"public-key","clientExtensionResults":{}}|} ) ;
+          let rsa_handle =
+            unb64
+              "T1RWa1l6VXdPRFV0WW1NNVlTMDBOVEkxTFRnd056Z3RabVZpWVdZNFpEVm1ZMk5p"
+          in
+          equal string
+            (Printf.sprintf "ok %s 1 true false false" rsa_handle)
+            (sign_in ~id:"ZoIKP1JQvKdrYj1bTUPJ2eTUsbLeFkv-X5xJQNr4k6s"
+               ~key:
+                 "pAEDAzkBACBZAQDfV20epzvQP-HtcdDpX-cGzdOxy73WQEvsU7Dnr9UWJophEfpngouvgnRLXaEUn_d8HGkp_HIx8rrpkx4BVs6X_B6ZjhLlezjIdJbLbVeb92BaEsmNn1HW2N9Xj2QM8cH-yx28_vCjf82ahQ9gyAr552Bn96G22n8jqFRQKdVpO-f-bvpvaP3IQ9F5LCX7CUaxptgbog1SFO6FI6ob5SlVVB00lVXsaYg8cIDZxCkkENkGiFPgwEaZ7995SCbiyCpUJbMqToLMgojPkAhWeyktu7TlK6UBWdJMHc3FPAIs0lH_2_2hKS-mGI1uZAFVAfW1X-mzKL0czUm2P1UlUox7IUMBAAE"
+               ~count:0 ~handle:rsa_handle ~uv:true
+               ~challenge:
+                 "iPmAi1Pp1XL6oAgq3PWZtZPnZa1zFUDoGbaQ0_KvVG1lF2s3Rt_3o4uSzccy0tmcTIpTTT4BU1T-I4maavndjQ"
+               {|{"id":"ZoIKP1JQvKdrYj1bTUPJ2eTUsbLeFkv-X5xJQNr4k6s","rawId":"ZoIKP1JQvKdrYj1bTUPJ2eTUsbLeFkv-X5xJQNr4k6s","response":{"authenticatorData":"SZYN5YgOjGh0NBcPZHZgW4_krrmihjLHmVzzuoMdl2MFAAAAAQ","clientDataJSON":"eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoiaVBtQWkxUHAxWEw2b0FncTNQV1p0WlBuWmExekZVRG9HYmFRMF9LdlZHMWxGMnMzUnRfM280dVN6Y2N5MHRtY1RJcFRUVDRCVTFULUk0bWFhdm5kalEiLCJvcmlnaW4iOiJodHRwOi8vbG9jYWxob3N0OjUwMDAiLCJjcm9zc09yaWdpbiI6ZmFsc2V9","signature":"iOHKX3erU5_OYP_r_9HLZ-CexCE4bQRrxM8WmuoKTDdhAnZSeTP0sjECjvjfeS8MJzN1ArmvV0H0C3yy_FdRFfcpUPZzdZ7bBcmPh1XPdxRwY747OrIzcTLTFQUPdn1U-izCZtP_78VGw9pCpdMsv4CUzZdJbEcRtQuRS03qUjqDaovoJhOqEBmxJn9Wu8tBi_Qx7A33RbYjlfyLm_EDqimzDZhyietyop6XUcpKarKqVH0M6mMrM5zTjp8xf3W7odFCadXEJg-ERZqFM0-9Uup6kJNLbr6C5J4NDYmSm3HCSA6lp2iEiMPKU8Ii7QZ61kybXLxsX4w4Dm3fOLjmDw","userHandle":"T1RWa1l6VXdPRFV0WW1NNVlTMDBOVEkxTFRnd056Z3RabVZpWVdZNFpEVm1ZMk5p"},"type":"public-key","clientExtensionResults":{}}|} ) ;
+          equal string "ok user-1 7 false false false"
+            (sign_in
+               ~id:
+                 "fq9Nj0nS24B5y6Pkw_h3-9GEAEA3-0LBPxE2zvTdLjDqtSeCSNYFe9VMRueSpAZxT3YDc6L1lWXdQNwI-sVNYrefEcRR1Nsb_0jpHE955WEtFud2xxZg3MvoLMxHLet63i5tajd1fHtP7I-00D6cehM8ZWlLp2T3s9lfZgVIFcA"
+               ~key:"pAEBAycgBiFYIMz6_SUFLiDid2Yhlq0YboyJ-CDrIrNpkPUGmJp4D3Dp"
+               ~count:3 ~handle:"user-1" ~user:"user-1"
+               ~challenge:
+                 "eZ4eeA3O4jy5FIzqDaSJ6JDNGu0bBc5zI1DjQ_kLso1WNqkG6k5mCYf1dtQhVUiBWZWlZkzR5MFeeWCpJRUNXw"
+               {|{"id":"fq9Nj0nS24B5y6Pkw_h3-9GEAEA3-0LBPxE2zvTdLjDqtSeCSNYFe9VMRueSpAZxT3YDc6L1lWXdQNwI-sVNYrefEcRR1Nsb_0jpHE955WEtFud2xxZg3MvoLMxHLet63i5tajd1fHtP7I-00D6cehM8ZWlLp2T3s9lfZgVIFcA","rawId":"fq9Nj0nS24B5y6Pkw_h3-9GEAEA3-0LBPxE2zvTdLjDqtSeCSNYFe9VMRueSpAZxT3YDc6L1lWXdQNwI-sVNYrefEcRR1Nsb_0jpHE955WEtFud2xxZg3MvoLMxHLet63i5tajd1fHtP7I-00D6cehM8ZWlLp2T3s9lfZgVIFcA","response":{"authenticatorData":"SZYN5YgOjGh0NBcPZHZgW4_krrmihjLHmVzzuoMdl2MBAAAABw","clientDataJSON":"eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoiZVo0ZWVBM080ank1Rkl6cURhU0o2SkROR3UwYkJjNXpJMURqUV9rTHNvMVdOcWtHNms1bUNZZjFkdFFoVlVpQldaV2xaa3pSNU1GZWVXQ3BKUlVOWHciLCJvcmlnaW4iOiJodHRwOi8vbG9jYWxob3N0OjUwMDAiLCJjcm9zc09yaWdpbiI6ZmFsc2V9","signature":"RRWV8mYDRvK7YdQgdtZD4pJ2dh1D_IWZ_D6jsZo6FHJBoenbj0CVT5nA20vUzlRhN4R6dOEUHmUwP1F8eRBhBg"},"type":"public-key","clientExtensionResults":{}}|} ) )
+    ; test "options refuse bad arguments" (fun () ->
+          let rp = Pk.rp ~id:pk_rp_id ~name:"E" ~origins:[pk_origin] in
+          let req = Caravan.Request.make Caravan.Method.GET "/" in
+          List.iter
+            (fun (label, f) ->
+              raises_match ~msg:label
+                (function Invalid_argument _ -> true | _ -> false)
+                (fun () -> ignore (f () : string)) )
+            [ ( "user 0"
+              , fun () ->
+                  Pk.creation_options rp req ~user_id:"" ~user_name:"n"
+                    ~display_name:"d" )
+            ; ( "user 65"
+              , fun () ->
+                  Pk.creation_options rp req ~user_id:(String.make 65 'u')
+                    ~user_name:"n" ~display_name:"d" )
+            ; ( "timeout 29 s"
+              , fun () ->
+                  Pk.creation_options ~timeout:(Span.s 29) rp req ~user_id:"u"
+                    ~user_name:"n" ~display_name:"d" )
+            ; ( "timeout 601 s"
+              , fun () -> Pk.request_options ~timeout:(Span.s 601) rp req ) ] )
+    ; test "pp_error" (fun () ->
+          equal (list string)
+            [ "No_ceremony"
+            ; "Expired"
+            ; {|Bad_response "m"|}
+            ; {|Bad_origin "o"|}
+            ; "Bad_rp_id"
+            ; "Not_present"
+            ; "Not_verified"
+            ; "Registered"
+            ; "Unknown_credential"
+            ; "Wrong_user"
+            ; "Bad_backup"
+            ; "Bad_signature"
+            ; {|Unsupported "u"|} ]
+            (List.map
+               (Format.asprintf "%a" Pk.pp_error)
+               [ Pk.No_ceremony
+               ; Expired
+               ; Bad_response "m"
+               ; Bad_origin "o"
+               ; Bad_rp_id
+               ; Not_present
+               ; Not_verified
+               ; Registered
+               ; Unknown_credential
+               ; Wrong_user
+               ; Bad_backup
+               ; Bad_signature
+               ; Unsupported "u" ] ) ) ]
+
 let () =
   Mirage_crypto_rng.set_default_generator
     (Mirage_crypto_rng.create ~seed:"caravan auth tests"
@@ -4307,4 +5054,5 @@ let () =
        ; oidc_tests
        ; flow_tests
        ; code_tests
-       ; passkey_parser_tests ] )
+       ; passkey_parser_tests
+       ; passkey_tests ] )

@@ -943,6 +943,246 @@ module Code : sig
       @raise Invalid_argument as {!Caravan_session.set}. *)
 end
 
+(** {1:passkey Passkeys}
+
+    Registration and sign-in with passkeys (W3C WebAuthn Level 3, the server
+    part). The server gives the options as JSON, the browser calls
+    [navigator.credentials.create] or [.get], and the server checks the JSON of
+    the response.
+
+    {[
+    // The browser. With a CSRF token on the POST (Caravan_session.Csrf).
+    const options = await (await fetch("/passkey/register-options")).json();
+    const credential = await navigator.credentials.create({
+      publicKey: PublicKeyCredential.parseCreationOptionsFromJSON(options) });
+    await fetch("/passkey/register", { method: "POST",
+      body: JSON.stringify(credential.toJSON()) });
+    ]}
+
+    {[
+    let rp =
+      Caravan_auth.Passkey.rp ~id:"example.com" ~name:"Example"
+        ~origins:["https://example.com"]
+
+    (* GET /passkey/register-options, for a signed-in user. *)
+    let register_options req user =
+      Caravan_auth.Passkey.creation_options rp req ~user_id:user.handle
+        ~user_name:user.email ~display_name:user.name
+        ~exclude:(credential_ids user)
+
+    (* POST /passkey/register, with a body of at most 64 KiB. *)
+    let register req body =
+      match
+        Caravan_auth.Passkey.register rp req ~registered:credential_exists body
+      with
+      | Ok c ->
+          store_credential c.id c.stored
+      | Error e ->
+          refuse e
+
+    (* POST /passkey/sign-in, after request_options. *)
+    let sign_in req body =
+      match
+        Caravan_auth.Passkey.authenticate rp req ~lookup:find_credential body
+      with
+      | Ok a when a.cloned ->
+          refuse_or_warn a
+      | Ok a ->
+          update_sign_count a.credential_id a.sign_count ;
+          Caravan_auth.sign_in req (user_of_handle a.user_handle)
+      | Error e ->
+          refuse e
+    ]}
+
+    - Each ceremony keeps a random challenge of 32 bytes in the session: at most
+      4 at a time (an autofill sign-in and a click can both wait), for the time
+      of [timeout]. When a response has the challenge of a ceremony, the
+      ceremony goes from the session, also when a later check fails. A response
+      with bad JSON, another type, or no challenge does not take a ceremony.
+    - The user handle of a response is not signed. {!authenticate} compares it
+      with the handle of the stored credential, and gives the stored handle:
+      find the user with [assertion.user_handle].
+    - Attestation: the options ask for none, and a statement of another format
+      is not verified. [credential.aaguid] is not verified: do not base a
+      decision on it.
+    - Store the credential ID with a UNIQUE index: [registered] checks it, but
+      two registrations at the same time can both pass.
+    - The RP ID is not checked against the public suffix list.
+    - Read the body of a response with a limit of 64 KiB: [register] and
+      [authenticate] refuse a larger one, but [Caravan.Config.max_body] is 8 MiB
+      by default.
+    - Two requests of one session at the same time can lose a change of the
+      other (the session middleware writes all the data of the session at the
+      end of a request): a response sent two times in parallel can pass two
+      times. Each options call can make a session for an anonymous visitor: put
+      a rate limit on these routes. *)
+module Passkey : sig
+  (** The type for a relying party: its RP ID, name and origins. *)
+  type rp
+
+  val rp : id:string -> name:string -> origins:string list -> rp
+  (** [rp ~id ~name ~origins] is a relying party.
+      - [id] is a domain in lowercase ASCII (labels of letters, digits and
+        ['-'], separated by ['.']), not an IP address, for example
+        ["example.com"] or ["login.example.com"].
+      - Each origin is [https://host] or [https://host:port] (not [:443]), with
+        [host] the RP ID or a subdomain of it, in lowercase, with no path. For
+        development, the RP ID [localhost] also accepts [http://localhost] and
+        [http://localhost:port]. A response must have one of these origins
+        exactly.
+
+      @raise Invalid_argument
+        if [id], [name] or an origin is not correct, or [origins] is empty. *)
+
+  (** A requirement of WebAuthn: of the user verification (a PIN or a biometric
+      check of the authenticator), or of a resident key. *)
+  type requirement = [`Required | `Preferred | `Discouraged]
+
+  val creation_options :
+       ?timeout:Weft.Span.t
+    -> ?verification:requirement
+    -> ?resident_key:requirement
+    -> ?exclude:string list
+    -> rp
+    -> Caravan.Request.t
+    -> user_id:string
+    -> user_name:string
+    -> display_name:string
+    -> string
+  (** [creation_options rp req ~user_id ~user_name ~display_name] is the JSON of
+      [PublicKeyCredentialCreationOptionsJSON], for the registration of a
+      passkey of the user [user_id] (the user handle: 1 to 64 random bytes of
+      the application, with no personal data). It keeps a new ceremony in the
+      session.
+      - The algorithms: EdDSA, ES256 and RS256. The attestation: none.
+      - [resident_key] (default [`Required]: a passkey that the authenticator
+        can find with no user name).
+      - [verification] (default [`Preferred]): with [`Required], a response with
+        no user verification is refused.
+      - [exclude] are the IDs of the credentials of the user: an authenticator
+        does not make a second one.
+      - [timeout] (default 5 min, 30 s to 10 min) is the time of the browser and
+        the life of the challenge.
+
+      @raise Invalid_argument
+        for a bad [timeout] or [user_id], or as {!Caravan_session.set}. *)
+
+  val request_options :
+       ?timeout:Weft.Span.t
+    -> ?verification:requirement
+    -> ?allow:string list
+    -> ?user:string
+    -> rp
+    -> Caravan.Request.t
+    -> string
+  (** [request_options rp req] is the JSON of
+      [PublicKeyCredentialRequestOptionsJSON], for a sign-in. It keeps a new
+      ceremony in the session.
+      - With no [user], any passkey of the RP can sign in (a discoverable
+        credential, also for the autofill of the browser): the response must
+        have a user handle.
+      - With [user] (the user handle of a user that the application knows, for
+        example after a password), only a credential of this user is accepted.
+        [allow] gives the IDs of its credentials to the browser.
+
+      @raise Invalid_argument
+        for a bad [timeout], for [allow] with no [user] (the server checks the
+        user, not the list), or as {!Caravan_session.set}. *)
+
+  (** The part of a credential to store, for a sign-in. *)
+  type stored =
+    { public_key: string  (** The COSE key. *)
+    ; sign_count: int
+    ; user_handle: string
+    ; backup_eligible: bool
+          (** The credential can be in a backup (a synced passkey). *) }
+
+  (** A new credential. *)
+  type credential =
+    { id: string  (** The credential ID: 1 to 1023 bytes. *)
+    ; stored: stored  (** Store it with [id]. *)
+    ; user_verified: bool
+    ; backed_up: bool
+    ; transports: string list
+          (** The transports that the browser told, for the records of the
+              application. *)
+    ; aaguid: string  (** 16 bytes; not verified. *) }
+
+  (** A sign-in. *)
+  type assertion =
+    { credential_id: string
+    ; user_handle: string  (** The stored handle: the user. *)
+    ; sign_count: int
+          (** The larger of the new and the stored counter: store it. *)
+    ; user_verified: bool
+    ; backed_up: bool
+    ; cloned: bool
+          (** The counter did not grow, and one of the two counters is not 0:
+              the authenticator can be a copy (§6.1.1). Passkeys that sync send
+              0 each time: then [false]. The application decides. *) }
+
+  type error =
+    | No_ceremony
+        (** No ceremony of the session has the challenge and the kind of the
+            response. *)
+    | Expired  (** The ceremony is older than its [timeout]. *)
+    | Bad_response of string
+        (** The JSON, the CBOR or a member is not correct. *)
+    | Bad_origin of string
+    | Bad_rp_id  (** The authenticator data is for another RP ID. *)
+    | Not_present  (** The user was not present (the flag UP). *)
+    | Not_verified  (** [`Required] verification, and none. *)
+    | Registered  (** [registered] knows the credential ID. *)
+    | Unknown_credential  (** [lookup] does not know the credential ID. *)
+    | Wrong_user
+        (** The credential is not of the [user] of the options, or the user
+            handle of the response is not the stored one. *)
+    | Bad_backup  (** The flag BE is not that of the registration. *)
+    | Bad_signature
+    | Unsupported of string  (** A key or an alg that caravan does not use. *)
+
+  val pp_error : Format.formatter -> error -> unit
+
+  val register :
+       rp
+    -> Caravan.Request.t
+    -> registered:(string -> bool)
+    -> string
+    -> (credential, error) result
+  (** [register rp req ~registered text] checks the JSON of
+      [credential.toJSON()] of [create] (WebAuthn §7.1):
+      - At most 64 KiB, [id] equal to [rawId].
+      - The client data: the type [webauthn.create], the challenge of a ceremony
+        of {!creation_options}, one of the origins, [crossOrigin] absent or
+        false, and no [topOrigin].
+      - The attestation object: [none] with no statement, or another format (not
+        verified).
+      - The authenticator data: the RP ID hash, the flag UP, the flag UV if the
+        verification was required, the attested credential data with the ID of
+        the response, a key of the asked algorithms.
+      - [registered id = false]. *)
+
+  val authenticate :
+       rp
+    -> Caravan.Request.t
+    -> lookup:(string -> stored option)
+    -> string
+    -> (assertion, error) result
+  (** [authenticate rp req ~lookup text] checks the JSON of
+      [credential.toJSON()] of [get] (WebAuthn §7.2):
+      - At most 64 KiB, [id] equal to [rawId].
+      - The client data: the type [webauthn.get], the challenge of a ceremony of
+        {!request_options}, one of the origins, [crossOrigin] absent or false,
+        and no [topOrigin].
+      - The credential [lookup id], of the [user] of the options if there is
+        one. The user handle of the response, if there, must be its stored
+        handle; it must be there with no [user].
+      - The authenticator data: the RP ID hash, the flags UP, UV (if required)
+        and BE.
+      - The signature of the authenticator data and of the hash of the client
+        data, with the stored key. *)
+end
+
 (**/**)
 
 (** Internal: for the tests. *)
@@ -953,4 +1193,13 @@ module Private : sig
   val key_of_cose : string -> (Jwt.Key.t * int, string) result
 
   val verify : Jwt.Key.t -> data:string -> signature:string -> bool
+
+  val passkey_ceremony :
+       Caravan.Request.t
+    -> create:bool
+    -> challenge:string
+    -> uv:bool
+    -> ?user:string
+    -> unit
+    -> unit
 end

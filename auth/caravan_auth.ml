@@ -9,6 +9,55 @@ let sha256 s = Digestif.SHA256.(to_raw_string (digest_string s))
 (* The posix time in seconds: a session can outlive a process. *)
 let now_s () = int_of_float (Weft.Time.posix_to_unix_s (Weft.Time.now Posix))
 
+let seconds span =
+  Int64.to_int (Int64.div (Weft.Span.to_ns span) 1_000_000_000L)
+
+(* The pending ceremonies of a session (the logins of [Oidc], the challenges of
+   [Passkey]): at most [max], the newest first, in one value of the session,
+   with ',' between them. The encoding of a ceremony has no ','. *)
+module Pending = struct
+  let max = 4
+
+  type 'a t =
+    { key: string
+    ; encode: 'a -> string
+    ; decode: string -> 'a option
+    ; expires: 'a -> int  (** Posix seconds. *) }
+
+  let load t req =
+    match Caravan_session.Private.find t.key req with
+    | Some v ->
+        List.filter_map t.decode (String.split_on_char ',' v)
+    | None ->
+        []
+
+  let save t req = function
+    | [] ->
+        Caravan_session.Private.remove t.key req
+    | l ->
+        Caravan_session.Private.set t.key
+          (String.concat "," (List.map t.encode l))
+          req
+
+  let live t now = List.filter (fun p -> now < t.expires p)
+
+  (* [add t req p] keeps [p] and the newest ceremonies that did not expire. *)
+  let add t req p =
+    let now = now_s () in
+    save t req (List.take max (p :: live t now (load t req)))
+
+  (* [take t req mine] is the ceremony that [mine] finds. It goes from the
+     session at once (one use), with the expired ones. *)
+  let take t req mine =
+    let now = now_s () in
+    match List.partition mine (load t req) with
+    | [], _ ->
+        Error `None
+    | p :: _, rest ->
+        save t req (live t now rest) ;
+        if now < t.expires p then Ok p else Error `Expired
+end
+
 (* [string_list l] is the strings of [l], if each element is a string. *)
 let string_list l =
   let s = List.filter_map (function `String s -> Some s | _ -> None) l in
@@ -1609,27 +1658,13 @@ module Oidc = struct
     | _ ->
         None
 
-  (* The pending logins of the session that did not expire. *)
-  let pendings req ~now =
-    match Caravan_session.Private.find key req with
-    | Some v ->
-        List.filter
-          (fun p -> now < p.expires)
-          (List.filter_map decode_pending (String.split_on_char ',' v))
-    | None ->
-        []
+  let pending =
+    { Pending.key
+    ; encode= encode_pending
+    ; decode= decode_pending
+    ; expires= (fun p -> p.expires) }
 
-  let save req = function
-    | [] ->
-        Caravan_session.Private.remove key req
-    | l ->
-        Caravan_session.Private.set key
-          (String.concat "," (List.map encode_pending l))
-          req
-
-  (* The most pending logins of a session, and the longest return path. *)
-  let max_pending = 4
-
+  (* The longest return path. *)
   let max_return = 1024
 
   let random () = b64_encode (Mirage_crypto_rng.generate 32)
@@ -1658,7 +1693,7 @@ module Oidc = struct
       ; verifier= random ()
       ; return }
     in
-    save req (List.take max_pending (p :: pendings req ~now)) ;
+    Pending.add pending req p ;
     let challenge = b64_encode (sha256 p.verifier) in
     let params =
       [ ("response_type", "code")
@@ -1816,22 +1851,13 @@ module Oidc = struct
         let mine p =
           p.issuer = issuer && p.client_id = c.id && Eqaf.equal p.state state
         in
-        let now = now_s () in
-        (* Read all the logins, also the expired ones: an expired login of the
-           state gives [Expired]. *)
-        let all =
-          match Caravan_session.Private.find key req with
-          | Some v ->
-              List.filter_map decode_pending (String.split_on_char ',' v)
-          | None ->
-              []
-        in
-        match List.partition mine all with
-        | [], _ ->
+        match Pending.take pending req mine with
+        | Ok p ->
+            Ok p
+        | Error `None ->
             Error No_login
-        | p :: _, rest ->
-            save req (List.filter (fun q -> now < q.expires) rest) ;
-            if now < p.expires then Ok p else Error Expired )
+        | Error `Expired ->
+            Error Expired )
 
   (* The checks of a callback, after the login: RFC 9207 §2.4 (iss), the error
      of the provider, the code, the token request, the ID token. *)
@@ -1906,8 +1932,6 @@ module Code = struct
     ; checks: string -> Span.t option }
 
   let b64 = b64_encode
-
-  let seconds span = Int64.to_int (Int64.div (Span.to_ns span) 1_000_000_000L)
 
   let make ?(purpose = "sign-in") ?(digits = 8) ?(ttl = Span.s 600)
       ?(attempts = 5) ?sends ?checks () =
@@ -2099,9 +2123,11 @@ module Passkey_key = struct
   (* [of_cose bytes] is the key of the COSE key [bytes] (a point on P-256, an
      Ed25519 key, or an RSA key that [Jwt.Key.rsa_ok] accepts) and its COSE
      alg. *)
-  let of_cose bytes =
+  let rec of_cose bytes = Result.bind (Cbor.decode_all bytes) of_cbor
+
+  (* [of_cbor c] is [of_cose] of the decoded COSE key [c]. *)
+  and of_cbor c =
     let ( let* ) = Result.bind in
-    let* c = Cbor.decode_all bytes in
     let* cose = Webauthn.cose_key c in
     let* material, alg =
       match cose with
@@ -2145,6 +2171,552 @@ module Passkey_key = struct
         Jwt.signs key data (lazy (sha256 data)) signature
 end
 
+module Passkey = struct
+  open Weft
+
+  type rp = {id: string; name: string; origins: string list; id_hash: string}
+
+  (* An RP ID: lowercase ASCII labels of letters, digits and '-', separated by
+     '.'; the last label has a letter (no IP address). *)
+  let good_id id =
+    let labels = String.split_on_char '.' id in
+    let good_label l =
+      let n = String.length l in
+      n >= 1 && n <= 63
+      && l.[0] <> '-'
+      && l.[n - 1] <> '-'
+      && String.for_all
+           (fun c -> (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c = '-')
+           l
+    in
+    String.length id <= 253
+    && List.for_all good_label labels
+    && String.exists
+         (fun c -> c >= 'a' && c <= 'z')
+         (List.nth labels (List.length labels - 1))
+
+  (* [host_port s] is the host and the port of [host[:port]]; the port must be 1
+     to 65535, with no leading zero. *)
+  let host_port s =
+    match String.index_opt s ':' with
+    | None ->
+        Some (s, None)
+    | Some i ->
+        let p = String.sub s (i + 1) (String.length s - i - 1) in
+        let ok =
+          p <> ""
+          && p.[0] <> '0'
+          (* No overflow of int_of_string. *)
+          && (String.length p <= 5) [@mutate off "6 digits are over 65535 too"]
+          && String.for_all (fun c -> c >= '0' && c <= '9') p
+          && int_of_string p <= 65535
+        in
+        if ok then Some (String.sub s 0 i, Some (int_of_string p)) else None
+
+  (* An origin of [id]: https://host[:port] with host = id or a subdomain of id,
+     and no :443; or http://localhost[:port] for the id localhost. *)
+  let good_origin id o =
+    let after prefix =
+      if String.starts_with ~prefix o then
+        Some
+          (String.sub o (String.length prefix)
+             (String.length o - String.length prefix) )
+      else None
+    in
+    match (after "https://", after "http://") with
+    | Some rest, _ -> (
+      match host_port rest with
+      | Some (host, port) ->
+          port <> Some 443
+          && (host = id || String.ends_with ~suffix:("." ^ id) host)
+          && good_id host
+      | None ->
+          false )
+    | None, Some rest -> (
+        id = "localhost"
+        &&
+        match host_port rest with
+        | Some ("localhost", port) ->
+            port <> Some 80
+        | _ ->
+            false )
+    | None, None ->
+        false
+
+  let rp ~id ~name ~origins =
+    let bad m = invalid_arg ("Caravan_auth.Passkey.rp: " ^ m) in
+    if not (good_id id) then bad "the RP ID is not a lowercase domain" ;
+    if name = "" then bad "the name is empty" ;
+    if origins = [] then bad "no origin" ;
+    List.iter
+      (fun o ->
+        if not (good_origin id o) then bad (o ^ " is not an origin of the RP ID") )
+      origins ;
+    {id; name; origins; id_hash= sha256 id}
+
+  type requirement = [`Required | `Preferred | `Discouraged]
+
+  let requirement_text = function
+    | `Required ->
+        "required"
+    | `Preferred ->
+        "preferred"
+    | `Discouraged ->
+        "discouraged"
+
+  (* A ceremony that waits for its response: a creation for a user handle, or a
+     sign-in, for an identified user or for any user. *)
+  type kind = Create of string | Get of string option
+
+  type pending =
+    { kind: kind
+    ; expires: int  (** Posix seconds. *)
+    ; challenge: string
+    ; uv: bool  (** User verification is required. *) }
+
+  (* The fields have '|' between them: each field is base64url, digits, or a
+     letter. *)
+  let encode p =
+    String.concat "|"
+      ( ( match p.kind with
+          | Create u ->
+              ["c"; b64_encode u]
+          | Get (Some u) ->
+              ["g"; b64_encode u]
+          | Get None ->
+              ["g"; "-"] )
+      @ [ string_of_int p.expires
+        ; b64_encode p.challenge
+        ; (if p.uv then "1" else "0") ] )
+
+  let decode s =
+    match String.split_on_char '|' s with
+    | [k; u; x; c; uv] -> (
+        let kind =
+          match (k, u) with
+          | "g", "-" ->
+              Some (Get None)
+          | "g", u ->
+              Option.map (fun u -> Get (Some u)) (b64_decode u)
+          | "c", u ->
+              Option.map (fun u -> Create u) (b64_decode u)
+          | _ ->
+              None
+        in
+        match (kind, int_of_string_opt x, b64_decode c) with
+        | Some kind, Some expires, Some challenge when uv = "0" || uv = "1" ->
+            Some {kind; expires; challenge; uv= uv = "1"}
+        | _ ->
+            None )
+    | _ ->
+        None
+
+  let pending =
+    { Pending.key= "caravan.passkey"
+    ; encode
+    ; decode
+    ; expires= (fun p -> p.expires) }
+
+  let check_timeout fn t =
+    if Span.compare t (Span.s 30) < 0 || Span.compare t (Span.s 600) > 0 then
+      invalid_arg
+        ("Caravan_auth.Passkey." ^ fn ^ ": the timeout is not 30 s to 10 min")
+
+  (* [start req ~timeout ~verification kind] keeps a new ceremony, and gives its
+     challenge. *)
+  let start req ~timeout ~verification kind =
+    let challenge = Mirage_crypto_rng.generate 32 in
+    Pending.add pending req
+      { kind
+      ; expires= now_s () + seconds timeout
+      ; challenge
+      ; uv= verification = `Required } ;
+    challenge
+
+  (* The COSE algorithms of the options: EdDSA, ES256, RS256. *)
+  let algs = [-8; -7; -257]
+
+  let ids l =
+    `List
+      (List.map
+         (fun id ->
+           `Assoc
+             [("type", `String "public-key"); ("id", `String (b64_encode id))] )
+         l )
+
+  let creation_options ?(timeout = Span.s 300) ?(verification = `Preferred)
+      ?(resident_key = `Required) ?(exclude = []) rp req ~user_id ~user_name
+      ~display_name =
+    check_timeout "creation_options" timeout ;
+    let n = String.length user_id in
+    if n < 1 || n > 64 then
+      invalid_arg
+        "Caravan_auth.Passkey.creation_options: the user ID is not 1 to 64 \
+         bytes" ;
+    let challenge = start req ~timeout ~verification (Create user_id) in
+    let selection =
+      [ ("residentKey", `String (requirement_text resident_key))
+      ; ("userVerification", `String (requirement_text verification)) ]
+      @
+      if resident_key = `Required then [("requireResidentKey", `Bool true)]
+      else []
+    in
+    Yojson.Safe.to_string
+      (`Assoc
+         [ ("rp", `Assoc [("id", `String rp.id); ("name", `String rp.name)])
+         ; ( "user"
+           , `Assoc
+               [ ("id", `String (b64_encode user_id))
+               ; ("name", `String user_name)
+               ; ("displayName", `String display_name) ] )
+         ; ("challenge", `String (b64_encode challenge))
+         ; ( "pubKeyCredParams"
+           , `List
+               (List.map
+                  (fun a ->
+                    `Assoc [("type", `String "public-key"); ("alg", `Int a)] )
+                  algs ) )
+         ; ("timeout", `Int (seconds timeout * 1000))
+         ; ("excludeCredentials", ids exclude)
+         ; ("authenticatorSelection", `Assoc selection)
+         ; ("attestation", `String "none") ] )
+
+  let request_options ?(timeout = Span.s 300) ?(verification = `Preferred)
+      ?(allow = []) ?user rp req =
+    check_timeout "request_options" timeout ;
+    if allow <> [] && user = None then
+      invalid_arg
+        "Caravan_auth.Passkey.request_options: allow with no user: the server \
+         would not check it" ;
+    let challenge = start req ~timeout ~verification (Get user) in
+    Yojson.Safe.to_string
+      (`Assoc
+         [ ("challenge", `String (b64_encode challenge))
+         ; ("timeout", `Int (seconds timeout * 1000))
+         ; ("rpId", `String rp.id)
+         ; ("allowCredentials", ids allow)
+         ; ("userVerification", `String (requirement_text verification)) ] )
+
+  type stored =
+    { public_key: string
+    ; sign_count: int
+    ; user_handle: string
+    ; backup_eligible: bool }
+
+  type credential =
+    { id: string
+    ; stored: stored
+    ; user_verified: bool
+    ; backed_up: bool
+    ; transports: string list
+    ; aaguid: string }
+
+  type assertion =
+    { credential_id: string
+    ; user_handle: string
+    ; sign_count: int
+    ; user_verified: bool
+    ; backed_up: bool
+    ; cloned: bool }
+
+  type error =
+    | No_ceremony
+    | Expired
+    | Bad_response of string
+    | Bad_origin of string
+    | Bad_rp_id
+    | Not_present
+    | Not_verified
+    | Registered
+    | Unknown_credential
+    | Wrong_user
+    | Bad_backup
+    | Bad_signature
+    | Unsupported of string
+
+  let pp_error ppf = function
+    | No_ceremony ->
+        Format.pp_print_string ppf "No_ceremony"
+    | Expired ->
+        Format.pp_print_string ppf "Expired"
+    | Bad_response m ->
+        Format.fprintf ppf "Bad_response %S" m
+    | Bad_origin o ->
+        Format.fprintf ppf "Bad_origin %S" o
+    | Bad_rp_id ->
+        Format.pp_print_string ppf "Bad_rp_id"
+    | Not_present ->
+        Format.pp_print_string ppf "Not_present"
+    | Not_verified ->
+        Format.pp_print_string ppf "Not_verified"
+    | Registered ->
+        Format.pp_print_string ppf "Registered"
+    | Unknown_credential ->
+        Format.pp_print_string ppf "Unknown_credential"
+    | Wrong_user ->
+        Format.pp_print_string ppf "Wrong_user"
+    | Bad_backup ->
+        Format.pp_print_string ppf "Bad_backup"
+    | Bad_signature ->
+        Format.pp_print_string ppf "Bad_signature"
+    | Unsupported m ->
+        Format.fprintf ppf "Unsupported %S" m
+
+  let ( let* ) = Result.bind
+
+  let bad m = Error (Bad_response m)
+
+  let max_response = 65536
+
+  let members what = function
+    | `Assoc m ->
+        Ok m
+    | _ ->
+        bad (what ^ " is not an object")
+
+  let field what m name =
+    match List.assoc_opt name m with
+    | Some (`String s) ->
+        Ok s
+    | _ ->
+        bad (what ^ " has no string " ^ name)
+
+  let b64_field what m name =
+    let* s = field what m name in
+    match b64_decode s with
+    | Some b ->
+        Ok b
+    | None ->
+        bad (name ^ " is not base64url")
+
+  (* The common part of a response: the credential ID, and the members of
+     [response]. *)
+  let parse_response text =
+    if String.length text > max_response then bad "the response is too large"
+    else
+      let* json =
+        Result.map_error (fun e -> Bad_response e) (Json.parse text)
+      in
+      let* m = members "the credential" json in
+      let* id = b64_field "the credential" m "id" in
+      let* raw = b64_field "the credential" m "rawId" in
+      let* () = if id = raw then Ok () else bad "id and rawId are different" in
+      let* t = field "the credential" m "type" in
+      let* () =
+        if t = "public-key" then Ok () else bad "the type is not public-key"
+      in
+      let* r =
+        match List.assoc_opt "response" m with
+        | Some r ->
+            members "the response" r
+        | None ->
+            bad "no response"
+      in
+      Ok (id, r)
+
+  (* The checks of the client data (§7.1 steps 5-11, §7.2 steps 10-15), and the
+     pending ceremony of its challenge and kind, which goes from the session
+     (one use). *)
+  let client_data rp req ~create bytes =
+    let* json =
+      Result.map_error
+        (fun e -> Bad_response ("clientDataJSON: " ^ e))
+        (Json.parse bytes)
+    in
+    let* m = members "clientDataJSON" json in
+    let* t = field "clientDataJSON" m "type" in
+    let* () =
+      if t = if create then "webauthn.create" else "webauthn.get" then Ok ()
+      else bad ("the client data type is " ^ t)
+    in
+    let* challenge = b64_field "clientDataJSON" m "challenge" in
+    let mine p =
+      (match p.kind with Create _ -> create | Get _ -> not create)
+      && Eqaf.equal p.challenge challenge
+    in
+    let* p =
+      match Pending.take pending req mine with
+      | Ok p ->
+          Ok p
+      | Error `None ->
+          Error No_ceremony
+      | Error `Expired ->
+          Error Expired
+    in
+    let* origin = field "clientDataJSON" m "origin" in
+    let* () =
+      if List.mem origin rp.origins then Ok () else Error (Bad_origin origin)
+    in
+    let* () =
+      match List.assoc_opt "crossOrigin" m with
+      | None | Some (`Bool false) ->
+          Ok ()
+      | Some _ ->
+          bad "crossOrigin is not false"
+    in
+    let* () =
+      if List.mem_assoc "topOrigin" m then bad "the client data has a topOrigin"
+      else Ok ()
+    in
+    Ok p
+
+  (* The checks of the flags and the RP ID hash (§7.1 steps 13-17, §7.2 steps
+     16-19). *)
+  let check_auth_data rp (p : pending) (d : Webauthn.auth_data) =
+    let* () =
+      if Eqaf.equal d.rp_id_hash rp.id_hash then Ok () else Error Bad_rp_id
+    in
+    let* () = if Webauthn.up d then Ok () else Error Not_present in
+    if p.uv && not (Webauthn.uv d) then Error Not_verified else Ok ()
+
+  let auth_data text =
+    Result.map_error
+      (fun e -> Bad_response ("the authenticator data: " ^ e))
+      (Webauthn.parse_auth_data text)
+
+  (* At most 8 transports of at most 32 bytes. *)
+  let transports r =
+    match List.assoc_opt "transports" r with
+    | None ->
+        Ok []
+    | Some (`List l) when List.compare_length_with l 8 <= 0 -> (
+      match string_list l with
+      | Some names when List.for_all (fun n -> String.length n <= 32) names ->
+          Ok names
+      | _ ->
+          bad "bad transports" )
+    | Some _ ->
+        bad "bad transports"
+
+  let register rp req ~registered text =
+    let* id, r = parse_response text in
+    let* cdata = b64_field "the response" r "clientDataJSON" in
+    let* p = client_data rp req ~create:true cdata in
+    let user_handle = match p.kind with Create u -> u | Get _ -> "" in
+    let* att = b64_field "the response" r "attestationObject" in
+    let* att =
+      match Cbor.decode_all att with
+      | Ok (Cbor.Map m) ->
+          Ok m
+      | Ok _ ->
+          bad "the attestation object is not a map"
+      | Error e ->
+          bad ("the attestation object: " ^ e)
+    in
+    let find k = List.assoc_opt (Cbor.Text k) att in
+    let* () =
+      match (find "fmt", find "attStmt") with
+      | Some (Cbor.Text "none"), Some (Cbor.Map []) ->
+          Ok ()
+      | Some (Cbor.Text "none"), _ ->
+          bad "a none attestation with a statement"
+      | Some (Cbor.Text _), Some (Cbor.Map _) ->
+          (* Not verified: see the docs. *)
+          Ok ()
+      | _ ->
+          bad "no fmt text or no attStmt map"
+    in
+    let* data =
+      match find "authData" with
+      | Some (Cbor.Bytes b) ->
+          Ok b
+      | _ ->
+          bad "no authData"
+    in
+    let* d = auth_data data in
+    let* () = check_auth_data rp p d in
+    let* a =
+      match d.attested with
+      | Some a ->
+          Ok a
+      | None ->
+          bad "no attested credential data"
+    in
+    let* () =
+      if a.credential_id = id then Ok ()
+      else bad "the credential ID is not that of the response"
+    in
+    let* _, alg =
+      Result.map_error (fun e -> Unsupported e) (Passkey_key.of_cbor a.key)
+    in
+    let* () =
+      if List.mem alg algs then Ok ()
+      else Error (Unsupported "an alg that the options did not ask")
+    in
+    let* () = if registered id then Error Registered else Ok () in
+    let* transports = transports r in
+    Ok
+      { id
+      ; stored=
+          { public_key= a.public_key
+          ; sign_count= d.sign_count
+          ; user_handle
+          ; backup_eligible= Webauthn.be d }
+      ; user_verified= Webauthn.uv d
+      ; backed_up= Webauthn.bs d
+      ; transports
+      ; aaguid= a.aaguid }
+
+  let authenticate rp req ~lookup text =
+    let* id, r = parse_response text in
+    let* cdata = b64_field "the response" r "clientDataJSON" in
+    let* p = client_data rp req ~create:false cdata in
+    let* (stored : stored) =
+      match lookup id with Some s -> Ok s | None -> Error Unknown_credential
+    in
+    let* () =
+      match p.kind with
+      | Get (Some u) when not (Eqaf.equal u stored.user_handle) ->
+          Error Wrong_user
+      | _ ->
+          Ok ()
+    in
+    (* The user handle is not signed: it must be the owner of the credential. *)
+    let* () =
+      match List.assoc_opt "userHandle" r with
+      | Some (`String h) -> (
+        match b64_decode h with
+        | Some h when Eqaf.equal h stored.user_handle ->
+            Ok ()
+        | Some _ ->
+            Error Wrong_user
+        | None ->
+            bad "userHandle is not base64url" )
+      | None | Some `Null ->
+          if p.kind = Get None then
+            bad "no userHandle for a discoverable credential"
+          else Ok ()
+      | Some _ ->
+          bad "userHandle is not a string"
+    in
+    let* data = b64_field "the response" r "authenticatorData" in
+    let* d = auth_data data in
+    let* () = check_auth_data rp p d in
+    let* () =
+      if Webauthn.be d = stored.backup_eligible then Ok () else Error Bad_backup
+    in
+    let* signature = b64_field "the response" r "signature" in
+    let* key, _ =
+      Result.map_error
+        (fun e -> Unsupported e)
+        (Passkey_key.of_cose stored.public_key)
+    in
+    let* () =
+      if Passkey_key.verify key ~data:(data ^ sha256 cdata) ~signature then
+        Ok ()
+      else Error Bad_signature
+    in
+    let n = d.sign_count in
+    let cloned = (n <> 0 || stored.sign_count <> 0) && n <= stored.sign_count in
+    Ok
+      { credential_id= id
+      ; user_handle= stored.user_handle
+      ; sign_count= max n stored.sign_count
+      ; user_verified= Webauthn.uv d
+      ; backed_up= Webauthn.bs d
+      ; cloned }
+end
+
 module Private = struct
   module Cbor = Cbor
   module Webauthn = Webauthn
@@ -2152,4 +2724,14 @@ module Private = struct
   let key_of_cose = Passkey_key.of_cose
 
   let verify = Passkey_key.verify
+
+  (* A pending ceremony with a known challenge, for the vectors of other
+     implementations. *)
+  let passkey_ceremony req ~create ~challenge ~uv ?user () =
+    let kind =
+      if create then Passkey.Create (Option.value user ~default:"")
+      else Passkey.Get user
+    in
+    Pending.add Passkey.pending req
+      {Passkey.kind; expires= now_s () + 300; challenge; uv}
 end
