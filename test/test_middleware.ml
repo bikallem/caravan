@@ -1994,6 +1994,354 @@ let cross_origin_tests =
               equal string "a=1" r.body ;
               equal status Status.ok (T.get t "/").status ) ) ]
 
+(* Rate_limit and Concurrency_limit *)
+
+module RL = Caravan_middleware.Rate_limit
+module CL = Caravan_middleware.Concurrency_limit
+
+let sleep s = Weft.Time.sleep Mono (Weft.Span.of_float_s s)
+
+(* [hit h ?k ()] is the status and the Retry-After of a request with the key [k]
+   (the field "K"). *)
+let hit h ?(k = "a") () =
+  let r =
+    h (Request.make ~headers:(Headers.of_list [("K", k)]) Method.GET "/")
+  in
+  (Status.code (Response.status r), field "retry-after" r)
+
+let by_field req = Headers.find "k" (Request.headers req)
+
+let limited ?max_keys ~burst ~every () =
+  RL.middleware ~key:by_field ?max_keys ~burst
+    ~every:(Weft.Span.of_float_s every)
+    () (reply "ok")
+
+let outcome = Testable.(pair int (option string))
+
+let ok = (200, None)
+
+let refused s = (429, Some s)
+
+let rate_limit_tests =
+  group "Rate_limit"
+    [ test "a burst, then a refusal" (fun () ->
+          Sim_support.run ~guard:(Weft.Span.s 60) (fun _ ->
+              let h = limited ~burst:3 ~every:1. () in
+              List.iter (fun _ -> equal outcome ok (hit h ())) [1; 2; 3] ;
+              equal outcome (refused "1") (hit h ()) ;
+              let r =
+                h
+                  (Request.make
+                     ~headers:(Headers.of_list [("K", "a")])
+                     Method.GET "/" )
+              in
+              equal string "Too Many Requests\n"
+                ( match Response.kind r with
+                | Response.Body b ->
+                    Body.to_string b
+                | Response.Upgrade _ ->
+                    "" ) ) )
+    ; test "one token each every" (fun () ->
+          Sim_support.run ~guard:(Weft.Span.s 60) (fun _ ->
+              let h = limited ~burst:1 ~every:1. () in
+              equal outcome ok (hit h ()) ;
+              sleep 0.5 ;
+              equal outcome (refused "1") (hit h ()) ;
+              sleep 0.5 ;
+              equal outcome ok (hit h ()) ;
+              (* A refusal does not move the bucket. *)
+              sleep 0.999 ;
+              equal outcome (refused "1") (hit h ()) ;
+              sleep 0.001 ;
+              equal outcome ok (hit h ()) ) )
+    ; test "the rest of a period carries over" (fun () ->
+          Sim_support.run ~guard:(Weft.Span.s 60) (fun _ ->
+              let h = limited ~burst:2 ~every:1. () in
+              equal outcome ok (hit h ()) ;
+              equal outcome ok (hit h ()) ;
+              equal outcome (refused "1") (hit h ()) ;
+              sleep 1.5 ;
+              equal outcome ok (hit h ()) ;
+              (* 0.5 s of the next token is there. *)
+              sleep 0.5 ;
+              equal outcome ok (hit h ()) ;
+              equal outcome (refused "1") (hit h ()) ) )
+    ; test "the bucket holds at most burst tokens" (fun () ->
+          Sim_support.run ~guard:(Weft.Span.s 60) (fun _ ->
+              let h = limited ~burst:3 ~every:1. () in
+              sleep 10. ;
+              List.iter (fun _ -> equal outcome ok (hit h ())) [1; 2; 3] ;
+              equal outcome (refused "1") (hit h ()) ) )
+    ; test "Retry-After is rounded up" (fun () ->
+          Sim_support.run ~guard:(Weft.Span.s 60) (fun _ ->
+              let h = limited ~burst:1 ~every:1.5 () in
+              equal outcome ok (hit h ()) ;
+              equal outcome (refused "2") (hit h ()) ;
+              (* 1.000000001 s gives 2. *)
+              let h =
+                RL.middleware ~key:by_field ~burst:1
+                  ~every:(Weft.Span.ns 1_000_000_001)
+                  () (reply "ok")
+              in
+              equal outcome ok (hit h ()) ;
+              equal outcome (refused "2") (hit h ()) ;
+              let h = limited ~burst:1 ~every:2. () in
+              equal outcome ok (hit h ()) ;
+              equal outcome (refused "2") (hit h ()) ;
+              sleep 1. ;
+              equal outcome (refused "1") (hit h ()) ) )
+    ; test "each key has its bucket, and None has no limit" (fun () ->
+          Sim_support.run ~guard:(Weft.Span.s 60) (fun _ ->
+              let h = limited ~burst:1 ~every:60. () in
+              equal outcome ok (hit h ~k:"a" ()) ;
+              equal outcome ok (hit h ~k:"b" ()) ;
+              equal outcome (refused "60") (hit h ~k:"a" ()) ;
+              List.iter
+                (fun _ ->
+                  equal outcome ok
+                    (let r = h (Request.make Method.GET "/") in
+                     (Status.code (Response.status r), field "retry-after" r) ) )
+                [1; 2; 3] ) )
+    ; test "deny gets the wait" (fun () ->
+          Sim_support.run ~guard:(Weft.Span.s 60) (fun _ ->
+              let waited = ref None in
+              let h =
+                RL.middleware ~key:by_field ~burst:1 ~every:(Weft.Span.s 3)
+                  ~deny:(fun ~retry_after _ ->
+                    waited := Some (Weft.Span.to_ns retry_after) ;
+                    Response.string ~status:Status.forbidden "" )
+                  () (reply "ok")
+              in
+              equal outcome ok (hit h ()) ;
+              sleep 1. ;
+              equal outcome (403, None) (hit h ()) ;
+              equal (option int64) (Some 2_000_000_000L) !waited ) )
+    ; test "a full table removes buckets, and never refuses" (fun () ->
+          Sim_support.run ~guard:(Weft.Span.s 60) (fun _ ->
+              let h = limited ~max_keys:2 ~burst:2 ~every:10. () in
+              equal outcome ok (hit h ~k:"a" ()) ;
+              sleep 1. ;
+              equal outcome ok (hit h ~k:"b" ()) ;
+              (* A new key: the bucket nearest to full (a) goes, b keeps its
+                 state. *)
+              equal outcome ok (hit h ~k:"c" ()) ;
+              equal outcome ok (hit h ~k:"b" ()) ;
+              equal outcome (refused "10") (hit h ~k:"b" ()) ;
+              (* a has a full bucket again. *)
+              equal outcome ok (hit h ~k:"a" ()) ;
+              equal outcome ok (hit h ~k:"a" ()) ;
+              (* Full buckets go first. *)
+              let h = limited ~max_keys:2 ~burst:1 ~every:1. () in
+              equal outcome ok (hit h ~k:"a" ()) ;
+              equal outcome ok (hit h ~k:"b" ()) ;
+              sleep 5. ;
+              equal outcome ok (hit h ~k:"c" ()) ;
+              equal outcome ok (hit h ~k:"d" ()) ;
+              equal outcome (refused "1") (hit h ~k:"c" ()) ;
+              (* One full bucket goes, and that is enough. *)
+              let h = limited ~max_keys:2 ~burst:1 ~every:1. () in
+              equal outcome ok (hit h ~k:"a" ()) ;
+              sleep 5. ;
+              equal outcome ok (hit h ~k:"b" ()) ;
+              equal outcome ok (hit h ~k:"c" ()) ;
+              equal outcome (refused "1") (hit h ~k:"b" ()) ) )
+    ; test "a full table keeps the half that is the farthest from full"
+        (fun () ->
+          Sim_support.run ~guard:(Weft.Span.s 60) (fun _ ->
+              let h = limited ~max_keys:4 ~burst:2 ~every:10. () in
+              List.iter
+                (fun k ->
+                  equal ~msg:k outcome ok (hit h ~k ()) ;
+                  sleep 1. )
+                ["a"; "b"; "c"; "d"] ;
+              (* A new key: a and b go, c and d keep their state. *)
+              equal outcome ok (hit h ~k:"e" ()) ;
+              List.iter
+                (fun k ->
+                  equal ~msg:k outcome ok (hit h ~k ()) ;
+                  equal ~msg:k int 429 (fst (hit h ~k ())) )
+                ["c"; "d"] ;
+              (* a has a full bucket again. *)
+              equal outcome ok (hit h ~k:"a" ()) ;
+              equal outcome ok (hit h ~k:"a" ()) ) )
+    ; test "a full table removes the oldest half, in each hash order" (fun () ->
+          Sim_support.run ~guard:(Weft.Span.s 600) (fun _ ->
+              (* Each table has a random seed, thus another order: four
+                 tables. *)
+              List.iter
+                (fun p ->
+                  let h = limited ~max_keys:8 ~burst:2 ~every:100. () in
+                  let k i = p ^ string_of_int i in
+                  for i = 1 to 8 do
+                    equal outcome ok (hit h ~k:(k i) ()) ;
+                    sleep 1.
+                  done ;
+                  equal outcome ok (hit h ~k:"new" ()) ;
+                  (* 5 to 8 have their state, 1 to 4 a full bucket again (key 1
+                     is not checked: its insert fills the table again). *)
+                  for i = 8 downto 2 do
+                    equal ~msg:(k i) outcome ok (hit h ~k:(k i) ()) ;
+                    equal ~msg:(k i) int
+                      (if i <= 4 then 200 else 429)
+                      (fst (hit h ~k:(k i) ()))
+                  done )
+                ["p"; "q"; "r"; "s"] ) )
+    ; test "the default key" (fun () ->
+          let key peer =
+            RL.client_key
+              (Request.make ?conn:(Option.map conn peer) Method.GET "/")
+          in
+          equal (option string) (Some "1.2.3.4") (key (Some (tcp "1.2.3.4"))) ;
+          equal (option string) (Some "2001:db8:1:2::/64")
+            (key (Some (tcp "2001:db8:1:2:3:4:5:6"))) ;
+          equal (option string) (Some "2001:db8:1:2::/64")
+            (key (Some (tcp "2001:DB8:1:2::9"))) ;
+          equal (option string) (Some "2001:db8:1:3::/64")
+            (key (Some (tcp "2001:db8:1:3::1"))) ;
+          equal (option string) (Some "1.2.3.4")
+            (key (Some (tcp "::ffff:1.2.3.4"))) ;
+          equal (option string) (Some "unix") (key (Some (Weft.Net.Unix "/s"))) ;
+          equal (option string) (Some "unknown") (key (Some (tcp ""))) ;
+          equal (option string) None (key None) ;
+          (* A bad forwarded field gives Unknown: a shared bucket. *)
+          let seen = ref None in
+          let h =
+            F.middleware
+              ~trusted:(fun _ -> true)
+              ()
+              (fun req ->
+                seen := RL.client_key req ;
+                Response.string "" )
+          in
+          ignore
+            (h
+               (Request.make
+                  ~conn:(conn (tcp "10.0.0.1"))
+                  ~headers:(Headers.of_list [(xff, "1.2.3.4"); (xfp, "x")])
+                  Method.GET "/" ) ) ;
+          equal (option string) (Some "unknown") !seen )
+    ; test "bad setups" (fun () ->
+          let bad label f =
+            raises_match ~msg:label is_invalid_arg (fun () -> made (f ()))
+          in
+          let mw ?max_keys ~burst ~every () =
+            RL.middleware ?max_keys ~burst ~every ()
+          in
+          bad "burst" (fun () -> mw ~burst:0 ~every:(Weft.Span.s 1) ()) ;
+          bad "max_keys" (fun () ->
+              mw ~max_keys:0 ~burst:1 ~every:(Weft.Span.s 1) () ) ;
+          bad "every 0" (fun () -> mw ~burst:1 ~every:Weft.Span.zero ()) ;
+          bad "every negative" (fun () ->
+              mw ~burst:1 ~every:(Weft.Span.ns (-1)) () ) ;
+          bad "every too large" (fun () ->
+              mw ~burst:1 ~every:(Weft.Span.of_ns Int64.max_int) () ) ;
+          (* burst * every at most max_int / 4 ns. *)
+          let q = max_int / 4 in
+          bad "burst * every" (fun () ->
+              mw ~burst:((q / 2) + 1) ~every:(Weft.Span.ns 2) () ) ;
+          made (mw ~burst:(q / 2) ~every:(Weft.Span.ns 2) ()) ;
+          bad "every over the limit" (fun () ->
+              mw ~burst:1 ~every:(Weft.Span.of_ns (Int64.of_int (q + 1))) () ) ;
+          made (mw ~burst:1 ~every:(Weft.Span.of_ns (Int64.of_int q)) ()) ;
+          made (mw ~max_keys:1 ~burst:1 ~every:(Weft.Span.ns 1) ()) )
+    ; test "on the wire" (fun () ->
+          let app =
+            RL.middleware ~burst:2 ~every:(Weft.Span.s 3600) () (reply "ok")
+          in
+          T.run app (fun t ->
+              equal status Status.ok (T.get t "/").status ;
+              equal status Status.ok (T.get t "/").status ;
+              let r = T.get t "/" in
+              equal status Status.too_many_requests r.status ;
+              equal (option string) (Some "3600")
+                (Headers.find "retry-after" r.headers) ) ) ]
+
+let concurrency_tests =
+  let streamed _ =
+    Response.make (Body.of_writer (fun w -> Body.Writer.write_string w "x"))
+  in
+  let code r = Status.code (Response.status r) in
+  let finish r =
+    match Response.kind r with
+    | Response.Body b ->
+        let w = Body.Writer.make ~write:(fun _ _ _ -> ()) ~flush:ignore in
+        Body.write_to b w
+    | Response.Upgrade _ ->
+        ()
+  in
+  let close r =
+    match Response.kind r with
+    | Response.Body b ->
+        Body.close b
+    | Response.Upgrade _ ->
+        ()
+  in
+  let get h = h (Request.make Method.GET "/") in
+  group "Concurrency_limit"
+    [ test "at most limit at the same time" (fun () ->
+          let h = CL.middleware ~limit:1 () streamed in
+          let first = get h in
+          let second = get h in
+          equal int 503 (code second) ;
+          equal string "Service Unavailable\n"
+            ( match Response.kind second with
+            | Response.Body b ->
+                Body.to_string b
+            | Response.Upgrade _ ->
+                "" ) ;
+          finish first ;
+          let third = get h in
+          equal int 200 (code third) ;
+          close third ;
+          equal int 200 (code (get h)) )
+    ; test "each end frees the slot, once" (fun () ->
+          let raises = ref true in
+          let h =
+            CL.middleware ~limit:1 () (fun req ->
+                if !raises then failwith "handler" else streamed req )
+          in
+          raises_match
+            (function Failure _ -> true | _ -> false)
+            (fun () -> ignore (get h)) ;
+          raises := false ;
+          (* The slot is free, and the count is not below 0. *)
+          let a = get h in
+          equal int 200 (code a) ;
+          equal int 503 (code (get h)) ;
+          (* An end, then a close: one release. *)
+          finish a ;
+          close a ;
+          let b = get h in
+          equal int 200 (code b) ;
+          equal int 503 (code (get h)) ;
+          (* A producer that raises. *)
+          close b ;
+          let failing =
+            CL.middleware ~limit:1 () (fun _ ->
+                Response.make (Body.of_writer (fun _ -> failwith "body")) )
+          in
+          let r = get failing in
+          (try finish r with Failure _ -> ()) ;
+          equal int 200 (code (get failing)) ;
+          (* An upgrade. *)
+          let up =
+            CL.middleware ~limit:1 () (fun _ -> Response.upgrade ignore)
+          in
+          ignore (get up) ;
+          equal int 101 (code (get up)) )
+    ; test "deny and bad setups" (fun () ->
+          let h =
+            CL.middleware ~limit:1
+              ~deny:(fun _ ->
+                Response.string ~status:Status.too_many_requests "" )
+              () streamed
+          in
+          ignore (get h) ;
+          equal int 429 (code (get h)) ;
+          raises_match is_invalid_arg (fun () ->
+              made (CL.middleware ~limit:0 ()) ) ;
+          made (CL.middleware ~limit:1 ()) ) ]
+
 let () =
   exit
     (Windtrap.run "middleware"
@@ -2004,4 +2352,6 @@ let () =
        ; cors_tests
        ; https_redirect_tests
        ; hsts_tests
-       ; cross_origin_tests ] )
+       ; cross_origin_tests
+       ; rate_limit_tests
+       ; concurrency_tests ] )

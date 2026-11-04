@@ -1053,3 +1053,160 @@ module Cross_origin = struct
     in
     fun next req -> if pass req then next req else deny req
 end
+
+module Rate_limit = struct
+  let client_key req =
+    match Forwarded.client req with
+    | None ->
+        None
+    | Some (Forwarded.Ip a) -> (
+      (* One host of IPv6 has a /64: one key for the /64. *)
+      match Forwarded.ipv6 a with
+      | Some (g1 :: g2 :: g3 :: g4 :: _) ->
+          Some (Printf.sprintf "%x:%x:%x:%x::/64" g1 g2 g3 g4)
+      | _ ->
+          Some a )
+    | Some Forwarded.Unix ->
+        Some "unix"
+    | Some Forwarded.Unknown ->
+        Some "unknown"
+
+  let seconds_up ns = (ns + 999_999_999) / 1_000_000_000
+
+  let too_many ~retry_after _ =
+    let wait = Int64.to_int (Weft.Span.to_ns retry_after) in
+    Response.string ~status:Status.too_many_requests
+      ~headers:
+        (Headers.of_list [("Retry-After", string_of_int (seconds_up wait))])
+      "Too Many Requests\n"
+
+  let middleware ?(key = client_key)
+      ?(max_keys =
+        (100_000 [@mutate off "a size: a test would make 100_000 keys"]))
+      ?(deny = too_many) ~burst ~every () =
+    let bad m =
+      invalid_arg ("Caravan_middleware.Rate_limit.middleware: " ^ m)
+    in
+    if burst < 1 then bad "burst is less than 1" ;
+    if max_keys < 1 then bad "max_keys is less than 1" ;
+    let every_ns = Weft.Span.to_ns every in
+    if every_ns <= 0L then bad "every is not positive" ;
+    (* The times stay far from max_int: [tat] is at most the time plus [burst *
+       every]. *)
+    if Int64.of_int burst > Int64.div (Int64.of_int (max_int / 4)) every_ns then
+      bad "burst * every is too large" ;
+    let every = Int64.to_int every_ns in
+    (* GCRA: a key has [tat], the time at which its bucket is full. A request is
+       refused if [tat] is more than [tolerance] after the time. *)
+    let tolerance = (burst - 1) * every in
+    let table : (string, int) Hashtbl.t =
+      Hashtbl.create ~random:(true [@mutate off "the seed is not visible"]) 1024
+    in
+    let lock = Weft.Fiber.Mutex.create () in
+    (* The times are ns from the mono time of the first request. *)
+    let origin = Atomic.make None in
+    let now () =
+      let t = Weft.Time.now Mono in
+      ( match Atomic.get origin with
+      | None ->
+          ignore (Atomic.compare_and_set origin None (Some t))
+      | Some _ ->
+          () ) ;
+      Int64.to_int
+        (Weft.Span.to_ns
+           (Weft.Time.diff Mono t (Option.get (Atomic.get origin))) )
+    in
+    (* [evict now] removes at least half of the buckets: the nearest to full,
+       thus the full ones first (a full bucket is the same as no bucket). A
+       first pass with no allocation removes the full ones. Else a sort of an
+       int array finds the cut. The work serves many later inserts. *)
+    let evict now =
+      Hashtbl.filter_map_inplace
+        (fun _ tat -> if tat <= now then None else Some tat)
+        table [@mutate off "a fast first pass: the cut removes the same"] ;
+      let excess = Hashtbl.length table - (max_keys / 2) in
+      if excess > 0 then (
+        let tats =
+          Array.make (Hashtbl.length table)
+            (0 [@mutate off "each cell is written next"])
+        in
+        let i = ref 0 in
+        Hashtbl.iter
+          (fun _ tat ->
+            tats.(!i) <- tat ;
+            incr i )
+          table ;
+        Array.sort Int.compare tats ;
+        let cut = tats.(excess - 1) in
+        Hashtbl.filter_map_inplace
+          (fun _ tat -> if tat <= cut then None else Some tat)
+          table )
+    in
+    (* [take k now] is the wait of a refusal, or [None]. *)
+    let take k now =
+      Weft.Fiber.Mutex.lock lock ;
+      Fun.protect
+        ~finally:(fun () -> Weft.Fiber.Mutex.unlock lock)
+        (fun () ->
+          let tat =
+            match Hashtbl.find_opt table k with
+            | Some tat ->
+                tat
+            | None ->
+                if Hashtbl.length table >= max_keys then evict now ;
+                now
+          in
+          let t = max tat now in
+          if t - now > tolerance then Some (t - now - tolerance)
+          else (
+            Hashtbl.replace table k (t + every) ;
+            None ) )
+    in
+    fun next req ->
+      match key req with
+      | None ->
+          next req
+      | Some k -> (
+          (* The time before the lock: a read of the clock can switch the
+             fiber. *)
+          let now = now () in
+          match take k now with
+          | None ->
+              next req
+          | Some wait ->
+              deny ~retry_after:(Weft.Span.of_ns (Int64.of_int wait)) req )
+end
+
+module Concurrency_limit = struct
+  let busy _ =
+    Response.string ~status:Status.service_unavailable "Service Unavailable\n"
+
+  let middleware ?(deny = busy) ~limit () =
+    if limit < 1 then
+      invalid_arg
+        "Caravan_middleware.Concurrency_limit.middleware: limit is less than 1" ;
+    let active = Atomic.make 0 in
+    let rec take () =
+      let n = Atomic.get active in
+      n < limit && (Atomic.compare_and_set active n (n + 1) || take ())
+    in
+    let release () = Atomic.decr active in
+    fun next req ->
+      if not (take ()) then deny req
+      else
+        match next req with
+        | exception e ->
+            let bt = Printexc.get_raw_backtrace () in
+            release () ;
+            Printexc.raise_with_backtrace e bt
+        | resp -> (
+          match Response.kind resp with
+          | Response.Upgrade _ ->
+              (* An upgrade runs on with no limit. *)
+              release () ; resp
+          | Response.Body b ->
+              (* The hook runs one time, at each end of the body. *)
+              Response.with_body
+                (Body.on_end (fun _ ~bytes:_ -> release ()) b)
+                resp )
+end

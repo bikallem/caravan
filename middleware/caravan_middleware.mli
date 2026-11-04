@@ -481,3 +481,68 @@ module Cross_origin : sig
         [scheme://host[:port]] as a browser sends it (the rules of
         {!Cors.Only}). *)
 end
+
+(** A limit of the rate of the requests of each client: a token bucket (the GCRA
+    form). Put it after {!Forwarded}, {!Request_id}, {!Access_log} and {!Cors}:
+    a refusal then has the client of the request, an ID, a log entry and its
+    CORS fields, and a preflight takes no token. Add [Retry-After] to the
+    [expose_headers] of {!Cors}, so that browser code can read it. *)
+module Rate_limit : sig
+  val client_key : Caravan.Request.t -> string option
+  (** [client_key req] is the default key: the client of {!Forwarded.client}. An
+      IPv4 address is its key. An IPv6 address gives the key of its /64
+      ([a:b:c:d::/64]): one host can have each address of a /64. [Unknown] gives
+      ["unknown"] and [Unix] gives ["unix"]: these clients share a bucket, thus
+      a bad forwarded field does not remove the limit. A request with no
+      connection gives [None].
+
+      A /64 can be too fine: a provider can give a user a /56 or a /48. It can
+      also be too coarse: with a NAT64 prefix ([64:ff9b::/96]), all the IPv4
+      clients share one /64. For these networks, give a [key]. *)
+
+  val middleware :
+       ?key:(Caravan.Request.t -> string option)
+    -> ?max_keys:int
+    -> ?deny:(retry_after:Weft.Span.t -> Caravan.Handler.t)
+    -> burst:int
+    -> every:Weft.Span.t
+    -> unit
+    -> Caravan.Handler.middleware
+  (** [middleware ~burst ~every ()] gives each key (default {!client_key}) a
+      bucket of [burst] tokens, with one new token each [every]. A request takes
+      a token. A request with no token gets [deny ~retry_after req], where
+      [retry_after] is the time until the next token (default:
+      [429 Too Many Requests] with [Retry-After] in seconds, rounded up). A key
+      [None] has no limit. Keep a custom key short, or use a hash of it: the
+      table keeps each key.
+
+      The table of the buckets has at most [max_keys] (default 100_000) keys. A
+      new key in a full table removes at least the half of the buckets that are
+      the nearest to full (the full ones first: a full bucket is the same as no
+      bucket). Thus the table never refuses a client, and a removed client gets
+      a full bucket again.
+
+      The time is the mono clock of weft. The buckets are in a
+      {!Weft.Fiber.Mutex}: the domains share them.
+
+      @raise Invalid_argument
+        if [burst] or [max_keys] is less than 1, [every] is not positive, or
+        [burst * every] is more than [max_int / 4] ns (about 36 years). *)
+end
+
+(** A limit of the requests that the next handler serves at the same time. *)
+module Concurrency_limit : sig
+  val middleware :
+    ?deny:Caravan.Handler.t -> limit:int -> unit -> Caravan.Handler.middleware
+  (** [middleware ~limit ()] gives at most [limit] requests to the next handler
+      at the same time. Another request gets [deny req] (default
+      [503 Service Unavailable]). A request counts until the end of its response
+      body (also a failure or a close), or until the handler raises, or until it
+      gives an upgrade response: an upgrade runs on with no limit. A middleware
+      before this one (outside it) must write the body or close it: else the
+      request counts for ever.
+
+      A request counts also while the client sends or receives its body. Thus a
+      few slow clients can hold all the slots: use the read and write timeouts
+      of the server. *)
+end
