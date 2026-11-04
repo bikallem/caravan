@@ -322,6 +322,9 @@ let app handler =
 - A response has `ETag`, `Last-Modified` and `X-Content-Type-Options:
   nosniff`. `If-None-Match` and `If-Modified-Since` give `304`, and
   `If-Match` and `If-Unmodified-Since` give `412`.
+- A `GET` with one byte range gets `206`, and a range out of the file
+  gets `416`. `If-Range` is supported. More than one satisfiable range
+  gives the full file.
 - The middleware refuses `..`, `%2F`, a backslash, the reserved names
   of Windows, and the names that start with a dot (`~dotfiles:true`
   permits them). The rules are the same on each OS.
