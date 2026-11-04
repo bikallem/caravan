@@ -320,7 +320,8 @@ type state =
   ; frozen: bool  (** The response is out: no more change. *) }
 
 (* The session of a request, and the keys of the middleware. *)
-type session = {state: state Atomic.t; keys: Key.t list}
+(* [loaded] is the data of the session at the start of the request. *)
+type session = {state: state Atomic.t; keys: Key.t list; loaded: string Smap.t}
 
 let attr : session Attrs.key = Attrs.key ~name:"session" ()
 
@@ -369,9 +370,10 @@ let retire st =
   | _ ->
       st.old
 
-let find name req = Smap.find_opt name (Atomic.get (state_of "find" req)).data
+let find_any name req =
+  Smap.find_opt name (Atomic.get (state_of "find" req)).data
 
-let set name value req =
+let set_any name value req =
   change "set" req (fun st ->
       let st = fresh st in
       let old =
@@ -386,7 +388,18 @@ let set name value req =
         invalid_arg "Caravan_session.set: the data has more than 64 KiB" ;
       Some {st with data= Smap.add name value st.data; size; changed= true} )
 
+(* The names [caravan.*] are for the libraries of caravan: a value of the
+   client, for example a form field, can never set them. *)
+let check_name fn name =
+  if String.starts_with ~prefix:"caravan." name then
+    invalid_arg ("Caravan_session." ^ fn ^ ": the names caravan.* are reserved")
+
+let find name req = check_name "find" name ; find_any name req
+
+let set name value req = check_name "set" name ; set_any name value req
+
 let remove name req =
+  check_name "remove" name ;
   change "remove" req (fun st ->
       match Smap.find_opt name st.data with
       | Some v ->
@@ -556,7 +569,9 @@ let middleware ?(cookie = "__Host-session") ?(idle = Span.s 1800)
     let value = Request.cookie cookie req in
     let st, loaded = load now value in
     let s = Atomic.make st in
-    let response = next (Request.with_attr attr {state= s; keys} req) in
+    let response =
+      next (Request.with_attr attr {state= s; keys; loaded= st.data} req)
+    in
     (* After the response, no change: a stream producer, an upgrade or a
        background fiber gets Invalid_argument. *)
     let rec freeze () =
@@ -606,7 +621,7 @@ module Csrf = struct
   let secret key id = Signed.raw_mac ~purpose key id
 
   let token req =
-    let {state; keys} = session_of "Csrf.token" req in
+    let {state; keys; _} = session_of "Csrf.token" req in
     (* A change each time: after the response, [modify] raises. *)
     let st =
       modify "Csrf.token" state (fun st ->
@@ -618,7 +633,7 @@ module Csrf = struct
     b64_encode (pad ^ xor pad (secret (List.hd keys) id))
 
   let check t req =
-    let {state; keys} = session_of "Csrf.check" req in
+    let {state; keys; _} = session_of "Csrf.check" req in
     match (Atomic.get state).id with
     | Some (id, _) when String.length t = length -> (
       (* A canonical text of 86 characters is 64 bytes. *)
@@ -687,4 +702,12 @@ module Csrf = struct
                       false
                 in
                 if good then next req else deny req ) )
+end
+
+module Private = struct
+  let find = find_any
+
+  let find_loaded name req = Smap.find_opt name (session_of "find" req).loaded
+
+  let set = set_any
 end

@@ -243,6 +243,29 @@ let signed_tests =
               "Pv__MDEyMzQ1Njc4OTAxMjM0NTY3ODl4eXp3-AABAgN"
             ; (* 4 bits after the last byte (2 characters at the end). *)
               "-_-_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh" ] )
+    ; test "the names caravan.* are reserved" (fun () ->
+          sim (fun _ ->
+              let store, _, _ = counting () in
+              let r =
+                mw store
+                  (fun req ->
+                    List.iter
+                      (fun f -> raises_match is_invalid f)
+                      [ (fun () -> M.set "caravan.auth.user" "x" req)
+                      ; (fun () -> ignore (M.find "caravan.x" req))
+                      ; (fun () -> M.remove "caravan." req) ] ;
+                    M.set "caravan" "1" req ;
+                    M.set "xcaravan.a" "2" req ;
+                    M.Private.set "caravan.a" "3" req ;
+                    equal (option string) (Some "3")
+                      (M.Private.find "caravan.a" req) ;
+                    equal (option string) (Some "1") (M.find "caravan" req) ;
+                    equal (option string) (Some "2") (M.find "xcaravan.a" req) ;
+                    Response.string "" )
+                  (req "/")
+              in
+              (* The values made a session: a new cookie. *)
+              is_some (cookie_of r) ) )
     ; test "the purposes caravan.* are reserved" (fun () ->
           raises_match is_invalid (fun () ->
               ignore (M.Signed.sign ~purpose:"caravan.session" key1 "v") ) ;

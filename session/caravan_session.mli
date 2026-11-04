@@ -165,7 +165,9 @@ val middleware :
     Each function raises [Invalid_argument] if the request did not go through
     {!middleware}. A function that changes the session raises [Invalid_argument]
     after the handler gave its response, for example in the producer of a
-    stream, in an upgrade or in a background fiber. *)
+    stream, in an upgrade or in a background fiber. {!find}, {!set} and
+    {!remove} raise [Invalid_argument] for a name that starts with [caravan.]:
+    these names are for the libraries of caravan. *)
 
 val find : string -> Caravan.Request.t -> string option
 (** [find name req] is the value of [name] in the session of [req], if any. *)
@@ -292,4 +294,17 @@ module Csrf : sig
         if [header] is not a field name, [field] is empty, or [max_bytes] is
         negative. Each request raises it if it did not go through
         {!Caravan_session.middleware}. *)
+end
+
+(**/**)
+
+(** Internal: for caravan.auth. The functions do not check the name. *)
+module Private : sig
+  val find : string -> Caravan.Request.t -> string option
+
+  val find_loaded : string -> Caravan.Request.t -> string option
+  (** [find_loaded name req] is the value of [name] at the start of the request,
+      before each change of the handler. *)
+
+  val set : string -> string -> Caravan.Request.t -> unit
 end
