@@ -68,7 +68,10 @@ let apply_mask ?(phase = 0) key buf off len =
         0xffff_ffffL
   in
   let k = Int64.logor k (Int64.shift_left k 32) in
-  let words = len / 8 in
+  let words =
+    len
+    / (8 [@mutate off "the byte loop masks the remaining bytes the same way"])
+  in
   for w = 0 to words - 1 do
     let i = off + (8 * w) in
     Bytes.set_int64_le buf i (Int64.logxor (Bytes.get_int64_le buf i) k)
@@ -107,7 +110,10 @@ let read_payload r ~key ~on_data len =
       loop buf (pos + n)
     end
   in
-  loop (Bytes.create (Int.min len 65536)) 0
+  loop
+    (Bytes.create
+       (Int.min len (65536 [@mutate off "a capacity: the buffer grows to len"])) )
+    0
 
 let read ?on_data r ~masked ~max =
   let hdr = Bytes.create 8 in
@@ -138,7 +144,11 @@ let read ?on_data r ~masked ~max =
   in
   if len > max && not (is_control opcode) then raise (Error Too_big) ;
   let key =
-    if masked then (really_read r hdr 0 4 ; Bytes.sub_string hdr 0 4) else ""
+    if masked then (
+      really_read r hdr 0 4 ;
+      Bytes.sub_string hdr 0
+        (4 [@mutate off "apply_mask uses only the first 4 bytes of the key"]) )
+    else ""
   in
   let on_data =
     match on_data with

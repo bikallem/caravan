@@ -12,7 +12,11 @@ let digest s =
   Bytes.set m len '\x80' ;
   Bytes.set_int64_be m (padded - 8) (Int64.mul (Int64.of_int len) 8L) ;
   let h = [|0x67452301; 0xefcdab89; 0x98badcfe; 0x10325476; 0xc3d2e1f0|] in
-  let w = Array.make 80 0 in
+  let w =
+    (Array.make 80 0
+     [@mutate
+       off "a capacity: each block sets the 80 words before it reads them"] )
+  in
   for block = 0 to (padded / 64) - 1 do
     for t = 0 to 15 do
       w.(t) <-

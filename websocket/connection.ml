@@ -89,7 +89,7 @@ let make ?protocol ?(max_message = 8 * 1024 * 1024) ?(close_timeout = Span.s 5)
     ; close_timeout
     ; read_timeout= Some read_timeout
     ; idle_timeout
-    ; in_frame= false
+    ; in_frame= false [@mutate off "next sets in_frame before each read of r"]
     ; close_at= Atomic.make None
     ; closing= Atomic.make None
     ; closed= Ivar.create () }
@@ -229,7 +229,11 @@ let append t (b, len) s =
     if len + n <= Bytes.length b then b
     else
       let cap =
-        Int.min t.max_message (Int.max (len + n) (2 * Bytes.length b))
+        Int.min t.max_message
+          (Int.max (len + n)
+             ( (2
+               [@mutate off "a capacity: another growth gives the same message"]
+               ) * Bytes.length b ) )
       in
       Bytes.extend b 0 (cap - Bytes.length b)
   in

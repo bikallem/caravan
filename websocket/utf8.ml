@@ -3,7 +3,8 @@ exception Invalid
 (* The length of the sequence that the lead byte [c] starts, 0 if [c] cannot
    start a sequence (Unicode table 3-7). *)
 let length c =
-  if c < 0x80 then 1
+  if c < 0x80 then (1
+    [@mutate off "only an incorrect pending gives ASCII: need <= 0 with 0"] )
   else if c < 0xc2 then 0
   else if c < 0xe0 then 2
   else if c < 0xf0 then 3
@@ -63,11 +64,12 @@ let rec scan buf i stop =
     if c < 0x80 then
       if
         (left >= 8) [@mutate off "the same result"]
-        && Int64.logand (Bytes.get_int64_le buf i) ascii8 = 0L
+        && Int64.logand (Bytes.get_int64_le buf i) ascii8
+           = (0L [@mutate off "never 1L: the byte loop gives the same result"])
       then scan buf (i + 8) stop
       else scan buf (i + 1) stop
     else if (left < 4) [@mutate off "the same result"] then begin
-      let next = ref 0 in
+      let next = ref (0 [@mutate off "tail sets next before scan reads it"]) in
       match tail buf i stop next with
       | "" ->
           scan buf !next stop

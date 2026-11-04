@@ -237,6 +237,7 @@ let frame_tests =
             ; ("unmasked", "81 00")
             ; ("top bit", "82 ff 80 00 00 00 00 00 00 00")
             ; ("2^62 - 1", "82 ff 3f ff ff ff ff ff ff ff")
+            ; ("2^62", "82 ff 40 00 00 00 00 00 00 00")
             ; ("1001", "82 fe 03 e9")
             ; ("1000", "82 fe 03 e8") ]
           in
@@ -260,6 +261,7 @@ pong of 127: protocol error: control frame longer than 125 bytes
 unmasked: protocol error: unmasked frame
 top bit: protocol error: length with its top bit set
 2^62 - 1: too big
+2^62: too big
 1001: too big
 1000: end of input|} ;
           expect
@@ -936,6 +938,65 @@ let connection_tests =
             close code 5000: closed 1002 "close code 5000" | -- | close 1002
             close code 65535: closed 1002 "close code 65535" | -- | close 1002
             |} )
+    ; test "the default max_message is 8 MiB" (fun () ->
+          (* Only the header of each frame: an 8 MiB frame passes the size
+             check, then the input ends. *)
+          let header n =
+            let b = Bytes.create 8 in
+            Bytes.set_int64_be b 0 (Int64.of_int n) ;
+            of_hex "82 ff" ^ Bytes.to_string b ^ "\x01\x02\x03\x04"
+          in
+          let size = 8 * 1024 * 1024 in
+          let recv note c =
+            match Ws.recv c with
+            | _ ->
+                note "a message"
+            | exception e ->
+                note_closed note e
+          in
+          expect
+            ( converse (header size) recv
+            ^ "\n"
+            ^ converse (header (size + 1)) recv )
+          @@ __POS_OF__
+               {|
+            closed 1006 ""
+            --
+            closed 1009 "message is too large"
+            --
+            close 1009
+            |} )
+    ; test "after a protocol error, the linger reads at most 1 MiB" (fun () ->
+          (* The first read gives a frame with a reserved bit. The next reads
+             never end the input. *)
+          let first = ref true and after = ref 0 in
+          let read buf off len =
+            if !first then begin
+              first := false ;
+              Bytes.blit_string (of_hex "c1 80") 0 buf off 2 ;
+              2
+            end
+            else begin
+              Bytes.fill buf off len 'x' ;
+              after := !after + len ;
+              len
+            end
+          in
+          let out = Buffer.create 16 in
+          let flow =
+            memory_flow ~write:(fun b o l -> Buffer.add_subbytes out b o l) read
+          in
+          let code =
+            Sim_support.run (fun _ ->
+                match Ws.recv (Ws.Private.of_flow flow) with
+                | _ ->
+                    0
+                | exception Ws.Closed {code; _} ->
+                    code )
+          in
+          equal int 1002 code ;
+          equal (list string) ["close 1002"] (frames (Buffer.contents out)) ;
+          equal int ~msg:"the bytes after the frame" (1024 * 1024) !after )
     ; test "control frames do not count in the size of a message" (fun () ->
           expect
             (converse ~max_message:16
@@ -2194,9 +2255,15 @@ let time_tests =
           let flow =
             memory_flow ~write:(fun b o l -> Buffer.add_subbytes out b o l) read
           in
-          Sim_support.run ~guard:(Span.s 60) (fun _ ->
-              Ws.close (Ws.Private.of_flow ~close_timeout:ws_close flow) ) ;
+          let after_close =
+            Sim_support.run ~guard:(Span.s 60) (fun _ ->
+                let c = Ws.Private.of_flow ~close_timeout:ws_close flow in
+                Ws.close c ;
+                outcome (fun () -> ignore (Ws.recv c)) )
+          in
           equal (list string) ["close 1000"] (frames (Buffer.contents out)) ;
+          equal string ~msg:"the connection after close" "closed 1006 \"\""
+            after_close ;
           is_true ~msg:"reads 1 ns before the close deadline" (!reads >= 20) ;
           equal int ~msg:"bytes after the close deadline" !at_deadline !served )
     ; test "a fiber in recv stops at the time limit of close" (fun () ->
@@ -2254,6 +2321,38 @@ let time_tests =
           (* Then the connection lingers for [close_timeout]. *)
           equal string "closed 1001 \"read timeout\""
             (ends_at sim ~t0:(t0 +: ws_read) ws_close second) )
+    ; test "the default read timeout is 30 s and the default close timeout 5 s"
+        (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_socket sim
+          @@ fun c peer ->
+          in_scope
+          @@ fun s ->
+          let t0 = Time.now Mono in
+          let reader =
+            call s (fun () -> outcome (fun () -> ignore (Ws.recv c)))
+          in
+          (* The frame stops after 2 bytes. *)
+          Flow.write_string peer (String.sub (client Text "hello") 0 2) ;
+          let close_frame = call s (fun () -> peer_frame peer) in
+          equal string "close 1001" (ends_at sim ~t0 (Span.s 30) close_frame) ;
+          (* Then the connection lingers for the close timeout. *)
+          equal string "closed 1001 \"read timeout\""
+            (ends_at sim ~t0:(t0 +: Span.s 30) (Span.s 5) reader) )
+    ; test "the default write timeout is 30 s" (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_socket sim
+          @@ fun c _peer ->
+          in_scope
+          @@ fun s ->
+          let t0 = Time.now Mono in
+          (* The peer never reads: only an advance can end the send. *)
+          let sender =
+            call s (fun () -> outcome (fun () -> Ws.send c (Binary large)))
+          in
+          equal string "closed 1006 \"\"" (ends_at sim ~t0 (Span.s 30) sender) )
     ; test "the read timeout does not apply between frames" (fun () ->
           Sim_support.manual
           @@ fun sim ->
