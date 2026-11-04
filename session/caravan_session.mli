@@ -307,4 +307,6 @@ module Private : sig
       before each change of the handler. *)
 
   val set : string -> string -> Caravan.Request.t -> unit
+
+  val remove : string -> Caravan.Request.t -> unit
 end

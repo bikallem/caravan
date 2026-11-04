@@ -398,8 +398,7 @@ let find name req = check_name "find" name ; find_any name req
 
 let set name value req = check_name "set" name ; set_any name value req
 
-let remove name req =
-  check_name "remove" name ;
+let remove_any name req =
   change "remove" req (fun st ->
       match Smap.find_opt name st.data with
       | Some v ->
@@ -410,6 +409,8 @@ let remove name req =
             ; changed= true }
       | None ->
           None )
+
+let remove name req = check_name "remove" name ; remove_any name req
 
 let renew req =
   change "renew" req (fun st ->
@@ -710,4 +711,6 @@ module Private = struct
   let find_loaded name req = Smap.find_opt name (session_of "find" req).loaded
 
   let set = set_any
+
+  let remove = remove_any
 end
