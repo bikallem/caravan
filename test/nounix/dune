@@ -1,11 +1,11 @@
 ; The guard: the build gives an error if caravan, caravan.client,
-; caravan.websocket, caravan.router, caravan.middleware or caravan.static
-; depends on unix, on threads or on a world of weft. Thus the six libraries run
-; in each world.
+; caravan.websocket, caravan.router, caravan.middleware, caravan.static or
+; caravan.tls depends on unix, on threads or on a world of weft. Thus the seven
+; libraries run in each world.
 ; weft.linux and weft.kqueue depend on weft.posix, thus the forbidden
 ; weft.posix also forbids these two worlds.
 ; weft.os selects a world of the OS, or no world on another system.
-; -linkall links each module of the six libraries, thus a module that no
+; -linkall links each module of the seven libraries, thus a module that no
 ; other module uses also gets the check. nounix.ml is empty. The windtrap
 ; suites link unix, thus the guard is a separate executable with no test
 ; library.
@@ -18,6 +18,7 @@
   caravan.websocket
   caravan.router
   caravan.middleware
-  caravan.static)
+  caravan.static
+  caravan.tls)
  (link_flags (-linkall))
  (forbidden_libraries unix threads.posix weft.posix weft.sim weft.os))

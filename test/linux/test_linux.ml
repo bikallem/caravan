@@ -685,6 +685,46 @@ let static_files ~domains () =
   let r = Caravan_static.dir ~root:"/dev" ["null"] (Request.make GET "/") in
   equal int 404 (Status.code (Response.status r))
 
+(* 14. TLS on loopback *)
+
+(* [tls_get] serves HTTPS with caravan.tls and the generator of the OS, and
+   sends one GET with the TLS client of caravan.tls. The certificates come from
+   Tls_support. *)
+let tls_get ~domains () =
+  Mirage_crypto_rng_unix.use_default () ;
+  let scfg, ccfg =
+    Tls_support.configs
+      ~time:(fun () -> Ptime.of_float_s (Unix.gettimeofday ()))
+      ()
+  in
+  in_world ~domains
+  @@ fun () ->
+  Server_support.with_server
+    ~engine:(Caravan_tls.engine scfg Server.http1)
+    ~handler:(fun req -> Response.string (Request.scheme req))
+    (fun server ->
+      let flow, _ =
+        Caravan_tls.client ccfg
+          (Tcp.connect (Net.Tcp ("127.0.0.1", port_of server)))
+      in
+      Fun.protect ~finally:(fun () -> Flow.close flow)
+      @@ fun () ->
+      Flow.write_string flow
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" ;
+      let b = Buffer.create 256 and buf = Bytes.create 4096 in
+      let rec go () =
+        match Flow.read flow buf 0 4096 with
+        | 0 ->
+            ()
+        | n ->
+            Buffer.add_subbytes b buf 0 n ;
+            go ()
+      in
+      go () ;
+      let r = Buffer.contents b in
+      is_true ~msg:r (String.starts_with ~prefix:"HTTP/1.1 200" r) ;
+      is_true ~msg:r (String.ends_with ~suffix:"https" r) )
+
 let tests =
   [ ( "1. EADDRINUSE: a start on the port of a running server gives In_use"
     , in_use )
@@ -711,7 +751,8 @@ let tests =
     , http_smoke )
   ; ( "12. smoke: a WebSocket echo and close, a client GET and POST"
     , websocket_and_client_smoke )
-  ; ("13. static files on the thread pool, and EACCES", static_files) ]
+  ; ("13. static files on the thread pool, and EACCES", static_files)
+  ; ("14. TLS on loopback, with the generator of the OS", tls_get) ]
 
 let on ~domains name =
   group name (List.map (fun (n, t) -> test n (t ~domains)) tests)

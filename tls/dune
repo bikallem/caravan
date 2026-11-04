@@ -1,0 +1,12 @@
+; TLS: a flow for a server and a client, and an engine that wraps another
+; engine. Optional: dune builds it only if tls is installed.
+
+(library
+ (name caravan_tls)
+ (public_name caravan.tls)
+ (optional)
+ (libraries caravan weft tls x509 domain-name mirage-crypto-rng)
+ (instrumentation
+  (backend ppx_windtrap.mutate))
+ (instrumentation
+  (backend ppx_windtrap.coverage)))

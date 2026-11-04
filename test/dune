@@ -1,5 +1,5 @@
 ; The suites of caravan. They run in the simulator of weft. The deps give the
-; source scan of test_core the files of the seven libraries.
+; source scan of test_core the files of the eight libraries.
 
 (tests
  (names
@@ -60,7 +60,8 @@
   (glob_files ../testing/*.ml)
   (glob_files ../router/*.ml)
   (glob_files ../middleware/*.ml)
-  (glob_files ../static/*.ml)))
+  (glob_files ../static/*.ml)
+  (glob_files ../tls/*.ml)))
 
 ; The hosts of the numeric tests of Resolver, shared by test_client and
 ; test_numeric_unix.
@@ -108,3 +109,32 @@
  (name test_printers)
  (modules test_printers)
  (libraries caravan.testing weft.sim windtrap))
+
+; The test certificates of caravan.tls, for test_tls and test_linux.
+
+(library
+ (name tls_support)
+ (modules tls_support)
+ (libraries tls x509 domain-name mirage-crypto-ec ptime))
+
+; The suite of caravan.tls. caravan.tls is optional for a user, and tls is a
+; dependency of the tests.
+
+(test
+ (name test_tls)
+ (modules test_tls)
+ (libraries
+  caravan
+  caravan.tls
+  caravan.testing
+  sim_support
+  tls_support
+  weft
+  weft.sim
+  windtrap
+  tls
+  x509
+  domain-name
+  mirage-crypto-rng
+  mirage-crypto-ec
+  ptime))

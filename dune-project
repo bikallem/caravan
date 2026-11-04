@@ -32,4 +32,21 @@
    (and
     :with-test
     (>= 0.2.0)))
-  (odoc :with-doc)))
+  (odoc :with-doc)
+  (mirage-crypto-rng :with-test)
+  (mirage-crypto-ec :with-test)
+  (ptime :with-test)
+  (tls
+   (and
+    :with-test
+    (>= 2.1))))
+ (depopts
+  ; caravan.tls
+  (tls
+   (>= 2.1))
+  x509
+  domain-name
+  mirage-crypto-rng)
+ (conflicts
+  (tls
+   (< 2.1))))

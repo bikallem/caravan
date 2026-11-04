@@ -111,6 +111,7 @@
                 ./router
                 ./middleware
                 ./static
+                ./tls
                 ./testing
                 ./LICENSE
                 ./README.md
@@ -119,6 +120,10 @@
             propagatedBuildInputs = [
               ocamlPackages.weft
               ocamlPackages.http-date
+              # caravan.tls, an optional library.
+              ocamlPackages.tls
+              ocamlPackages.x509
+              ocamlPackages.domain-name
             ];
             doCheck = false;
             meta = {
@@ -148,6 +153,15 @@
               # Dependencies (weft here is the flake input, so use ocamlPackages.weft)
               ocamlPackages.weft
               http-date
+
+              # caravan.tls (optional), and its tests: a seeded generator and
+              # the test certificates.
+              tls
+              x509
+              domain-name
+              mirage-crypto-rng
+              mirage-crypto-ec
+              ptime
 
               # Test dependencies (windtrap here is the flake input, so use
               # ocamlPackages.windtrap)
