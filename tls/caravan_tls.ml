@@ -58,9 +58,10 @@ let split s =
 
    The reader never writes. A response of handle_tls (for example a KeyUpdate)
    waits in [pending] for the next write (RFC 8446 §4.6.3). Thus a reader never
-   waits for a TCP write, and [read_now] never waits. Only the reader uses
-   [carry], [plain], [pos], [plain_total] and [empty]. [status] is atomic: a
-   failure stays. *)
+   waits for a TCP write, and [read_now] never waits for input. But [read_now]
+   can wait for the state lock while a writer encrypts one record, thus a cancel
+   can come in it. Only the reader uses [carry], [plain], [pos], [plain_total]
+   and [empty]. [status] is atomic: a failure stays. *)
 type t =
   { tcp: Flow.t
   ; cbuf: bytes  (** The buffer of the TCP reads. *)
@@ -376,25 +377,102 @@ let client config tcp =
   let t, epoch = establish ~read:(read_with_deadlines tcp) tcp tls in
   (flow_of t, epoch)
 
-let engine config inner =
-  let protocols = (Tls.Config.of_server config).alpn_protocols in
-  if List.exists (fun p -> p <> "http/1.1") protocols then
-    invalid_arg
-      "Caravan_tls.engine: the ALPN list has a protocol other than http/1.1" ;
+(* [refuse name m] raises [Invalid_argument] for the function [name]. *)
+let refuse name m = invalid_arg (Printf.sprintf "Caravan_tls.%s: %s" name m)
+
+(* [check name c] refuses the configurations that caravan cannot use. [name] is
+   the name of the function, for the message. *)
+let check name (c : Tls.Config.config) =
+  let refuse = refuse name in
+  (* Caravan has only HTTP/1.1, and a peer that gets "h2" sends HTTP/2. *)
+  if List.exists (fun p -> p <> "http/1.1") c.alpn_protocols then
+    refuse "the ALPN list has a protocol other than http/1.1" ;
   (* With TLS 1.0 and a CBC cipher, ocaml-tls puts an empty record before each
      write: each one costs in the budget of the peer. *)
-  ( match fst (Tls.Config.of_server config).protocol_versions with
+  ( match fst c.protocol_versions with
   | `TLS_1_0 | `TLS_1_1 ->
-      invalid_arg "Caravan_tls.engine: the lowest version is before TLS 1.2"
+      refuse "the lowest version is before TLS 1.2"
   | `TLS_1_2 | `TLS_1_3 ->
       () ) ;
-  ( match Mirage_crypto_rng.default_generator () with
+  match Mirage_crypto_rng.default_generator () with
   | _ ->
       ()
   | exception Mirage_crypto_rng.No_default_generator ->
-      invalid_arg
-        "Caravan_tls.engine: no default generator: call \
-         Mirage_crypto_rng_unix.use_default () first" ) ;
+      refuse
+        "no default generator: call Mirage_crypto_rng_unix.use_default () first"
+
+(* [peer config host] is [config] for the host of a URL: an IPv6 address in
+   brackets, an IPv4 address, or a name. [None] if [host] is not one of
+   these. *)
+let peer config host =
+  let n = String.length host in
+  let ip a = Some (Tls.Config.ip config a) in
+  if
+    ( n >= 2
+    && host.[0] = '['
+    && host.[n - 1] = ']' )
+    [@mutate
+      off
+        "\"[]\" and a host with one bracket are not names either: the two \
+         branches give None"]
+  then
+    match Ipaddr.V6.of_string (String.sub host 1 (n - 2)) with
+    | Ok a ->
+        ip (Ipaddr.V6 a)
+    | Error _ ->
+        None
+  else
+    match Ipaddr.V4.of_string host with
+    | Ok a ->
+        ip (Ipaddr.V4 a)
+    | Error _ -> (
+      match Result.bind (Domain_name.of_string host) Domain_name.host with
+      | Ok name ->
+          Some (Tls.Config.peer config name)
+      | Error _ ->
+          None )
+
+(* [selected p] accepts the ALPN protocol [p] of a server. ocaml-tls 2.1.3 does
+   not compare the protocol of a TLS 1.3 server with the list of the client. No
+   server of ocaml-tls selects another protocol, thus a test gives an epoch of
+   its own to [https_with]. *)
+let selected = function
+  | None | Some "http/1.1" ->
+      Ok ()
+  | Some p ->
+      Error ("the server selected the protocol " ^ p)
+
+(* [https_with ~client config] is [https config], with the handshake [client]. A
+   test gives a [client] that returns an epoch of its own. *)
+let https_with ~client config =
+  let c = Tls.Config.of_client config in
+  let refuse = refuse "https" in
+  if Option.is_some c.peer_name then
+    refuse "the configuration has a peer name: the URL gives it" ;
+  if Option.is_some c.ip then
+    refuse "the configuration has an IP address: the URL gives it" ;
+  (* ocaml-tls does not compare the peer name of a cached session with the host,
+     and a resumed session skips the check of the certificate. *)
+  if Option.is_some c.cached_session || Option.is_some c.cached_ticket then
+    refuse "the configuration has a cached session" ;
+  check "https" c ;
+  fun ~host tcp ->
+    match peer config host with
+    | None ->
+        Error ("not a host name or an address: " ^ host)
+    | Some config -> (
+      match client config tcp with
+      | flow, (epoch : Tls.Core.epoch_data) ->
+          Result.map (fun () -> flow) (selected epoch.alpn_protocol)
+      | exception Handshake_error m ->
+          Error m
+      | exception Flow.Closed ->
+          Error "the peer closed the connection" )
+
+let https config = https_with ~client config
+
+let engine config inner =
+  check "engine" (Tls.Config.of_server config) ;
   fun (ctx : Caravan.Engine.ctx) tcp handler ->
     let c = ctx.config in
     let deadline = Time.add Mono (Time.now Mono) c.header_timeout in
@@ -463,3 +541,7 @@ let engine config inner =
             ()
         | exception (Flow.Closed | Flow.Timeout) ->
             () )
+
+module Private = struct
+  let https_with = https_with
+end

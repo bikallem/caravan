@@ -912,4 +912,284 @@ let flow_tests =
                   Flow.close server ;
                   Net.close l ) ) ) ]
 
-let () = exit (Windtrap.run "tls" [engine_tests; flow_tests])
+(* {1 The client: Caravan_tls.https} *)
+
+module C = Caravan_client
+
+(* GET gives "hello", POST gives its body. *)
+let echo req =
+  if Method.equal (Request.meth req) Method.POST then
+    Response.string (Body.to_string (Request.body req))
+  else Response.string "hello"
+
+(* [run_https ?ips ?config ?count handler f] serves [handler] over TLS, as
+   [run], with [localhost] at 127.0.0.1. The test host listens on port 80, thus
+   the URLs are [https://localhost:80/]. It gives [f] the hook of a client
+   configuration with no peer name. [count] counts the connections. *)
+let run_https ?ips ?config ?(count = Atomic.make 0) handler f =
+  seed () ;
+  let scfg, ccfg =
+    Tls_support.configs ~client_peer:false ?ips ~time:posix_now ()
+  in
+  let engine ctx tcp h =
+    Atomic.incr count ;
+    S.engine scfg Server.http1 ctx tcp h
+  in
+  T.run ?config ~engine handler (fun t ->
+      Weft_sim.set_posix (T.sim t) (Time.posix_of_unix_s t0) ;
+      Weft_sim.set_dns (T.sim t) "localhost" (Addresses ["127.0.0.1"]) ;
+      f t (S.https ccfg) )
+
+(* The text of an error of the client: ["Tls"] for [Tls _], whose text comes
+   from ocaml-tls. *)
+let client_error f =
+  match f () with
+  | _ ->
+      "no error"
+  | exception C.Error (Tls _) ->
+      "Tls"
+  | exception e ->
+      Printexc.to_string e
+
+let get_text c url = Body.to_string (C.body (C.get c url))
+
+let post_text c url body =
+  let scheme, authority, path = C.Private.parse_url url in
+  Body.to_string
+    (C.body
+       (C.request c
+          (Request.make ~scheme ~authority ~body:(Body.of_string body)
+             Method.POST path ) ) )
+
+let localhost_ip = Ipaddr.of_string_exn "127.0.0.1"
+
+(* [epoch ()] is the data of a TLS session, for a cached session. *)
+let epoch () =
+  let scfg, ccfg = setup () in
+  Sim_support.run (fun sim ->
+      Weft_sim.set_posix sim (Time.posix_of_unix_s t0) ;
+      let l = listen () in
+      Fiber.scope (fun s ->
+          let server =
+            Fiber.fork_promise s (fun () ->
+                let c, _ = Net.accept l in
+                S.server scfg (Tcp.flow c) )
+          in
+          let flow, epoch = S.client ccfg (connect ()) in
+          let sflow, _ = Promise.await server in
+          Flow.close flow ; Flow.close sflow ; Net.close l ; epoch ) )
+
+(* A flow with no peer: the fake handshakes do not use it. *)
+let connect_nothing () =
+  Flow.make
+    ~read:(fun _ _ _ -> 0)
+    ~read_now:(fun _ _ _ -> None)
+    ~write:(fun _ _ _ -> ())
+    ~readable:(always ()) ~shutdown_send:ignore ~close:ignore
+    ~set_read_deadline:ignore ~set_write_deadline:ignore ()
+
+let client_tests =
+  group "The client"
+    [ test "a GET and a POST over https" (fun () ->
+          run_https echo (fun _ tls ->
+              C.run ~tls (fun c ->
+                  equal string "hello" (get_text c "https://localhost:80/") ;
+                  equal string "data"
+                    (post_text c "https://localhost:80/" "data") ) ) )
+    ; test "requests in sequence use one TLS connection" (fun () ->
+          let count = Atomic.make 0 in
+          run_https ~count echo (fun _ tls ->
+              C.run ~tls (fun c ->
+                  for _ = 1 to 3 do
+                    equal string "hello" (get_text c "https://localhost:80/")
+                  done ) ) ;
+          equal int 1 (Atomic.get count) )
+    ; test "a certificate of a different CA gives Error (Tls _)" (fun () ->
+          run_https echo (fun _ _ ->
+              (* The generator continues: a new CA. *)
+              let _, other =
+                Tls_support.configs ~client_peer:false ~time:posix_now ()
+              in
+              C.run ~tls:(S.https other) (fun c ->
+                  equal string "Tls"
+                    (client_error (fun () -> C.get c "https://localhost:80/")) ) ) )
+    ; test "an IP host checks the address of the certificate" (fun () ->
+          run_https ~ips:[localhost_ip] echo (fun _ tls ->
+              C.run ~tls (fun c ->
+                  equal string "hello" (get_text c "https://127.0.0.1:80/") ) ) ;
+          run_https echo (fun _ tls ->
+              C.run ~tls (fun c ->
+                  equal string "Tls"
+                    (client_error (fun () -> C.get c "https://127.0.0.1:80/")) ) ) )
+    ; test "a host that is not a name gives Error (Tls _)" (fun () ->
+          run_https echo (fun t tls ->
+              Weft_sim.set_dns (T.sim t) "a_b" (Addresses ["127.0.0.1"]) ;
+              C.run ~tls (fun c ->
+                  equal string "Tls"
+                    (client_error (fun () -> C.get c "https://a_b:80/")) ) ) )
+    ; test "a name goes in SNI, an address does not" (fun () ->
+          seed () ;
+          let scfg, ccfg =
+            Tls_support.configs ~client_peer:false
+              ~ips:[localhost_ip; Ipaddr.of_string_exn "::1"]
+              ~time:posix_now ()
+          in
+          let names = ref [] in
+          Sim_support.run (fun sim ->
+              Weft_sim.set_posix sim (Time.posix_of_unix_s t0) ;
+              Weft_sim.set_dns sim "localhost" (Addresses ["127.0.0.1"]) ;
+              let l4 = Net.listen (Net.Tcp ("127.0.0.1", 443))
+              and l6 = Net.listen (Net.Tcp ("::1", 443)) in
+              Fiber.scope (fun s ->
+                  let server =
+                    Fiber.fork_promise s (fun () ->
+                        List.iter
+                          (fun l ->
+                            let c, _ = Net.accept l in
+                            let tcp = Tcp.flow c in
+                            ( match S.server scfg tcp with
+                            | _, e ->
+                                names :=
+                                  Option.fold ~none:"no SNI"
+                                    ~some:Domain_name.to_string
+                                    e.Tls.Core.own_name
+                                  :: !names
+                            | exception _ ->
+                                names := "failed" :: !names ) ;
+                            Flow.close tcp )
+                          [l4; l6; l4] )
+                  in
+                  C.run ~tls:(S.https ccfg) (fun c ->
+                      List.iter
+                        (fun url ->
+                          ignore (client_error (fun () -> C.get c url)) )
+                        [ "https://127.0.0.1/"
+                        ; "https://[::1]/"
+                        ; "https://localhost/" ] ) ;
+                  Promise.await server ;
+                  Net.close l4 ;
+                  Net.close l6 ) ) ;
+          equal (list string)
+            ["no SNI"; "no SNI"; "localhost"]
+            (List.rev !names) )
+    ; test "an idle connection that the server ended is not used" (fun () ->
+          (* The server ends an idle connection after 1 s, with close_notify.
+             The client keeps idle connections for 5 s. A POST gets no retry: a
+             reuse of the ended connection fails. *)
+          let count = Atomic.make 0 in
+          let config = {Config.default with idle_timeout= Span.s 1} in
+          run_https ~config ~count echo (fun _ tls ->
+              C.run ~tls (fun c ->
+                  equal string "hello" (get_text c "https://localhost:80/") ;
+                  Time.sleep Mono (Span.s 2) ;
+                  equal string "data"
+                    (post_text c "https://localhost:80/" "data") ) ) ;
+          equal int 2 (Atomic.get count) )
+    ; test "a body to the end of the connection needs close_notify" (fun () ->
+          let serve ~notify =
+            seed () ;
+            let scfg, ccfg =
+              Tls_support.configs ~client_peer:false ~time:posix_now ()
+            in
+            Sim_support.run (fun sim ->
+                Weft_sim.set_posix sim (Time.posix_of_unix_s t0) ;
+                Weft_sim.set_dns sim "localhost" (Addresses ["127.0.0.1"]) ;
+                let l = Net.listen (Net.Tcp ("127.0.0.1", 443)) in
+                Fiber.scope (fun s ->
+                    let server =
+                      Fiber.fork_promise s (fun () ->
+                          let c, _ = Net.accept l in
+                          let tcp = Tcp.flow c in
+                          let flow, _ = S.server scfg tcp in
+                          let b = Buffer.create 256
+                          and buf = Bytes.create 256 in
+                          let rec head () =
+                            let n = Flow.read flow buf 0 256 in
+                            Buffer.add_subbytes b buf 0 n ;
+                            let h = Buffer.contents b in
+                            let len = String.length h in
+                            if
+                              n > 0
+                              && not
+                                   ( len >= 4
+                                   && String.sub h (len - 4) 4 = "\r\n\r\n" )
+                            then head ()
+                          in
+                          head () ;
+                          Flow.write_string flow "HTTP/1.1 200 OK\r\n\r\nhello" ;
+                          if notify then Flow.shutdown_send flow ;
+                          Flow.close tcp )
+                    in
+                    let r =
+                      C.run ~tls:(S.https ccfg) (fun c ->
+                          match get_text c "https://localhost/" with
+                          | text ->
+                              text
+                          | exception e ->
+                              client_error (fun () -> raise e) )
+                    in
+                    Promise.await server ; Net.close l ; r ) )
+          in
+          equal string ~msg:"close_notify" "hello" (serve ~notify:true) ;
+          equal string ~msg:"no close_notify"
+            "Caravan_client.Error: the response body is truncated"
+            (serve ~notify:false) )
+    ; test "https refuses a configuration that it cannot use" (fun () ->
+          let is_invalid = function Invalid_argument _ -> true | _ -> false in
+          let refused msg cfg =
+            raises_match ~msg is_invalid (fun () ->
+                ignore
+                  ( S.https cfg
+                    : host:string -> Flow.t -> (Flow.t, string) result ) )
+          in
+          let epoch = epoch () in
+          seed () ;
+          let authenticator =
+            X509.Authenticator.chain_of_trust ~time:posix_now []
+          in
+          let client f = Result.get_ok (f ()) in
+          refused "a peer name" (snd (setup ())) ;
+          refused "an IP address"
+            (client (Tls.Config.client ~authenticator ~ip:localhost_ip)) ;
+          refused "a cached session"
+            (client (Tls.Config.client ~authenticator ~cached_session:epoch)) ;
+          refused "a cached ticket"
+            (client
+               (Tls.Config.client ~authenticator
+                  ~cached_ticket:
+                    ( { Tls.Core.identifier= "t"
+                      ; obfuscation= 0l
+                      ; secret= String.make 32 'k'
+                      ; lifetime= 0l
+                      ; early_data= 0l
+                      ; issued_at= Ptime.epoch }
+                    , epoch ) ) ) ;
+          refused "h2"
+            (client (Tls.Config.client ~authenticator ~alpn_protocols:["h2"])) ;
+          refused "TLS 1.0"
+            (client
+               (Tls.Config.client ~authenticator ~version:(`TLS_1_0, `TLS_1_3)) ) ;
+          let ok = client (Tls.Config.client ~authenticator) in
+          ignore (S.https ok : host:string -> Flow.t -> (Flow.t, string) result) ;
+          Mirage_crypto_rng.unset_default_generator () ;
+          Fun.protect ~finally:seed @@ fun () -> refused "no generator" ok )
+    ; test "the client accepts no ALPN protocol or http/1.1" (fun () ->
+          (* No server of ocaml-tls selects a protocol that the client did not
+             offer: the handshake here gives an epoch with the protocol. *)
+          let e = epoch () in
+          seed () ;
+          let _, ccfg =
+            Tls_support.configs ~client_peer:false ~time:posix_now ()
+          in
+          let show = function Ok _ -> "ok" | Error m -> m in
+          equal (list string)
+            ["ok"; "ok"; "the server selected the protocol h2"]
+            (List.map
+               (fun p ->
+                 let client _ tcp = (tcp, {e with Tls.Core.alpn_protocol= p}) in
+                 show
+                   (S.Private.https_with ~client ccfg ~host:"localhost"
+                      (connect_nothing ()) ) )
+               [None; Some "http/1.1"; Some "h2"] ) ) ]
+
+let () = exit (Windtrap.run "tls" [engine_tests; flow_tests; client_tests])

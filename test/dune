@@ -118,7 +118,7 @@
 (library
  (name tls_support)
  (modules tls_support)
- (libraries tls x509 domain-name mirage-crypto-ec ptime))
+ (libraries tls x509 domain-name ipaddr mirage-crypto-ec ptime))
 
 ; The suite of caravan.tls. caravan.tls is optional for a user, and tls is a
 ; dependency of the tests.
@@ -128,6 +128,7 @@
  (modules test_tls)
  (libraries
   caravan
+  caravan.client
   caravan.tls
   caravan.testing
   sim_support
@@ -138,6 +139,7 @@
   tls
   x509
   domain-name
+  ipaddr
   mirage-crypto-rng
   mirage-crypto-ec
   ptime))

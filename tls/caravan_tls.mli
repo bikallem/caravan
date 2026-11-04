@@ -30,8 +30,10 @@
     {!server} and {!client} give a {!Caravan.Flow.t}. A read and a write can run
     at the same time in two fibers, as the flow contract permits. A reader never
     waits for a TCP write: it waits for a writer only while the writer encrypts
-    one record. A response of the session to the peer, for example a TLS 1.3
-    KeyUpdate, goes out before the next write.
+    one record. Thus [Caravan.Flow.read_now] never waits for input, but it can
+    wait for the lock of the session, and a cancel can come in it. A response of
+    the session to the peer, for example a TLS 1.3 KeyUpdate, goes out before
+    the next write.
 
     After the handshake:
     - A TLS failure of the peer (for example a bad record or an alert) makes a
@@ -78,6 +80,50 @@ val client :
     [Tls.Config.peer]). Without a peer name, the authenticator checks no name:
     give one for each server on the Internet. *)
 
+val https :
+     Tls.Config.client
+  -> host:string
+  -> Caravan.Flow.t
+  -> (Caravan.Flow.t, string) result
+(** [https config] is the TLS of [caravan.client] for [https] URLs:
+    {[
+    let () = Mirage_crypto_rng_unix.use_default ()
+
+    let ok = function Ok v -> v | Error (`Msg m) -> failwith m
+
+    let config =
+      ok (Tls.Config.client ~authenticator:(ok (Ca_certs.authenticator ())) ())
+
+    let main () =
+      Caravan_client.run ~tls:(Caravan_tls.https config)
+      @@ fun client -> Caravan_client.get client "https://example.com/"
+    ]}
+
+    [Ca_certs.authenticator ()] of the package ca-certs trusts the certificate
+    authorities of the system. Caravan does not depend on it.
+
+    For each connection, [https] sets the peer of [config] from [host]:
+    - A name: [Tls.Config.peer]. The client sends the name in SNI, and the
+      authenticator checks the name of the certificate.
+    - An IPv4 address, or an IPv6 address in brackets: [Tls.Config.ip]. No SNI
+      goes (RFC 6066 §3), and the authenticator checks the address of the
+      certificate.
+
+    An authenticator that is not from [X509.Authenticator] can ignore the name
+    or the address. The client certificates of [config] go to each server.
+
+    [Error] tells the cause: a failed handshake (also a failed check of the
+    certificate), the end of the connection in the handshake, a [host] that is
+    not a name or an address, or an ALPN protocol of the server other than
+    ["http/1.1"].
+
+    @raise Invalid_argument
+      at [https config], before a connection, if [config] has a peer name or an
+      IP address (the URL gives them), or a cached session or ticket (ocaml-tls
+      does not compare the name of a cached session with the host, and a resumed
+      session skips the check of the certificate). Also for the checks of
+      {!engine}: the ALPN list, the lowest version and the generator. *)
+
 val engine : Tls.Config.server -> Caravan.Engine.t -> Caravan.Engine.t
 (** [engine config inner] does the TLS handshake of each connection, then calls
     [inner] with the TLS flow and the connection with the scheme [`Https] and
@@ -99,3 +145,19 @@ val engine : Tls.Config.server -> Caravan.Engine.t -> Caravan.Engine.t
       ocaml-tls sends an empty record before each write, and each one costs in
       the budget of the peer), or if no default generator is set (see {!rng}).
 *)
+
+(**/**)
+
+module Private : sig
+  val https_with :
+       client:
+         (   Tls.Config.client
+          -> Caravan.Flow.t
+          -> Caravan.Flow.t * Tls.Core.epoch_data )
+    -> Tls.Config.client
+    -> host:string
+    -> Caravan.Flow.t
+    -> (Caravan.Flow.t, string) result
+  (* [https_with ~client config] is [https config] with the handshake [client],
+     for a test. *)
+end

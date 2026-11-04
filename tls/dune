@@ -5,7 +5,7 @@
  (name caravan_tls)
  (public_name caravan.tls)
  (optional)
- (libraries caravan weft tls x509 domain-name mirage-crypto-rng)
+ (libraries caravan weft tls x509 domain-name ipaddr mirage-crypto-rng)
  (instrumentation
   (backend ppx_windtrap.mutate))
  (instrumentation

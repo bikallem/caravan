@@ -6,7 +6,7 @@ let dn cn =
   [ X509.Distinguished_name.(
       Relative_distinguished_name.singleton (CN (Common_name.v cn)) ) ]
 
-let pki () =
+let pki ?(ips = []) () =
   let valid_from = ptime 1_577_836_800.
   and valid_until = ptime 2_208_988_800. in
   let ca_key = X509.Private_key.generate `P256 in
@@ -33,7 +33,14 @@ let pki () =
            X509.Extension.(
              empty
              |> add Subject_alt_name
-                  (false, X509.General_name.(singleton DNS ["localhost"]))
+                  ( false
+                  , X509.General_name.(
+                      let names = singleton DNS ["localhost"] in
+                      if ips = [] then names
+                      else
+                        add IP
+                          (List.map (fun a -> Ipaddr.to_octets a) ips)
+                          names ) )
              |> add Ext_key_usage (false, [`Server_auth])
              |> add Basic_constraints (true, (false, None)) )
          ca_key ca_dn )
@@ -43,8 +50,8 @@ let pki () =
 let localhost = Domain_name.(host_exn (of_string_exn "localhost"))
 
 let configs ?(server_alpn = ["http/1.1"]) ?client_alpn ?(peer_name = localhost)
-    ~time () =
-  let ca, leaf, key = pki () in
+    ?(client_peer = true) ?ips ~time () =
+  let ca, leaf, key = pki ?ips () in
   let server =
     ok
       (Tls.Config.server
@@ -54,7 +61,8 @@ let configs ?(server_alpn = ["http/1.1"]) ?client_alpn ?(peer_name = localhost)
   let authenticator = X509.Authenticator.chain_of_trust ~time [ca] in
   let client =
     ok
-      (Tls.Config.client ~authenticator ~peer_name ?alpn_protocols:client_alpn
-         () )
+      (Tls.Config.client ~authenticator
+         ?peer_name:(if client_peer then Some peer_name else None)
+         ?alpn_protocols:client_alpn () )
   in
   (server, client)
