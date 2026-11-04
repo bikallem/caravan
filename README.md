@@ -84,8 +84,8 @@ let handler = Handler.compose [auth] hello
 `examples/middleware.ml` has a full example.
 
 The libraries `caravan`, `caravan.client`, `caravan.websocket`,
-`caravan.router`, `caravan.middleware`, `caravan.static` and
-`caravan.tls` depend on no world of weft.
+`caravan.router`, `caravan.middleware`, `caravan.static`,
+`caravan.tls` and `caravan.session` depend on no world of weft.
 They run in each world, for example the OS world
 (`Weft.run (module Weft_os)`) and the simulator of weft
 (`Weft_sim.run`). `caravan.testing` runs only in the simulator.
@@ -266,6 +266,52 @@ let clear _ =
   gives the order, and a sibling subdomain can set a cookie with the
   same name: use a `__Host-` name for a security cookie.
 - `Cookie.pp` shows the length of the value, not the value.
+
+## Sessions
+
+The optional `caravan.session` library keeps a session for each client,
+with a signed cookie and a store:
+
+```ocaml
+let () = Mirage_crypto_rng_unix.use_default ()
+
+(* A key of 32 random bytes, from the configuration of all the
+   processes. *)
+let key = Caravan_session.Key.of_base64url (Sys.getenv "SESSION_KEY")
+
+let app =
+  Caravan.Handler.compose
+    [ Caravan_session.middleware ~keys:[key]
+        ~store:(Caravan_session.memory_store ())
+        () ]
+    (fun req ->
+      match Caravan.Request.path req with
+      | "/login" ->
+          (* A new ID after a login: no session fixation. *)
+          Caravan_session.renew req ;
+          Caravan_session.set "user" "ada" req ;
+          Caravan.Response.string "welcome"
+      | "/logout" ->
+          Caravan_session.clear req ;
+          Caravan.Response.string "bye"
+      | _ ->
+          Caravan.Response.string
+            (Option.value ~default:"guest" (Caravan_session.find "user" req)) )
+```
+
+- The cookie is `__Host-session` by default: `Secure`, `HttpOnly`,
+  `SameSite=Lax`, `Path=/`. A response that sets it gets
+  `Cache-Control: no-store`.
+- A session ends at most 30 min after the last request (between 15 and
+  30 min: the limit moves only after half of it), and 8 h after its
+  creation. `clear` ends it on the server: a request that runs at the
+  same time cannot bring it back.
+- `Caravan_session.store` connects a store of the application, for
+  example a database. The store keys are hashes of the IDs.
+- `Caravan_session.Signed` signs other values with the same keys. The
+  first key signs, and the other keys verify: a rotation.
+- Make no session for an anonymous user: a session starts at the first
+  `set` (or `id`).
 
 ## File uploads
 

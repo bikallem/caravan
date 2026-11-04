@@ -152,3 +152,16 @@
   (with-stdout-to
    readme_tls.ml
    (run awk -v "section=TLS" -f %{dep:section.awk} %{dep:../README.md}))))
+
+; The example of the "Sessions" section of README.md, as readme_sessions.ml.
+
+(executable
+ (name readme_sessions)
+ (modules readme_sessions)
+ (libraries caravan caravan.session mirage-crypto-rng.unix))
+
+(rule
+ (action
+  (with-stdout-to
+   readme_sessions.ml
+   (run awk -v "section=Sessions" -f %{dep:section.awk} %{dep:../README.md}))))
