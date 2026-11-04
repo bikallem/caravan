@@ -2655,6 +2655,21 @@ let oidc_tests =
 
 (* {2 The login and the callback} *)
 
+(* [keep_cookie cookie resp] is the cookie after [resp]: its Set-Cookie, if any.
+   An empty value ends the cookie. *)
+let keep_cookie cookie resp =
+  match Caravan.Headers.find "set-cookie" (Caravan.Response.headers resp) with
+  | Some sc -> (
+    match Caravan.Cookie.parse_set_cookie sc with
+    | Some (_, "") ->
+        None
+    | Some (n, v) ->
+        Some (n ^ "=" ^ v)
+    | None ->
+        cookie )
+  | None ->
+      cookie
+
 (* A browser: the client and the session cookie. *)
 type browser = {http: C.t; mutable cookie: string option}
 
@@ -2672,17 +2687,7 @@ let visit b ?(meth = Caravan.Method.GET) path =
          meth path )
   in
   let body = Body.to_string (C.body resp) in
-  ( match Caravan.Headers.find "set-cookie" (Caravan.Response.headers resp) with
-  | Some sc -> (
-    match Caravan.Cookie.parse_set_cookie sc with
-    | Some (_, "") ->
-        b.cookie <- None
-    | Some (n, v) ->
-        b.cookie <- Some (n ^ "=" ^ v)
-    | None ->
-        () )
-  | None ->
-      () ) ;
+  b.cookie <- keep_cookie b.cookie resp ;
   (resp, body)
 
 let header name resp =
@@ -3272,6 +3277,404 @@ let flow_tests =
                ; Token "m"
                ; Id_token Missing_nonce ] ) ) ]
 
+(* {1 Codes by email} *)
+
+module Code = Caravan_auth.Code
+module Limiter = Caravan_middleware.Rate_limit.Limiter
+
+(* The application of the code tests, called as a function (no network):
+   /email?address=A starts a code, /code?code=C checks it and signs the user in,
+   /me is the user, /raw is the session value of the code, /corrupt puts a bad
+   value there. *)
+let code_app codes =
+  let text = Caravan.Response.string in
+  let q req n =
+    Option.value ~default:""
+      (Caravan.Form.find n (Caravan.Request.query_params req))
+  in
+  (* /email<suffix> and /code<suffix> of [codes]. With [sign_in], a right code
+     signs the user in. *)
+  let routes_for ~suffix ~sign_in codes req =
+    match Caravan.Request.path_only req with
+    | p when p = "/email" ^ suffix -> (
+      match Code.start codes req ~address:(q req "address") with
+      | Ok code ->
+          Some (text ("code:" ^ code))
+      | Error wait ->
+          Some (text (Printf.sprintf "wait:%Ld" (Span.to_ns wait))) )
+    | p when p = "/code" ^ suffix -> (
+      match Code.check codes req (q req "code") with
+      | Ok address ->
+          if sign_in then
+            Caravan_auth.sign_in req (Caravan_auth.User.make address) ;
+          Some (text ("ok:" ^ address))
+      | Error f ->
+          Some (text (Format.asprintf "%a" Code.pp_failure f)) )
+    | _ ->
+        None
+  in
+  let up = Code.make ~purpose:"sign-up" () in
+  let routes req =
+    match routes_for ~suffix:"" ~sign_in:true codes req with
+    | Some r ->
+        r
+    | None -> (
+      match routes_for ~suffix:"-up" ~sign_in:false up req with
+      | Some r ->
+          r
+      | None -> (
+        match Caravan.Request.path_only req with
+        | "/me" ->
+            text
+              (Option.fold ~none:"none" ~some:Caravan_auth.User.id
+                 (Caravan_auth.user req) )
+        | "/raw" ->
+            text
+              (Option.value ~default:""
+                 (Caravan_session.Private.find "caravan.code.sign-in" req) )
+        | "/corrupt" ->
+            Caravan_session.Private.set "caravan.code.sign-in" "x|1" req ;
+            text ""
+        | _ ->
+            text "" ) )
+  in
+  Caravan.Handler.compose
+    [ Caravan_session.middleware
+        ~keys:[Caravan_session.Key.generate ()]
+        ~store:(Caravan_session.memory_store ())
+        ()
+    ; Caravan_auth.middleware ~schemes:[Caravan_auth.Scheme.session ()] () ]
+    routes
+
+(* A browser of the code tests: its cookie. *)
+type jar = {mutable jar: string option}
+
+(* [call app j path] is the body of the response of [app] to a GET of [path],
+   with the cookie of [j]. *)
+let call app j path =
+  let headers =
+    Caravan.Headers.of_list
+      (Option.fold ~none:[] ~some:(fun c -> [("Cookie", c)]) j.jar)
+  in
+  let resp = app (Caravan.Request.make ~headers Caravan.Method.GET path) in
+  j.jar <- keep_cookie j.jar resp ;
+  match Caravan.Response.kind resp with
+  | Caravan.Response.Body b ->
+      Body.to_string b
+  | _ ->
+      ""
+
+(* [email app j address] starts a code: the code, or the wait. *)
+let email app j address =
+  call app j ("/email?" ^ Caravan.Form.encode [("address", address)])
+
+let code_of_body body =
+  if String.starts_with ~prefix:"code:" body then
+    String.sub body 5 (String.length body - 5)
+  else fail ("no code: " ^ body)
+
+let enter app j code =
+  call app j ("/code?" ^ Caravan.Form.encode [("code", code)])
+
+(* A wrong code of [digits] digits for [code]. *)
+let other code =
+  String.map (fun c -> if c = '9' then '0' else Char.chr (Char.code c + 1)) code
+
+let with_codes ?codes f =
+  Sim_support.run
+    ~guard:(Span.s (3 * 86400))
+    (fun sim ->
+      Weft_sim.set_posix sim (Time.posix_of_unix_s oidc_t0) ;
+      let codes = match codes with Some c -> c () | None -> Code.make () in
+      f (code_app codes) )
+
+let big () = Limiter.take (Limiter.make ~burst:100_000 ~every:(Span.ms 1) ())
+
+let code_tests =
+  group "Codes by email"
+    [ test "a code signs the user in, one time" (fun () ->
+          with_codes (fun app ->
+              let j = {jar= None} in
+              let code = code_of_body (email app j "ada@example.com") in
+              equal int 8 (String.length code) ;
+              let before = j.jar in
+              equal string "ok:ada@example.com" (enter app j code) ;
+              is_true ~msg:"a new session ID" (j.jar <> before) ;
+              equal string "ada@example.com" (call app j "/me") ;
+              equal string "No_code" (enter app j code) ) )
+    ; test "spaces and '-' in the text are removed" (fun () ->
+          with_codes (fun app ->
+              let j = {jar= None} in
+              let code = code_of_body (email app j "a@x") in
+              let text =
+                " " ^ String.sub code 0 4 ^ "-" ^ String.sub code 4 4 ^ " "
+              in
+              equal string "ok:a@x" (enter app j text) ) )
+    ; test "wrong codes take the attempts" (fun () ->
+          with_codes (fun app ->
+              let j = {jar= None} in
+              let code = code_of_body (email app j "a@x") in
+              List.iter
+                (fun left ->
+                  equal string
+                    (Printf.sprintf {|Wrong {address= "a@x"; left= %d}|} left)
+                    (enter app j (other code)) )
+                [4; 3; 2; 1; 0] ;
+              equal string "No_code" (enter app j code) ) )
+    ; test "a text that is not the digits is a wrong code" (fun () ->
+          with_codes (fun app ->
+              let j = {jar= None} in
+              let code = code_of_body (email app j "a@x") in
+              List.iter
+                (fun (t, left) ->
+                  equal string ~msg:t
+                    (Printf.sprintf {|Wrong {address= "a@x"; left= %d}|} left)
+                    (enter app j t) )
+                [ (String.sub code 0 7, 4)
+                ; (code ^ "0", 3)
+                ; ("abcdefgh", 2)
+                ; ("", 1) ] ;
+              equal string "ok:a@x" (enter app j code) ) )
+    ; test "a code expires after ttl" (fun () ->
+          with_codes (fun app ->
+              let j = {jar= None} in
+              let code = code_of_body (email app j "a@x") in
+              Time.sleep Mono (Span.s 599) ;
+              equal string {|Wrong {address= "a@x"; left= 4}|}
+                (enter app j (other code)) ;
+              Time.sleep Mono (Span.s 1) ;
+              equal string "Expired" (enter app j code) ;
+              equal string "No_code" (enter app j code) ) )
+    ; test "sends: 3 codes, then one each 10 min" (fun () ->
+          with_codes (fun app ->
+              let j = {jar= None} in
+              ignore (code_of_body (email app j "a@x")) ;
+              ignore (code_of_body (email app j "a@x")) ;
+              let last = code_of_body (email app j "a@x") in
+              equal string "wait:600000000000" (email app j "a@x") ;
+              (* The code of the session stays. *)
+              equal string "ok:a@x" (enter app j last) ;
+              Time.sleep Mono (Span.s 599) ;
+              equal string "wait:1000000000" (email app j "a@x") ;
+              Time.sleep Mono (Span.s 1) ;
+              ignore (code_of_body (email app j "a@x")) ) )
+    ; test "the variants of an address share the limits" (fun () ->
+          with_codes (fun app ->
+              let j = {jar= None} in
+              List.iter
+                (fun a -> ignore (code_of_body (email app j a)))
+                ["Ada@Example.com"; "ada@example.com"; " ADA@EXAMPLE.COM "] ;
+              equal string "wait:600000000000" (email app j "ada@example.COM") ) )
+    ; test "checks: 10 for an address over all sessions, then one an hour"
+        (fun () ->
+          with_codes
+            ~codes:(fun () -> Code.make ~sends:(big ()) ())
+            (fun app ->
+              (* 2 wrong codes in each of 5 sessions. *)
+              for _ = 1 to 5 do
+                let j = {jar= None} in
+                let code = code_of_body (email app j "a@x") in
+                ignore (enter app j (other code)) ;
+                ignore (enter app j (other code))
+              done ;
+              let j = {jar= None} in
+              let code = code_of_body (email app j "a@x") in
+              (* The right code too: no token. The attempts stay. *)
+              equal string {|Too_many {address= "a@x"; wait= 3600000000000 ns}|}
+                (enter app j code) ;
+              (* One token an hour. The session ends after 30 min idle: a new
+                 session. *)
+              Time.sleep Mono (Span.s 3600) ;
+              let j = {jar= None} in
+              let code = code_of_body (email app j "a@x") in
+              equal string {|Wrong {address= "a@x"; left= 4}|}
+                (enter app j (other code)) ;
+              equal string {|Too_many {address= "a@x"; wait= 3600000000000 ns}|}
+                (enter app j code) ) )
+    ; test "Too_many does not take an attempt" (fun () ->
+          with_codes
+            ~codes:(fun () ->
+              Code.make
+                ~checks:
+                  (Limiter.take (Limiter.make ~burst:1 ~every:(Span.s 60) ()))
+                () )
+            (fun app ->
+              let j = {jar= None} in
+              let code = code_of_body (email app j "a@x") in
+              equal string {|Wrong {address= "a@x"; left= 4}|}
+                (enter app j (other code)) ;
+              equal string {|Too_many {address= "a@x"; wait= 60000000000 ns}|}
+                (enter app j code) ;
+              Time.sleep Mono (Span.s 60) ;
+              equal string {|Wrong {address= "a@x"; left= 3}|}
+                (enter app j (other code)) ;
+              Time.sleep Mono (Span.s 60) ;
+              equal string "ok:a@x" (enter app j code) ) )
+    ; test "a new code replaces the code of the session" (fun () ->
+          with_codes (fun app ->
+              let j = {jar= None} in
+              let old = code_of_body (email app j "a@x") in
+              let code = code_of_body (email app j "a@x") in
+              if old <> code then
+                equal string {|Wrong {address= "a@x"; left= 4}|}
+                  (enter app j old) ;
+              equal string "ok:a@x" (enter app j code) ) )
+    ; test "a code works only in its session" (fun () ->
+          with_codes (fun app ->
+              let code = code_of_body (email app {jar= None} "a@x") in
+              equal string "No_code" (enter app {jar= None} code) ) )
+    ; test "the session keeps a hash, not the code" (fun () ->
+          with_codes (fun app ->
+              let j = {jar= None} in
+              let code = code_of_body (email app j "a@x") in
+              let raw = call app j "/raw" in
+              is_true ~msg:raw (String.length raw > 0) ;
+              is_false ~msg:raw (contains raw code) ) )
+    ; test "a bad value in the session gives No_code" (fun () ->
+          with_codes (fun app ->
+              let j = {jar= None} in
+              ignore (call app j "/corrupt") ;
+              equal string "No_code" (enter app j "12345678") ) )
+    ; test "the variants of an address share the checks" (fun () ->
+          with_codes
+            ~codes:(fun () ->
+              Code.make ~sends:(big ())
+                ~checks:
+                  (Limiter.take (Limiter.make ~burst:1 ~every:(Span.s 60) ()))
+                () )
+            (fun app ->
+              let j = {jar= None} in
+              let code = code_of_body (email app j "A@x") in
+              ignore (enter app j (other code)) ;
+              let j = {jar= None} in
+              let code = code_of_body (email app j "a@X ") in
+              equal string {|Too_many {address= "a@X "; wait= 60000000000 ns}|}
+                (enter app j code) ) )
+    ; test "9 digits: no bias of the modulo" (fun () ->
+          (* 2^30 mod 10^9 = 73_741_824: with no new draw, the codes below it
+             would have two times the probability (about 1370 in 10_000, not
+             about 737). *)
+          with_codes
+            ~codes:(fun () -> Code.make ~digits:9 ~sends:(big ()) ())
+            (fun app ->
+              let j = {jar= None} in
+              let low = ref 0 in
+              for _ = 1 to 10_000 do
+                if int_of_string (code_of_body (email app j "a@x")) < 73_741_824
+                then incr low
+              done ;
+              is_true ~msg:(string_of_int !low) (!low >= 600 && !low <= 900) ) )
+    ; test "a long text is a wrong code" (fun () ->
+          with_codes (fun app ->
+              let j = {jar= None} in
+              let code = code_of_body (email app j "a@x") in
+              equal string {|Wrong {address= "a@x"; left= 4}|}
+                (enter app j (code ^ String.make 57 ' ')) ;
+              equal string "ok:a@x" (enter app j (code ^ String.make 56 ' ')) ) )
+    ; test "the codes are uniform" (fun () ->
+          with_codes
+            ~codes:(fun () -> Code.make ~sends:(big ()) ())
+            (fun app ->
+              let j = {jar= None} in
+              let counts = Array.make_matrix 8 10 0 in
+              for _ = 1 to 10_000 do
+                String.iteri
+                  (fun i c ->
+                    let d = Char.code c - 48 in
+                    counts.(i).(d) <- counts.(i).(d) + 1 )
+                  (code_of_body (email app j "a@x"))
+              done ;
+              Array.iteri
+                (fun i row ->
+                  Array.iteri
+                    (fun d n ->
+                      is_true
+                        ~msg:(Printf.sprintf "position %d, digit %d: %d" i d n)
+                        (n >= 800 && n <= 1200) )
+                    row )
+                counts ) )
+    ; test "digits from 6 to 9" (fun () ->
+          List.iter
+            (fun digits ->
+              with_codes
+                ~codes:(fun () -> Code.make ~digits ())
+                (fun app ->
+                  let j = {jar= None} in
+                  let code = code_of_body (email app j "a@x") in
+                  equal int digits (String.length code) ;
+                  is_true (String.for_all (fun c -> c >= '0' && c <= '9') code) ;
+                  equal string "ok:a@x" (enter app j code) ) )
+            [6; 7; 9] )
+    ; test "two purposes keep two codes" (fun () ->
+          with_codes (fun app ->
+              let j = {jar= None} in
+              let code = code_of_body (email app j "a@x") in
+              equal string "No_code"
+                (call app j
+                   ("/code-up?" ^ Caravan.Form.encode [("code", code)]) ) ;
+              let up =
+                code_of_body
+                  (call app j
+                     ("/email-up?" ^ Caravan.Form.encode [("address", "b@x")]) )
+              in
+              equal string "ok:a@x" (enter app j code) ;
+              equal string "ok:b@x"
+                (call app j ("/code-up?" ^ Caravan.Form.encode [("code", up)])) ) )
+    ; test "one limiter can serve sends and checks" (fun () ->
+          with_codes
+            ~codes:(fun () ->
+              let l =
+                Limiter.take (Limiter.make ~burst:1 ~every:(Span.s 3600) ())
+              in
+              Code.make ~sends:l ~checks:l () )
+            (fun app ->
+              let j = {jar= None} in
+              let code = code_of_body (email app j "a@x") in
+              equal string "ok:a@x" (enter app j code) ) )
+    ; test "start refuses an empty or long address" (fun () ->
+          with_codes (fun app ->
+              let j = {jar= None} in
+              ignore (code_of_body (email app j (String.make 320 'a'))) ;
+              List.iter
+                (fun a ->
+                  raises_match
+                    (function Invalid_argument _ -> true | _ -> false)
+                    (fun () -> ignore (email app j a)) )
+                [""; String.make 321 'a'] ) )
+    ; test "make refuses bad arguments" (fun () ->
+          List.iter
+            (fun (label, f) ->
+              raises_match ~msg:label
+                (function Invalid_argument _ -> true | _ -> false)
+                (fun () -> ignore (f () : Code.t)) )
+            [ ("digits 5", fun () -> Code.make ~digits:5 ())
+            ; ("digits 10", fun () -> Code.make ~digits:10 ())
+            ; ("ttl 59 s", fun () -> Code.make ~ttl:(Span.s 59) ())
+            ; ("ttl 61 min", fun () -> Code.make ~ttl:(Span.s 3601) ())
+            ; ("attempts 0", fun () -> Code.make ~attempts:0 ())
+            ; ("attempts 11", fun () -> Code.make ~attempts:11 ())
+            ; ("empty purpose", fun () -> Code.make ~purpose:"" ())
+            ; ("purpose with a space", fun () -> Code.make ~purpose:"a b" ())
+            ; ("purpose with a dot", fun () -> Code.make ~purpose:"a.b" ()) ] ;
+          ignore
+            ( Code.make ~purpose:"azAZ09-" ~digits:6 ~ttl:(Span.s 60)
+                ~attempts:1 ()
+              : Code.t ) ;
+          ignore
+            (Code.make ~digits:9 ~ttl:(Span.s 3600) ~attempts:10 () : Code.t) )
+    ; test "attempts and ttl of make" (fun () ->
+          with_codes
+            ~codes:(fun () -> Code.make ~attempts:1 ~ttl:(Span.s 60) ())
+            (fun app ->
+              let j = {jar= None} in
+              let code = code_of_body (email app j "a@x") in
+              equal string {|Wrong {address= "a@x"; left= 0}|}
+                (enter app j (other code)) ;
+              equal string "No_code" (enter app j code) ;
+              let code = code_of_body (email app j "a@x") in
+              Time.sleep Mono (Span.s 60) ;
+              equal string "Expired" (enter app j code) ) ) ]
+
 let () =
   Mirage_crypto_rng.set_default_generator
     (Mirage_crypto_rng.create ~seed:"caravan auth tests"
@@ -3290,4 +3693,5 @@ let () =
        ; policy_tests
        ; session_tests
        ; oidc_tests
-       ; flow_tests ] )
+       ; flow_tests
+       ; code_tests ] )

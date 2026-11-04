@@ -8,6 +8,7 @@
  (libraries
   caravan
   caravan.client
+  caravan.middleware
   caravan.session
   weft
   digestif

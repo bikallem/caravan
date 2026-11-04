@@ -796,3 +796,149 @@ module Oidc : sig
       Each response gets [Referrer-Policy: no-referrer] if it has none: the URL
       of the callback has the code. *)
 end
+
+(** {1:code Codes by email} *)
+
+(** Sign-in with a one-time code that the application sends to an address, for
+    example by email. The user types the code in the same browser.
+
+    {[
+    let codes = Caravan_auth.Code.make ()
+
+    (* POST /email, with a rate limit: each start can make a session. *)
+    let email req =
+      let address = normalize (form_field "email" req) in
+      ( match Caravan_auth.Code.start codes req ~address with
+      | Ok code ->
+          send_in_background address code
+      | Error _wait ->
+          () ) ;
+      (* The same response for each case: no hint of the accounts. *)
+      page "We sent a code if the address is correct."
+
+    (* POST /code, with a rate limit. *)
+    let code req =
+      match Caravan_auth.Code.check codes req (form_field "code" req) with
+      | Ok address ->
+          Caravan_auth.sign_in req (find_or_make_user address) ;
+          redirect "/"
+      | Error _ ->
+          page "The code is not correct."
+    ]}
+
+    Rules for the application:
+    - Call {!start} for an address with no account too, give the same response
+      for each result, and send the message in the background: the response and
+      its time must not tell which addresses have an account. Make the session
+      first (for example at the [GET] of the form): else only [Ok] sets the
+      session cookie, and that tells a refusal of [sends].
+    - Give a normalized address (for example the domain in lowercase). The
+      limits use the address in lowercase, with no spaces at its ends: the
+      account lookup must not be coarser than that.
+    - Check with a [POST] form. A link in the message must open a form, not
+      check the code with a [GET]: mail scanners open links, and a URL goes to
+      logs. The code works only in the browser of {!start}.
+    - Put [Caravan_middleware.Rate_limit] on the routes of {!start} and
+      {!check}: each [start] can make a session, and the limits of [Code] are
+      for each address, not for each client.
+    - After [Ok], call {!Caravan_auth.sign_in} (it renews the session), or
+      [Caravan_session.renew] in a flow with no sign-in: a request of the same
+      session that runs at the same time can else write the code back.
+    - Give one [checks] to the [t] values that sign in the same accounts (for
+      example two purposes): each [make] has its own default limiters.
+
+    Limits:
+    - With the default [checks], an attacker who does not have the mailbox makes
+      about 8760 guesses a year for one address: with 8 digits (the default), a
+      chance of about 0.009 % a year; with 6 digits, about 0.9 %. Over many
+      addresses, the chances add.
+    - The default limiters are in the memory of the process. [N] processes give
+      [N] times the guesses. A full table forgets the buckets nearest to full
+      (see [Caravan_middleware.Rate_limit.Limiter]): a flood of new addresses
+      can give the old addresses new tokens. For a deployment of more processes,
+      or for a larger table, give [sends] and [checks]: for example
+      [Limiter.take] of a limiter with a larger [max_keys], or a function of a
+      shared store.
+    - The other side of the limits: one wrong code each hour keeps the code
+      sign-in of an address closed, and one {!start} each 10 min keeps its
+      [sends] empty (and sends up to 147 messages a day). Give a second way to
+      sign in, for example a passkey or an OpenID provider. Log the failures
+      ({!failure} has the address).
+    - NIST SP 800-63B rev. 3 §5.2.2 limits the failures in a row to 100 for each
+      account: [checks] limits a rate, not a count. NIST does not accept email
+      for out-of-band authentication (rev. 3 §5.1.3.1): a code by email has the
+      strength of a mail to reset a password.
+    - The session keeps a salted SHA-256 of the code, not the code. A reader of
+      the store can find a code from its hash, but the code works only in its
+      session.
+    - Two checks of one session at the same time read the same attempts: then
+      only [checks] limits them. Two right checks at the same time both give
+      [Ok]. *)
+module Code : sig
+  type t
+
+  val make :
+       ?purpose:string
+    -> ?digits:int
+    -> ?ttl:Weft.Span.t
+    -> ?attempts:int
+    -> ?sends:(string -> Weft.Span.t option)
+    -> ?checks:(string -> Weft.Span.t option)
+    -> unit
+    -> t
+  (** [make ()] is a kind of code:
+      - [purpose] (default ["sign-in"]) separates the codes of two flows (for
+        example a sign-up and a sign-in): a session keeps one code for each
+        purpose.
+      - [digits] (default 8) is the length of a code.
+      - [ttl] (default 10 min) is the life of a code.
+      - [attempts] (default 5) is the number of wrong codes before the code
+        goes.
+      - [sends] (default: 3, then one each 10 min) limits the codes for each
+        address. [checks] (default: 10, then one each hour) limits the checks
+        for each address, also of right codes. Each is a function of a key:
+        [None] lets the action go, [Some wait] refuses it, as
+        [Caravan_middleware.Rate_limit.Limiter.take]. The keys have a prefix for
+        each use ([send:] or [check:]) and a hash of the address: one function
+        can serve the two, and more [t] values.
+
+      @raise Invalid_argument
+        if [purpose] is empty or has a character other than a letter, a digit
+        and ['-']; [digits] is not 6 to 9; [ttl] is not 1 min to 1 h; or
+        [attempts] is not 1 to 10. *)
+
+  val start :
+    t -> Caravan.Request.t -> address:string -> (string, Weft.Span.t) result
+  (** [start t req ~address] makes a random code for [address], and keeps its
+      hash, the address, the expiry and the attempts in the session of [req]. It
+      replaces the code of the session for this purpose. [Ok code]: send [code]
+      to [address]. [Error wait]: [sends] refused the address for [wait]; the
+      session does not change. A cancellation point.
+
+      @raise Invalid_argument
+        if [address] is empty or has more than 320 bytes, or as
+        {!Caravan_session.set}. *)
+
+  (** The type for the failures of {!check}. *)
+  type failure =
+    | No_code  (** The session has no code for this purpose. *)
+    | Expired  (** The code is older than [ttl]: {!check} removes it. *)
+    | Wrong of {address: string; left: int}
+        (** A wrong code: [left] attempts are left. At 0, {!check} removes the
+            code from the session. *)
+    | Too_many of {address: string; wait: Weft.Span.t}
+        (** [checks] refused the address for [wait]. The attempts do not change.
+        *)
+
+  val pp_failure : Format.formatter -> failure -> unit
+
+  val check : t -> Caravan.Request.t -> string -> (string, failure) result
+  (** [check t req text] checks [text] against the code of the session. Spaces
+      and ['-'] in [text] are removed; a text of more than 64 bytes is a wrong
+      code. First the expiry, then a token of [checks] for the address, then the
+      compare (constant time). [Ok address]: {!check} removes the code from the
+      session (one use); sign the user in ({!Caravan_auth.sign_in}). A text that
+      is not [digits] digits is a wrong code. A cancellation point.
+
+      @raise Invalid_argument as {!Caravan_session.set}. *)
+end

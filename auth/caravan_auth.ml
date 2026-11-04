@@ -2,6 +2,13 @@ module Base64 = Caravan.Private.Base64
 
 let b64_decode = Base64.decode ~url:true ~pad:false
 
+let b64_encode = Base64.encode ~url:true ~pad:false
+
+let sha256 s = Digestif.SHA256.(to_raw_string (digest_string s))
+
+(* The posix time in seconds: a session can outlive a process. *)
+let now_s () = int_of_float (Weft.Time.posix_to_unix_s (Weft.Time.now Posix))
+
 (* [string_list l] is the strings of [l], if each element is a string. *)
 let string_list l =
   let s = List.filter_map (function `String s -> Some s | _ -> None) l in
@@ -479,10 +486,7 @@ module Jwt = struct
                         Error (Malformed "a part is not base64url")
                     | Some signature -> (
                         let input = String.sub token 0 d2 in
-                        let digest =
-                          lazy
-                            Digestif.SHA256.(to_raw_string (digest_string input))
-                        in
+                        let digest = lazy (sha256 input) in
                         if
                           not
                             (List.exists
@@ -1584,8 +1588,6 @@ module Oidc = struct
      base64url or digits: no '|' or ','. *)
   let key = "caravan.oidc"
 
-  let b64_encode = Base64.encode ~url:true ~pad:false
-
   let encode_pending p =
     String.concat "|"
       [ b64_encode p.issuer
@@ -1606,8 +1608,6 @@ module Oidc = struct
           None )
     | _ ->
         None
-
-  let now_s () = int_of_float (Time.posix_to_unix_s (Time.now Posix))
 
   (* The pending logins of the session that did not expire. *)
   let pendings req ~now =
@@ -1659,9 +1659,7 @@ module Oidc = struct
       ; return }
     in
     save req (List.take max_pending (p :: pendings req ~now)) ;
-    let challenge =
-      b64_encode Digestif.SHA256.(to_raw_string (digest_string p.verifier))
-    in
+    let challenge = b64_encode (sha256 p.verifier) in
     let params =
       [ ("response_type", "code")
       ; ("client_id", c.id)
@@ -1891,4 +1889,205 @@ module Oidc = struct
           no_referrer (f req tokens ~return:p.return)
       | Error e ->
           no_referrer (failed req e)
+end
+
+(* {1 Codes by email} *)
+
+module Code = struct
+  module Limiter = Caravan_middleware.Rate_limit.Limiter
+  open Weft
+
+  type t =
+    { key: string  (** The name of the value in the session. *)
+    ; digits: int
+    ; ttl: int  (** Seconds. *)
+    ; attempts: int
+    ; sends: string -> Span.t option
+    ; checks: string -> Span.t option }
+
+  let b64 = b64_encode
+
+  let seconds span = Int64.to_int (Int64.div (Span.to_ns span) 1_000_000_000L)
+
+  let make ?(purpose = "sign-in") ?(digits = 8) ?(ttl = Span.s 600)
+      ?(attempts = 5) ?sends ?checks () =
+    let bad m = invalid_arg ("Caravan_auth.Code.make: " ^ m) in
+    let good c =
+      (c >= 'a' && c <= 'z')
+      || (c >= 'A' && c <= 'Z')
+      || (c >= '0' && c <= '9')
+      || c = '-'
+    in
+    if purpose = "" || not (String.for_all good purpose) then
+      bad "the purpose is not letters, digits and '-'" ;
+    if digits < 6 || digits > 9 then bad "digits is not 6 to 9" ;
+    if Span.compare ttl (Span.s 60) < 0 || Span.compare ttl (Span.s 3600) > 0
+    then bad "ttl is not 1 min to 1 h" ;
+    if attempts < 1 || attempts > 10 then bad "attempts is not 1 to 10" ;
+    let sends =
+      match sends with
+      | Some f ->
+          f
+      | None ->
+          Limiter.take (Limiter.make ~burst:3 ~every:(Span.s 600) ())
+    in
+    let checks =
+      match checks with
+      | Some f ->
+          f
+      | None ->
+          Limiter.take (Limiter.make ~burst:10 ~every:(Span.s 3600) ())
+    in
+    { key= "caravan.code." ^ purpose
+    ; digits
+    ; ttl= seconds ttl
+    ; attempts
+    ; sends
+    ; checks }
+
+  (* The key of an address in a limiter: [prefix] and a hash of the address in
+     lowercase, with no spaces at its ends. Thus the variants of the case of an
+     address share their buckets, and a key is short. *)
+  let limit_key prefix address =
+    prefix ^ b64 (sha256 (String.lowercase_ascii (String.trim address)))
+
+  (* A code of [digits] decimal digits, uniform: 30 random bits, and a new draw
+     over the largest multiple of 10^digits (no modulo bias). *)
+  let random_code digits =
+    let n = int_of_float (10. ** float_of_int digits) in
+    let limit = (1 lsl 30) / n * n in
+    let rec draw () =
+      let v =
+        Int32.to_int
+          (String.get_int32_be
+             (Mirage_crypto_rng.generate
+                (4 [@mutate off "get_int32_be reads 4 bytes"]) )
+             0 )
+        land 0x3FFF_FFFF
+      in
+      if
+        ( v < limit )
+        [@mutate
+          off
+            "<= changes only the value v = limit: a probability of 2^-30 for \
+             each draw"]
+      then Printf.sprintf "%0*d" digits (v mod n)
+      else draw ()
+    in
+    draw ()
+
+  (* The code of a session. *)
+  type entry =
+    { address: string
+    ; expires: int  (** Posix seconds. *)
+    ; left: int  (** The attempts left. *)
+    ; salt: string
+    ; hash: string  (** SHA-256 of the salt and the code. *) }
+
+  (* The fields with '|' between them: each one is base64url or digits. *)
+  let encode e =
+    String.concat "|"
+      [ b64 e.address
+      ; string_of_int e.expires
+      ; string_of_int e.left
+      ; b64 e.salt
+      ; b64 e.hash ]
+
+  let decode s =
+    match String.split_on_char '|' s with
+    | [a; x; l; salt; hash] -> (
+      match
+        ( b64_decode a
+        , int_of_string_opt x
+        , int_of_string_opt l
+        , b64_decode salt
+        , b64_decode hash )
+      with
+      | Some address, Some expires, Some left, Some salt, Some hash ->
+          Some {address; expires; left; salt; hash}
+      | _ ->
+          None )
+    | _ ->
+        None
+
+  let start t req ~address =
+    if address = "" || String.length address > 320 then
+      invalid_arg "Caravan_auth.Code.start: the address is empty or too long" ;
+    match t.sends (limit_key "send:" address) with
+    | Some wait ->
+        Error wait
+    | None ->
+        let code = random_code t.digits in
+        let salt =
+          Mirage_crypto_rng.generate
+            (16 [@mutate off "each length of a salt works the same"])
+        in
+        Caravan_session.Private.set t.key
+          (encode
+             { address
+             ; expires= now_s () + t.ttl
+             ; left= t.attempts
+             ; salt
+             ; hash= sha256 (salt ^ code) } )
+          req ;
+        Ok code
+
+  type failure =
+    | No_code
+    | Expired
+    | Wrong of {address: string; left: int}
+    | Too_many of {address: string; wait: Span.t}
+
+  let pp_failure ppf = function
+    | No_code ->
+        Format.pp_print_string ppf "No_code"
+    | Expired ->
+        Format.pp_print_string ppf "Expired"
+    | Wrong {address; left} ->
+        Format.fprintf ppf "Wrong {address= %S; left= %d}" address left
+    | Too_many {address; wait} ->
+        Format.fprintf ppf "Too_many {address= %S; wait= %Ld ns}" address
+          (Span.to_ns wait)
+
+  let check t req text =
+    match Option.bind (Caravan_session.Private.find t.key req) decode with
+    | None ->
+        Error No_code
+    | Some e -> (
+        let address = e.address in
+        if now_s () >= e.expires then (
+          Caravan_session.Private.remove t.key req ;
+          Error Expired )
+        else
+          (* A token before the compare: a right code costs one too. Else an
+             attacker over the limit would learn the right code. *)
+          match t.checks (limit_key "check:" address) with
+          | Some wait ->
+              Error (Too_many {address; wait})
+          | None ->
+              (* A long text is not a code: no copy of it. *)
+              let code =
+                if String.length text > 64 then ""
+                else
+                  String.of_seq
+                    (Seq.filter
+                       (fun c -> c <> ' ' && c <> '-')
+                       (String.to_seq text) )
+              in
+              (* The length first: no hash of a text of another length. A text
+                 with a non-digit cannot have the hash of a code. *)
+              let right =
+                String.length code = t.digits
+                && Eqaf.equal (sha256 (e.salt ^ code)) e.hash
+              in
+              if right then (
+                Caravan_session.Private.remove t.key req ;
+                Ok address )
+              else
+                (* [start] sets 1 or more, and the code goes at 0. *)
+                let left = e.left - 1 in
+                if left = 0 then Caravan_session.Private.remove t.key req
+                else
+                  Caravan_session.Private.set t.key (encode {e with left}) req ;
+                Error (Wrong {address; left}) )
 end
