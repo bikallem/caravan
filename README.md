@@ -599,6 +599,38 @@ let () =
   issuers: give `~issuers:["https://accounts.google.com";
   "accounts.google.com"]`.
 
+`Oidc.login` and `Oidc.callback` do the sign-in with the authorization
+code flow and PKCE. Your function gets the checked tokens, finds or
+makes the user, and signs the user in:
+
+```ocaml
+let google provider =
+  Caravan_auth.Oidc.client ~secret:"..." ~provider ~id:"123.apps"
+    ~redirect_uri:"https://app.example/auth/callback" ()
+
+let signed_in req (t : Caravan_auth.Oidc.tokens) ~return =
+  let user = find_or_make_user t.subject (Caravan_auth.Jwt.string "email" t.claims) in
+  Caravan_auth.sign_in req user ;
+  Caravan.Response.empty ~status:Caravan.Status.see_other
+    ~headers:(Caravan.Headers.of_list [("Location", return)]) ()
+
+let routes client =
+  Caravan_router.
+    [ get "/auth/login" (Caravan_auth.Oidc.login client)
+    ; get "/auth/callback" (Caravan_auth.Oidc.callback client signed_in) ]
+```
+
+- `login` keeps a random state, nonce and PKCE verifier in the session
+  (at most 4 logins, 10 minutes each), and sends the browser to the
+  provider. Put a rate limit on the login route: each login of a
+  browser with no session makes a session.
+- `callback` takes the login of the `state` from the session (one use),
+  checks the client and the `iss` parameter (RFC 9207), gets the
+  tokens with the secret (`Basic` or `Post`), and checks the ID token
+  with the nonce of the login.
+- Give each client its own redirect URI. The session cookie must be
+  `SameSite=Lax` (the default) or `None`.
+
 ## Compression
 
 The optional `caravan.compress` library compresses the responses with
