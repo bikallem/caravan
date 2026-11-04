@@ -1078,6 +1078,937 @@ let claims_tests =
             ; (J.Bad_issuer, "Bad_issuer")
             ; (J.Bad_audience, "Bad_audience") ] ) ]
 
+(* {1 Authentication and authorization} *)
+
+module A = Caravan_auth
+module S = Caravan_session
+open Caravan
+
+let user_payload =
+  Printf.sprintf
+    {|{"exp":%.0f,"sub":"ada","roles":["admin","dev"],"scope":"read write","n":1}|}
+    rfc_exp
+
+let user_token () = hs_token ~payload:user_payload ()
+
+let bearer ?realm ?user ?(keys = fun () -> [hs_key]) () =
+  A.Scheme.bearer ?realm ?user ~issuer:Any ~audience:Any ~keys ()
+
+(* A handler that tells the user: "id scheme roles", or "-". *)
+let who req =
+  Response.string
+    ( match A.user req with
+    | Some u ->
+        String.concat " "
+          [A.User.id u; A.User.scheme u; String.concat "," (A.User.roles u)]
+    | None ->
+        "-" )
+
+let body r =
+  match Response.kind r with
+  | Response.Body b ->
+      Body.to_string b
+  | Response.Upgrade _ ->
+      fail "an upgrade"
+
+let code r = Status.code (Response.status r)
+
+let field name r = Headers.find name (Response.headers r)
+
+let get ?(fields = []) ?(meth = Method.GET) path =
+  Request.make ~headers:(Headers.of_list fields) meth path
+
+let auth v = ("Authorization", v)
+
+(* [with_mw ?schemes h req] is the response of [h] behind the middleware
+   (default: the bearer scheme only). *)
+let with_mw ?(schemes = [bearer ()]) h req = A.middleware ~schemes () h req
+
+(* [failure_of ?schemes req] is [A.failure] of [req] behind the middleware. *)
+let failure_of ?schemes req =
+  let f = ref None in
+  ignore
+    (with_mw ?schemes
+       (fun req ->
+         f := A.failure req ;
+         Response.string "" )
+       req ) ;
+  !f
+
+let bearer_tests =
+  group "The bearer scheme"
+    [ test "no credentials: an anonymous request goes on" (fun () ->
+          at before (fun _ ->
+              let r = with_mw who (get "/") in
+              equal string "-" (body r) ;
+              equal (option (pair string string)) None (failure_of (get "/")) ) )
+    ; test "the schemes run only at the first need, one time" (fun () ->
+          let calls = ref 0 in
+          let s =
+            A.Scheme.make ~name:"Count"
+              ~authenticate:(fun _ ->
+                incr calls ;
+                A.Authenticated (A.User.make "c") )
+              ~challenge:(fun ~failure:_ _ -> Response.string "")
+          in
+          ignore (with_mw ~schemes:[s] (fun _ -> Response.string "") (get "/")) ;
+          equal int 0 !calls ;
+          ignore
+            (with_mw ~schemes:[s]
+               (fun req ->
+                 ignore (A.user req) ;
+                 ignore (A.failure req) ;
+                 ignore (A.user req) ;
+                 Response.string "" )
+               (get "/") ) ;
+          equal int 1 !calls )
+    ; test "a good token gives the user" (fun () ->
+          at before (fun _ ->
+              let seen = ref None in
+              let r =
+                with_mw
+                  (fun req ->
+                    seen := A.user req ;
+                    who req )
+                  (get ~fields:[auth ("Bearer " ^ user_token ())] "/")
+              in
+              equal string "ada Bearer admin,dev" (body r) ;
+              let u = Option.get !seen in
+              equal (option string) (Some "ada") (A.User.claim "sub" u) ;
+              equal (option string) (Some "read write") (A.User.claim "scope" u) ;
+              (* Only the string claims. *)
+              equal (option string) None (A.User.claim "n" u) ;
+              is_true ~msg:"claims" (List.mem_assoc "sub" (A.User.claims u)) ) )
+    ; test "the form of the field" (fun () ->
+          at before (fun _ ->
+              let t = user_token () in
+              let run v =
+                let failure = ref None in
+                let r =
+                  with_mw
+                    (fun req ->
+                      failure := A.failure req ;
+                      who req )
+                    (get ~fields:[auth v] "/")
+                in
+                (body r, Option.map snd !failure)
+              in
+              let outcome = Testable.(pair string (option string)) in
+              let malformed = Some "a malformed Authorization field" in
+              List.iter
+                (fun (v, expected) -> equal ~msg:v outcome expected (run v))
+                [ ("bearer " ^ t, ("ada Bearer admin,dev", None))
+                ; ("BEARER  " ^ t, ("ada Bearer admin,dev", None))
+                ; ("Basic YTpi", ("-", None))
+                ; ("Digest x", ("-", None))
+                ; ("Pearer " ^ t, ("-", None))
+                ; ("Bearerx", ("-", None))
+                ; ("Bearerx " ^ t, ("-", None))
+                ; ("", ("-", None))
+                ; ("Bearer", ("-", malformed))
+                ; ("Bearer\t" ^ t, ("-", malformed))
+                ; ("Bearer " ^ t ^ " x", ("-", malformed))
+                ; ("Bearer ," ^ t, ("-", malformed))
+                ; ("Bearer =", ("-", malformed))
+                ; ("Bearer a=b", ("-", malformed))
+                ; ("Bearer a==", ("-", Some {|Malformed "not three parts"|}))
+                ; ( "Bearer a-._~+/b"
+                  , ("-", Some {|Malformed "not three parts"|}) ) ] ) )
+    ; test "two Authorization fields" (fun () ->
+          at before (fun _ ->
+              let req =
+                get
+                  ~fields:[auth ("Bearer " ^ user_token ()); auth "Basic x"]
+                  "/"
+              in
+              let failure = ref None in
+              ignore
+                (with_mw
+                   (fun req ->
+                     failure := A.failure req ;
+                     Response.string "" )
+                   req ) ;
+              equal
+                (option (pair string string))
+                (Some ("Bearer", "two Authorization fields"))
+                !failure ;
+              let r = with_mw (A.require () who) req in
+              equal int 401 (code r) ;
+              equal (option string)
+                (Some {|Bearer realm="api", error="invalid_request"|})
+                (field "www-authenticate" r) ) )
+    ; test "a bad token: 401 with invalid_token" (fun () ->
+          at before (fun _ ->
+              List.iter
+                (fun (label, t, m) ->
+                  let req = get ~fields:[auth ("Bearer " ^ t)] "/" in
+                  let failure = ref None in
+                  let r =
+                    with_mw
+                      (fun req ->
+                        failure := A.failure req ;
+                        A.require () who req )
+                      req
+                  in
+                  equal ~msg:label int 401 (code r) ;
+                  equal ~msg:label (option string)
+                    (Some {|Bearer realm="api", error="invalid_token"|})
+                    (field "www-authenticate" r) ;
+                  equal ~msg:label (option string) (Some m)
+                    (Option.map snd !failure) ;
+                  equal ~msg:label string "Unauthorized\n" (body r) )
+                [ ( "no sub"
+                  , hs_token ~payload:{|{"exp":1300819380}|} ()
+                  , "no sub" )
+                ; ( "expired"
+                  , hs_token ~payload:{|{"exp":1,"sub":"a"}|} ()
+                  , "Expired" )
+                ; ( "bad signature"
+                  , token ~header:(alg_header "HS256")
+                      (hs ~secret:(String.make 32 'z') ())
+                      user_payload
+                  , "Bad_signature" ) ] ) )
+    ; test "the challenge with no credentials" (fun () ->
+          at before (fun _ ->
+              let r = with_mw (A.require () who) (get "/") in
+              equal int 401 (code r) ;
+              equal (option string) (Some {|Bearer realm="api"|})
+                (field "www-authenticate" r) ;
+              let r =
+                with_mw
+                  ~schemes:[bearer ~realm:"orders" ()]
+                  (A.require () who) (get "/")
+              in
+              equal (option string) (Some {|Bearer realm="orders"|})
+                (field "www-authenticate" r) ;
+              equal string "Unauthorized\n" (body r) ) )
+    ; test "challenge and forbid in a handler" (fun () ->
+          at before (fun _ ->
+              let r = with_mw A.challenge (get "/") in
+              equal int 401 (code r) ;
+              equal (option string) (Some {|Bearer realm="api"|})
+                (field "www-authenticate" r) ;
+              let r =
+                with_mw A.challenge (get ~fields:[auth "Bearer x.y.z"] "/")
+              in
+              equal (option string)
+                (Some {|Bearer realm="api", error="invalid_token"|})
+                (field "www-authenticate" r) ;
+              let r = A.forbid (get "/") in
+              equal int 403 (code r) ;
+              equal string "Forbidden\n" (body r) ) )
+    ; test "a custom user mapping" (fun () ->
+          at before (fun _ ->
+              let user c =
+                match A.Jwt.string "iss" c with
+                | Some iss ->
+                    Ok
+                      (A.User.make ~roles:["r"]
+                         (iss ^ "|" ^ Option.get (A.Jwt.subject c)) )
+                | None ->
+                    Error "no iss"
+              in
+              let t =
+                hs_token ~payload:{|{"exp":1300819380,"sub":"a","iss":"i"}|} ()
+              in
+              let r =
+                with_mw
+                  ~schemes:[bearer ~user ()]
+                  who
+                  (get ~fields:[auth ("Bearer " ^ t)] "/")
+              in
+              equal string "i|a Bearer r" (body r) ;
+              equal
+                (option (pair string string))
+                (Some ("Bearer", "no iss"))
+                (failure_of
+                   ~schemes:[bearer ~user ()]
+                   (get ~fields:[auth ("Bearer " ^ user_token ())] "/") ) ;
+              (* A text of the application with the letters of a field failure
+                 is not a field failure. *)
+              let user _ = Error "two Authorization fields" in
+              let r =
+                with_mw
+                  ~schemes:[bearer ~user ()]
+                  (A.require () who)
+                  (get ~fields:[auth ("Bearer " ^ user_token ())] "/")
+              in
+              equal (option string)
+                (Some {|Bearer realm="api", error="invalid_token"|})
+                (field "www-authenticate" r) ) )
+    ; test "the claim of the roles, and an empty sub" (fun () ->
+          at before (fun _ ->
+              let r =
+                with_mw
+                  ~schemes:
+                    [ A.Scheme.bearer ~roles_claim:"scope" ~issuer:Any
+                        ~audience:Any
+                        ~keys:(fun () -> [hs_key])
+                        () ]
+                  who
+                  (get ~fields:[auth ("Bearer " ^ user_token ())] "/")
+              in
+              equal string "ada Bearer " (body r) ;
+              (* A string, not a list: no roles. *)
+              let t =
+                hs_token
+                  ~payload:{|{"exp":1300819380,"sub":"a","roles":"admin"}|} ()
+              in
+              equal string "a Bearer "
+                (body (with_mw who (get ~fields:[auth ("Bearer " ^ t)] "/"))) ;
+              let t = hs_token ~payload:{|{"exp":1300819380,"sub":""}|} () in
+              equal
+                (option (pair string string))
+                (Some ("Bearer", "no sub"))
+                (failure_of (get ~fields:[auth ("Bearer " ^ t)] "/")) ) )
+    ; test "keys is called for each request" (fun () ->
+          at before (fun _ ->
+              let keys = ref [] in
+              let h =
+                with_mw ~schemes:[bearer ~keys:(fun () -> !keys) ()] who
+              in
+              let req = get ~fields:[auth ("Bearer " ^ user_token ())] "/" in
+              equal string "-" (body (h req)) ;
+              keys := [hs_key] ;
+              equal string "ada Bearer admin,dev" (body (h req)) ) ) ]
+
+let policy_tests =
+  group "Policies"
+    [ test "require and the policies" (fun () ->
+          at before (fun _ ->
+              let req = get ~fields:[auth ("Bearer " ^ user_token ())] "/" in
+              let status policy =
+                code (with_mw (A.require ~policy () who) req)
+              in
+              List.iter
+                (fun (label, policy, expected) ->
+                  equal ~msg:label int expected (status policy) )
+                [ ("authenticated", A.authenticated, 200)
+                ; ("role admin", A.role "admin", 200)
+                ; ("role Admin", A.role "Admin", 403)
+                ; ("role x", A.role "x", 403)
+                ; ("scope write", A.scope "write", 200)
+                ; ("scope rea", A.scope "rea", 403)
+                ; ("all", A.all [A.role "admin"; A.role "dev"], 200)
+                ; ("all x", A.all [A.role "admin"; A.role "x"], 403)
+                ; ("all []", A.all [], 200)
+                ; ("any", A.any [A.role "x"; A.role "dev"], 200)
+                ; ("any x", A.any [A.role "x"; A.role "y"], 403)
+                ; ("any []", A.any [], 403) ] ;
+              let r = with_mw (A.require ~policy:(A.role "x") () who) req in
+              equal string "Forbidden\n" (body r) ;
+              is_false ~msg:"scope of no claim"
+                (A.scope "read" (A.User.make "u")) ;
+              is_false ~msg:"has_role"
+                (A.User.has_role "admin" (A.User.make "u")) ) )
+    ; test "require marks a response private" (fun () ->
+          at before (fun _ ->
+              let req = get ~fields:[auth ("Bearer " ^ user_token ())] "/" in
+              let r = with_mw (A.require () who) req in
+              equal (option string) (Some "private") (field "cache-control" r) ;
+              let own _ =
+                Response.string
+                  ~headers:(Headers.of_list [("Cache-Control", "no-store")])
+                  ""
+              in
+              let r = with_mw (A.require () own) req in
+              equal (list string) ["no-store"]
+                (Headers.find_all "cache-control" (Response.headers r)) ;
+              (* No user, or a refused one: no handler, no field. *)
+              let r = with_mw (A.require () who) (get "/") in
+              equal (option string) None (field "cache-control" r) ) )
+    ; test "with no middleware, the functions raise" (fun () ->
+          let raises f =
+            raises_match (function Invalid_argument _ -> true | _ -> false) f
+          in
+          raises (fun () -> ignore (A.require () who (get "/"))) ;
+          raises (fun () -> ignore (A.user (get "/"))) ;
+          raises (fun () -> ignore (A.failure (get "/"))) ;
+          raises (fun () -> ignore (A.challenge (get "/"))) )
+    ; test "bad setups raise" (fun () ->
+          let raises label f =
+            raises_match ~msg:label
+              (function Invalid_argument _ -> true | _ -> false)
+              f
+          in
+          let made (_ : Handler.middleware) = () in
+          raises "no scheme" (fun () -> made (A.middleware ~schemes:[] ())) ;
+          raises "two names" (fun () ->
+              made (A.middleware ~schemes:[bearer (); bearer ()] ()) ) ;
+          List.iter
+            (fun name ->
+              raises ("name " ^ name) (fun () ->
+                  ignore
+                    (A.Scheme.make ~name
+                       ~authenticate:(fun _ -> A.No_credentials)
+                       ~challenge:(fun ~failure:_ _ -> Response.string "") ) ) )
+            ["Bearer"; "Session"] ;
+          raises "empty name" (fun () ->
+              ignore
+                (A.Scheme.make ~name:""
+                   ~authenticate:(fun _ -> A.No_credentials)
+                   ~challenge:(fun ~failure:_ _ -> Response.string "") ) ) ;
+          List.iter
+            (fun realm ->
+              raises
+                ("realm " ^ String.escaped realm)
+                (fun () -> ignore (bearer ~realm ())) )
+            ["a\"b"; "a\\b"; "a\nb"; "a\x7fb"] ;
+          raises "issuer" (fun () ->
+              ignore
+                (A.Scheme.bearer ~issuer:(One_of []) ~audience:Any
+                   ~keys:(fun () -> [])
+                   () ) ) ;
+          raises "audience" (fun () ->
+              ignore
+                (A.Scheme.bearer ~issuer:Any ~audience:(One_of [])
+                   ~keys:(fun () -> [])
+                   () ) ) ;
+          raises "leeway" (fun () ->
+              ignore
+                (A.Scheme.bearer ~leeway:(Span.ns (-1)) ~issuer:Any
+                   ~audience:Any
+                   ~keys:(fun () -> [])
+                   () ) ) ;
+          ignore
+            (A.Scheme.bearer ~leeway:Span.zero ~realm:"a b" ~issuer:Any
+               ~audience:Any
+               ~keys:(fun () -> [])
+               () ) ;
+          List.iter
+            (fun login ->
+              raises
+                ("login " ^ String.escaped login)
+                (fun () -> ignore (A.Scheme.session ~login ())) )
+            ["x"; "//x"; "/a?b"; "/\\x"; "/a\\b"; "/a\tb"; ""] ;
+          ignore (A.Scheme.session ~login:"/" ()) ;
+          ignore (A.Scheme.session ~login:"/login" ()) )
+    ; test "a scheme of the application" (fun () ->
+          let s =
+            A.Scheme.make ~name:"Key"
+              ~authenticate:(fun req ->
+                match Headers.find "x-key" (Request.headers req) with
+                | Some "good" ->
+                    A.Authenticated (A.User.make "k")
+                | Some _ ->
+                    A.Failed "bad key"
+                | None ->
+                    A.No_credentials )
+              ~challenge:(fun ~failure _ ->
+                Response.string ~status:Status.unauthorized
+                  (Option.value ~default:"none" failure) )
+          in
+          equal string "Key" (A.Scheme.name s) ;
+          let h = with_mw ~schemes:[s] (A.require () who) in
+          equal string "k Key " (body (h (get ~fields:[("X-Key", "good")] "/"))) ;
+          equal string "bad key" (body (h (get ~fields:[("X-Key", "x")] "/"))) ;
+          equal string "none" (body (h (get "/"))) ;
+          equal string "" (A.User.scheme (A.User.make "u")) )
+    ; test "require ~challenge chooses the scheme of the challenge" (fun () ->
+          at before (fun _ ->
+              let schemes = [A.Scheme.session ~login:"/login" (); bearer ()] in
+              let nav = [("Sec-Fetch-Mode", "navigate")] in
+              let h ?challenge req =
+                S.middleware
+                  ~keys:[S.Key.of_string (String.make 32 's')]
+                  ~store:(S.memory_store ()) ()
+                  (with_mw ~schemes (A.require ?challenge () who))
+                  req
+              in
+              equal int 303 (code (h (get ~fields:nav "/"))) ;
+              let r = h ~challenge:"Bearer" (get ~fields:nav "/") in
+              equal int 401 (code r) ;
+              equal (option string) (Some {|Bearer realm="api"|})
+                (field "www-authenticate" r) ;
+              (* A failure has its own challenge. *)
+              let r =
+                h ~challenge:"Session"
+                  (get ~fields:(auth "Bearer x.y.z" :: nav) "/")
+              in
+              equal int 401 (code r) ;
+              raises_match
+                (function Invalid_argument _ -> true | _ -> false)
+                (fun () -> ignore (h ~challenge:"Key" (get "/"))) ;
+              (* Also for a request with a user. *)
+              raises_match
+                (function Invalid_argument _ -> true | _ -> false)
+                (fun () ->
+                  ignore
+                    (h ~challenge:"Key"
+                       (get ~fields:[auth ("Bearer " ^ user_token ())] "/") ) ) ) )
+    ; test "with the router, a 404 gets no challenge" (fun () ->
+          at before (fun _ ->
+              let app =
+                with_mw
+                  (Caravan_router.handler
+                     [ Caravan_router.group
+                         ~middleware:[A.require ~policy:(A.role "admin") ()]
+                         "/admin"
+                         [Caravan_router.get "/x" who] ] )
+              in
+              equal int 401 (code (app (get "/admin/x"))) ;
+              equal int 404 (code (app (get "/admin/y"))) ;
+              equal int 200
+                (code
+                   (app
+                      (get
+                         ~fields:[auth ("Bearer " ^ user_token ())]
+                         "/admin/x" ) ) ) ) ) ]
+
+(* {1 The session scheme} *)
+
+let session_key = S.Key.of_string (String.make 32 's')
+
+let cookie_name = "__Host-session"
+
+let cookie_of r =
+  List.find_map
+    (fun f ->
+      match Cookie.parse_set_cookie f with
+      | Some (n, v) when n = cookie_name ->
+          Some v
+      | _ ->
+          None )
+    (Headers.find_all "set-cookie" (Response.headers r))
+
+let with_cookie ?(fields = []) cookie =
+  match cookie with
+  | Some c ->
+      ("Cookie", cookie_name ^ "=" ^ c) :: fields
+  | None ->
+      fields
+
+(* [session_app ?schemes ?login store h] is the session middleware, then the
+   auth middleware with the session scheme, then [h]. *)
+let session_app ?schemes ?login ?validate store h =
+  let schemes =
+    Option.value schemes ~default:[A.Scheme.session ?login ?validate ()]
+  in
+  S.middleware ~keys:[session_key] ~store () (A.middleware ~schemes () h)
+
+(* A handler: /login signs in "ada", /logout signs out, /data sets "cart",
+   others tell the user and the cart. *)
+let site req =
+  match Request.path_only req with
+  | "/login" ->
+      A.sign_in req
+        (A.User.make ~roles:["admin"] ~claims:[("mail", "a@x")] "ada") ;
+      Response.string "in"
+  | "/login-bob" ->
+      A.sign_in req (A.User.make "bob") ;
+      Response.string "in"
+  | "/logout" ->
+      A.sign_out req ; Response.string "out"
+  | "/data" ->
+      S.set "cart" "3" req ; Response.string "data"
+  | "/token" ->
+      Response.string (S.Csrf.token req)
+  | _ ->
+      let u =
+        match A.user req with
+        | Some u ->
+            A.User.id u ^ " " ^ A.User.scheme u
+        | None ->
+            "-"
+      in
+      Response.string (u ^ " " ^ Option.value ~default:"-" (S.find "cart" req))
+
+let session_tests =
+  group "The session scheme"
+    [ test "sign in, a later request, sign out" (fun () ->
+          at before (fun _ ->
+              let store = S.memory_store () in
+              let h = session_app store site in
+              let send ?cookie path =
+                h (get ~fields:(with_cookie cookie) path)
+              in
+              let r = send "/data" in
+              let anon = cookie_of r in
+              equal string "- 3" (body (send ?cookie:anon "/")) ;
+              let r = send ?cookie:anon "/login" in
+              let c = cookie_of r in
+              is_true ~msg:"a new ID" (c <> anon && c <> None) ;
+              (* The anonymous data stays after the first sign in. *)
+              equal string "ada Session 3" (body (send ?cookie:c "/")) ;
+              (* The old ID is no session. *)
+              equal string "- -" (body (send ?cookie:anon "/")) ;
+              let r = send ?cookie:c "/logout" in
+              equal string "out" (body r) ;
+              equal string "- -" (body (send ?cookie:c "/")) ) )
+    ; test "a second sign in ends the old session" (fun () ->
+          at before (fun _ ->
+              let store = S.memory_store () in
+              let h = session_app store site in
+              let send ?cookie path =
+                h (get ~fields:(with_cookie cookie) path)
+              in
+              let c = cookie_of (send "/login") in
+              (* /data sets no new cookie: the session exists. *)
+              is_none (cookie_of (send ?cookie:c "/data")) ;
+              equal string "ada Session 3" (body (send ?cookie:c "/")) ;
+              let c2 = cookie_of (send ?cookie:c "/login-bob") in
+              is_true ~msg:"a new ID" (c2 <> c) ;
+              equal string "bob Session -" (body (send ?cookie:c2 "/")) ;
+              equal string "- -" (body (send ?cookie:c "/")) ) )
+    ; test "the user keeps its roles and claims, not a scheme" (fun () ->
+          at before (fun _ ->
+              let store = S.memory_store () in
+              let seen = ref None in
+              let h =
+                S.middleware ~keys:[session_key] ~store ()
+                  (A.middleware
+                     ~schemes:[bearer (); A.Scheme.session ()]
+                     ()
+                     (fun req ->
+                       match Request.path_only req with
+                       | "/login" ->
+                           A.sign_in req (Option.get (A.user req)) ;
+                           Response.string ""
+                       | _ ->
+                           seen := A.user req ;
+                           Response.string "" ) )
+              in
+              let r =
+                h (get ~fields:[auth ("Bearer " ^ user_token ())] "/login")
+              in
+              let c = cookie_of r in
+              ignore (h (get ~fields:(with_cookie c) "/")) ;
+              let u = Option.get !seen in
+              equal string "ada" (A.User.id u) ;
+              equal string "Session" (A.User.scheme u) ;
+              equal (list string) ["admin"; "dev"] (A.User.roles u) ;
+              equal (option string) (Some "read write") (A.User.claim "scope" u) ) )
+    ; test "the order of the schemes" (fun () ->
+          at before (fun _ ->
+              let store = S.memory_store () in
+              let schemes = [bearer (); A.Scheme.session ()] in
+              let h = session_app ~schemes store site in
+              let c = cookie_of (h (get "/login")) in
+              (* No Authorization: the session. *)
+              equal string "ada Session -"
+                (body (h (get ~fields:(with_cookie c) "/"))) ;
+              (* A bad token stops before the session. *)
+              let bad = with_cookie ~fields:[auth "Bearer x.y.z"] c in
+              equal string "- -" (body (h (get ~fields:bad "/"))) ;
+              (* The challenge is of the scheme that failed. *)
+              let h =
+                session_app
+                  ~schemes:[A.Scheme.session (); bearer ()]
+                  store (A.require () site)
+              in
+              let r = h (get ~fields:[auth "Bearer x.y.z"] "/") in
+              equal int 401 (code r) ;
+              equal (option string)
+                (Some {|Bearer realm="api", error="invalid_token"|})
+                (field "www-authenticate" r) ;
+              (* With no failure: the first scheme. *)
+              let r = h (get "/") in
+              equal int 401 (code r) ;
+              equal (option string) None (field "www-authenticate" r) ;
+              (* The session first: its user wins over a bad token. *)
+              let h =
+                session_app ~schemes:[A.Scheme.session (); bearer ()] store site
+              in
+              equal string "ada Session -"
+                (body
+                   (h
+                      (get
+                         ~fields:(with_cookie ~fields:[auth "Bearer x.y.z"] c)
+                         "/" ) ) ) ) )
+    ; test "session data that does not decode" (fun () ->
+          at before (fun _ ->
+              let store = S.memory_store () in
+              List.iter
+                (fun text ->
+                  let failure = ref None in
+                  let h =
+                    S.middleware ~keys:[session_key] ~store () (fun req ->
+                        match Request.path_only req with
+                        | "/plant" ->
+                            S.Private.set "caravan.auth.user" text req ;
+                            Response.string ""
+                        | _ ->
+                            A.middleware
+                              ~schemes:[A.Scheme.session ()]
+                              ()
+                              (fun req ->
+                                failure := A.failure req ;
+                                who req )
+                              req )
+                  in
+                  let c = cookie_of (h (get "/plant")) in
+                  equal ~msg:(String.escaped text) string "-"
+                    (body (h (get ~fields:(with_cookie c) "/"))) ;
+                  equal ~msg:(String.escaped text)
+                    (option (pair string string))
+                    (Some ("Session", "bad session data"))
+                    !failure )
+                [ (* No version, another version. *)
+                  ""
+                ; "2" ^ "1:a1:0" (* A field with no colon, no count. *)
+                ; "1" ^ "1:a1:0x"
+                ; "1" ^ "1:a"
+                  (* A length with a leading zero, too long, empty, not digits,
+                     too large for an int. *)
+                ; "1" ^ "01:a1:0"
+                ; "1" ^ "9:a"
+                ; "1" ^ ":a"
+                ; "1" ^ "1xa1:0"
+                ; "1" ^ "11"
+                ; "1" ^ "99999999999999999999:a"
+                ; "1" ^ "1:a1:" (* A count that is not canonical, too large. *)
+                ; "1" ^ "1:a2:-1"
+                ; "1" ^ "1:a1:x"
+                ; "1" ^ "1:a2:+0"
+                ; "1" ^ "1:a2:00"
+                ; "1" ^ "1:a3:0x0"
+                ; "1" ^ "1:a3:0_0"
+                ; "1" ^ "1:a1:2" (* A claim with no value. *)
+                ; "1" ^ "1:a1:01:k"
+                ; "1" ^ "1:a1:01:k1:v1:x" ] ) )
+    ; test "the encoding of an empty user" (fun () ->
+          at before (fun _ ->
+              let store = S.memory_store () in
+              let seen = ref None in
+              let h =
+                session_app store (fun req ->
+                    ( match Request.path_only req with
+                    | "/login" ->
+                        A.sign_in req (A.User.make "")
+                    | _ ->
+                        seen := A.user req ) ;
+                    Response.string "" )
+              in
+              let c = cookie_of (h (get "/login")) in
+              ignore (h (get ~fields:(with_cookie c) "/")) ;
+              let u = Option.get !seen in
+              equal string "" (A.User.id u) ;
+              equal (list string) [] (A.User.roles u) ;
+              equal (list (pair string string)) [] (A.User.claims u) ) )
+    ; test "the encoding of a user" (fun () ->
+          at before (fun _ ->
+              let store = S.memory_store () in
+              let seen = ref None in
+              let u =
+                A.User.make
+                  ~roles:["a:b"; ""; "1:x"; "123456789"]
+                  ~claims:[("", ""); ("k\n", "v:1"); ("10", "0")]
+                  ("id:12\n" ^ String.make 10000 'x')
+              in
+              let h =
+                S.middleware ~keys:[session_key] ~store ()
+                  (A.middleware
+                     ~schemes:[A.Scheme.session ()]
+                     ()
+                     (fun req ->
+                       ( match Request.path_only req with
+                       | "/login" ->
+                           A.sign_in req u
+                       | _ ->
+                           seen := A.user req ) ;
+                       Response.string "" ) )
+              in
+              let c = cookie_of (h (get "/login")) in
+              ignore (h (get ~fields:(with_cookie c) "/")) ;
+              let v = Option.get !seen in
+              equal string ("id:12\n" ^ String.make 10000 'x') (A.User.id v) ;
+              equal (list string)
+                ["a:b"; ""; "1:x"; "123456789"]
+                (A.User.roles v) ;
+              equal
+                (list (pair string string))
+                [("", ""); ("k\n", "v:1"); ("10", "0")]
+                (A.User.claims v) ) )
+    ; test "validate" (fun () ->
+          at before (fun _ ->
+              let store = S.memory_store () in
+              let failure = ref None in
+              let validate u =
+                if A.User.id u = "ada" then
+                  Some (A.User.make ~roles:["new"] "ada2")
+                else None
+              in
+              let h =
+                session_app ~validate store (fun req ->
+                    failure := A.failure req ;
+                    match Request.path_only req with
+                    | "/login" | "/login-bob" ->
+                        site req
+                    | _ ->
+                        who req )
+              in
+              let c = cookie_of (h (get "/login")) in
+              equal string "ada2 Session new"
+                (body (h (get ~fields:(with_cookie c) "/"))) ;
+              let c = cookie_of (h (get "/login-bob")) in
+              equal string "-" (body (h (get ~fields:(with_cookie c) "/"))) ;
+              equal
+                (option (pair string string))
+                (Some ("Session", "the user is not valid"))
+                !failure ) )
+    ; test "the challenge of the session scheme" (fun () ->
+          at before (fun _ ->
+              let store = S.memory_store () in
+              let h = session_app ~login:"/login" store (A.require () site) in
+              let send ?(meth = Method.GET) fields path =
+                h (get ~meth ~fields path)
+              in
+              let nav = [("Sec-Fetch-Mode", "navigate")] in
+              let r = send nav "/a%20b/c?x=1&y=/" in
+              equal int 303 (code r) ;
+              equal (option string)
+                (Some "/login?return=/a%2520b/c%3Fx%3D1%26y%3D/")
+                (field "location" r) ;
+              equal int 303 (code (send ~meth:Method.HEAD nav "/")) ;
+              equal int 303 (code (send [("Accept", "text/html")] "/")) ;
+              equal int 303
+                (code
+                   (send
+                      [("Accept", "application/xhtml+xml,TEXT/HTML;q=0.9")]
+                      "/" ) ) ;
+              List.iter
+                (fun (label, meth, fields) ->
+                  let r = send ~meth fields "/" in
+                  equal ~msg:label int 401 (code r) ;
+                  equal ~msg:label (option string) None (field "location" r) )
+                [ ("POST", Method.POST, nav)
+                ; ( "cors"
+                  , Method.GET
+                  , [("Sec-Fetch-Mode", "cors"); ("Accept", "text/html")] )
+                ; ("json", Method.GET, [("Accept", "application/json")])
+                ; ("text/htm", Method.GET, [("Accept", "text/htm")])
+                ; ("xext/html", Method.GET, [("Accept", "xext/html")])
+                ; ("no accept", Method.GET, []) ] ;
+              (* A path that starts with // stays in the return value, and
+                 return_path refuses it. *)
+              let r = send nav "//evil.example/x" in
+              let location = Option.get (field "location" r) in
+              equal string "/login?return=//evil.example/x" location ;
+              equal (option string) None (A.return_path (get location)) ;
+              (* With no login: 401. *)
+              let h = session_app store (A.require () site) in
+              equal int 401 (code (h (get ~fields:nav "/"))) ) )
+    ; test "the user of a request does not change in the request" (fun () ->
+          at before (fun _ ->
+              let store = S.memory_store () in
+              let seen = ref [] in
+              let h =
+                session_app store (fun req ->
+                    ( match Request.path_only req with
+                    | "/login" ->
+                        A.sign_in req (A.User.make "ada")
+                    | "/logout" ->
+                        A.sign_out req
+                    | _ ->
+                        () ) ;
+                    seen := Option.map A.User.id (A.user req) :: !seen ;
+                    Response.string "" )
+              in
+              let c = cookie_of (h (get "/login")) in
+              ignore (h (get ~fields:(with_cookie c) "/logout")) ;
+              equal (list (option string)) [Some "ada"; None] !seen ) )
+    ; test "sign_in with bad data ends the old session" (fun () ->
+          at before (fun _ ->
+              let store = S.memory_store () in
+              let h =
+                S.middleware ~keys:[session_key] ~store ()
+                  (A.middleware
+                     ~schemes:[A.Scheme.session ()]
+                     ()
+                     (fun req ->
+                       match Request.path_only req with
+                       | "/plant" ->
+                           S.Private.set "caravan.auth.user" "bad" req ;
+                           S.set "cart" "3" req ;
+                           Response.string ""
+                       | _ ->
+                           site req ) )
+              in
+              let send ?cookie path =
+                h (get ~fields:(with_cookie cookie) path)
+              in
+              let old = cookie_of (send "/plant") in
+              let c = cookie_of (send ?cookie:old "/login") in
+              equal string "ada Session -" (body (send ?cookie:c "/")) ;
+              equal string "- -" (body (send ?cookie:old "/")) ) )
+    ; test "sign_in after the response raises" (fun () ->
+          at before (fun _ ->
+              let store = S.memory_store () in
+              let raised = ref false in
+              let r =
+                session_app store
+                  (fun req ->
+                    Response.stream (fun _ ->
+                        try A.sign_in req (A.User.make "a")
+                        with Invalid_argument _ -> raised := true ) )
+                  (get "/")
+              in
+              ignore (body r) ;
+              is_true !raised ) )
+    ; test "return_path" (fun () ->
+          let rp q = A.return_path (get ("/login" ^ q)) in
+          List.iter
+            (fun (q, expected) -> equal ~msg:q (option string) expected (rp q))
+            [ ("?return=/a/b", Some "/a/b")
+            ; ("?return=/", Some "/")
+            ; ("?return=/a%20b", Some "/a b")
+            ; ("?return=%2Fa%3Fx%3D1", Some "/a?x=1")
+            ; ("?return=//evil.example", None)
+            ; ("?return=/%5Cevil.example", None)
+            ; ("?return=/a%5Cb", None)
+            ; ("?return=/%09/evil.example", None)
+            ; ("?return=/a%7F", None)
+            ; ("?return=https://evil.example", None)
+            ; ("?return=a", None)
+            ; ("?return=", None)
+            ; ("", None) ] )
+    ; test "CSRF: a cookie POST needs a token, a bearer POST does not"
+        (fun () ->
+          at before (fun _ ->
+              let store = S.memory_store () in
+              let app =
+                Handler.compose
+                  [ Caravan_middleware.Cross_origin.middleware ()
+                  ; S.middleware ~keys:[session_key] ~store ()
+                  ; A.middleware ~schemes:[bearer (); A.Scheme.session ()] ()
+                  ; S.Csrf.middleware
+                      ~exempt:(fun r ->
+                        match A.user r with
+                        | Some u ->
+                            A.User.scheme u = "Bearer"
+                        | None ->
+                            false )
+                      () ]
+                  (fun req ->
+                    (* The login route is not under require. *)
+                    if Request.path_only req = "/login" then site req
+                    else A.require () site req )
+              in
+              let c = cookie_of (app (get "/login")) in
+              is_some ~msg:"a session cookie" c ;
+              (* A form POST with the cookie and no token. *)
+              let r =
+                app (get ~meth:Method.POST ~fields:(with_cookie c) "/x")
+              in
+              equal int 403 (code r) ;
+              (* The same POST with a token of the session. *)
+              let token = body (app (get ~fields:(with_cookie c) "/token")) in
+              let r =
+                app
+                  (get ~meth:Method.POST
+                     ~fields:(with_cookie ~fields:[("X-CSRF-Token", token)] c)
+                     "/x" )
+              in
+              equal int 200 (code r) ;
+              (* A POST with a bearer token and no session. *)
+              let r =
+                app
+                  (get ~meth:Method.POST
+                     ~fields:[auth ("Bearer " ^ user_token ())]
+                     "/x" )
+              in
+              equal int 200 (code r) ) ) ]
+
 let () =
   Mirage_crypto_rng.set_default_generator
     (Mirage_crypto_rng.create ~seed:"caravan auth tests"
@@ -1091,4 +2022,7 @@ let () =
        ; jwks_tests
        ; form_tests
        ; json_tests
-       ; claims_tests ] )
+       ; claims_tests
+       ; bearer_tests
+       ; policy_tests
+       ; session_tests ] )

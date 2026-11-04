@@ -164,6 +164,9 @@
  (libraries
   caravan
   caravan.auth
+  caravan.session
+  caravan.router
+  caravan.middleware
   tls_support
   sim_support
   weft

@@ -545,3 +545,473 @@ module Jwt = struct
 
   let payload c = c.payload
 end
+
+(* {1 Users} *)
+
+let is_ctl c = Char.code c < 0x20 || c = '\x7f'
+
+(* [/] and then not [/], with no [\] and no control character: a path of this
+   site. A [\] at 1 is a [\] anywhere. *)
+let is_local_path p =
+  String.length p >= 1
+  && p.[0] = '/'
+  && (String.length p = 1 || p.[1] <> '/')
+  && String.for_all (fun c -> c <> '\\' && not (is_ctl c)) p
+
+module User = struct
+  type t =
+    { id: string
+    ; scheme: string
+    ; roles: string list
+    ; claims: (string * string) list }
+
+  let make ?(roles = []) ?(claims = []) id = {id; scheme= ""; roles; claims}
+
+  let id u = u.id
+
+  let scheme u = u.scheme
+
+  let roles u = u.roles
+
+  let has_role r u = List.mem r u.roles
+
+  let claim name u = List.assoc_opt name u.claims
+
+  let claims u = u.claims
+
+  (* The text of a user in a session: version 1, then [len:bytes] fields: the
+     id, the count of the roles (decimal), the roles, then the names and values
+     of the claims. The scheme is not kept: the scheme that reads it sets it. *)
+  let field s = string_of_int (String.length s) ^ ":" ^ s
+
+  let encode u =
+    String.concat ""
+      ( "1" :: field u.id
+        :: field (string_of_int (List.length u.roles))
+        :: List.map field u.roles
+      @ List.concat_map (fun (n, v) -> [field n; field v]) u.claims )
+
+  (* [number s] is the value of the decimal digits [s], with no sign and no
+     leading zero. *)
+  let number s =
+    let n = String.length s in
+    if
+      n = 0
+      || (n > 1 && s.[0] = '0')
+      || not (String.for_all (fun c -> c >= '0' && c <= '9') s)
+    then None
+    else int_of_string_opt s
+
+  (* [fields s i] is the [len:bytes] fields of [s] from [i] to its end. *)
+  let rec fields s i =
+    if i = String.length s then Some []
+    else
+      match String.index_from_opt s i ':' with
+      | None ->
+          None
+      | Some colon -> (
+        match number (String.sub s i (colon - i)) with
+        | Some l when l <= String.length s - colon - 1 ->
+            Option.map
+              (fun rest -> String.sub s (colon + 1) l :: rest)
+              (fields s (colon + 1 + l))
+        | _ ->
+            None )
+
+  let rec take n l =
+    match (n, l) with
+    | 0, l ->
+        Some ([], l)
+    | n, x :: l ->
+        Option.map (fun (a, b) -> (x :: a, b)) (take (n - 1) l)
+    | _, [] ->
+        None
+
+  let rec pairs = function
+    | [] ->
+        Some []
+    | n :: v :: rest ->
+        Option.map (fun r -> (n, v) :: r) (pairs rest)
+    | [_] ->
+        None
+
+  let ( let* ) = Option.bind
+
+  let decode s =
+    let* () = if String.starts_with ~prefix:"1" s then Some () else None in
+    let* l = fields s 1 in
+    match l with
+    | id :: count :: rest ->
+        let* count = number count in
+        let* roles, rest = take count rest in
+        let* claims = pairs rest in
+        Some {id; scheme= ""; roles; claims}
+    | _ ->
+        None
+end
+
+type outcome = Authenticated of User.t | No_credentials | Failed of string
+
+(* {1 Schemes} *)
+
+module Scheme = struct
+  type t =
+    { name: string
+    ; authenticate: Caravan.Request.t -> outcome
+    ; challenge:
+        failure:string option -> Caravan.Request.t -> Caravan.Response.t }
+
+  let name s = s.name
+
+  let make ~name ~authenticate ~challenge =
+    if name = "" || name = "Bearer" || name = "Session" then
+      invalid_arg
+        "Caravan_auth.Scheme.make: an empty name, or the name of a scheme of \
+         this library" ;
+    {name; authenticate; challenge}
+
+  let is_token68 = function
+    | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '-' | '.' | '_' | '~' | '+' | '/'
+      ->
+        true
+    | _ ->
+        false
+
+  (* The failures of the form of the field: [invalid_request] (RFC 6750 §3.1).
+     The challenge compares them physically, thus a text of the application with
+     the same letters is not one of them. *)
+  let two_fields = "two Authorization fields"
+
+  let malformed = "a malformed Authorization field"
+
+  (* [starts_ci v w] is [true] if [v] starts with [w] (lower case), with no
+     case. *)
+  let starts_ci v w =
+    let n = String.length w in
+    let rec at i =
+      i = n || (Char.lowercase_ascii v.[i] = w.[i] && at (i + 1))
+    in
+    String.length v >= n && at 0
+
+  (* [parse v] is the token of the field value [v] for the scheme Bearer. The
+     scheme is the run of tchar at the start. *)
+  let parse v =
+    let n = String.length v in
+    if
+      (not (starts_ci v "bearer"))
+      || (n > 6 && Caravan.Private.Token.is_tchar v.[6])
+    then `Other
+    else
+      let rec skip p i = if i < n && p v.[i] then skip p (i + 1) else i in
+      let t = skip (fun c -> c = ' ') 6 in
+      let c = skip is_token68 t in
+      if t = 6 || c = t || skip (fun c -> c = '=') c <> n then `Malformed
+      else `Token (String.sub v t (n - t))
+
+  let default_user roles_claim (claims : Jwt.claims) =
+    match Jwt.subject claims with
+    | None | Some "" ->
+        Error "no sub"
+    | Some id ->
+        let roles = Option.value ~default:[] (Jwt.strings roles_claim claims) in
+        let strings =
+          List.filter_map
+            (function n, `String v -> Some (n, v) | _ -> None)
+            claims.Jwt.members
+        in
+        Ok (User.make ~roles ~claims:strings id)
+
+  let bearer ?(realm = "api") ?leeway ?(roles_claim = "roles") ?user ~issuer
+      ~audience ~keys () =
+    let bad m = invalid_arg ("Caravan_auth.Scheme.bearer: " ^ m) in
+    if String.exists (fun c -> c = '"' || c = '\\' || is_ctl c) realm then
+      bad "the realm has a quote, a backslash or a control character" ;
+    ( match (issuer, audience) with
+    | Jwt.One_of [], _ | _, Jwt.One_of [] ->
+        bad "an empty list for issuer or audience"
+    | _ ->
+        () ) ;
+    ( match leeway with
+    | Some l when Weft.Span.compare l Weft.Span.zero < 0 ->
+        bad "a negative leeway"
+    | _ ->
+        () ) ;
+    let user_of =
+      match user with Some f -> f | None -> default_user roles_claim
+    in
+    let authenticate req =
+      match
+        Caravan.Headers.find_all "authorization" (Caravan.Request.headers req)
+      with
+      | [] ->
+          No_credentials
+      | _ :: _ :: _ ->
+          Failed two_fields
+      | [v] -> (
+        match parse v with
+        | `Other ->
+            No_credentials
+        | `Malformed ->
+            Failed malformed
+        | `Token token -> (
+          match Jwt.verify ?leeway ~issuer ~audience ~keys:(keys ()) token with
+          | Error e ->
+              Failed (Format.asprintf "%a" Jwt.pp_error e)
+          | Ok claims -> (
+            match user_of claims with
+            | Ok u ->
+                Authenticated u
+            | Error m ->
+                Failed m ) ) )
+    in
+    let challenge ~failure _ =
+      let error =
+        match failure with
+        | None ->
+            ""
+        | Some m when m == two_fields || m == malformed ->
+            {|, error="invalid_request"|}
+        | Some _ ->
+            {|, error="invalid_token"|}
+      in
+      Caravan.Response.string ~status:Caravan.Status.unauthorized
+        ~headers:
+          (Caravan.Headers.of_list
+             [("WWW-Authenticate", {|Bearer realm="|} ^ realm ^ {|"|} ^ error)] )
+        "Unauthorized\n"
+    in
+    {name= "Bearer"; authenticate; challenge}
+
+  let member = "caravan.auth.user"
+
+  (* [contains_ci a w] is [true] if [a] contains [w] (lower case), with no case
+     and no copy. *)
+  let contains_ci a w =
+    let n = String.length a and m = String.length w in
+    let rec at i j =
+      j = m || (Char.lowercase_ascii a.[i + j] = w.[j] && at i (j + 1))
+    in
+    let rec from i = i + m <= n && (at i 0 || from (i + 1)) in
+    from 0
+
+  (* A navigation of a browser: a GET or HEAD for a page. *)
+  let navigation req =
+    let h = Caravan.Request.headers req in
+    ( match Caravan.Request.meth req with
+      | Caravan.Method.GET | Caravan.Method.HEAD ->
+          true
+      | _ ->
+          false )
+    &&
+    match Caravan.Headers.find "sec-fetch-mode" h with
+    | Some m ->
+        m = "navigate"
+    | None -> (
+      match Caravan.Headers.find "accept" h with
+      | Some a ->
+          contains_ci a "text/html"
+      | None ->
+          false )
+
+  (* The bytes of a path in a query value: the unreserved characters and [/]
+     stay. *)
+  let encode_path p =
+    let b = Buffer.create (String.length p) in
+    String.iter
+      (fun c ->
+        match c with
+        | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '-' | '.' | '_' | '~' | '/' ->
+            Buffer.add_char b c
+        | c ->
+            Buffer.add_string b (Printf.sprintf "%%%02X" (Char.code c)) )
+      p ;
+    Buffer.contents b
+
+  let session ?login ?(validate = Option.some) () =
+    ( match login with
+    | Some l when (not (is_local_path l)) || String.contains l '?' ->
+        invalid_arg
+          "Caravan_auth.Scheme.session: login is not a path that starts with \
+           one /"
+    | _ ->
+        () ) ;
+    let authenticate req =
+      (* The session at the start of the request: a sign in or a sign out of the
+         handler does not change the user of this request. *)
+      match Caravan_session.Private.find_loaded member req with
+      | None ->
+          No_credentials
+      | Some text -> (
+        match Option.map validate (User.decode text) with
+        | None ->
+            Failed "bad session data"
+        | Some None ->
+            Failed "the user is not valid"
+        | Some (Some u) ->
+            Authenticated u )
+    in
+    let challenge ~failure:_ req =
+      match login with
+      | Some l when navigation req ->
+          Caravan.Response.empty ~status:Caravan.Status.see_other
+            ~headers:
+              (Caravan.Headers.of_list
+                 [ ( "Location"
+                   , l ^ "?return=" ^ encode_path (Caravan.Request.path req) )
+                 ] )
+            ()
+      | _ ->
+          Caravan.Response.string ~status:Caravan.Status.unauthorized
+            "Unauthorized\n"
+    in
+    {name= "Session"; authenticate; challenge}
+end
+
+let sign_in req user =
+  ( match Caravan_session.Private.find Scheme.member req with
+  | Some _ ->
+      (* Another user: a new session, with no data of the old one. *)
+      Caravan_session.clear req
+  | None ->
+      Caravan_session.renew req ) ;
+  Caravan_session.Private.set Scheme.member (User.encode user) req
+
+let sign_out req = Caravan_session.clear req
+
+(* {1 The middleware} *)
+
+(* The result of the schemes: the user, or the scheme that failed. *)
+type result = {user: User.t option; failure: (Scheme.t * string) option}
+
+(* The schemes run at the first need of their result, not for each request: a
+   public route pays nothing. Two fibers of one request can compute it at the
+   same time: the first result stays. *)
+type context =
+  {schemes: Scheme.t list; run: unit -> result; result: result option Atomic.t}
+
+let context_key : context Caravan.Attrs.key =
+  Caravan.Attrs.key ~name:"caravan.auth" ()
+
+let middleware ~schemes () =
+  let names = List.map Scheme.name schemes in
+  ( match schemes with
+  | [] ->
+      invalid_arg "Caravan_auth.middleware: no scheme"
+  | _ ->
+      () ) ;
+  if List.length (List.sort_uniq String.compare names) <> List.length names then
+    invalid_arg "Caravan_auth.middleware: two schemes with one name" ;
+  fun next req ->
+    let run () =
+      let rec go = function
+        | [] ->
+            {user= None; failure= None}
+        | (s : Scheme.t) :: rest -> (
+          match s.authenticate req with
+          | Authenticated u ->
+              {user= Some {u with User.scheme= s.name}; failure= None}
+          | No_credentials ->
+              go rest
+          | Failed m ->
+              {user= None; failure= Some (s, m)} )
+      in
+      go schemes
+    in
+    next
+      (Caravan.Request.with_attr context_key
+         {schemes; run; result= Atomic.make None}
+         req )
+
+let context fn req =
+  match Caravan.Request.find_attr context_key req with
+  | Some c ->
+      c
+  | None ->
+      invalid_arg
+        ( "Caravan_auth." ^ fn
+        ^ ": the request did not go through Caravan_auth.middleware" )
+
+let result c =
+  match Atomic.get c.result with
+  | Some r ->
+      r
+  | None ->
+      (* Another fiber can set it first: its result stays. *)
+      ignore (Atomic.compare_and_set c.result None (Some (c.run ()))) ;
+      Option.get (Atomic.get c.result)
+
+let user req = (result (context "user" req)).user
+
+let failure req =
+  Option.map
+    (fun ((s : Scheme.t), m) -> (s.name, m))
+    (result (context "failure" req)).failure
+
+(* [challenge_of ?scheme c req] is the challenge of the scheme that failed, else
+   of [scheme], else of the first scheme. *)
+let challenge_of ?scheme c req =
+  match ((result c).failure, scheme) with
+  | Some ((s : Scheme.t), m), _ ->
+      s.challenge ~failure:(Some m) req
+  | None, Some (s : Scheme.t) ->
+      s.challenge ~failure:None req
+  | None, None ->
+      (List.hd c.schemes).challenge ~failure:None req
+
+let challenge req = challenge_of (context "challenge" req) req
+
+let forbid _ =
+  Caravan.Response.string ~status:Caravan.Status.forbidden "Forbidden\n"
+
+let return_path req =
+  match Caravan.Form.find "return" (Caravan.Request.query_params req) with
+  | Some p when is_local_path p ->
+      Some p
+  | _ ->
+      None
+
+(* {1 Authorization} *)
+
+type policy = User.t -> bool
+
+let authenticated _ = true
+
+let role = User.has_role
+
+let scope s u =
+  match User.claim "scope" u with
+  | Some v ->
+      List.mem s (String.split_on_char ' ' v)
+  | None ->
+      false
+
+let all ps u = List.for_all (fun p -> p u) ps
+
+let any ps u = List.exists (fun p -> p u) ps
+
+let require ?(policy = authenticated) ?challenge () next req =
+  let c = context "require" req in
+  let scheme =
+    Option.map
+      (fun name ->
+        match List.find_opt (fun (s : Scheme.t) -> s.name = name) c.schemes with
+        | Some s ->
+            s
+        | None ->
+            invalid_arg
+              ("Caravan_auth.require: no scheme " ^ name ^ " in the middleware") )
+      challenge
+  in
+  match (result c).user with
+  | None ->
+      challenge_of ?scheme c req
+  | Some u ->
+      if policy u then
+        let r = next req in
+        let h = Caravan.Response.headers r in
+        if Caravan.Headers.mem "cache-control" h then r
+        else
+          Caravan.Response.with_headers
+            (Caravan.Headers.add "Cache-Control" "private" h)
+            r
+      else forbid req
