@@ -165,3 +165,20 @@
   (with-stdout-to
    readme_sessions.ml
    (run awk -v "section=Sessions" -f %{dep:section.awk} %{dep:../README.md}))))
+
+; The example of the "CSRF" section of README.md, as readme_csrf.ml.
+
+(executable
+ (name readme_csrf)
+ (modules readme_csrf)
+ (libraries
+  caravan
+  caravan.session
+  caravan.middleware
+  mirage-crypto-rng.unix))
+
+(rule
+ (action
+  (with-stdout-to
+   readme_csrf.ml
+   (run awk -v "section=CSRF" -f %{dep:section.awk} %{dep:../README.md}))))

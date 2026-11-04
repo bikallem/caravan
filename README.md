@@ -325,6 +325,50 @@ let app =
 - Make no session for an anonymous user: a session starts at the first
   `set` (or `id`).
 
+## CSRF
+
+`Caravan_middleware.Cross_origin` stops the cross-origin requests of
+the browsers with no token. `Caravan_session.Csrf` adds tokens bound to
+the session, also for older browsers:
+
+```ocaml
+let () = Mirage_crypto_rng_unix.use_default ()
+
+let key = Caravan_session.Key.of_base64url (Sys.getenv "SESSION_KEY")
+
+let app =
+  Caravan.Handler.compose
+    [ Caravan_middleware.Cross_origin.middleware ()
+    ; Caravan_session.middleware ~keys:[key]
+        ~store:(Caravan_session.memory_store ())
+        ()
+    ; Caravan_session.Csrf.middleware () ]
+    (fun req ->
+      match Caravan.Request.meth req with
+      | GET ->
+          Caravan.Response.string
+            ~headers:(Caravan.Headers.of_list [("Content-Type", "text/html")])
+            ( "<form method=post>\
+               <input type=hidden name=_csrf value=\""
+            ^ Caravan_session.Csrf.token req
+            ^ "\"><button>Send</button></form>" )
+      | _ ->
+          Caravan.Response.string "sent" )
+```
+
+- The order: `Cross_origin`, then the session, then `Csrf`.
+- `Csrf.token` gives a new text for each call (a random mask against
+  BREACH), and the response gets `Cache-Control: no-store`. A login
+  (`renew`) and a logout (`clear`) end the tokens.
+- The middleware reads the token from `X-CSRF-Token`, or from the field
+  `_csrf` of an urlencoded form. The handler gets the same bytes of the
+  form. Another body (JSON, multipart) needs the header.
+- A request with no session has no token: by default it gets 403. A
+  login form for anonymous users has no session: exempt it, and
+  `Cross_origin` protects it.
+- Use `Csrf` only for the routes of the cookie sessions. A JSON API
+  with a bearer token needs no token against CSRF.
+
 ## File uploads
 
 `Request.multipart` streams the parts of a `multipart/form-data` body,
