@@ -31,6 +31,8 @@ module Server = Server
 (** Internal modules, exposed for tests. Not part of the public API. *)
 module Private : sig
   module Date = Date
+  module Percent = Percent
+  module Token = Token
   module Deadline = Deadline
   module Cancel = Cancel
   module Buf_reader = Buf_reader

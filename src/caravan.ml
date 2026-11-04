@@ -19,6 +19,8 @@ module Server = Server
 
 module Private = struct
   module Date = Date
+  module Percent = Percent
+  module Token = Token
   module Deadline = Deadline
   module Cancel = Cancel
   module Buf_reader = Buf_reader
