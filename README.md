@@ -125,8 +125,8 @@ let app =
 ## Middleware
 
 The `caravan.middleware` library has middleware for the requests that
-come through a reverse proxy, request IDs, an access log, CORS and an
-error page:
+come through a reverse proxy, request IDs, an access log, CORS, an
+error page, the HTTPS redirect and HSTS:
 
 ```ocaml
 open Caravan_middleware
@@ -138,6 +138,8 @@ let app handler =
     ; Access_log.middleware
         ~log:(fun e -> print_string (Access_log.line e ^ "\n"))
         ()
+    ; Hsts.middleware ()
+    ; Https_redirect.middleware ()
     ; Cors.middleware
         ~origins:(Cors.Only ["https://app.example"])
         ~allow_headers:["content-type"]
@@ -172,6 +174,17 @@ let app handler =
 - `Error_page` gives a page (by default a plain 500) for an exception of
   the handler, after a call of `report`. A cancel and the error of a
   request body go to the server as before.
+- `Https_redirect` sends each `http` request to `https` with a 307 (308
+  is better in production, when HTTPS works). A request with no valid
+  authority, or with a path that does not start with `/`, gets 400.
+- `Hsts` adds `Strict-Transport-Security` (365 days by default) to the
+  responses of `https` requests, but not for `localhost` (also
+  `*.localhost`), `127.0.0.1` and `[::1]`.
+- The order: `Forwarded` first (it gives the scheme of the client), then
+  `Request_id` and `Access_log` (so that each redirect has a log entry),
+  then `Hsts`, `Https_redirect`, `Cors` and `Error_page`. A middleware
+  that changes the path goes after `Https_redirect`, so that the
+  redirect keeps the path of the client.
 
 ## Queries and forms
 
