@@ -113,6 +113,7 @@
                 ./static
                 ./tls
                 ./session
+                ./auth
                 ./testing
                 ./LICENSE
                 ./README.md
@@ -129,6 +130,11 @@
               ocamlPackages.digestif
               ocamlPackages.eqaf
               ocamlPackages.mirage-crypto-rng
+              # caravan.auth, an optional library.
+              ocamlPackages.mirage-crypto-pk
+              ocamlPackages.mirage-crypto-ec
+              ocamlPackages.yojson
+              ocamlPackages.zarith
             ];
             doCheck = false;
             meta = {
@@ -169,6 +175,10 @@
               ptime
               digestif
               eqaf
+              # caravan.auth (optional)
+              mirage-crypto-pk
+              yojson
+              zarith
 
               # Test dependencies (windtrap here is the flake input, so use
               # ocamlPackages.windtrap)

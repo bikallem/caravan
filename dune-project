@@ -41,7 +41,10 @@
     :with-test
     (>= 2.1)))
   (digestif :with-test)
-  (eqaf :with-test))
+  (eqaf :with-test)
+  (mirage-crypto-pk :with-test)
+  (yojson :with-test)
+  (zarith :with-test))
  (depopts
   ; caravan.tls
   (tls
@@ -51,7 +54,12 @@
   mirage-crypto-rng
   ; caravan.session
   digestif
-  eqaf)
+  eqaf
+  ; caravan.auth
+  mirage-crypto-pk
+  mirage-crypto-ec
+  yojson
+  zarith)
  (conflicts
   (tls
    (< 2.1))))

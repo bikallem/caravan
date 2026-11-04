@@ -22,6 +22,9 @@ depends: [
   "tls" {with-test & >= "2.1"}
   "digestif" {with-test}
   "eqaf" {with-test}
+  "mirage-crypto-pk" {with-test}
+  "yojson" {with-test}
+  "zarith" {with-test}
 ]
 depopts: [
   "tls" {>= "2.1"}
@@ -30,6 +33,10 @@ depopts: [
   "mirage-crypto-rng"
   "digestif"
   "eqaf"
+  "mirage-crypto-pk"
+  "mirage-crypto-ec"
+  "yojson"
+  "zarith"
 ]
 conflicts: [
   "tls" {< "2.1"}
