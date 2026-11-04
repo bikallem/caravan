@@ -298,24 +298,158 @@ let method_not_allowed () =
 let is_get_or_head req =
   match Request.meth req with Method.GET | Method.HEAD -> true | _ -> false
 
-(* [body fd size] reads [size] bytes of [fd] from the start. The hook closes
-   [fd] at the end of the body: the server closes each response body, thus the
-   hook runs also for HEAD, 304 and an error. *)
-let body fd size =
+(* [body fd ~first ~length] reads [length] bytes of [fd] from the byte [first].
+   The hook closes [fd] at the end of the body: the server closes each response
+   body, thus the hook runs also for HEAD and an error. *)
+let body fd ~first ~length =
   let pos = ref 0 in
-  Body.of_source ~length:size (fun buf off len ->
-      let remaining = size - !pos in
+  Body.of_source ~length (fun buf off len ->
+      let remaining = length - !pos in
       if remaining = 0 then 0
       else
-        let k = File.pread fd ~file_offset:!pos buf off (min len remaining) in
+        let k =
+          File.pread fd ~file_offset:(first + !pos) buf off (min len remaining)
+        in
         pos := !pos + k ;
         k )
   |> Body.on_end (fun _ ~bytes:_ -> File.close fd)
 
+(* {1 Ranges} *)
+
+(* A range of a Range field (RFC 9110 §14.1.1): [From (first, last)] is
+   [first-last], or [first-] with the last byte [cap]. [Suffix n] is [-n]. *)
+type spec = From of int * int | Suffix of int
+
+(* A number stays at [cap] after it reaches it, and [cap] is more than the size
+   of each file (RFC 9110 §14.1.2: large numerals). [10 * cap + 9] is less than
+   [max_int], thus the step to [cap] has no overflow. *)
+let cap = 1 lsl 58
+
+(* The most elements of a Range field. A server can ignore a field with many
+   ranges (RFC 9110 §14.2), thus the parse of a long field costs nothing. *)
+let max_ranges = 100
+
+(* [after s i] is the text of [s] after the index [i]. *)
+let after s i = String.sub s (i + 1) (String.length s - i - 1)
+
+(* [number s] is the value of the decimal digits [s], or [None] if [s] is empty
+   or has another character. *)
+let number s =
+  if s = "" || not (String.for_all (fun c -> c >= '0' && c <= '9') s) then None
+  else
+    Some
+      (String.fold_left
+         (fun n c -> min cap ((n * 10) + Char.code c - Char.code '0'))
+         0 s )
+
+(* [digits_le x y] is [true] if the decimal number [x] is at most [y]. It
+   compares the digits, thus two numbers above [cap] keep their order. *)
+let digits_le x y =
+  let strip s =
+    let n = String.length s in
+    let rec go i = if i < n && s.[i] = '0' then go (i + 1) else i in
+    let i = go 0 in
+    String.sub s i (n - i)
+  in
+  let x = strip x and y = strip y in
+  String.length x < String.length y
+  || (String.length x = String.length y && x <= y)
+
+(* [spec s] is the range of the element [s], with no OWS. *)
+let spec s =
+  match String.index_opt s '-' with
+  | Some 0 ->
+      Option.map (fun n -> Suffix n) (number (after s 0))
+  | Some i -> (
+      let f = String.sub s 0 i in
+      let first = number f in
+      match after s i with
+      | "" ->
+          Option.map (fun a -> From (a, cap)) first
+      | l -> (
+        match (first, number l) with
+        | Some a, Some b when digits_le f l ->
+            Some (From (a, b))
+        | _ ->
+            None ) )
+  | None ->
+      None
+
+(* [ranges v] is the list of the ranges of the Range value [v], or [None] if it
+   is not a correct [bytes] range, or if it has more than [max_ranges] elements.
+   One incorrect element makes the whole value incorrect. Empty elements and OWS
+   around each element are permitted. *)
+let ranges v =
+  match String.index_opt v '=' with
+  | Some 5
+    when String.lowercase_ascii (String.sub v 0 5) = "bytes"
+         && String.fold_left (fun n c -> if c = ',' then n + 1 else n) 0 v
+            < max_ranges ->
+      let elements =
+        String.split_on_char ',' (after v 5)
+        |> List.map String.trim
+        |> List.filter (( <> ) "")
+      in
+      let specs = List.filter_map spec elements in
+      if specs = [] || List.compare_lengths specs elements <> 0 then None
+      else Some specs
+  | _ ->
+      None
+
+(* [satisfy size r] is the first and the last byte of [r] in a file of [size]
+   bytes, if [r] is satisfiable. [size] is more than 0. *)
+let satisfy size = function
+  | From (a, b) ->
+      if a < size then Some (a, min b (size - 1)) else None
+  | Suffix n ->
+      if n > 0 then Some (max 0 (size - n), size - 1) else None
+
+(* [range ~year ~now_s ~etag ~modified_s size req] is the range of the response,
+   after the preconditions. RFC 9110 §14.2: Range only for GET, and an empty
+   file ignores it. More than one satisfiable range gives the full file, as a
+   server may.
+
+   If-Range has one line with the ETag, or one date. The date matches if it is
+   the second of Last-Modified, and this second is before the second of the
+   response: a heuristic for a strong date (RFC 9110 §8.8.2.2). A tag never
+   decodes as a date. *)
+let range ~year ~now_s ~etag ~modified_s size req =
+  let headers = Request.headers req in
+  let if_range () =
+    match Headers.find_all "if-range" headers with
+    | [] ->
+        true
+    | [v] -> (
+        v = etag
+        ||
+        match date ~year v with
+        | Some d ->
+            d = modified_s && modified_s < now_s
+        | None ->
+            false )
+    | _ ->
+        false
+  in
+  match Headers.find_all "range" headers with
+  | [v] when Method.equal (Request.meth req) Method.GET && size > 0 -> (
+    match ranges v with
+    | Some specs when if_range () -> (
+      match List.filter_map (satisfy size) specs with
+      | [] ->
+          `Unsatisfiable
+      | [r] ->
+          `Part r
+      | _ ->
+          `Full )
+    | _ ->
+        `Full )
+  | _ ->
+      `Full
+
 (* [serve ~fields fd st req] is the response for the regular file [fd], after
-   the preconditions of RFC 9110 §13.2.2. [fields ()] gives the [Content-Type]
-   and the [Cache-Control]: it runs after the open, thus in the protect of
-   [fd]. *)
+   the preconditions of RFC 9110 §13.2.2, then the range. [fields ()] gives the
+   [Content-Type] and the [Cache-Control]: it runs after the open, thus in the
+   protect of [fd]. *)
 let serve ~fields fd (st : File.stat) req =
   close_on_raise fd (fun () ->
       let content_type, cache_control = fields () in
@@ -371,14 +505,31 @@ let serve ~fields fd (st : File.stat) req =
       else if not_modified then
         respond Status.not_modified (("ETag", etag) :: cache)
       else
-        let fields =
+        let entity =
           [ ("Content-Type", content_type)
           ; ("ETag", etag)
           ; ("Last-Modified", Date.to_imf modified)
-          ; ("X-Content-Type-Options", "nosniff") ]
+          ; ("X-Content-Type-Options", "nosniff")
+          ; ("Accept-Ranges", "bytes") ]
           @ cache
         in
-        Response.make ~headers:(Headers.of_list fields) (body fd st.size) )
+        let ok status extra first length =
+          Response.make ~status
+            ~headers:(Headers.of_list (entity @ extra))
+            (body fd ~first ~length)
+        in
+        match range ~year ~now_s ~etag ~modified_s st.size req with
+        | `Unsatisfiable ->
+            respond Status.range_not_satisfiable
+              [("Content-Range", Printf.sprintf "bytes */%d" st.size)]
+        | `Part (first, last) ->
+            ok Status.partial_content
+              [ ( "Content-Range"
+                , Printf.sprintf "bytes %d-%d/%d" first last st.size ) ]
+              first
+              (last - first + 1)
+        | `Full ->
+            ok Status.ok [] 0 st.size )
 
 let file ?content_type:ct ?cache_control path req =
   if not (is_get_or_head req) then method_not_allowed ()

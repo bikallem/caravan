@@ -13,7 +13,8 @@
     domain. Each response has an [ETag] and a [Last-Modified] field, and the
     functions do the preconditions of RFC 9110 §13.2.2: [If-Match],
     [If-Unmodified-Since], [If-None-Match] and [If-Modified-Since]. They give
-    [304 Not Modified] and [412 Precondition Failed].
+    [304 Not Modified] and [412 Precondition Failed]. They also serve one byte
+    range of a file (see {!ranges}).
 
     {1:root The root}
 
@@ -77,6 +78,30 @@
     open. If the file gets shorter after the response starts, the body ends
     before its [Content-Length]: the server reports [Length_mismatch] and closes
     the connection. If the file gets longer, the body stops at the first size.
+
+    {1:ranges Ranges}
+
+    A [GET] with a [Range] field of one byte range gets [206 Partial Content],
+    with [Content-Range] (RFC 9110 §14). A 200 and a 206 have
+    [Accept-Ranges: bytes]. The rules:
+    - The preconditions come first: a 304 or a 412 has no range.
+    - [HEAD] ignores [Range] (RFC 9110 §14.2), and an empty file ignores it.
+    - A [Range] field with more than one line, with an incorrect element, or
+      with a unit that is not [bytes] (with no case), or with more than 100
+      elements, is ignored. A space or a tab around an element is permitted, but
+      not around [-].
+    - More than one satisfiable range gives the full file, with no
+      [multipart/byteranges] (RFC 9110 §14.2 lets a server ignore [Range]).
+    - No satisfiable range gives [416 Range Not Satisfiable], with only
+      [Content-Range: bytes */size] and no body.
+    - A large number does not overflow: a large first byte is not satisfiable, a
+      large last byte is the end of the file, and a large suffix is the whole
+      file, as a 206.
+    - [If-Range] matches with one strong entity tag that is the [ETag], or with
+      one date that is the second of [Last-Modified]. A date matches only if
+      this second is before the second of the response: a heuristic for a strong
+      date (RFC 9110 §8.8.2.2). If [If-Range] does not match, the response is
+      the full file.
 
     {1:validators Validators}
 

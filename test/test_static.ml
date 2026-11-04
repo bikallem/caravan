@@ -256,9 +256,10 @@ let file_tests =
                 equal ~msg:(string_of_int ms) int n (fds s)
               done ) ) ]
 
-(* [pre ?meth headers] is the response of [file] for [root/a.txt], with
-   [headers], and its body. *)
-let pre ?meth headers = get ?meth ~headers (S.file (root ^ "/a.txt")) "/"
+(* [pre ?meth ?file ?cache_control headers] is the response of [file] for
+   [root/file] (default [a.txt]), with [headers], and its body. *)
+let pre ?meth ?(file = "a.txt") ?cache_control headers =
+  get ?meth ~headers (S.file ?cache_control (root ^ "/" ^ file)) "/"
 
 let code (r, _) = Status.code (Response.status r)
 
@@ -777,6 +778,303 @@ let dir_tests =
                let _, b = get (mw ~dotfiles:true ()) p in
                is_false ~msg:p (String.equal b "SECRET") ) ) ) ]
 
+(* The file of the range tests: 10 bytes, at [t0]. *)
+let digits = "0123456789"
+
+let range_site () = site [("r.txt", digits)]
+
+(* [r_pre] is [pre] for the file of the range tests. *)
+let r_pre ?meth ?cache_control headers =
+  pre ?meth ~file:"r.txt" ?cache_control headers
+
+let r_etag () = Option.get (field "etag" (fst (r_pre [])))
+
+(* [range_of ?headers v] is the status, the body and the Content-Range of
+   [Range: v]. *)
+let range_of ?(headers = []) v =
+  let ((r, b) as reply) = r_pre (("Range", v) :: headers) in
+  (code reply, b, field "content-range" r)
+
+let range_result = Testable.(triple int string (option string))
+
+let full = (200, digits, None)
+
+let range_tests =
+  group "Ranges"
+    [ test "one range gives 206 with its bytes and fields" (fun () ->
+          sim (fun _ ->
+              range_site () ;
+              let r =
+                S.file ~cache_control:"max-age=1" (root ^ "/r.txt")
+                  (req ~headers:[("Range", "bytes=0-3")] "/")
+              in
+              check_status ~msg:"206" 206 r ;
+              equal (option int) (Some 4) (Body.length (body_of r)) ;
+              equal string "0123" (body r) ;
+              List.iter
+                (fun (n, v) -> equal ~msg:n (option string) v (field n r))
+                [ ("content-range", Some "bytes 0-3/10")
+                ; ("accept-ranges", Some "bytes")
+                ; ("content-type", Some "text/plain; charset=utf-8")
+                ; ("cache-control", Some "max-age=1")
+                ; ("x-content-type-options", Some "nosniff")
+                ; ("last-modified", Some (imf 1_700_000_000.)) ] ;
+              is_some ~msg:"etag" (field "etag" r) ) )
+    ; test "the forms of a range and the clamp of the end" (fun () ->
+          sim (fun _ ->
+              range_site () ;
+              equal (list range_result)
+                [ (206, "789", Some "bytes 7-9/10")
+                ; (206, "789", Some "bytes 7-9/10")
+                ; (206, "56789", Some "bytes 5-9/10")
+                ; (206, digits, Some "bytes 0-9/10")
+                ; (206, "0", Some "bytes 0-0/10")
+                ; (206, "9", Some "bytes 9-9/10")
+                ; (206, digits, Some "bytes 0-9/10")
+                ; (206, digits, Some "bytes 0-9/10")
+                ; (206, "34", Some "bytes 3-4/10") ]
+                (List.map
+                   (fun v -> range_of v)
+                   [ "bytes=7-"
+                   ; "bytes=-3"
+                   ; "bytes=5-100"
+                   ; "bytes=-100"
+                   ; "BYTES=0-0"
+                   ; "Bytes=9-9"
+                   ; "bytes=0-99999999999999999999"
+                   ; "bytes=-99999999999999999999"
+                   ; "bytes=0000000000000000000003-4" ] ) ) )
+    ; test "a range that is not satisfiable gives 416" (fun () ->
+          sim (fun _ ->
+              range_site () ;
+              List.iter
+                (fun v ->
+                  let ((r, b) as reply) =
+                    r_pre ~cache_control:"immutable" [("Range", v)]
+                  in
+                  equal ~msg:v int 416 (code reply) ;
+                  equal ~msg:v string "" b ;
+                  equal ~msg:v (option string) (Some "bytes */10")
+                    (field "content-range" r) ;
+                  List.iter
+                    (fun n ->
+                      equal ~msg:(v ^ " " ^ n) (option string) None (field n r) )
+                    [ "cache-control"
+                    ; "etag"
+                    ; "content-type"
+                    ; "accept-ranges"
+                    ; "last-modified" ] )
+                [ "bytes=10-"
+                ; "bytes=10-20"
+                ; "bytes=-0"
+                ; "bytes=99999999999999999999-"
+                ; "bytes=10-11, 20-" ] ) )
+    ; test "an incorrect Range field gives the full file" (fun () ->
+          sim (fun _ ->
+              range_site () ;
+              List.iter
+                (fun v -> equal ~msg:v range_result full (range_of v))
+                [ "bytes=3-1"
+                ; "bytes=a-b"
+                ; "bytes=1-2-3"
+                ; "items=0-1"
+                ; "bytes 0-1"
+                ; "bytes="
+                ; "bytes=,"
+                ; "bytes=-"
+                ; "bytes=1"
+                ; "bytes=--1"
+                ; "bytes=+1-2"
+                ; "bytes=1-+2"
+                ; "bytesx=0-1"
+                ; "byte=0-1"
+                ; "=0-1"
+                ; "bytes = 0-0"
+                ; "bytes=0 - 0"
+                ; "bytes=0-1,3-1"
+                ; "bytes=0-1,x"
+                ; "bytes=99999999999999999999-99999999999999999998"
+                ; "bytes=10-9"
+                ; (* More than 100 elements: 100 commas, and one satisfiable
+                     range. *)
+                  "bytes=0-0" ^ String.make 99 ',' ^ ",20-30"
+                ; "bytes=0-0" ^ String.make 100 ',' ] ;
+              (* 100 elements, with 99 commas. *)
+              equal range_result
+                (206, "0", Some "bytes 0-0/10")
+                (range_of ("bytes=0-0" ^ String.make 99 ',')) ;
+              (* The order of two large numbers. *)
+              equal range_result
+                (206, "9", Some "bytes 9-9/10")
+                (range_of "bytes=09-99999999999999999999") ;
+              equal range_result
+                (416, "", Some "bytes */10")
+                (range_of "bytes=99999999999999999998-99999999999999999999") ) )
+    ; test "OWS and empty elements of the list" (fun () ->
+          sim (fun _ ->
+              range_site () ;
+              List.iter
+                (fun v ->
+                  equal ~msg:v range_result
+                    (206, "0", Some "bytes 0-0/10")
+                    (range_of v) )
+                ["bytes=0-0 ,"; "bytes=,\t0-0"; "bytes=0-0, ,"; "bytes=, 0-0"] ) )
+    ; test "more than one satisfiable range gives the full file" (fun () ->
+          sim (fun _ ->
+              range_site () ;
+              equal (list range_result)
+                [full; (206, "01", Some "bytes 0-1/10"); full]
+                (List.map
+                   (fun v -> range_of v)
+                   ["bytes=0-1,5-6"; "bytes=0-1, 20-30"; "bytes=0-1,0-1"] ) ) )
+    ; test "two Range lines give the full file" (fun () ->
+          sim (fun _ ->
+              range_site () ;
+              equal range_result full
+                (range_of ~headers:[("Range", "bytes=0-1")] "bytes=0-1") ) )
+    ; test "HEAD and an empty file ignore Range" (fun () ->
+          sim (fun _ ->
+              range_site () ;
+              site [("e", "")] ;
+              (* A direct call keeps the body of a HEAD: the server drops it. *)
+              let ((r, _) as reply) =
+                r_pre ~meth:Method.HEAD [("Range", "bytes=0-3")]
+              in
+              equal int 200 (code reply) ;
+              equal (option int) (Some 10) (Body.length (body_of r)) ;
+              equal (option string) None (field "content-range" r) ;
+              equal (option string) (Some "bytes") (field "accept-ranges" r) ;
+              List.iter
+                (fun v ->
+                  let r, b =
+                    get ~headers:[("Range", v)] (S.file (root ^ "/e")) "/"
+                  in
+                  check_status ~msg:v 200 r ;
+                  equal ~msg:v string "" b ;
+                  equal ~msg:v (option string) None (field "content-range" r) )
+                ["bytes=0-"; "bytes=-5"; "bytes=0-0"] ) )
+    ; test "If-Range" (fun () ->
+          sim (fun s ->
+              range_site () ;
+              let e = r_etag () in
+              let lm = imf 1_700_000_000. in
+              (* The response is 10 s after the change of the file. *)
+              Weft_sim.set_posix s (Weft.Time.posix_of_unix_s 1_700_000_010.) ;
+              let ir v = [("If-Range", v)] in
+              let p = (206, "0123", Some "bytes 0-3/10") in
+              List.iter
+                (fun (msg, headers, expected) ->
+                  equal ~msg range_result expected
+                    (range_of ~headers "bytes=0-3") )
+                [ ("the ETag", ir e, p)
+                ; ("a weak ETag", ir ("W/" ^ e), full)
+                ; ("another tag", ir "\"x\"", full)
+                ; ("*", ir "*", full)
+                ; ("a list", ir ("\"x\", " ^ e), full)
+                ; ("a list after", ir (e ^ ","), full)
+                ; ("the date", ir lm, p)
+                ; ("another date", ir (imf 1_699_999_999.), full)
+                ; ("a later date", ir (imf 1_700_000_005.), full)
+                ; ("garbage", ir "garbage", full)
+                ; ("two lines", ir e @ ir e, full) ] ;
+              (* If-Range comes before the satisfiable check. *)
+              equal range_result full
+                (range_of ~headers:(ir "\"x\"") "bytes=10-") ;
+              equal range_result
+                (416, "", Some "bytes */10")
+                (range_of ~headers:(ir e) "bytes=10-") ;
+              (* The date is strong only if it is before the second of the
+                 response. *)
+              Weft_sim.set_posix s (Weft.Time.posix_of_unix_s 1_700_000_000.9) ;
+              equal range_result full (range_of ~headers:(ir lm) "bytes=0-3") ) )
+    ; test "the preconditions come before the range" (fun () ->
+          sim (fun _ ->
+              range_site () ;
+              let e = r_etag () in
+              let status_of h = code (r_pre (("Range", "bytes=0-3") :: h)) in
+              equal (list int) [304; 304; 412; 412]
+                [ status_of [("If-None-Match", e)]
+                ; status_of [("If-Modified-Since", imf 1_700_000_000.)]
+                ; status_of [("If-Match", "\"x\"")]
+                ; status_of [("If-Unmodified-Since", imf 1_699_999_999.)] ] ;
+              let r, _ = r_pre [("Range", "bytes=0-3"); ("If-None-Match", e)] in
+              equal (option string) None (field "accept-ranges" r) ;
+              equal (option string) None (field "content-range" r) ;
+              let r, _ = r_pre [("If-Match", "\"x\"")] in
+              equal (option string) None (field "accept-ranges" r) ) )
+    ; test "a range of a large file" (fun () ->
+          sim (fun _ ->
+              let data =
+                String.init ((3 * 16384) + 5) (fun i -> Char.chr (i mod 251))
+              in
+              site [("big", data)] ;
+              let r, b =
+                get
+                  ~headers:[("Range", "bytes=16380-32780")]
+                  (S.file (root ^ "/big"))
+                  "/"
+              in
+              check_status ~msg:"206" 206 r ;
+              is_true ~msg:"the bytes"
+                (String.equal (String.sub data 16380 16401) b) ) )
+    ; test "the fds of a 206 and a 416 close" (fun () ->
+          sim (fun s ->
+              range_site () ;
+              let n = fds s in
+              ignore (r_pre [("Range", "bytes=0-3")]) ;
+              equal int n (fds s) ;
+              ignore (r_pre [("Range", "bytes=10-")]) ;
+              equal int n (fds s) ;
+              close
+                (S.file (root ^ "/r.txt")
+                   (req ~headers:[("Range", "bytes=1-2")] "/") ) ;
+              equal int n (fds s) ) )
+    ; (let gen =
+         Gen.triple (Gen.int_range 0 40)
+           (Gen.of_list [`From; `From_to; `Suffix])
+           (Gen.pair (Gen.int_range 0 45) (Gen.int_range 0 45))
+       in
+       prop ~count:300 "a range agrees with a model" gen
+         (fun (size, form, (a, b)) ->
+           let data = String.init size (fun i -> Char.chr (65 + (i mod 26))) in
+           let v, model =
+             match form with
+             | `From ->
+                 ( Printf.sprintf "bytes=%d-" a
+                 , if a < size then `Part (a, size - 1) else `None )
+             | `From_to ->
+                 ( Printf.sprintf "bytes=%d-%d" a b
+                 , if b < a then `Full
+                   else if a < size then `Part (a, min b (size - 1))
+                   else `None )
+             | `Suffix ->
+                 ( Printf.sprintf "bytes=-%d" a
+                 , if a > 0 then `Part (max 0 (size - a), size - 1) else `None
+                 )
+           in
+           (* An empty file ignores Range. *)
+           let model = if size = 0 then `Full else model in
+           sim (fun _ ->
+               site [("p", data)] ;
+               let r, body =
+                 get ~headers:[("Range", v)] (S.file (root ^ "/p")) "/"
+               in
+               let got =
+                 (Status.code (Response.status r), body, field "content-range" r)
+               in
+               let expected =
+                 match model with
+                 | `Full ->
+                     (200, data, None)
+                 | `None ->
+                     (416, "", Some (Printf.sprintf "bytes */%d" size))
+                 | `Part (f, l) ->
+                     ( 206
+                     , String.sub data f (l - f + 1)
+                     , Some (Printf.sprintf "bytes %d-%d/%d" f l size) )
+               in
+               equal ~msg:v range_result expected got ) ) ) ]
+
 let wire_tests =
   group "On the wire"
     [ test "a GET and a HEAD through the server, and the fds" (fun () ->
@@ -826,6 +1124,32 @@ let wire_tests =
               equal status Status.precondition_failed r.status ;
               T.settle t ;
               equal int n (fds (T.sim t)) ) )
+    ; test "a 206 and a 416 through the server, then a request" (fun () ->
+          let app = S.middleware ~root () Handler.not_found in
+          T.run app (fun t ->
+              site [("r.txt", digits)] ;
+              let get v =
+                T.get ~headers:(Headers.of_list [("Range", v)]) t "/r.txt"
+              in
+              let r = get "bytes=2-4" in
+              equal status Status.partial_content r.status ;
+              equal string "234" r.body ;
+              equal (option string) (Some "3")
+                (Headers.find "content-length" r.headers) ;
+              equal (option string) (Some "bytes 2-4/10")
+                (Headers.find "content-range" r.headers) ;
+              let r = get "bytes=10-" in
+              equal status Status.range_not_satisfiable r.status ;
+              equal string "" r.body ;
+              equal (option string) (Some "bytes */10")
+                (Headers.find "content-range" r.headers) ;
+              (* The framing of the 416 lets the next request work. *)
+              let r = get "bytes=-1" in
+              equal string "9" r.body ;
+              equal (list string) []
+                (List.map
+                   (fun (e, _) -> Printexc.to_string e)
+                   (T.take_errors t) ) ) )
     ; test "a file that gets shorter ends the connection" (fun () ->
           let data = String.make 100_000 'x' in
           let app req =
@@ -857,4 +1181,5 @@ let () =
        ; file_tests
        ; precondition_tests
        ; dir_tests
+       ; range_tests
        ; wire_tests ] )
