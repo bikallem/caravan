@@ -53,7 +53,8 @@ end
 (** The type for bodies. *)
 type t
 
-(** Raised by {!to_string} when a body exceeds its [max]. *)
+(** Raised by {!to_string} when a body exceeds its [max], and by the reads of a
+    body with a limit of its own, for example a decoded request body. *)
 exception Too_large
 
 (** Raised by reads when the peer ends a body before its declared end, for

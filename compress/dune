@@ -5,7 +5,13 @@
  (name caravan_compress)
  (public_name caravan.compress)
  (optional)
- (libraries caravan decompress.de decompress.gz decompress.zl)
+ (libraries
+  caravan
+  decompress.de
+  decompress.gz
+  decompress.zl
+  checkseum
+  optint)
  (instrumentation
   (backend ppx_windtrap.mutate))
  (instrumentation

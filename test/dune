@@ -186,6 +186,8 @@
  (libraries
   caravan
   caravan.compress
+  caravan.middleware
+  checkseum
   caravan.static
   caravan.testing
   sim_support

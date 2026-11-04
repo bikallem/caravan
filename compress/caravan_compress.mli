@@ -92,3 +92,41 @@ val middleware :
     @raise Invalid_argument
       if [min_size] is negative, [max_size] is less than [min_size],
       [max_active] is less than 1, or [level] is not in 0 to 9. *)
+
+(** {1:requests Request bodies} *)
+
+val decompress : ?max_bytes:int -> unit -> Caravan.Handler.middleware
+(** [decompress ()] decodes the body of a request with [Content-Encoding: gzip]
+    (or [x-gzip]) or [deflate] (the zlib format of RFC 1950; raw deflate is not
+    [deflate] and gives 400). The names of the codings have no case, and
+    [identity] elements are ignored.
+    - A request with no coding, a body of known length 0, or a [Content-Range]:
+      no change.
+    - Another coding, or two codings: [415 Unsupported Media Type] with
+      [Accept-Encoding: gzip, deflate], and the body is not read.
+    - Else the next handler gets a body that decodes the old one, with no
+      [Content-Encoding], no [Content-Length], and no digest field in the fields
+      or the trailers. gzip members one after the other are one body (RFC 1952
+      §2.2).
+    - More than [max_bytes] (default 1 MiB) of decoded bytes in the body, or
+      more than [max_bytes] + 64 KiB of compressed bytes: a read raises
+      {!Caravan.Body.Too_large} ({!Caravan.Request.form} gives
+      [Error Too_large]). A [Content-Length] over that limit gives
+      [413 Content Too Large] with no read.
+    - A body that does not decode: a read raises an exception of this module.
+      The check is strict: an empty body with no known length, zero bytes after
+      the last gzip member, or a bad CRC give it.
+    - After an error of the decoder, each later read raises it again. If the
+      handler lets it out of [next], the middleware gives
+      [413 Content Too Large] or [400 Bad Request]. After the response (for
+      example in a stream producer), it goes out as other exceptions. An error
+      of the old body (the client left, the [max_body] limit of the server) goes
+      out with no change: the server maps it.
+    - The decoder yields after each 4 KiB of input or output. From the first
+      read, a decoded body uses about 60 KiB of memory.
+
+    Put it after [Caravan_middleware.Error_page] in a list of
+    {!Caravan.Handler.compose}: else the error page takes the errors of the
+    decoder as errors of the handler (500).
+
+    @raise Invalid_argument if [max_bytes] is negative. *)
