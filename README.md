@@ -126,7 +126,8 @@ let app =
 
 The `caravan.middleware` library has middleware for the requests that
 come through a reverse proxy, request IDs, an access log, CORS, an
-error page, the HTTPS redirect, HSTS and a protection against CSRF:
+error page, the HTTPS redirect, HSTS, a protection against CSRF, a
+rate limit and a concurrency limit:
 
 ```ocaml
 open Caravan_middleware
@@ -191,11 +192,18 @@ let app handler =
   `api.example.com` needs `https://app.example.com` in
   `trusted_origins`. Put the CORS origins with credentials there too.
   `exempt` lets a path, for example a webhook, take cross-origin POSTs.
+- `Rate_limit` gives each client (an IPv4 address, or the /64 of an
+  IPv6 address) a token bucket of `burst` requests, with one new token
+  `every` span, and refuses the other requests with 429 and
+  `Retry-After`. `Concurrency_limit` serves at most `limit` requests at
+  the same time, and refuses the others with 503.
 - The order: `Forwarded` first (it gives the scheme of the client), then
-  `Request_id` and `Access_log` (so that each redirect has a log entry),
-  then `Hsts`, `Https_redirect`, `Cors`, `Error_page` and
-  `Cross_origin` (a refusal gets its CORS fields), then the sessions
-  and the router. A middleware that changes the path goes after
+  `Request_id` and `Access_log` (so that each redirect and each refusal
+  has a log entry), then `Hsts`, `Https_redirect` and `Cors`, then the
+  limits, `Error_page` and `Cross_origin` (a refusal gets its CORS
+  fields, and a preflight takes no token), then the sessions and the
+  router. Add `Retry-After` to the `expose_headers` of `Cors`. A
+  middleware that changes the path goes after
   `Https_redirect`, so that the redirect keeps the path of the client.
 
 ## Queries and forms
