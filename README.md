@@ -39,7 +39,7 @@ them.
 | `caravan.router` | Routes, path parameters, 405 with `Allow`, groups | |
 | `caravan.middleware` | Forwarded fields, request IDs, access log, CORS, error page, HTTPS redirect, HSTS, cross-origin protection, rate limit, concurrency limit, health checks, cache headers | |
 | `caravan.session` | Sessions, signed cookies, CSRF tokens | digestif, eqaf, mirage-crypto-rng |
-| `caravan.auth` | JWT, bearer and cookie schemes, users, policies, OpenID Connect, codes by email | the dependencies of `caravan.session`, and mirage-crypto-pk, mirage-crypto-ec, x509, yojson, zarith |
+| `caravan.auth` | JWT, bearer and cookie schemes, users, policies, OpenID Connect, codes by email, passkeys | the dependencies of `caravan.session`, and mirage-crypto-pk, mirage-crypto-ec, x509, yojson, zarith |
 | `caravan.compress` | gzip and deflate responses, decompression of request bodies | decompress |
 | `caravan.static` | Static files with ETag, conditional requests and ranges | |
 | `caravan.tls` | The TLS server, with ALPN, and HTTPS for the client | tls, x509, domain-name, ipaddr, mirage-crypto-rng |
@@ -70,6 +70,7 @@ executable:
 - [Users and policies](#users-and-policies)
 - [OpenID Connect](#openid-connect)
 - [Codes by email](#codes-by-email)
+- [Passkeys](#passkeys)
 - [Compression](#compression)
 - [File uploads](#file-uploads)
 - [Static files](#static-files)
@@ -669,6 +670,56 @@ let code req text =
 - Give the same response for known and unknown addresses, put a rate
   limit on the two routes, and give a second way to sign in: an
   attacker can keep the code sign-in of an address closed.
+
+## Passkeys
+
+`Caravan_auth.Passkey` does the server part of WebAuthn: the options
+for `navigator.credentials.create()` and `.get()`, and the checks of
+their responses.
+
+```ocaml
+let rp =
+  Caravan_auth.Passkey.rp ~id:"example.com" ~name:"Example"
+    ~origins:["https://example.com"]
+
+(* Registration, for a signed-in user. *)
+let options req user =
+  Caravan_auth.Passkey.creation_options rp req ~user_id:user.handle
+    ~user_name:user.email ~display_name:user.name
+
+let register req body =
+  match Caravan_auth.Passkey.register rp req ~registered:credential_exists body with
+  | Ok c -> store c.id c.stored
+  | Error e -> refuse e
+
+(* Sign-in: request_options, then authenticate. *)
+let sign_in req body =
+  match Caravan_auth.Passkey.authenticate rp req ~lookup:find_credential body with
+  | Ok a when a.cloned -> refuse_or_warn a
+  | Ok a ->
+      update_sign_count a.credential_id a.sign_count ;
+      Caravan_auth.sign_in req (user_of_handle a.user_handle)
+  | Error e -> refuse e
+```
+
+In the browser, `PublicKeyCredential.parseCreationOptionsFromJSON` and
+`parseRequestOptionsFromJSON` read the options, and
+`credential.toJSON()` gives the body of the response.
+
+- The keys: ES256, EdDSA and RS256 (COSE). The attestation is none: a
+  statement of another format is not verified.
+- Each ceremony keeps a random challenge in the session (at most 4, for
+  5 minutes by default). A response uses its challenge one time.
+- `authenticate` checks the user handle of the response against the
+  stored credential, and gives the stored handle: the handle of a
+  response is not signed.
+- The counter: `cloned` tells a counter that did not grow, except for
+  passkeys that sync and always send 0.
+- `allow` needs `user`: the server checks the user of the credential,
+  not the list.
+- Read the body of a response with a limit of 64 KiB, and put a rate
+  limit on the routes of the options: each one can make a session. Two
+  copies of one response sent at the same time can both pass.
 
 ## Compression
 
