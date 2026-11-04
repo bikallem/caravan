@@ -209,7 +209,9 @@ let rec same buf delim i k =
   k = String.length delim
   || (Bytes.get buf (i + k) = delim.[k] && same buf delim i (k + 1))
 
-let is_delim st i = same st.buf st.delim i 0
+let is_delim st i =
+  same st.buf st.delim i
+    (0 [@mutate off "find_delim calls it only at a CR, the first byte of delim"])
 
 (* The index of the first delimiter in the bytes of [st], or [-1]. Each search
    starts at [scan], thus each byte is examined once. *)
@@ -627,7 +629,9 @@ let choose_boundary fields =
     in
     (set, count)
   in
-  let _, count = markers 0 in
+  let _, count =
+    markers (0 [@mutate off "the count of the markers does not depend on k"])
+  in
   (* [2^k > count], thus one of the [2^k] suffixes is free. *)
   let rec bits k = if 1 lsl k > count then k else bits (k + 1) in
   let k = bits 0 in

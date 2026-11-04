@@ -193,7 +193,9 @@ let headers_tests =
             (Headers.find "CONTENT-TYPE" h) ;
           equal (list string) ["text/plain"; "x"]
             (Headers.find_all "content-type" h) ;
-          equal (option string) None (Headers.find "Host" h) )
+          equal (option string) None (Headers.find "Host" h) ;
+          (* The compare starts at the first byte of the name. *)
+          equal (option string) None (Headers.find "Xontent-Type" h) )
     ; test "to_list keeps order, case and duplicates" (fun () ->
           let l =
             [("Set-Cookie", "a=1"); ("Host", "x"); ("set-cookie", "b=2")]
@@ -398,6 +400,7 @@ let date_tests =
             (fun (t, text) -> equal string text (Date.to_imf (posix t)))
             [ (784111777.9, "Sun, 06 Nov 1994 08:49:37 GMT")
             ; (-1.5, "Wed, 31 Dec 1969 23:59:58 GMT")
+            ; (951782400., "Tue, 29 Feb 2000 00:00:00 GMT")
             ; (-9214560000., "Sat, 01 Jan 1678 00:00:00 GMT")
             ; (9214646400., "Wed, 01 Jan 2262 00:00:00 GMT")
             ; (-9223372036., "Tue, 21 Sep 1677 00:12:44 GMT") ] ;
@@ -409,7 +412,10 @@ let date_tests =
           equal string "Wed, 31 Dec 1969 23:59:59 GMT"
             (Date.of_posix (posix (-0.5))) ;
           equal string "Wed, 31 Dec 1969 23:59:59 GMT"
-            (Date.of_posix (posix (-1.))) )
+            (Date.of_posix (posix (-1.))) ;
+          (* A whole second before 1970 is not in the second before it. *)
+          equal string "Wed, 31 Dec 1969 23:59:58 GMT"
+            (Date.of_posix (posix (-1.5))) )
     ; test "of_posix drops a fraction near 1 s" (fun () ->
           (* 100 ns before midnight: a float rounds it up to the next second. *)
           let second =
@@ -1803,7 +1809,9 @@ let cookie_tests =
             (Cookie.to_string (Cookie.make ~secure:true "__Host-a" "1")) ;
           ok (fun () -> Cookie.make ~secure:true "__Secure-a" "1") ;
           ok (fun () -> Cookie.make "__Securea" "1") ;
-          ok (fun () -> Cookie.make "__Hos" "1") )
+          ok (fun () -> Cookie.make "__Hos" "1") ;
+          ok (fun () -> Cookie.make "x_Secure-a" "1") ;
+          ok (fun () -> Cookie.make "x_Host-a" "1") )
     ; test "expired keeps the attributes that the user agent matches" (fun () ->
           let c =
             Cookie.make ~max_age:60 ~domain:"example.com" ~path:"/x"
@@ -2035,6 +2043,7 @@ let multipart_tests =
             ; "x\r\n--c"
             ; "x\r\n-"
             ; "x--b"
+            ; "x-b"
             ; "\r\n--B"
             ; "\r"
             ; "\r\n"
@@ -2071,6 +2080,15 @@ let multipart_tests =
                 raises Body.Truncated (fun () -> Body.to_string (Mp.body p)) )
           in
           malformed r ;
+          (* The callback lets the error go, and a close delimiter comes after
+             the incorrect bytes. *)
+          malformed
+            (Mp.fold ~boundary:"b"
+               (Body.of_string
+                  ("--b\r\n" ^ disp "a" ^ "\r\n1\r\n--bX\r\n--b--") )
+               ~init:()
+               (fun () p ->
+                 raises Body.Truncated (fun () -> Body.to_string (Mp.body p)) ) ) ;
           (* The bytes after the boundary make a correct head. *)
           malformed
             (mp_read_all
@@ -2112,7 +2130,8 @@ let multipart_tests =
             ; "Content-Disposition: form-data; name=a; filename=x; filename=y\r\n"
             ; "Content-Disposition: form-data; name=\"a\r\n"
             ; "Content-Disposition: form-data; name=a b\r\n"
-            ; "Content-Disposition: form-data; name=\r\n" ] )
+            ; "Content-Disposition: form-data; name=\r\n"
+            ; "Content-Disposition:\r\n" ] )
     ; test "incorrect head lines" (fun () ->
           List.iter
             (fun h ->
@@ -2152,7 +2171,7 @@ let multipart_tests =
           malformed (mp_read_all ~max_header_bytes:size (pre (size + 1))) )
     ; test "the limits at their exact values" (fun () ->
           (* The epilogue: the body ends iff it has at most max_header_bytes. *)
-          let ended k =
+          let ended ?chunk k =
             let e = ref false in
             let s =
               "--b\r\n" ^ disp "a" ^ "\r\nx\r\n--b--" ^ String.make k 'e'
@@ -2160,7 +2179,7 @@ let multipart_tests =
             let body =
               Body.on_end
                 (fun o ~bytes:_ -> e := o = Body.Ended)
-                (Body.of_string s)
+                (Body.of_source (chunked_reader ?chunk s))
             in
             equal mp_result
               (Ok [field "a" "x"])
@@ -2169,6 +2188,8 @@ let multipart_tests =
           in
           is_true ~msg:"100" (ended 100) ;
           is_false ~msg:"101" (ended 101) ;
+          (* In reads of 10 bytes, the limit counts each byte one time. *)
+          is_true ~msg:"100 in chunks" (ended ~chunk:10 100) ;
           (* A preamble across many reads of a small buffer. *)
           let pre chunk k =
             Mp.fold ~max_header_bytes:100 ~buffer_size:14 ~boundary:"b"
@@ -2259,6 +2280,43 @@ let multipart_tests =
           equal (result unit mp_error) (Ok ()) (count 2) ;
           equal (result unit mp_error) (Error Mp.Too_many_parts) (count 3) ;
           equal int 2 !calls )
+    ; test "the default limits" (fun () ->
+          (* max_parts is 1000. *)
+          let parts n = mp_body (List.init n (fun _ -> (disp "a", ""))) in
+          equal (result int mp_error) (Ok 1000)
+            (Result.map List.length (mp_read_all (parts 1000))) ;
+          equal (result int mp_error) (Error Mp.Too_many_parts)
+            (Result.map List.length (mp_read_all (parts 1001))) ;
+          (* max_header_bytes is 16384: the head and its empty line. *)
+          let head k =
+            let h = disp "a" ^ "X: \r\n" in
+            disp "a" ^ "X: "
+            ^ String.make (k - String.length h - 2) 'v'
+            ^ "\r\n"
+          in
+          equal mp_result
+            (Ok [field "a" "x"])
+            (mp_read_all (mp_body [(head 16384, "x")])) ;
+          equal mp_result (Error Mp.Header_too_large)
+            (mp_read_all (mp_body [(head 16385, "x")])) ;
+          (* buffer_size is 16384: no read of the source asks for more. *)
+          let most = ref 0 in
+          let src = chunked_reader (mp_body [(disp "a", "x")]) in
+          let body =
+            Body.of_source (fun b o l ->
+                most := max !most l ;
+                src b o l )
+          in
+          equal mp_result (Ok [field "a" "x"]) (Mp.read_all ~boundary:"b" body) ;
+          equal int 16384 !most ;
+          (* max_bytes of read_all is 8 MiB: the head and the data. *)
+          let h = disp "a" in
+          let data k = String.make (k - String.length h - 2) 'x' in
+          let limit = 8 * 1024 * 1024 in
+          is_true ~msg:"8 MiB"
+            (Result.is_ok (mp_read_all (mp_body [(h, data limit)]))) ;
+          equal mp_result (Error Mp.Too_large)
+            (mp_read_all (mp_body [(h, data (limit + 1))])) )
     ; test "max_bytes counts the heads and the data of all parts" (fun () ->
           let h = disp "a" in
           let s = mp_body [(h, "12345"); (h, "67890")] in
@@ -2280,7 +2338,12 @@ let multipart_tests =
             ; "--b\r\n" ^ disp "a" ^ "\r\nx\r\n--b"
             ; "--b\r\n" ^ disp "a"
             ; "only a preamble"
-            ; "" ] )
+            ; "" ] ;
+          equal mp_result (Error (Mp.Malformed "no close delimiter"))
+            (mp_read_all ("--b\r\n" ^ disp "a" ^ "\r\nx\r\n--b")) ;
+          equal mp_result
+            (Error (Mp.Malformed "the body ends in the head of a part"))
+            (mp_read_all ("--b\r\n" ^ disp "a" ^ "\r\nx\r\n--b\r\n")) )
     ; test "a copy of a part with no close delimiter fails" (fun () ->
           let outcome = ref "" in
           let s = "--b\r\n" ^ disp "a" ^ "\r\nsome data" in
@@ -2324,7 +2387,38 @@ let multipart_tests =
                 (Mp.name p, Bytes.sub_string buf 0 (go 0)) :: acc )
           in
           equal (result pairs mp_error) (Ok [("b", ""); ("a", "")]) (run 0) ;
-          equal (result pairs mp_error) (Ok [("b", "x"); ("a", "012")]) (run 3) )
+          equal (result pairs mp_error) (Ok [("b", "x"); ("a", "012")]) (run 3) ;
+          (* The discard of a part larger than its read buffer. *)
+          equal
+            (result (list string) mp_error)
+            (Ok ["b"; "a"])
+            (Mp.fold ~boundary:"b"
+               (Body.of_string
+                  (mp_body
+                     [(disp "a", String.make 10_000 'x'); (disp "b", "y")] ) )
+               ~init:[]
+               (fun acc p -> Mp.name p :: acc) ) )
+    ; test "a read gives the safe bytes before the next read of the source"
+        (fun () ->
+          (* With a delimiter of 5 bytes, only "h" of "hello" cannot start a
+             delimiter that the next bytes complete. *)
+          let head = "--b\r\n" ^ disp "a" ^ "\r\nhello" in
+          let first = ref true in
+          let src buf off _ =
+            if !first then begin
+              first := false ;
+              Bytes.blit_string head 0 buf off (String.length head) ;
+              String.length head
+            end
+            else raise Exit
+          in
+          let got = ref "" in
+          raises Exit (fun () ->
+              Mp.fold ~boundary:"b" (Body.of_source src) ~init:() (fun () p ->
+                  let b = Bytes.create 16 in
+                  let n = Body.read (Mp.body p) b 0 16 in
+                  got := Bytes.sub_string b 0 n ) ) ;
+          equal string "h" !got )
     ; test "the discard finds a syntax error" (fun () ->
           let skip s =
             Mp.fold ~boundary:"b"
@@ -2457,6 +2551,21 @@ let multipart_tests =
               equal int 40 (List.length l)
           | Error e ->
               fail (Format.asprintf "%a" Mp.pp_error e) ) ;
+          (* The delimiter is after the buffer: each search finds no delimiter.
+             A search from the start of the buffer at each read of 1 byte takes
+             many seconds. *)
+          let t1 = Sys.time () in
+          let rec timed b n =
+            if Sys.time () -. t1 > 1. then fail "a search examines bytes again"
+            else match Body.read b one 0 1 with 0 -> n | k -> timed b (n + k)
+          in
+          let beyond = String.make (1 lsl 18) 'a' in
+          equal (result int mp_error)
+            (Ok (String.length beyond))
+            (Mp.fold ~buffer_size:(1 lsl 16) ~boundary:"b"
+               (Body.of_string (mp_body [(disp "a", beyond)]))
+               ~init:0
+               (fun n p -> n + timed (Mp.body p) 0) ) ;
           (* The CPU time of the process: other processes do not change it. *)
           is_true ~msg:"less than 5 s of CPU" (Sys.time () -. t0 < 5.) )
     ; test "fold refuses incorrect arguments" (fun () ->
@@ -2567,6 +2676,7 @@ let multipart_tests =
               equal ~msg:(String.escaped data) string b
                 (fst (Mp.encode [field "a" data])) )
             [ ("x caravan-0", "caravan-")
+            ; ("x\n--caravan-0", "caravan-")
             ; ("\r\n--caravan-", "caravan-0")
             ; ("--caravan-0", "caravan-1")
             ; ("--caravan-00\r\n--caravan-01", "caravan-10")

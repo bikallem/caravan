@@ -1141,6 +1141,19 @@ let connection_tests =
             \r\n
             [FIN]
             |} )
+    ; test "a stopping server lingers on one byte of a next request" (fun () ->
+          expect (show (get "/stop" ^ "G"))
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 200 OK\r\n
+            Transfer-Encoding: chunked\r\n
+            \r\n
+            3\r\n
+            bye\r\n
+            0\r\n
+            \r\n
+            [FIN]
+            |} )
     ; test "a stopping server ends an idle connection without reading"
         (fun () ->
           let flow =
@@ -1250,6 +1263,25 @@ let connection_tests =
             \r\n
             3\r\n
             hel\r\n
+            [FIN]
+            |} )
+    ; test "a malformed request body that a response streams gets 400"
+        (fun () ->
+          expect
+            (show
+               "POST /stream-echo HTTP/1.1\r\n\
+                Host: a\r\n\
+                Transfer-Encoding: chunked\r\n\
+                \r\n\
+                zz\r\n" )
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 400 Bad Request\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 12\r\n
+            Connection: close\r\n
+            \r\n
+            Bad Request
             [FIN]
             |} )
     ; test "responses get a Date field" (fun () ->
@@ -1366,6 +1398,31 @@ let timeout_tests =
             (show ~config:Server_support.timed_config ~stall:true
                ~ends_after:Server_support.header_h "" )
           @@ __POS_OF__ {||} )
+    ; test "one byte of a next request starts its head with no wait" (fun () ->
+          (* After the byte the flow stalls: a read raises Flow.Timeout at once,
+             and the virtual time does not move. *)
+          let m = memory ~stall:true (get "/" ^ "G") in
+          Sim_support.manual (fun sim ->
+              Fiber.scope (fun s ->
+                  let c = engine s (ctx Server_support.timed_config) m.flow in
+                  is_true ~msg:"the engine ended at the start"
+                    (Sim_support.ended sim c) ;
+                  Sim_support.await c ) ) ;
+          expect (show_crlf (m.output ()))
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 200 OK\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 5\r\n
+            \r\n
+            helloHTTP/1.1 408 Request Timeout\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 16\r\n
+            Connection: close\r\n
+            \r\n
+            Request Timeout
+            [FIN]
+            |} )
     ; test "an idle connection is closed" (fun () ->
           (* The close is not a linger: no [FIN]. *)
           expect
@@ -1715,6 +1772,7 @@ let upgrade_tests =
                   ; (["echo/2"], "echo")
                   ; (["echo/2"], "echo/3")
                   ; (["echo/2"], "echo/2")
+                  ; (["a/1"], "b/1")
                   ; (["echo"], "echo/2")
                   ; (["Echo/V2"], "echo/v2")
                   ; (["A/b/c"], "a/b/c")
@@ -1731,6 +1789,7 @@ let upgrade_tests =
             echo/2       -> echo     => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: echo")
             echo/2       -> echo/3   => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: echo/3")
             echo/2       -> echo/2   => HTTP/1.1 101 Switching Protocols
+            a/1          -> b/1      => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: b/1")
             echo         -> echo/2   => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: echo/2")
             Echo/V2      -> echo/v2  => HTTP/1.1 500 Internal Server Error ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: echo/v2")
             A/b/c        -> a/b/c    => HTTP/1.1 101 Switching Protocols

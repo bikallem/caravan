@@ -343,7 +343,10 @@ let serve : Engine.t =
                 (* The writer ignores keep_alive for an upgrade. *)
                 ignore
                   (write ~committed ~body
-                     ~keep_alive:(fun () -> true)
+                     ~keep_alive:(fun () ->
+                       (true
+                       [@mutate off "the head of an upgrade has no keep-alive"]
+                       ) )
                      head response ) ;
                 switch f ) )
         (* RFC 9110 §9.3.6: a 2xx to CONNECT opens a tunnel. *)
@@ -434,8 +437,9 @@ let serve : Engine.t =
       | `Response r ->
           `Response r
       (* Without this case, watch reads the buffered bytes. *)
-      | (`Read [@mutate off "the same result"]) when Buf_reader.buffered r > 0
-        ->
+      | (`Read [@mutate off "the same result"])
+        when ( Buf_reader.buffered r > 0 )
+             [@mutate off "watch finds the buffered bytes: the same result"] ->
           `Response (Promise.await p)
       | `Read ->
           (* After the read of a request, the readiness of the flow is stale.
@@ -475,13 +479,18 @@ let serve : Engine.t =
      head, and sets [committed], just before the first output of the body. It
      calls [keep_alive ()] then. Until that point, the engine can answer a
      failure of the body correctly. *)
-  and write ?(committed = ref false) ?body ~keep_alive (head : H1_parse.head)
-      response =
-    let request_failed () = Option.fold ~none:false ~some:H1_body.failed body in
+  and write
+      ?(committed =
+        ref (false [@mutate off "write_head sets it before each failure"]))
+      ?body ~keep_alive (head : H1_parse.head) response =
+    let request_failed () = Option.exists H1_body.failed body in
     let framing =
       H1_write.framing ~meth:head.meth ~version:head.version response
     in
-    let kept_alive = ref false in
+    let kept_alive =
+      ref
+        (false [@mutate off "H1_write.body calls write_head before it returns"])
+    in
     let write_head () =
       committed := true ;
       kept_alive := keep_alive () && framing <> H1_write.Close_delimited ;
@@ -493,7 +502,9 @@ let serve : Engine.t =
        close: reset the connection. *)
     match Response.kind response with
     | Response.Upgrade _ ->
-        write_head () ; Buf_writer.flush w ; true
+        write_head () ;
+        Buf_writer.flush w ;
+        true [@mutate off "the caller of an upgrade ignores the result"]
     | Response.Body b -> (
       match H1_write.body ~before:write_head w framing b with
       | () ->
@@ -515,10 +526,10 @@ let serve : Engine.t =
           (* A request body that the response streams was cut short or is
              malformed: the fault of the client, not of the server. *)
           | Body.Truncated when request_failed () ->
-              false
+              false [@mutate off "drain gives false for a failed request body"]
           | H1_error.E e when request_failed () ->
               if not !committed then ignore (error ~meth:head.meth e) ;
-              false
+              false [@mutate off "drain gives false for a failed request body"]
           | e ->
               config.on_error e bt ;
               if not !committed then ignore (fail_500 head) ;

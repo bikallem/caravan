@@ -56,7 +56,7 @@ type t =
   { kind: kind
   ; length: int option
   ; closed: bool Atomic.t (* also set once a producer has run *)
-  ; mutable finished: bool
+  ; mutable finished: bool (* the source gave 0, only for a source *)
   ; mutable trailers: Headers.t
   ; mutable hook: hook }
 
@@ -135,8 +135,13 @@ let on_end f b =
         f
     | Hook old ->
         let inner how ~bytes =
-          if not (Atomic.exchange old.once true) then
-            old.run how ~bytes:(old.bytes + bytes)
+          (* Only this function reads [old.once] after [on_end], and it runs one
+             time only. *)
+          if
+            not
+              (Atomic.exchange old.once
+                 (true [@mutate off "no read of old.once comes after this"]) )
+          then old.run how ~bytes:(old.bytes + bytes)
         in
         both inner f
   in
@@ -228,7 +233,6 @@ let copy b w =
          some. *)
       if not (Headers.is_empty own.trailers) then
         Writer.set_trailers w own.trailers ;
-      b.finished <- true ;
       b.trailers <- own.trailers
 
 let write_to b w =

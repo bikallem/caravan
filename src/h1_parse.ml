@@ -271,7 +271,7 @@ let is_ip_literal_char = function
 let is_authority ?(port = false) s =
   let n = String.length s in
   let host_end =
-    if n > 0 && s.[0] = '[' then
+    if String.starts_with ~prefix:"[" s then
       match String.index_opt s ']' with
       | Some i
         when i > 1 && String.for_all is_ip_literal_char (String.sub s 1 (i - 1))

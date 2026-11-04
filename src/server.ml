@@ -92,7 +92,12 @@ let acceptor (config : Config.t) (module L : LISTENER) l ~conns ~slots ~stop
      second release adds a permit with no error, and then the server serves more
      than [max_connections] connections. *)
   let with_slot id =
-    let handed = ref false in
+    let handed =
+      ref
+        (false
+        [@mutate off "the acceptor ends after each exit that releases the slot"]
+        )
+    in
     Fun.protect
       ~finally:(fun () -> if not !handed then Fiber.Semaphore.release slots)
       (fun () ->

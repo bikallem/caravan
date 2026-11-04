@@ -155,7 +155,9 @@ let fill_now r =
   else if r.eof then `Eof
   else begin
     if Bytes.length r.buf = 0 then r.buf <- Bytes.create r.size ;
-    r.pos <- 0 ;
+    begin[@mutate off "pos is 0 here: consume sets it to 0 when no byte stays"]
+      r.pos <- 0
+    end ;
     match r.read_now r.buf 0 (Bytes.length r.buf) with
     | None ->
         `Would_block

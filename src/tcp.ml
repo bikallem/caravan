@@ -122,7 +122,7 @@ module Listener = struct
   (* No handler closes [sock]: Net.local_addr does not wait, thus a cancel
      cannot stop it. We know of no failure of getsockname(2) on a new
      listener. *)
-  let listen ?(backlog = 1024) addr =
+  let listen ?(backlog = Config.default.backlog) addr =
     let sock = Net.listen ~backlog addr in
     {sock; addr= Net.local_addr sock}
 

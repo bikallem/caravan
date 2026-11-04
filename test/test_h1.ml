@@ -44,6 +44,45 @@ let buf_reader_tests =
             (Buf_reader.capacity r) ;
           equal string "89abcdefghij" (Buf_reader.read_line r ~max:100) ;
           equal int ~msg:"grown for a long line" 16 (Buf_reader.capacity r) )
+    ; test "the input is read into the whole buffer, and not after its end"
+        (fun () ->
+          equal int ~msg:"4 KiB by default" 4096
+            (let r = Buf_reader.of_string "x" in
+             ignore (Buf_reader.peek_eof r) ;
+             Buf_reader.capacity r ) ;
+          (* Each read of the input records its offset and length. *)
+          let reads = ref [] in
+          let reader input =
+            let pos = ref 0 in
+            Buf_reader.make ~size:4 (fun buf off len ->
+                reads := (off, len) :: !reads ;
+                let n = Int.min len (String.length input - !pos) in
+                Bytes.blit_string input !pos buf off n ;
+                pos := !pos + n ;
+                n )
+          in
+          let r = reader "ab\r\ncd\r\n" in
+          equal string "ab" (Buf_reader.read_line r ~max:9) ;
+          equal string "cd" (Buf_reader.read_line r ~max:9) ;
+          is_true (Buf_reader.peek_eof r) ;
+          is_true (Buf_reader.peek_eof r) ;
+          raises Buf_reader.Eof (fun () -> Buf_reader.read_line r ~max:9) ;
+          equal int 0 (Buf_reader.read_into r (Bytes.create 1) 0 1) ;
+          equal
+            (list (pair int int))
+            ~msg:
+              "an empty buffer fills from the start, and one read sees the end"
+            [(0, 4); (0, 4); (0, 4)]
+            (List.rev !reads) ;
+          reads := [] ;
+          let r = reader "" in
+          equal int 0 (Buf_reader.read_into r (Bytes.create 8) 0 8) ;
+          equal int 0 (Buf_reader.read_into r (Bytes.create 8) 0 8) ;
+          equal
+            (list (pair int int))
+            ~msg:"a large read sees the end one time"
+            [(0, 8)]
+            (List.rev !reads) )
     ; test "a given buffer is used from the start, until the reader grows"
         (fun () ->
           let buffer = Bytes.make 16 '.' in
@@ -352,6 +391,7 @@ let request_head_tests =
             (table
                [ "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
                ; "\r\n\r\nPOST /a?b=1 HTTP/1.0\r\n\r\n"
+               ; "\r\n\r\n\r\n\r\nGET / HTTP/1.1\r\n\r\n"
                ; "get /!~ HTTP/1.9\r\n\r\n"
                ; "CONNECT example.com:443 HTTP/1.1\r\n\
                   host:example.com:443\r\n\
@@ -369,6 +409,8 @@ let request_head_tests =
               Host: "example.com"
             "\r\n\r\nPOST /a?b=1 HTTP/1.0\r\n\r\n"
             => POST /a?b=1 HTTP/1.0
+            "\r\n\r\n\r\n\r\nGET / HTTP/1.1\r\n\r\n"
+            => GET / HTTP/1.1
             "get /!~ HTTP/1.9\r\n\r\n"
             => get /!~ HTTP/1.1
             "CONNECT example.com:443 HTTP/1.1\r\nhost:example.com:443\r\n\r\n"
@@ -475,7 +517,8 @@ let request_head_tests =
                ; "GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n"
                ; "GET / HTTP/1.1\r\nA: 0123456789\r\nB: 1234\r\n\r\n"
                ; "GET / HTTP/1.1\r\nA: 0123456789\r\nB: 12345\r\n\r\n"
-               ; "GET / HTTP/1.1\r\nA: 0123456789012345678901\r\n\r\n" ] )
+               ; "GET / HTTP/1.1\r\nA: 0123456789012345678901\r\n\r\n"
+               ; "GET / HTTP/1.1\r\nA: 01234567890123456\r\nB\r\n\r\n" ] )
           @@ __POS_OF__
                {|
             "GET /01 HTTP/1.1\r\n\r\n"
@@ -495,6 +538,8 @@ let request_head_tests =
             "GET / HTTP/1.1\r\nA: 0123456789\r\nB: 12345\r\n\r\n"
             => 431 Request Header Fields Too Large
             "GET / HTTP/1.1\r\nA: 0123456789012345678901\r\n\r\n"
+            => 431 Request Header Fields Too Large
+            "GET / HTTP/1.1\r\nA: 01234567890123456\r\nB\r\n\r\n"
             => 431 Request Header Fields Too Large
             |} )
     ; test "input ending early" (fun () ->
@@ -1617,6 +1662,9 @@ let recorded ?size () =
 let buf_writer_tests =
   group "Buf_writer"
     [ test "the buffer is allocated by the first write that needs it" (fun () ->
+          let w, _ = recorded () in
+          Buf_writer.write_char w 'a' ;
+          equal int ~msg:"4 KiB by default" 4096 (Buf_writer.capacity w) ;
           let w, calls = recorded ~size:8 () in
           equal int 0 (Buf_writer.capacity w) ;
           Buf_writer.write_string w "12345678" ;
@@ -1678,7 +1726,12 @@ let buf_writer_tests =
           Buf_writer.write_string w "abcd" ;
           Buf_writer.write_string w "" ;
           equal (list string) ["ab01"; "23456789"; "abcd"] (calls ()) ;
-          equal int 0 (Buf_writer.buffered w) )
+          equal int 0 (Buf_writer.buffered w) ;
+          let w, calls = recorded ~size:4 () in
+          Buf_writer.write_char w 'a' ;
+          Buf_writer.write_string w "0123456789" ;
+          equal (list string) ~msg:"one buffered byte goes with the large write"
+            ["a012"; "3456789"] (calls ()) )
     ; test "invalid arguments" (fun () ->
           (* A large write to an empty buffer skips the copy. Thus only the
              range check can raise. *)
