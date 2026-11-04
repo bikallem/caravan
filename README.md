@@ -34,6 +34,28 @@ the dune stanza of your executable:
 Add `caravan.client` for the client and `caravan.websocket` for
 WebSocket.
 
+## Contents
+
+- [What the server does](#what-the-server-does)
+- [Routing](#routing)
+- [Middleware](#middleware)
+- [Queries and forms](#queries-and-forms)
+- [Cookies](#cookies)
+- [Sessions](#sessions)
+- [CSRF](#csrf)
+- [Authentication](#authentication)
+- [Users and policies](#users-and-policies)
+- [Compression](#compression)
+- [File uploads](#file-uploads)
+- [Static files](#static-files)
+- [TLS](#tls)
+- [WebSocket](#websocket)
+- [Client](#client)
+- [Testing](#testing)
+- [Requirements](#requirements)
+- [Development](#development)
+- [License](#license)
+
 ## What the server does
 
 - A strict RFC 9112 parser, written from scratch: CRLF only, no
