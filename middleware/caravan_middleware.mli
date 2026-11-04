@@ -340,3 +340,80 @@ module Cors : sig
   val permits : origins -> string -> bool
   (** [permits origins o] is [true] if the [Origin] [o] is permitted. *)
 end
+
+(** A redirect of each [http] request to [https]. Put it after {!Forwarded}:
+    behind a proxy that ends TLS, {!Forwarded} gives the request the scheme of
+    the client. Put it after {!Request_id} and {!Access_log} too, so that each
+    redirect has an ID and a log entry.
+
+    {[
+    Caravan.Handler.compose
+      [ Caravan_middleware.Forwarded.middleware ~trusted ()
+      ; Caravan_middleware.Request_id.middleware ()
+      ; Caravan_middleware.Hsts.middleware ()
+      ; Caravan_middleware.Https_redirect.middleware () ]
+      handler
+    ]} *)
+module Https_redirect : sig
+  val middleware :
+    ?status:Caravan.Status.t -> ?port:int -> unit -> Caravan.Handler.middleware
+  (** [middleware ~status ~port ()] gives a request with the scheme [https] to
+      the next handler. Each other request gets [status] (default
+      [307 Temporary Redirect]) with [Location: https://<host>[:<port>]<path>],
+      and no body (RFC 9110 permits it).
+      - [<host>] is the host of {!Caravan.Request.authority}, with no port. For
+        an absolute-form target, it is the authority of the target, not the
+        [Host] field (RFC 9112 §3.2.2).
+      - [<port>] is [port], and nothing for 443 (the default).
+      - [<path>] is {!Caravan.Request.path}: the path and the query.
+
+      A request with no authority, with an authority that
+      {!Caravan.Request.is_valid_authority} refuses, or with a path that does
+      not start with [/] (for example [OPTIONS *]), gets [400 Bad Request]: no
+      URL is possible, and the request does not go to the next handler over
+      HTTP.
+
+      A 307 is the default because a browser keeps a 308 or a 301 with no time
+      limit: a fault in the first setup of HTTPS then stays. In production,
+      [~status:Caravan.Status.permanent_redirect] (308) is better. A host filter
+      goes before this middleware: the client chooses the [Host] field.
+
+      @raise Invalid_argument
+        if [status] is not 301, 302, 307 or 308, or if [port] is not in 1 to
+        65535. *)
+end
+
+(** The [Strict-Transport-Security] field (HSTS, RFC 6797) on the responses of
+    [https] requests. Its order with {!Https_redirect} does not matter. Put it
+    before {!Error_page} if the error pages need it too. *)
+module Hsts : sig
+  val middleware :
+       ?max_age:int
+    -> ?include_subdomains:bool
+    -> ?preload:bool
+    -> ?exclude_hosts:string list
+    -> unit
+    -> Caravan.Handler.middleware
+  (** [middleware ~max_age ~include_subdomains ~preload ~exclude_hosts ()] gives
+      the response of a request with the scheme [https] the field
+      [Strict-Transport-Security: max-age=N[; includeSubDomains][; preload]].
+      - [max_age] is in seconds (default 31536000, 365 days). [0] tells the
+        browser to remove its HSTS entry for the host.
+      - The middleware adds no field to the response of an [http] request: a
+        host must not send it over HTTP (RFC 6797 §7.2).
+      - The middleware adds no field for a host of [exclude_hosts] (default
+        [localhost], [127.0.0.1] and [[::1]]). A browser keeps HSTS for
+        [localhost], and then it refuses HTTP for each later development server
+        on that host. A browser ignores HSTS for an IP address (RFC 6797 §8.1),
+        thus the two IP entries only stop a field with no effect. The compare
+        has no case, removes the port and a dot at the end of the host, and the
+        entry [localhost] also matches each host that ends with [.localhost].
+      - A response that has the field keeps it: the handler decides.
+      - An exception of the next handler goes on.
+
+      @raise Invalid_argument
+        if [max_age] is negative, if [preload] is [true] and
+        [include_subdomains] is [false] or [max_age] is less than 31536000 (the
+        rules of hstspreload.org), or if an entry of [exclude_hosts] has a port.
+  *)
+end

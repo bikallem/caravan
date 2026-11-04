@@ -1540,6 +1540,235 @@ let cors_tests =
           is_false (C.permits (C.Only [a]) "https://b.example") ;
           is_true (C.permits (C.Matching (fun o -> o = "x")) "x") ) ]
 
+module R = Caravan_middleware.Https_redirect
+module H = Caravan_middleware.Hsts
+
+let ok_handler = reply "ok"
+
+(* [redirect ?mw ?scheme ?authority ?meth path] is the status and the Location
+   of [mw] (default [R.middleware ()]) for a request. *)
+let redirect ?(mw = R.middleware ()) ?(scheme = "http") ?authority
+    ?(meth = Method.GET) path =
+  let r = mw ok_handler (Request.make ~scheme ?authority meth path) in
+  (Status.code (Response.status r), field "location" r)
+
+let loc = Testable.(pair int (option string))
+
+let https_redirect_tests =
+  group "Https_redirect"
+    [ test "an http request gets 307 to https" (fun () ->
+          equal loc
+            (307, Some "https://example.com/a?b=1")
+            (redirect ~authority:"example.com:8080" "/a?b=1") ;
+          let r =
+            R.middleware () ok_handler
+              (Request.make ~scheme:"http" ~authority:"example.com" Method.GET
+                 "/" )
+          in
+          equal string ""
+            ( match Response.kind r with
+            | Response.Body b ->
+                Body.to_string b
+            | Response.Upgrade _ ->
+                "an upgrade" ) )
+    ; test "the port" (fun () ->
+          equal loc
+            (307, Some "https://example.com:8443/a")
+            (redirect
+               ~mw:(R.middleware ~port:8443 ())
+               ~authority:"example.com" "/a" ) ;
+          equal loc
+            (307, Some "https://example.com/a")
+            (redirect
+               ~mw:(R.middleware ~port:443 ())
+               ~authority:"example.com:80" "/a" ) )
+    ; test "the host of an authority" (fun () ->
+          List.iter
+            (fun (a, l) ->
+              equal ~msg:a loc (307, Some l) (redirect ~authority:a "/x") )
+            [ ("[::1]:80", "https://[::1]/x")
+            ; ("[::1]", "https://[::1]/x")
+            ; ("a.example:", "https://a.example/x")
+            ; ("A.Example", "https://A.Example/x")
+            ; ("10.0.0.1:8080", "https://10.0.0.1/x") ] ;
+          (* A path that starts with // stays a path of the host. *)
+          equal loc
+            (307, Some "https://a.example//evil.example/x")
+            (redirect ~authority:"a.example" "//evil.example/x") )
+    ; test "an https request goes to the next handler" (fun () ->
+          equal loc (200, None)
+            (redirect ~scheme:"https" ~authority:"example.com" "/a") )
+    ; test "a POST and another status" (fun () ->
+          (* The redirect does not read the body: the engine drains it. *)
+          let read = ref false in
+          let body =
+            Body.of_source (fun _ _ _ ->
+                read := true ;
+                0 )
+          in
+          let r =
+            R.middleware () ok_handler
+              (Request.make ~scheme:"http" ~authority:"example.com" ~body
+                 Method.POST "/form" )
+          in
+          equal int 307 (Status.code (Response.status r)) ;
+          is_false ~msg:"no read" !read ;
+          List.iter
+            (fun s ->
+              equal ~msg:(string_of_int s) loc
+                (s, Some "https://example.com/")
+                (redirect
+                   ~mw:(R.middleware ~status:(Status.v s) ())
+                   ~authority:"example.com" "/" ) )
+            [301; 302; 307; 308] )
+    ; test "no URL gives 400" (fun () ->
+          equal loc (400, None) (redirect "/a") ;
+          equal loc (400, None)
+            (redirect ~meth:Method.OPTIONS ~authority:"example.com" "*") ;
+          equal loc (400, None) (redirect ~authority:"evil.com/x" "/a") ;
+          equal loc (400, None) (redirect ~authority:"a@b" "/a") ;
+          equal loc (400, None) (redirect ~authority:"" "/a") ;
+          equal loc (400, None) (redirect ~authority:":80" "/a") )
+    ; test "bad arguments" (fun () ->
+          List.iter
+            (fun s ->
+              raises_match ~msg:(string_of_int s) is_invalid_arg (fun () ->
+                  made (R.middleware ~status:(Status.v s) ()) ) )
+            [200; 303; 304; 400] ;
+          List.iter
+            (fun port ->
+              raises_match ~msg:(string_of_int port) is_invalid_arg (fun () ->
+                  made (R.middleware ~port ()) ) )
+            [0; 65536; -1] ;
+          made (R.middleware ~port:1 ()) ;
+          made (R.middleware ~port:65535 ()) ) ]
+
+(* [sts ?mw ?scheme ?authority ?handler ()] is the HSTS field of the response of
+   [mw] (default [H.middleware ()]). *)
+let sts ?(mw = H.middleware ()) ?(scheme = "https") ?authority
+    ?(handler = ok_handler) () =
+  field "strict-transport-security"
+    (mw handler (Request.make ~scheme ?authority Method.GET "/"))
+
+let hsts_tests =
+  group "Hsts"
+    [ test "an https response gets the field" (fun () ->
+          equal (option string) (Some "max-age=31536000")
+            (sts ~authority:"example.com" ()) ;
+          (* No authority: the field goes out. *)
+          equal (option string) (Some "max-age=31536000") (sts ()) )
+    ; test "an http response gets no field" (fun () ->
+          equal (option string) None
+            (sts ~scheme:"http" ~authority:"example.com" ()) )
+    ; test "the excluded hosts" (fun () ->
+          List.iter
+            (fun a -> equal ~msg:a (option string) None (sts ~authority:a ()))
+            [ "localhost"
+            ; "LOCALHOST:8443"
+            ; "localhost."
+            ; "localhost:"
+            ; "app.localhost"
+            ; "127.0.0.1"
+            ; "[::1]:443" ] ;
+          List.iter
+            (fun a -> is_some ~msg:a (sts ~authority:a ()))
+            ["mylocalhost"; "localhost.example"; "127.0.0.2"] ;
+          is_some ~msg:"no exclusion"
+            (sts
+               ~mw:(H.middleware ~exclude_hosts:[] ())
+               ~authority:"localhost" () ) ;
+          is_none ~msg:"an entry with a case and a dot"
+            (sts
+               ~mw:(H.middleware ~exclude_hosts:["Dev.Example."] ())
+               ~authority:"dev.example:8443" () ) ;
+          (* A [.localhost] host matches only the entry localhost. *)
+          is_some ~msg:"app.localhost with no entry localhost"
+            (sts
+               ~mw:(H.middleware ~exclude_hosts:["dev.example"] ())
+               ~authority:"app.localhost" () ) ;
+          (* An IPv6 literal with no end bracket is not excluded. *)
+          is_some ~msg:"[::1" (sts ~authority:"[::1" ()) ;
+          is_some ~msg:"a.dev.example"
+            (sts
+               ~mw:(H.middleware ~exclude_hosts:["dev.example"] ())
+               ~authority:"a.dev.example" () ) )
+    ; test "the options" (fun () ->
+          equal (option string)
+            (Some "max-age=31536000; includeSubDomains; preload")
+            (sts
+               ~mw:(H.middleware ~include_subdomains:true ~preload:true ())
+               ~authority:"example.com" () ) ;
+          equal (option string) (Some "max-age=60; includeSubDomains")
+            (sts
+               ~mw:(H.middleware ~max_age:60 ~include_subdomains:true ())
+               ~authority:"example.com" () ) ;
+          equal (option string) (Some "max-age=0")
+            (sts ~mw:(H.middleware ~max_age:0 ()) ~authority:"example.com" ()) )
+    ; test "bad arguments" (fun () ->
+          let bad f = raises_match is_invalid_arg (fun () -> made (f ())) in
+          bad (fun () -> H.middleware ~max_age:(-1) ()) ;
+          bad (fun () -> H.middleware ~preload:true ()) ;
+          bad (fun () ->
+              H.middleware ~preload:true ~include_subdomains:true
+                ~max_age:31535999 () ) ;
+          bad (fun () -> H.middleware ~exclude_hosts:["localhost:8443"] ()) ;
+          made (H.middleware ~exclude_hosts:["[::1]"; "a.example"] ()) ;
+          made
+            (H.middleware ~preload:true ~include_subdomains:true
+               ~max_age:31536000 () ) )
+    ; test "the field of the handler stays, and an exception goes on" (fun () ->
+          let handler _ =
+            Response.string
+              ~headers:
+                (Headers.of_list [("Strict-Transport-Security", "max-age=5")])
+              "x"
+          in
+          equal (option string) (Some "max-age=5")
+            (sts ~handler ~authority:"example.com" ()) ;
+          raises_match
+            (function Failure _ -> true | _ -> false)
+            (fun () ->
+              ignore
+                (sts
+                   ~handler:(fun _ -> failwith "h")
+                   ~authority:"example.com" () ) ) )
+    ; test "behind a trusted proxy" (fun () ->
+          (* Forwarded gives the scheme of the client: https, thus no redirect
+             and HSTS. An untrusted peer keeps http: a redirect, no HSTS. *)
+          let app trusted =
+            Handler.compose
+              [F.middleware ~trusted (); H.middleware (); R.middleware ()]
+              ok_handler
+          in
+          let req =
+            Request.make ~scheme:"http" ~authority:"example.com"
+              ~conn:(conn (tcp "10.0.0.1"))
+              ~headers:(Headers.of_list [(xff, "1.2.3.4"); (xfp, "https")])
+              Method.GET "/a"
+          in
+          let r = app (fun _ -> true) req in
+          equal int 200 (Status.code (Response.status r)) ;
+          equal (option string) (Some "max-age=31536000")
+            (field "strict-transport-security" r) ;
+          let r = app (fun _ -> false) req in
+          equal int 307 (Status.code (Response.status r)) ;
+          equal (option string) None (field "strict-transport-security" r) )
+    ; test "an upgrade response gets the field and stays an upgrade" (fun () ->
+          let r =
+            H.middleware ()
+              (fun _ -> Response.upgrade (fun _ -> ()))
+              (Request.make ~scheme:"https" ~authority:"example.com" Method.GET
+                 "/ws" )
+          in
+          equal (option string) (Some "max-age=31536000")
+            (field "strict-transport-security" r) ;
+          is_true ~msg:"an upgrade"
+            ( match Response.kind r with
+            | Response.Upgrade _ ->
+                true
+            | Response.Body _ ->
+                false ) ) ]
+
 let () =
   exit
     (Windtrap.run "middleware"
@@ -1547,4 +1776,6 @@ let () =
        ; request_id_tests
        ; access_log_tests
        ; error_page_tests
-       ; cors_tests ] )
+       ; cors_tests
+       ; https_redirect_tests
+       ; hsts_tests ] )

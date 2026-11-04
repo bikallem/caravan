@@ -881,3 +881,111 @@ module Cors = struct
       | origin ->
           actual origin (next req)
 end
+
+(* [host_of a] is the host of the authority [a], with no port. An IPv6 literal
+   keeps its brackets. [a.example:], with no digit, gives [a.example]. *)
+let host_of a =
+  if String.starts_with ~prefix:"[" a then
+    match String.index_opt a ']' with
+    | Some i ->
+        String.sub a 0 (i + 1)
+    | None ->
+        a
+  else
+    match String.rindex_opt a ':' with Some i -> String.sub a 0 i | None -> a
+
+module Https_redirect = struct
+  let middleware ?(status = Status.temporary_redirect) ?port () =
+    ( match Status.code status with
+    | 301 | 302 | 307 | 308 ->
+        ()
+    | _ ->
+        invalid_arg
+          "Caravan_middleware.Https_redirect.middleware: the status is not \
+           301, 302, 307 or 308" ) ;
+    let port =
+      match port with
+      | None | Some 443 ->
+          ""
+      | Some p when p >= 1 && p <= 65535 ->
+          ":" ^ string_of_int p
+      | Some _ ->
+          invalid_arg
+            "Caravan_middleware.Https_redirect.middleware: the port is not in \
+             1 to 65535"
+    in
+    fun next req ->
+      if Request.scheme req = "https" then next req
+      else
+        let path = Request.path req in
+        match Request.authority req with
+        (* [is_valid_authority] refuses an empty host. *)
+        | Some a
+          when Request.is_valid_authority a
+               && String.starts_with ~prefix:"/" path ->
+            Response.empty ~status
+              ~headers:
+                (Headers.of_list
+                   [("Location", "https://" ^ host_of a ^ port ^ path)] )
+              ()
+        | _ ->
+            Response.string ~status:Status.bad_request "Bad Request\n"
+end
+
+module Hsts = struct
+  (* [normal h] is the host [h] in lower case, with no dot at its end. *)
+  let normal h =
+    let h = String.lowercase_ascii h in
+    if String.ends_with ~suffix:"." h then String.sub h 0 (String.length h - 1)
+    else h
+
+  (* A host that ends with ".localhost" is a loopback host (RFC 6761). *)
+  let excluded hosts host =
+    let host = normal host in
+    List.exists
+      (fun e ->
+        host = e
+        || (e = "localhost" && String.ends_with ~suffix:".localhost" host) )
+      hosts
+
+  let middleware ?(max_age = 31536000) ?(include_subdomains = false)
+      ?(preload = false) ?(exclude_hosts = ["localhost"; "127.0.0.1"; "[::1]"])
+      () =
+    if max_age < 0 then
+      invalid_arg "Caravan_middleware.Hsts.middleware: a negative max_age" ;
+    if preload && ((not include_subdomains) || max_age < 31536000) then
+      invalid_arg
+        "Caravan_middleware.Hsts.middleware: preload needs include_subdomains \
+         and a max_age of 31536000 or more" ;
+    let value =
+      "max-age=" ^ string_of_int max_age
+      ^ (if include_subdomains then "; includeSubDomains" else "")
+      ^ if preload then "; preload" else ""
+    in
+    List.iter
+      (fun e ->
+        if host_of e <> e then
+          invalid_arg
+            (Printf.sprintf
+               "Caravan_middleware.Hsts.middleware: the excluded host %S has a \
+                port"
+               e ) )
+      exclude_hosts ;
+    let hosts = List.map normal exclude_hosts in
+    fun next req ->
+      let r = next req in
+      let skip =
+        Request.scheme req <> "https"
+        || ( match Request.authority req with
+          | Some a ->
+              excluded hosts (host_of a)
+          | None ->
+              false )
+        || Headers.mem "strict-transport-security" (Response.headers r)
+      in
+      if skip then r
+      else
+        Response.with_headers
+          (Headers.add "Strict-Transport-Security" value (Response.headers r))
+          r
+end
