@@ -200,8 +200,8 @@ let engine_tests =
               equal string "https none" (body_of (raw_read tcp tls)) ) )
     ; test "a handshake that fails or ends early is not reported" (fun () ->
           run info (fun t _ ->
-              (* A handshake record with a bad body: the server sends an
-                 alert. *)
+              (* A handshake record with a bad body ("hello" declares a long
+                 message): the server ends the connection. *)
               let tcp = Tcp.connect server_addr in
               Flow.write_string tcp "\x16\x03\x01\x00\x05hello" ;
               ignore (read_all tcp) ;
@@ -276,6 +276,40 @@ let engine_tests =
               Flow.close tcp ;
               is_true ~msg:"less than 1 s"
                 (elapsed start < Span.to_ns (Span.s 1)) ) )
+    ; test "a stop or the deadline before the handshake: no read" (fun () ->
+          (* The ClientHello waits in the socket. The engine examines the stop
+             and the deadline before each read. A header_timeout of 0 puts the
+             deadline at the time of the first read. *)
+          let first_read ~stopping ~header_timeout =
+            let scfg, ccfg = setup () in
+            Sim_support.run (fun sim ->
+                Weft_sim.set_posix sim (Time.posix_of_unix_s t0) ;
+                Sim_support.with_pair sim (fun a b ->
+                    let client = Tcp.flow a and tcp = Tcp.flow b in
+                    let _, hello = Tls.Engine.client ccfg in
+                    Flow.write_string client hello ;
+                    let ran = ref false in
+                    let ctx =
+                      { Engine.config= {Config.default with header_timeout}
+                      ; conn=
+                          Conn_info.make ~id:0 ~peer:server_addr
+                            ~local:server_addr
+                            ~stopping:(if stopping then always () else never)
+                            ()
+                      ; is_stopping= (fun () -> stopping) }
+                    in
+                    S.engine scfg (fun _ _ _ -> ran := true) ctx tcp info ;
+                    let wrote =
+                      Option.is_some (Flow.read_now client (Bytes.create 1) 0 1)
+                    in
+                    (!ran, wrote) ) )
+          in
+          let none = (false, false) in
+          equal (pair bool bool) ~msg:"a stop" none
+            (first_read ~stopping:true
+               ~header_timeout:Config.default.header_timeout ) ;
+          equal (pair bool bool) ~msg:"the deadline" none
+            (first_read ~stopping:false ~header_timeout:Span.zero) )
     ; test "the client refuses a certificate for another name" (fun () ->
           let peer_name =
             Domain_name.(host_exn (of_string_exn "example.org"))
@@ -430,12 +464,17 @@ let flow_tests =
           pair (fun server client _ ->
               Flow.write_string server "bye" ;
               Flow.shutdown_send server ;
+              (* A second shutdown_send sends nothing: the flow can still
+                 read. *)
+              Flow.shutdown_send server ;
+              Flow.write_string client "hi" ;
               (* The data and close_notify can come in one TCP read. *)
               Time.sleep Mono (Span.ms 100) ;
               equal string "bye" (read_string client 16) ;
               equal int 0 (Flow.read client (Bytes.create 1) 0 1) ;
               equal (option int) (Some 0)
-                (Flow.read_now client (Bytes.create 1) 0 1) ) )
+                (Flow.read_now client (Bytes.create 1) 0 1) ;
+              equal string "hi" (read_string server 16) ) )
     ; test "a TCP end with no close_notify raises Closed" (fun () ->
           pair (fun server client tcp ->
               Flow.shutdown_send tcp ;
@@ -541,6 +580,50 @@ let flow_tests =
           in
           equal string "x" (updates 64) ;
           equal string "too many records with no plaintext" (updates 65) )
+    ; test "a handshake of exactly 64 KiB starts a session" (fun () ->
+          (* The ClientHello, ChangeCipherSpec records and the Finished message
+             have 65536 bytes in all. ocaml-tls ignores the body of a
+             ChangeCipherSpec record in the handshake. *)
+          let scfg, ccfg = setup () in
+          Sim_support.run (fun sim ->
+              Weft_sim.set_posix sim (Time.posix_of_unix_s t0) ;
+              let l = listen () in
+              Fiber.scope (fun s ->
+                  let server = accept_one s scfg l in
+                  let tcp = connect () in
+                  let tls, hello = Tls.Engine.client ccfg in
+                  Flow.write_string tcp hello ;
+                  let buf = Bytes.create 65536 in
+                  let rec finished tls =
+                    let n = Flow.read tcp buf 0 65536 in
+                    match
+                      Tls.Engine.handle_tls tls (Bytes.sub_string buf 0 n)
+                    with
+                    | Ok (tls, _, `Response (Some fin), _)
+                      when not (Tls.Engine.handshake_in_progress tls) ->
+                        fin
+                    | Ok (tls, _, _, _) ->
+                        finished tls
+                    | Error (f, _) ->
+                        fail (Tls.Engine.string_of_failure f)
+                  in
+                  let fin = finished tls in
+                  (* Four records with a body of 16 KiB or less. *)
+                  let pad = 65536 - String.length hello - String.length fin in
+                  let body = (pad - 20) / 4 in
+                  let ccs n =
+                    Printf.sprintf "\x14\x03\x03%c%c%s"
+                      (Char.chr (n lsr 8))
+                      (Char.chr (n land 255))
+                      (String.make n '\x01')
+                  in
+                  let last = pad - 20 - (3 * body) in
+                  is_true ~msg:"the size of a record" (last <= 16384) ;
+                  Flow.write_string tcp
+                    (ccs body ^ ccs body ^ ccs body ^ ccs last ^ fin) ;
+                  equal string "a session" (Promise.await server) ;
+                  Flow.close tcp ;
+                  Net.close l ) ) )
     ; test "records after close_notify, and no empty record" (fun () ->
           let scfg, ccfg = setup () in
           Sim_support.run (fun sim ->
@@ -689,6 +772,11 @@ let flow_tests =
                   is_true ~msg:"client" (String.equal data (read_n client size)) ;
                   is_true ~msg:"server" (String.equal data (Promise.await got)) ) ) )
     ; test "a peer that leaves or stops in the handshake" (fun () ->
+          let _, other =
+            setup
+              ~peer_name:Domain_name.(host_exn (of_string_exn "example.org"))
+              ()
+          in
           let scfg, ccfg = setup () in
           Sim_support.run (fun sim ->
               Weft_sim.set_posix sim (Time.posix_of_unix_s t0) ;
@@ -698,6 +786,15 @@ let flow_tests =
                   Flow.close (connect ()) ;
                   equal string "the peer closed the connection"
                     (Promise.await server) ;
+                  (* A client that refuses the certificate sends an alert before
+                     it closes. *)
+                  let server = accept_one s scfg l in
+                  let tcp = connect () in
+                  raises_match
+                    (function S.Handshake_error _ -> true | _ -> false)
+                    (fun () -> ignore (S.client other tcp)) ;
+                  Flow.close tcp ;
+                  equal string "alert bad certificate" (Promise.await server) ;
                   (* A close_notify alert in place of a ClientHello. *)
                   let server = accept_one s scfg l in
                   let tcp = connect () in

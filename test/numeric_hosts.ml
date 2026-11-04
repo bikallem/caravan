@@ -22,6 +22,7 @@ let table =
   ; ("a.example", None)
   ; ("localhost", None)
   ; ("256.0.0.1", None)
+  ; ("99999999999999999999.0.0.1", None)
   ; ("01.2.3.4", None)
   ; ("1.2.3", None)
   ; ("1.2.3.4.5", None)

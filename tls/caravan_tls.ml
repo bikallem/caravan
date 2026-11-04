@@ -146,7 +146,12 @@ let take t buf off len =
     Bytes.blit_string t.plain t.pos buf off n ;
     if n = avail then (
       t.plain <- "" ;
-      t.pos <- 0 )
+      t.pos <-
+        (0
+        [@mutate
+          off
+            "[plain] is empty: each [pos] of 0 or more gives no plaintext, and \
+             [feed] sets [pos] again"] ) )
     else t.pos <- t.pos + n ;
     Some n )
   else
@@ -278,10 +283,8 @@ let establish ~read tcp tls =
           raise (Handshake_error "the peer closed the connection")
       | n ->
           let total = total + n in
-          if
-            ( total > max_handshake )
-            [@mutate off "the exact bound of a limit of 64 KiB"]
-          then raise (Handshake_error "the handshake is too large") ;
+          if total > max_handshake then
+            raise (Handshake_error "the handshake is too large") ;
           let records, carry = split (carry ^ Bytes.sub_string cbuf 0 n) in
           let tls, plain, eof, empty =
             List.fold_left
@@ -304,7 +307,13 @@ let establish ~read tcp tls =
                             let bytes =
                               List.fold_left
                                 (fun n d -> n + String.length d)
-                                0 plain
+                                (0
+                                [@mutate
+                                  off
+                                    "the budget changes only at 16383 bytes, \
+                                     and then the 16896 bytes of one read have \
+                                     no space for 65 records"] )
+                                plain
                             in
                             if empty > empty_budget bytes then
                               raise

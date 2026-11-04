@@ -11,13 +11,14 @@ let is_digit c = c >= '0' && c <= '9'
 
 let is_hex c = is_digit c || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 
-(* Four parts in dotted decimal, each 0 to 255 with no leading zero. *)
+(* Four parts in dotted decimal, each 0 to 255 with no leading zero. A part of
+   many digits gives [None] from [int_of_string_opt]. *)
 let is_ipv4 s =
   let part p =
     let n = String.length p in
-    n >= 1 && n <= 3 && String.for_all is_digit p
+    n >= 1 && String.for_all is_digit p
     && (n = 1 || p.[0] <> '0')
-    && int_of_string p <= 255
+    && match int_of_string_opt p with Some v -> v <= 255 | None -> false
   in
   match String.split_on_char '.' s with
   | [_; _; _; _] as parts ->

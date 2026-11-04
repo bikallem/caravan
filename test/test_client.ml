@@ -359,6 +359,19 @@ let exchange_tests =
           in
           equal int 200 (status (t.run (req "/"))) ;
           await s )
+    ; test "ten 1xx responses are skipped" (fun () ->
+          with_conn
+          @@ fun t ->
+          let s =
+            serve t (fun r ->
+                ignore (read_request r) ;
+                respond t
+                  ( String.concat ""
+                      (List.init 10 (fun _ -> "HTTP/1.1 100 Continue\r\n\r\n"))
+                  ^ "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" ) )
+          in
+          equal int 200 (status (t.run (req "/"))) ;
+          await s )
     ; test "eleven 1xx responses give Bad_response" (fun () ->
           with_conn
           @@ fun t ->
@@ -1065,6 +1078,36 @@ let exchange_tests =
           equal string "Invalid_argument" (sync (Ivar.read seen)) ;
           equal (list bool) [false] (t.releases ()) ;
           await s )
+    ; test "a producer that reads its own response releases one time" (fun () ->
+          with_conn
+          @@ fun t ->
+          let s =
+            serve t (fun r ->
+                ignore (read_head r) ;
+                respond t "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello" )
+          in
+          let resp = ref None
+          and ready = Ivar.create ()
+          and seen = Ivar.create () in
+          let producer =
+            Body.of_writer (fun w ->
+                Body.Writer.write_string w "abc" ;
+                Body.Writer.flush w ;
+                wait ready ;
+                match Body.to_string (body (Option.get !resp)) with
+                | _ ->
+                    ignore (Ivar.try_fill seen "no error")
+                | exception Invalid_argument _ ->
+                    ignore (Ivar.try_fill seen "Invalid_argument") )
+          in
+          resp := Some (t.run (req ~meth:Method.POST ~body:producer "/")) ;
+          fill ready ;
+          equal string "Invalid_argument" (sync (Ivar.read seen)) ;
+          (* The read at the end released the connection. A close of the caller
+             after that does not release it again. *)
+          Body.close (body (Option.get !resp)) ;
+          equal (list bool) [false] (t.releases ()) ;
+          await s )
     ; test "which ends of the writer stop a read" (fun () ->
           let show phase e = string_of_bool (Exchange.stops phase e) in
           equal (list string)
@@ -1422,6 +1465,26 @@ let exchange_tests =
             "Invalid_argument(\"Caravan_client: the client is closed\")"
             (error_text (fun () -> t.run (req "/"))) ;
           equal (list bool) [false] (t.releases ()) )
+    ; test "finishing writers refuse a job while a job runs" (fun () ->
+          (* The scope of the writers takes a fork until its last job ends. The
+             refusal comes from [stopping]. *)
+          Sim_support.run
+          @@ fun sim ->
+          Fiber.scope
+          @@ fun s ->
+          let writers = Writers.make s and go = Ivar.create () in
+          Writers.start writers (Writers.job (fun () -> wait go)) ;
+          let finish =
+            Sim_support.call ~name:"finish" s (fun () ->
+                Writers.finish writers ~grace:(Span.s 1) )
+          in
+          Weft_sim.settle sim ;
+          is_true ~msg:"stopping" (Writers.is_stopping writers) ;
+          raises_match is_invalid_arg (fun () ->
+              Writers.start writers (Writers.job ignore) ) ;
+          fill go ;
+          await finish ;
+          Writers.wait writers )
     ; test "writers whose scope ended refuse a job" (fun () ->
           (* The end of the scope cancels the daemon of the writers, and
              [stopping] stays empty: the fork into the scope of the writers
@@ -2001,6 +2064,36 @@ let pool_tests =
           equal (list bool) [true; true] (List.map is_closed (made ())) ;
           raises_match is_invalid_arg (fun () ->
               Pool.checkout pool ~host:"a" ~port:80 ) )
+    ; test "two pools close their connections in one order" (fun () ->
+          (* The tables of a pool are not random: thus a replay of a seed is
+             exact. 16 connections are idle, and 16 are in use. *)
+          let order () =
+            Sim_support.run
+            @@ fun _ ->
+            let closed = ref [] in
+            let connect ~host ~port:_ =
+              Flow.make
+                ~read:(fun _ _ _ -> 0)
+                ~read_now:(fun _ _ _ -> None)
+                ~write:(fun _ _ _ -> ())
+                ~readable:never ~shutdown_send:ignore
+                ~close:(fun () -> closed := host :: !closed)
+                ~set_read_deadline:ignore ~set_write_deadline:ignore ()
+            in
+            let pool = Pool.make ~connect Client_config.default in
+            let conns =
+              List.init 32 (fun i ->
+                  fst (Pool.checkout pool ~host:(string_of_int i) ~port:80) )
+            in
+            List.iteri
+              (fun i c -> if i < 16 then Pool.release pool c ~reusable:true)
+              conns ;
+            Pool.close pool ;
+            List.rev !closed
+          in
+          let first = order () in
+          equal int 32 (List.length first) ;
+          equal (list string) first (order ()) )
     ; test "reap closes the idle connections that are too old" (fun () ->
           Sim_support.manual
           @@ fun sim ->
@@ -2057,6 +2150,8 @@ let pool_tests =
           Pool.close pool ;
           raises_match is_invalid_arg (fun () ->
               Pool.checkout ~reuse:false pool ~host:"a" ~port:80 ) ;
+          raises_match is_invalid_arg (fun () ->
+              Pool.checkout pool ~host:"a" ~port:80 ) ;
           equal int 0 (List.length (made ())) )
     ; test "a connect during close is closed" (fun () ->
           Sim_support.run
@@ -2757,6 +2852,28 @@ let api_tests =
           equal string "a" (text (C.request client (at_port port "/"))) ;
           equal string "b" (text (C.request client (at_port port "/"))) ;
           equal int 2 (Atomic.get accepted) )
+    ; test "the retry takes a new connection, not a second idle one" (fun () ->
+          (* Two idle connections whose servers close at the next request. *)
+          let closes_next name flow r =
+            ignore (read_request r) ;
+            Flow.write_string flow
+              ("HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n" ^ name) ;
+            ignore (read_head r)
+          and third flow r =
+            ignore (read_request r) ;
+            Flow.write_string flow
+              "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nc"
+          in
+          with_scripts [closes_next "a"; closes_next "b"; third]
+          @@ fun client port accepted ->
+          (* The first body is not read: the second request takes a second
+             connection. *)
+          let a = C.request client (at_port port "/") in
+          let b = C.request client (at_port port "/") in
+          equal string "b" (text b) ;
+          equal string "a" (text a) ;
+          equal string "c" (text (C.request client (at_port port "/"))) ;
+          equal int 3 (Atomic.get accepted) )
     ; test "a stale connection is retried for a PUT with an empty body"
         (fun () ->
           let first flow r =
@@ -2894,6 +3011,16 @@ let api_tests =
                 "Invalid_argument"
             | exception e ->
                 Printexc.to_string e ) )
+    ; test "a request with the scheme https gives Unsupported" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          C.run
+          @@ fun client ->
+          (* A connect to this port gives Error (Connect _). *)
+          equal string "Caravan_client.Error: unsupported: the scheme https"
+            (error_text (fun () ->
+                 C.request client
+                   (Request.with_scheme `Https (at_port refused_port "/")) ) ) )
     ; test "request after close raises Invalid_argument" (fun () ->
           Sim_support.run
           @@ fun _ ->
@@ -3045,7 +3172,10 @@ let api_tests =
                   ; "http://a:65536/"
                   ; "http://a:+80/"
                   ; "http://a:9/"
-                  ; "http://[::1/" ] ) )
+                  ; "http://[::1/"
+                  ; "http://:80/"
+                  ; "http:a.example/p"
+                  ; "http:///p" ] ) )
           @@ __POS_OF__
                {|
             http://a.example => a.example /
@@ -3068,6 +3198,9 @@ let api_tests =
             http://a:+80/ => Invalid_argument
             http://a:9/ => a:9 /
             http://[::1/ => Invalid_argument
+            http://:80/ => Invalid_argument
+            http:a.example/p => Invalid_argument
+            http:///p => Invalid_argument
             |} )
     ; test "the client and the server under load" (fun () ->
           let client_config =

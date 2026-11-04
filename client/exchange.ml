@@ -250,7 +250,12 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
   ( try Writers.start writers job
     with e ->
       let bt = Printexc.get_raw_backtrace () in
-      ignore (release ~ended:false) ;
+      ignore
+        (release
+           ~ended:
+             (false
+             [@mutate
+               off "the job did not start: [release] does not read [ended]"] ) ) ;
       (* The job never runs, thus the body closes here. *)
       ( try Body.close inner with _ -> () ) ;
       Printexc.raise_with_backtrace e bt ) ;
@@ -270,7 +275,13 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
   with
   | exception e -> (
       let bt = Printexc.get_raw_backtrace () in
-      ignore (release ~ended:false) ;
+      ignore
+        (release
+           ~ended:
+             (false
+             [@mutate
+               off "[response] is None here: [keep] is false for each [ended]"]
+             ) ) ;
       match e with
       | Buf_reader.Eof | Flow.Closed ->
           if Buf_reader.consumed r = 0 && Buf_reader.buffered r = 0 then
@@ -288,7 +299,13 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
       | e ->
           Printexc.raise_with_backtrace e bt )
   | _, Tunnel ->
-      ignore (release ~ended:false) ;
+      ignore
+        (release
+           ~ended:
+             (false
+             [@mutate
+               off "[response] is None here: [keep] is false for each [ended]"]
+             ) ) ;
       Error.fail (Unsupported "protocol switch")
   | h, fr ->
       response := Some h ;
