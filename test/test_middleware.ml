@@ -2342,6 +2342,341 @@ let concurrency_tests =
               made (CL.middleware ~limit:0 ()) ) ;
           made (CL.middleware ~limit:1 ()) ) ]
 
+(* Health and Cache_control *)
+
+module HC = Caravan_middleware.Health
+module CC = Caravan_middleware.Cache_control
+
+let body_text r =
+  match Response.kind r with
+  | Response.Body b ->
+      Body.to_string b
+  | Response.Upgrade _ ->
+      ""
+
+let probe ?(meth = Method.GET) ?(path = "/") h =
+  let r = h (Request.make meth path) in
+  (Status.code (Response.status r), body_text r)
+
+let sleeping ?(result = HC.Healthy) s () = sleep s ; result
+
+let health_tests =
+  let ok_check name = HC.check name (fun () -> HC.Healthy) in
+  let reply_of s = fun () -> s in
+  group "Health"
+    [ test "no checks; one healthy check" (fun () ->
+          Sim_support.run (fun _ ->
+              let r = HC.handler [] (Request.make Method.GET "/") in
+              equal int 200 (Status.code (Response.status r)) ;
+              equal string "Healthy\n" (body_text r) ;
+              equal (option string) (Some "no-store") (field "cache-control" r) ;
+              equal (option string) (Some "text/plain; charset=utf-8")
+                (field "content-type" r) ;
+              equal (pair int string) (200, "Healthy\n")
+                (probe (HC.handler [ok_check "a"])) ) )
+    ; test "the worst status, in each order" (fun () ->
+          Sim_support.run (fun _ ->
+              let c n s = HC.check n (reply_of s) in
+              let run l = probe (HC.handler l) in
+              equal (pair int string) (200, "Degraded\n")
+                (run [c "a" HC.Healthy; c "b" HC.Degraded; c "c" HC.Healthy]) ;
+              equal (pair int string) (503, "Unhealthy\n")
+                (run [c "a" HC.Degraded; c "b" HC.Unhealthy]) ;
+              equal (pair int string) (503, "Unhealthy\n")
+                (run [c "a" HC.Unhealthy; c "b" HC.Degraded]) ;
+              equal (pair int string) (503, "Unhealthy\n")
+                (run [c "a" HC.Unhealthy; c "b" HC.Healthy]) ) )
+    ; test "failures, the timeout and the detail" (fun () ->
+          Sim_support.run ~guard:(Weft.Span.s 60) (fun _ ->
+              let checks =
+                [ HC.check "slow" (sleeping 2.)
+                ; HC.check "raises" (fun () -> failwith "secret text")
+                ; HC.check ~timeout:(Weft.Span.s 1) "late" (sleeping 1.5)
+                ; HC.check ~failure:HC.Degraded ~timeout:(Weft.Span.s 1) "soft"
+                    (sleeping 3.)
+                ; (* A check that catches its cancel. *)
+                  HC.check ~timeout:(Weft.Span.s 1) "deaf" (fun () ->
+                      try sleep 3. ; HC.Healthy with _ -> HC.Healthy )
+                ; HC.check ~timeout:(Weft.Span.s 1) "fast" (sleeping 0.999)
+                ; (* A Timeout of the check before the deadline is an
+                     exception. *)
+                  HC.check ~timeout:(Weft.Span.s 1) "inner" (fun () ->
+                      Weft.Fiber.with_timeout Mono (Weft.Span.of_float_s 0.1)
+                        (sleeping 1.) )
+                ; (* An exception after the deadline is a timeout. *)
+                  HC.check ~timeout:(Weft.Span.s 1) "wraps" (fun () ->
+                      try sleep 3. ; HC.Healthy with _ -> failwith "wrapped" )
+                ]
+              in
+              let t0 = Weft.Time.now Mono in
+              let code, text = probe (HC.handler ~detail:true checks) in
+              (* The checks run in parallel: 2 s, not the sum. *)
+              equal int64 2_000_000_000L
+                (Weft.Span.to_ns (Weft.Time.diff Mono (Weft.Time.now Mono) t0)) ;
+              equal int 503 code ;
+              equal string
+                "Unhealthy\n\
+                 slow: Healthy\n\
+                 raises: Unhealthy (exception)\n\
+                 late: Unhealthy (timeout)\n\
+                 soft: Degraded (timeout)\n\
+                 deaf: Unhealthy (timeout)\n\
+                 fast: Healthy\n\
+                 inner: Unhealthy (exception)\n\
+                 wraps: Unhealthy (timeout)\n"
+                text ;
+              (* The default timeout is 5 s; no detail by default. *)
+              equal (pair int string) (200, "Healthy\n")
+                (probe (HC.handler [HC.check "a" (sleeping 4.999)])) ;
+              equal (pair int string) (503, "Unhealthy\n")
+                (probe (HC.handler [HC.check "a" (sleeping 5.)])) ) )
+    ; test "filter" (fun () ->
+          Sim_support.run (fun _ ->
+              let ran = ref [] in
+              let c ?tags n =
+                HC.check ?tags n (fun () ->
+                    ran := n :: !ran ;
+                    HC.Unhealthy )
+              in
+              let checks = [c ~tags:["ready"] "db"; c "disk"] in
+              equal (pair int string) (200, "Healthy\n")
+                (probe (HC.handler ~filter:(fun _ -> false) checks)) ;
+              equal (list string) [] !ran ;
+              equal int 503
+                (fst
+                   (probe
+                      (HC.handler
+                         ~filter:(fun c -> List.mem "ready" (HC.tags c))
+                         ~detail:true checks ) ) ) ;
+              equal (list string) ["db"] !ran ;
+              equal string "disk" (HC.name (c "disk")) ) )
+    ; test "HEAD, and other methods" (fun () ->
+          Sim_support.run (fun _ ->
+              let h = HC.handler [ok_check "a"] in
+              equal int 200 (fst (probe ~meth:Method.HEAD h)) ;
+              let r = h (Request.make Method.POST "/") in
+              equal int 405 (Status.code (Response.status r)) ;
+              equal (option string) (Some "GET, HEAD") (field "allow" r) ) )
+    ; test "one run at a time; a client that leaves" (fun () ->
+          Sim_support.run ~guard:(Weft.Span.s 60) (fun sim ->
+              let runs = ref 0 in
+              let h =
+                HC.handler
+                  [HC.check "a" (fun () -> incr runs ; sleep 1. ; HC.Degraded)]
+              in
+              Weft.Fiber.scope (fun sc ->
+                  let first = Sim_support.call sc (fun () -> probe h) in
+                  sleep 0.5 ;
+                  let second = Sim_support.call sc (fun () -> probe h) in
+                  sleep 0.1 ;
+                  (* The cancel of the first request does not stop the run: the
+                     two requests get its result, not a 503. The server sees the
+                     cancel at its next wait. *)
+                  Sim_support.cancel first ;
+                  equal (pair int string) (200, "Degraded\n")
+                    (Sim_support.await second) ;
+                  equal bool true (Sim_support.ended sim first) ;
+                  equal (pair int string) (200, "Degraded\n")
+                    (Sim_support.await first) ;
+                  equal int 1 !runs ;
+                  (* After the run, a new run. *)
+                  equal (pair int string) (200, "Degraded\n") (probe h) ;
+                  equal int 2 !runs ) ) )
+    ; test "middleware" (fun () ->
+          Sim_support.run (fun _ ->
+              let h =
+                HC.middleware ~path:"/health" [ok_check "a"] (reply "next")
+              in
+              equal (pair int string) (200, "Healthy\n")
+                (probe ~path:"/health" h) ;
+              equal (pair int string) (200, "Healthy\n")
+                (probe ~path:"/health?probe=1" h) ;
+              equal (pair int string) (200, "next") (probe ~path:"/healthz" h) ;
+              equal (pair int string) (200, "next") (probe ~path:"/" h) ) )
+    ; test "bad setups" (fun () ->
+          let bad label f = raises_match ~msg:label is_invalid_arg f in
+          let f () = HC.Healthy in
+          bad "empty name" (fun () -> HC.check "" f) ;
+          bad "long name" (fun () -> HC.check (String.make 129 'a') f) ;
+          ignore (HC.check (String.make 128 'a') f) ;
+          ignore (HC.check " ~" f) ;
+          bad "control" (fun () -> HC.check "a\nb" f) ;
+          bad "DEL" (fun () -> HC.check "a\127" f) ;
+          bad "zero timeout" (fun () -> HC.check ~timeout:Weft.Span.zero "a" f) ;
+          ignore (HC.check ~timeout:(Weft.Span.ns 1) "a" f) ;
+          bad "duplicate" (fun () ->
+              HC.handler [HC.check "a" f; HC.check "a" f] ) ;
+          bad "filtered duplicate" (fun () ->
+              HC.handler
+                ~filter:(fun _ -> false)
+                [HC.check "a" f; HC.check "a" f] ) ;
+          let (_ : Handler.t) = HC.handler [HC.check "a" f; HC.check "b" f] in
+          bad "path" (fun () -> HC.middleware ~path:"health" []) ;
+          made (HC.middleware ~path:"/" []) )
+    ; test "on the wire" (fun () ->
+          let app =
+            HC.middleware ~path:"/health" [ok_check "a"] (reply "next")
+          in
+          T.run app (fun t ->
+              let r = T.get t "/health" in
+              equal status Status.ok r.status ;
+              equal string "Healthy\n" r.body ) ) ]
+
+let cache_control_tests =
+  let mk = CC.make in
+  let text c = CC.to_string c in
+  let respond ?(headers = []) ?(status = Status.ok) _ =
+    Response.string ~status ~headers:(Headers.of_list headers) "x"
+  in
+  let apply ?cacheable ?(meth = Method.GET) ?(req = []) ?headers ?status c =
+    let r =
+      CC.middleware ?cacheable c (respond ?headers ?status)
+        (Request.make ~headers:(Headers.of_list req) meth "/")
+    in
+    field "cache-control" r
+  in
+  let public = mk ~scope:`Public ~max_age:60 () in
+  let personal = mk ~scope:`Private ~max_age:60 () in
+  group "Cache_control"
+    [ test "make: each directive, in a fixed order" (fun () ->
+          equal string
+            "public, no-cache, max-age=1, s-maxage=2, must-revalidate, \
+             proxy-revalidate, no-transform, stale-while-revalidate=3, \
+             stale-if-error=4"
+            (text
+               (mk ~stale_if_error:4 ~stale_while_revalidate:3
+                  ~no_transform:true ~proxy_revalidate:true
+                  ~must_revalidate:true ~s_maxage:2 ~max_age:1 ~no_cache:true
+                  ~scope:`Public () ) ) ;
+          equal string "private, max-age=0, immutable"
+            (text (mk ~scope:`Private ~max_age:0 ~immutable:true ())) ;
+          equal string "no-store" (text (mk ~no_store:true ())) ;
+          equal string "private, no-store"
+            (text (mk ~scope:`Private ~no_store:true ())) ;
+          equal string "no-transform" (text (mk ~no_transform:true ())) ;
+          equal bool true (CC.shared public) ;
+          equal bool true (CC.shared (mk ~max_age:1 ())) ;
+          equal bool false (CC.shared personal) ;
+          equal bool false (CC.shared (mk ~no_store:true ())) )
+    ; test "make: the cap of the ages" (fun () ->
+          let a n = text (mk ~max_age:n ()) in
+          equal string "max-age=2147483647" (a 2147483647) ;
+          equal string "max-age=2147483648" (a 2147483648) ;
+          equal string "max-age=2147483648" (a 2147483649) ;
+          equal string "s-maxage=2147483648" (text (mk ~s_maxage:max_int ())) )
+    ; test "make: bad mixes" (fun () ->
+          let bad label f =
+            raises_match ~msg:label is_invalid_arg (fun () -> ignore (f ()))
+          in
+          bad "nothing" (fun () -> mk ()) ;
+          bad "negative max_age" (fun () -> mk ~max_age:(-1) ()) ;
+          bad "negative s_maxage" (fun () -> mk ~s_maxage:(-1) ()) ;
+          bad "negative swr" (fun () -> mk ~stale_while_revalidate:(-1) ()) ;
+          bad "negative sie" (fun () -> mk ~stale_if_error:(-1) ()) ;
+          bad "no_store max_age" (fun () -> mk ~no_store:true ~max_age:1 ()) ;
+          bad "no_store public" (fun () -> mk ~no_store:true ~scope:`Public ()) ;
+          bad "no_store no_cache" (fun () ->
+              mk ~no_store:true ~no_cache:true () ) ;
+          bad "no_store must_revalidate" (fun () ->
+              mk ~no_store:true ~must_revalidate:true () ) ;
+          bad "no_store proxy_revalidate" (fun () ->
+              mk ~no_store:true ~proxy_revalidate:true () ) ;
+          bad "no_store swr" (fun () ->
+              mk ~no_store:true ~stale_while_revalidate:1 () ) ;
+          bad "no_store sie" (fun () -> mk ~no_store:true ~stale_if_error:1 ()) ;
+          bad "no_store s_maxage" (fun () -> mk ~no_store:true ~s_maxage:1 ()) ;
+          bad "no_store immutable" (fun () ->
+              mk ~no_store:true ~immutable:true () ) ;
+          bad "private s_maxage" (fun () -> mk ~scope:`Private ~s_maxage:1 ()) ;
+          bad "immutable alone" (fun () -> mk ~immutable:true ()) ;
+          bad "immutable no_cache" (fun () ->
+              mk ~immutable:true ~max_age:1 ~no_cache:true () ) ;
+          ignore (mk ~scope:`Public ~s_maxage:1 ()) )
+    ; test "middleware: the statuses" (fun () ->
+          List.iter
+            (fun (code, set) ->
+              equal ~msg:(string_of_int code) (option string)
+                (if set then Some "public, max-age=60" else None)
+                (apply ~status:(Status.v code) public) )
+            [ (200, true)
+            ; (203, true)
+            ; (204, true)
+            ; (206, true)
+            ; (300, true)
+            ; (301, true)
+            ; (304, true)
+            ; (308, true)
+            ; (302, false)
+            ; (307, false)
+            ; (404, false)
+            ; (500, false) ] ;
+          equal (option string) (Some "public, max-age=60")
+            (apply
+               ~cacheable:(fun s -> Status.code s = 404)
+               ~status:Status.not_found public ) ;
+          equal (option string) None
+            (apply ~cacheable:(fun s -> Status.code s = 404) public) )
+    ; test "middleware: methods, an existing field, an upgrade" (fun () ->
+          equal (option string) (Some "public, max-age=60")
+            (apply ~meth:Method.HEAD public) ;
+          equal (option string) None (apply ~meth:Method.POST public) ;
+          equal (option string) (Some "no-cache")
+            (apply ~headers:[("cache-control", "no-cache")] public) ;
+          let r =
+            CC.middleware
+              ~cacheable:(fun _ -> true)
+              public
+              (fun _ -> Response.upgrade ignore)
+              (Request.make Method.GET "/")
+          in
+          equal (option string) None (field "cache-control" r) )
+    ; test "middleware: responses for one user" (fun () ->
+          let cases =
+            [ ( "authorization"
+              , fun c -> apply ~req:[("Authorization", "Bearer x")] c )
+            ; ("cookie", fun c -> apply ~req:[("Cookie", "s=1")] c)
+            ; ("set-cookie", fun c -> apply ~headers:[("Set-Cookie", "s=1")] c)
+            ]
+          in
+          let full =
+            mk ~scope:`Public ~no_cache:true ~max_age:60 ~s_maxage:120
+              ~must_revalidate:true ~proxy_revalidate:true ~no_transform:true
+              ~stale_while_revalidate:5 ~stale_if_error:6 ()
+          in
+          List.iter
+            (fun (label, f) ->
+              equal ~msg:label (option string) (Some "private, max-age=60")
+                (f public) ;
+              equal ~msg:label (option string) (Some "private")
+                (f (mk ~s_maxage:60 ())) ;
+              equal ~msg:label (option string) (Some "private, max-age=60")
+                (f (mk ~max_age:60 ())) ;
+              equal ~msg:label (option string)
+                (Some
+                   "private, no-cache, max-age=60, must-revalidate, \
+                    no-transform, stale-while-revalidate=5, stale-if-error=6" )
+                (f full) ;
+              equal ~msg:label (option string) (Some "private, max-age=60")
+                (f personal) ;
+              equal ~msg:label (option string) (Some "no-store")
+                (f (mk ~no_store:true ())) )
+            cases )
+    ; test "the field of an inner middleware wins" (fun () ->
+          (* An inner middleware that sets the field wins. *)
+          let inner next req =
+            let r = next req in
+            Response.with_headers
+              (Headers.add "Cache-Control" "private" (Response.headers r))
+              r
+          in
+          let h =
+            Handler.compose
+              [CC.middleware public; inner]
+              (respond ?headers:None ?status:None)
+          in
+          equal (option string) (Some "private")
+            (field "cache-control" (h (Request.make Method.GET "/"))) ) ]
+
 let () =
   exit
     (Windtrap.run "middleware"
@@ -2354,4 +2689,6 @@ let () =
        ; hsts_tests
        ; cross_origin_tests
        ; rate_limit_tests
-       ; concurrency_tests ] )
+       ; concurrency_tests
+       ; health_tests
+       ; cache_control_tests ] )

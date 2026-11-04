@@ -546,3 +546,136 @@ module Concurrency_limit : sig
       few slow clients can hold all the slots: use the read and write timeouts
       of the server. *)
 end
+
+(** Health checks, for the probes of a load balancer or of Kubernetes.
+
+    Put {!Health.middleware} outside (before) {!Https_redirect}, the limits, the
+    sessions and the authentication: a probe must get the true status, not a
+    redirect or a 429. Keep the path on the inner network. *)
+module Health : sig
+  (** The constructors are in the order of the status: [compare] and [max] give
+      the worse status. *)
+  type status = Healthy | Degraded | Unhealthy
+
+  type check
+
+  val check :
+       ?timeout:Weft.Span.t
+    -> ?failure:status
+    -> ?tags:string list
+    -> string
+    -> (unit -> status)
+    -> check
+  (** [check name f] is a check that runs [f] in its own fiber. If [f] raises,
+      or does not end in [timeout] (default 5 s), the check gives [failure]
+      (default [Unhealthy]). A value that [f] gives after the deadline is also a
+      timeout.
+
+      weft cancels a fiber only at a wait. Thus [f] must use weft I/O, must not
+      block its domain, and must let [Weft.Fiber.Cancelled] go out. The timeout
+      cannot stop a check that blocks or never yields: such a check holds its
+      domain. Checks run on many domains at the same time: [f] must be safe for
+      that.
+
+      Give a [timeout] below the timeout of the probe (1 s by default in
+      Kubernetes).
+
+      @raise Invalid_argument
+        if [name] does not have 1 to 128 bytes from 0x20 to 0x7E, or if
+        [timeout] is not positive. *)
+
+  val name : check -> string
+
+  val tags : check -> string list
+
+  val handler :
+    ?filter:(check -> bool) -> ?detail:bool -> check list -> Caravan.Handler.t
+  (** [handler checks] answers GET and HEAD: it runs in parallel the checks that
+      [filter] takes (default: all), and gives the worst status. [Healthy] and
+      [Degraded] give 200, [Unhealthy] 503 (no checks: [Healthy]). The body is
+      the status and a newline, as [text/plain], with [Cache-Control: no-store].
+      With [detail] (default false: the names can tell an attacker about the
+      system), one more line for each check, in the order of the list:
+      [<name>: <status>], with [" (timeout)"] or [" (exception)"] for a failure.
+      The text of an exception never goes out. Another method gets 405 with
+      [Allow: GET, HEAD].
+
+      One run at a time: a request during a run waits for its result. A client
+      that leaves does not stop the run, thus a shutdown of the server can wait
+      for the largest timeout of the checks.
+
+      A liveness probe has no dependencies: [~filter:(fun _ -> false)]. A
+      readiness probe can take the checks of a tag:
+      [~filter:(fun c -> List.mem "ready" (tags c))].
+
+      @raise Invalid_argument if two checks have the same name. *)
+
+  val middleware :
+       ?filter:(check -> bool)
+    -> ?detail:bool
+    -> path:string
+    -> check list
+    -> Caravan.Handler.middleware
+  (** [middleware ~path checks] gives the requests with the path [path] (with no
+      query) to [handler checks], and the others to the next handler.
+
+      @raise Invalid_argument
+        if [path] does not start with ["/"], or as {!handler}. *)
+end
+
+(** A [Cache-Control] field (RFC 9111 §5.2.2).
+
+    The order: [Caravan_compress.middleware], then [Cache_control], then the
+    sessions, then the router with [Caravan_auth.require]. Put [Cache_control]
+    outside [Caravan_auth.require]: a scheme can read a field that this
+    middleware does not know. A middleware inside gives its own [Cache-Control]
+    first, and this one keeps it. Give a shared value only to public content,
+    for example in a router group. *)
+module Cache_control : sig
+  type t
+
+  val make :
+       ?scope:[`Public | `Private]
+    -> ?no_cache:bool
+    -> ?no_store:bool
+    -> ?max_age:int
+    -> ?s_maxage:int
+    -> ?must_revalidate:bool
+    -> ?proxy_revalidate:bool
+    -> ?immutable:bool
+    -> ?no_transform:bool
+    -> ?stale_while_revalidate:int
+    -> ?stale_if_error:int
+    -> unit
+    -> t
+  (** [make ()] is a value with the directives that the arguments give, in a
+      fixed order. An age is in seconds; an age over 2147483648 is sent as
+      2147483648 (RFC 9111 §1.2.2).
+
+      @raise Invalid_argument
+        if an age is negative, if there is no directive, if [no_store] goes with
+        an age, [`Public], [no_cache], [must_revalidate], [proxy_revalidate] or
+        [immutable], if [`Private] goes with [s_maxage], or if [immutable] has
+        no [max_age] or goes with [no_cache]. *)
+
+  val to_string : t -> string
+
+  val shared : t -> bool
+  (** [shared t] is [true] if a shared cache can keep a response with [t]: [t]
+      has no [`Private] and no [no_store]. *)
+
+  val middleware :
+    ?cacheable:(Caravan.Status.t -> bool) -> t -> Caravan.Handler.middleware
+  (** [middleware t] adds [Cache-Control: t] to a response to GET or HEAD that
+      has no [Cache-Control] and a status that [cacheable] takes. The default
+      statuses are 200, 203, 204, 206, 300, 301, 304 and 308: no 4xx status,
+      thus a 404 never gets a long life. An upgrade response gets no field.
+
+      A response for one user (a request with [Authorization] or [Cookie], or a
+      response with [Set-Cookie]) gets the private form of a {!shared} value:
+      [private] in place of [public], with no [s-maxage] and no
+      [proxy-revalidate]. A value that is not shared goes on these responses
+      with no change. A browser sends the cookies of the origin also with an
+      asset: to keep assets in a shared cache, serve them from an origin with no
+      cookies, or remove [Cookie] at the CDN. *)
+end

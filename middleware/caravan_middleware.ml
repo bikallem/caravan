@@ -1210,3 +1210,224 @@ module Concurrency_limit = struct
                 (Body.on_end (fun _ ~bytes:_ -> release ()) b)
                 resp )
 end
+
+module Health = struct
+  type status = Healthy | Degraded | Unhealthy
+
+  type check =
+    { name: string
+    ; tags: string list
+    ; timeout: Weft.Span.t
+    ; failure: status
+    ; run: unit -> status }
+
+  let bad m = invalid_arg ("Caravan_middleware.Health." ^ m)
+
+  let check ?(timeout = Weft.Span.s 5) ?(failure = Unhealthy) ?(tags = []) name
+      run =
+    let n = String.length name in
+    if
+      n < 1 || n > 128
+      || not (String.for_all (fun c -> c >= ' ' && c <= '~') name)
+    then bad "check: a name has 1 to 128 printable ASCII bytes" ;
+    if Weft.Span.compare timeout Weft.Span.zero <= 0 then
+      bad "check: the timeout is not positive" ;
+    {name; tags; timeout; failure; run}
+
+  let name c = c.name
+
+  let tags c = c.tags
+
+  let text = function
+    | Healthy ->
+        "Healthy"
+    | Degraded ->
+        "Degraded"
+    | Unhealthy ->
+        "Unhealthy"
+
+  (* [run_one c] is the status of [c] and the cause of a failure. The run is in
+     a shield: a cancel here is the cancel of the check. *)
+  let run_one c =
+    let start = Weft.Time.now Mono in
+    let late at =
+      Weft.Span.compare (Weft.Time.diff Mono at start) c.timeout >= 0
+    in
+    (* The time of the end of [c.run], before the join of the scope. *)
+    let ended = ref start in
+    match
+      Weft.Fiber.with_timeout Mono c.timeout (fun () ->
+          Fun.protect ~finally:(fun () -> ended := Weft.Time.now Mono) c.run )
+    with
+    | s ->
+        (* A check that catches its cancel gives a value after the deadline. *)
+        if late !ended then (c.failure, " (timeout)") else (s, "")
+    | exception _ ->
+        (* The time decides: [Timeout] of the deadline, or an exception after it
+           (a check that wraps its cancel), is a timeout. A [Timeout] of the
+           check itself before the deadline is an exception. *)
+        if late !ended then (c.failure, " (timeout)")
+        else (c.failure, " (exception)")
+
+  (* [run_all checks] runs the checks in parallel, each in its fiber. *)
+  let run_all checks =
+    Weft.Fiber.scope (fun sc ->
+        List.map
+          (fun c -> Weft.Fiber.fork_promise sc (fun () -> run_one c))
+          checks
+        |> List.map Weft.Promise.await )
+
+  let handler ?(filter = fun _ -> true) ?(detail = false) checks =
+    let names = List.map name checks in
+    if List.length (List.sort_uniq String.compare names) <> List.length names
+    then bad "handler: two checks have the same name" ;
+    let checks = List.filter filter checks in
+    (* A single flight: the requests during a run wait for its result. *)
+    let current = Atomic.make None in
+    let results_of = function
+      | Ok r ->
+          r
+      | Error (e, bt) ->
+          Printexc.raise_with_backtrace e bt
+    in
+    let rec results () =
+      match Atomic.get current with
+      | Some ivar ->
+          results_of (Weft.sync (Weft.Ivar.read ivar))
+      | None ->
+          let ivar = Weft.Ivar.create () in
+          if not (Atomic.compare_and_set current None (Some ivar)) then
+            results ()
+          else
+            (* A shield: a client that leaves does not stop the run of the
+               others. *)
+            (* [run_one] catches each exception: [Error] is only for safety. *)
+            let r =
+              match Weft.Fiber.shield (fun () -> run_all checks) with
+              | r ->
+                  Ok r
+              | exception e ->
+                  Error (e, Printexc.get_raw_backtrace ())
+            in
+            Atomic.set current None ; Weft.Ivar.fill ivar r ; results_of r
+    in
+    fun req ->
+      let m = Request.meth req in
+      if not (Method.equal m Method.GET || Method.equal m Method.HEAD) then
+        Response.string ~status:Status.method_not_allowed
+          ~headers:(Headers.of_list [("Allow", "GET, HEAD")])
+          ""
+      else
+        let rs = results () in
+        (* The constructors are in the order of the status. *)
+        let worst = List.fold_left (fun w (s, _) -> max w s) Healthy rs in
+        let lines =
+          if detail then
+            List.map2
+              (fun c (s, cause) -> c.name ^ ": " ^ text s ^ cause ^ "\n")
+              checks rs
+          else []
+        in
+        Response.string
+          ~status:
+            (if worst = Unhealthy then Status.service_unavailable else Status.ok)
+          ~headers:(Headers.of_list [("Cache-Control", "no-store")])
+          (String.concat "" ((text worst ^ "\n") :: lines))
+
+  let middleware ?filter ?detail ~path checks =
+    if not (String.starts_with ~prefix:"/" path) then
+      bad "middleware: the path does not start with /" ;
+    let h = handler ?filter ?detail checks in
+    fun next req -> if Request.path_only req = path then h req else next req
+end
+
+module Cache_control = struct
+  (* [personal] is the text for a response for one user. *)
+  type t = {text: string; personal: string; shared: bool}
+
+  let bad m = invalid_arg ("Caravan_middleware.Cache_control.make: " ^ m)
+
+  (* RFC 9111 §1.2.2: a cache takes a larger age as 2^31. Send no more. *)
+  let age name = function
+    | None ->
+        []
+    | Some n ->
+        if n < 0 then bad (name ^ " is negative") ;
+        [name ^ "=" ^ string_of_int (min n 2147483648)]
+
+  let make ?scope ?(no_cache = false) ?(no_store = false) ?max_age ?s_maxage
+      ?(must_revalidate = false) ?(proxy_revalidate = false)
+      ?(immutable = false) ?(no_transform = false) ?stale_while_revalidate
+      ?stale_if_error () =
+    let flag b d = if b then [d] else [] in
+    if
+      no_store
+      && ( max_age <> None || s_maxage <> None
+         || stale_while_revalidate <> None
+         || stale_if_error <> None || scope = Some `Public || no_cache
+         || must_revalidate || proxy_revalidate || immutable )
+    then bad "no_store goes with no age and no other rule of storage" ;
+    if scope = Some `Private && s_maxage <> None then
+      bad "s_maxage is for shared caches, not private" ;
+    if immutable && (max_age = None || no_cache) then
+      bad "immutable needs max_age and no no_cache" ;
+    (* [directives ~shared] are the directives, and with [shared = false] the
+       directives for a private cache only. *)
+    let directives ~shared scope =
+      ( match scope with
+        | Some `Public ->
+            ["public"]
+        | Some `Private ->
+            ["private"]
+        | None ->
+            [] )
+      @ flag no_cache "no-cache" @ flag no_store "no-store"
+      @ age "max-age" max_age
+      @ (if shared then age "s-maxage" s_maxage else [])
+      @ flag must_revalidate "must-revalidate"
+      @ flag (shared && proxy_revalidate) "proxy-revalidate"
+      @ flag immutable "immutable"
+      @ flag no_transform "no-transform"
+      @ age "stale-while-revalidate" stale_while_revalidate
+      @ age "stale-if-error" stale_if_error
+    in
+    let ds = directives ~shared:true scope in
+    if ds = [] then bad "no directive" ;
+    let text = String.concat ", " ds in
+    let shared = scope <> Some `Private && not no_store in
+    { text
+    ; personal=
+        ( if shared then
+            String.concat ", " (directives ~shared:false (Some `Private))
+          else text )
+    ; shared }
+
+  let to_string t = t.text
+
+  let shared t = t.shared
+
+  let default_cacheable s =
+    List.mem (Status.code s) [200; 203; 204; 206; 300; 301; 304; 308]
+
+  let middleware ?(cacheable = default_cacheable) t next req =
+    let resp = next req in
+    let m = Request.meth req in
+    let h = Response.headers resp in
+    match Response.kind resp with
+    | Response.Body _
+      when (Method.equal m Method.GET || Method.equal m Method.HEAD)
+           && cacheable (Response.status resp)
+           && not (Headers.mem "cache-control" h) ->
+        let rh = Request.headers req in
+        (* A response for one user gets the private form of the value. *)
+        let v =
+          if
+            Headers.mem "authorization" rh
+            || Headers.mem "cookie" rh || Headers.mem "set-cookie" h
+          then t.personal
+          else t.text
+        in
+        Response.with_headers (Headers.add "Cache-Control" v h) resp
+    | _ ->
+        resp
+end
