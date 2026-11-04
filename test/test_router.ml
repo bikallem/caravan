@@ -391,13 +391,19 @@ let build_tests =
             ; ("/x/** prefix", [R.group "/x/**" [R.get "/y" h]])
             ; ("a group with no routes", [R.group "/a b/**/c" []]) ] )
     ; test "the text of a build error has the pattern" (fun () ->
+          let has_text text = function
+            | Invalid_argument m ->
+                String.starts_with ~prefix:text m
+            | _ ->
+                false
+          in
+          raises_match (has_text {|Caravan_router: "/a"|}) (fun () ->
+              R.handler [R.route (Method.Other "a b") "/a" (reply "")] ) ;
+          (* A top-level pattern "" gets the error of the parse, not an error of
+             String.sub. *)
           raises_match
-            (function
-              | Invalid_argument m ->
-                  String.starts_with ~prefix:{|Caravan_router: "/a"|} m
-              | _ ->
-                  false )
-            (fun () -> R.handler [R.route (Method.Other "a b") "/a" (reply "")]) )
+            (has_text {|Caravan_router: "": a pattern must start with /|})
+            (fun () -> R.handler [R.get "" (reply "")] ) )
     ; test "one method and one shape" (fun () ->
           let h = reply "" in
           rejects

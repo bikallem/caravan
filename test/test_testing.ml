@@ -209,6 +209,12 @@ let error_tests =
           expect (Printexc.to_string (T.Guard_expired (Span.ns 7)))
           @@ __POS_OF__
                {|Caravan_testing.Guard_expired: the function did not end before the guard of 7 ns of virtual time|} ;
+          expect (Printexc.to_string (T.Guard_expired (Span.ns 1)))
+          @@ __POS_OF__
+               {|Caravan_testing.Guard_expired: the function did not end before the guard of 1 ns of virtual time|} ;
+          expect (Printexc.to_string (T.Guard_expired (Span.ns 2000)))
+          @@ __POS_OF__
+               {|Caravan_testing.Guard_expired: the function did not end before the guard of 2 us of virtual time|} ;
           expect (Printexc.to_string Exit) @@ __POS_OF__ {|Stdlib.Exit|} ) ]
 
 let end_tests =
@@ -236,7 +242,28 @@ let end_tests =
             (fun () ->
               T.run ~guard:(Span.s 1)
                 (fun _ -> ok "")
-                (fun _ -> sync (Ivar.read (Ivar.create ()))) ) )
+                (fun _ -> sync (Ivar.read (Ivar.create ()))) ) ;
+          (* The guard error has no frames of its own: its backtrace starts at
+             the raise in run. *)
+          let recording = Printexc.backtrace_status () in
+          Printexc.record_backtrace true ;
+          Fun.protect
+            ~finally:(fun () -> Printexc.record_backtrace recording)
+            (fun () ->
+              match
+                T.race ~seeds:1 ~guard:(Span.s 1)
+                  (fun _ -> ok "")
+                  (fun _ -> sync (Ivar.read (Ivar.create ())))
+              with
+              | () ->
+                  fail "no Race_failed"
+              | exception T.Race_failed {error= T.Guard_expired _; backtrace; _}
+                -> (
+                match Printexc.backtrace_slots backtrace with
+                | Some slots ->
+                    is_true (Printexc.Slot.is_raise slots.(0))
+                | None ->
+                    fail "no slots" ) ) )
     ; test "the default guard is 10 min" (fun () ->
           let wait d =
             T.run (fun _ -> ok "") (fun _ -> Time.sleep Mono d ; "v")
@@ -419,6 +446,15 @@ let race_tests =
               T.race ~replay:4 ~domains:2
                 (fun _ -> ok "")
                 (fun _ -> failwith "x") ) )
+    ; test "100 seeds on 4 domains by default" (fun () ->
+          let runs = ref [] in
+          T.race
+            (fun _ -> ok "")
+            (fun t -> runs := (T.seed t, T.domains t) :: !runs) ;
+          equal
+            (list (pair int int))
+            (List.init 100 (fun i -> (i + 1, 4)))
+            (List.rev !runs) )
     ; test "one seed on one domain" (fun () ->
           let runs = ref 0 in
           T.race ~seeds:1 ~domains:1 (fun _ -> ok "") (fun _ -> incr runs) ;
@@ -511,17 +547,20 @@ let manual_tests =
                 (fun _ -> ok "")
                 (fun _ -> sync (Ivar.read (Ivar.create ()))) ) )
     ; test "the checks of advance" (fun () ->
-          let is_advance_error = function
+          (* Each function gives an error with its own name. *)
+          let error_of name = function
             | Invalid_argument m ->
-                String.starts_with ~prefix:"Caravan_testing.advance" m
+                String.starts_with ~prefix:("Caravan_testing." ^ name ^ ":") m
             | _ ->
                 false
           in
+          let is_advance_error = error_of "advance" in
+          let is_advance_to_error = error_of "advance_to" in
           T.run
             (fun _ -> ok "")
             (fun t ->
               raises_match is_advance_error (fun () -> T.advance t (Span.s 1)) ;
-              raises_match is_advance_error (fun () ->
+              raises_match is_advance_to_error (fun () ->
                   T.advance_to t (Time.now Mono) ) ;
               (* settle works in auto mode. *)
               T.settle t ) ;
@@ -530,7 +569,7 @@ let manual_tests =
             (fun t ->
               let t0 = Time.now Mono in
               T.advance t (Span.s 2) ;
-              raises_match is_advance_error (fun () -> T.advance_to t t0) ;
+              raises_match is_advance_to_error (fun () -> T.advance_to t t0) ;
               raises_match is_advance_error (fun () ->
                   T.advance t (Span.s (-1)) ) ;
               raises_match is_advance_error (fun () ->

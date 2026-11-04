@@ -209,7 +209,14 @@ let seconds p =
    §5.6.7). *)
 let date ~year s =
   let utc (y, month, day) (hour, minute, second) =
-    Time.of_utc {year= y; month; day; hour; minute; second; weekday= 0}
+    Time.of_utc
+      { year= y
+      ; month
+      ; day
+      ; hour
+      ; minute
+      ; second
+      ; weekday= (0 [@mutate off "Time.of_utc ignores the weekday"]) }
     |> Option.map seconds
   in
   match Http_date.decode s with

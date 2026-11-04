@@ -236,6 +236,16 @@ let file_tests =
               File.close f ;
               equal string "he" (body r) ;
               equal int n (fds s) ) )
+    ; test "an error of the open other than a missing file raises" (fun () ->
+          (* EMFILE is not a missing file: the handler does not give 404. *)
+          sim (fun s ->
+              site [("a.txt", "hello")] ;
+              Weft_sim.set_fd_limit s (Some (Weft_sim.open_fds s)) ;
+              raises_match
+                (function
+                  | File.Error (No_resources "EMFILE", _) -> true | _ -> false )
+                (fun () -> S.file (root ^ "/a.txt") (req "/")) ;
+              Weft_sim.set_fd_limit s None ) )
     ; test "a cancel during the open or the fstat closes the fd" (fun () ->
           (* Each file operation takes up to 10 ms. A timeout of 1 to 30 ms
              cancels the open, the fstat, or neither. *)
@@ -413,6 +423,16 @@ let precondition_tests =
                    ; [ius "bad"]
                    ; [("If-Match", e); ius (imf 1_699_999_999.)]
                    ; [("If-Match", "\"x\""); ius (imf 1_700_000_000.)] ] ) ) )
+    ; test "a date before 1970 rounds down to a whole second" (fun () ->
+          sim (fun s ->
+              (* The file is from -86400.5 s, thus its second is -86401 s. The
+                 date of -86401 s is a whole second. *)
+              Weft_sim.set_posix s (Weft.Time.posix_of_unix_s (-86_400.5)) ;
+              site [("a.txt", "hello")] ;
+              Weft_sim.set_posix s t0 ;
+              let ius v = [("If-Unmodified-Since", v)] in
+              equal (list int) [200; 412]
+                (codes [ius (imf (-86_401.)); ius (imf (-86_402.))]) ) )
     ; test "a 412 comes before a 304" (fun () ->
           sim (fun _ ->
               site [("a.txt", "hello")] ;
@@ -519,6 +539,7 @@ let dir_tests =
             ; ("/a.", "a.")
             ; ("/a%20", "a ")
             ; ("/GIT~1", "GIT~1")
+            ; ("/~1", "~1")
             ; ("/%E2%80%8C.git", "\xe2\x80\x8c.git")
             ; ("/a%E2%80%8F", "a\xe2\x80\x8f")
             ; ("/a%E2%80%AA", "a\xe2\x80\xaa")

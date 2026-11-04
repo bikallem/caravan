@@ -190,24 +190,14 @@ let template : string Attrs.key = Attrs.key ~name:"template" ()
 
 (* The match *)
 
-(* The order of [Allow]. *)
-let rank = function
-  | Method.GET ->
-      0
-  | HEAD ->
-      1
-  | POST ->
-      2
-  | PUT ->
-      3
-  | DELETE ->
-      4
-  | OPTIONS ->
-      5
-  | PATCH ->
-      6
-  | _ ->
-      7
+(* The order of [Allow]: these methods in this order, then the other methods in
+   the order of [Method.compare]. *)
+let allow_order = Method.[GET; HEAD; POST; PUT; DELETE; OPTIONS; PATCH]
+
+let rank m =
+  Option.value
+    (List.find_index (Method.equal m) allow_order)
+    ~default:(List.length allow_order)
 
 let compare_allow a b =
   match Int.compare (rank a) (rank b) with 0 -> Method.compare a b | c -> c
@@ -283,9 +273,9 @@ let decoded_segments path =
     | [] ->
         Some (List.rev acc)
     | s :: rest -> (
-        if not (String.exists (function '%' | '#' -> true | _ -> false) s)
-        then if is_dot s then None else go (s :: acc) rest
-        else if String.contains s '#' then None
+        if String.contains s '#' then None
+        else if not (String.contains s '%') then
+          if is_dot s then None else go (s :: acc) rest
         else
           match decode s with
           | Some d when not (is_dot d || String.contains d '\x00') ->
