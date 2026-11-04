@@ -15,9 +15,9 @@
 
 (package
  (name caravan)
- (synopsis "HTTP/1.1 server, client and WebSocket built on weft")
+ (synopsis "A web programming library for OCaml 5, built on weft")
  (description
-  "Caravan is an HTTP/1.1 server, client and WebSocket library for OCaml 5, built on the weft concurrency library. It streams bodies, shuts down gracefully, and gives connections to WebSocket and CONNECT tunnels. The design leaves room for HTTP/2, HTTP/3 and a reverse proxy.")
+  "Caravan is a web programming library for OCaml 5, built on the weft concurrency library. It has an HTTP/1.1 server, client and WebSocket, and a framework layer similar to ASP.NET Core: routing, middleware, sessions, authentication, compression, static files, TLS and a test host that runs in the weft simulator. HTTP/2, HTTP/3 and a reverse proxy are not there yet.")
  (depends
   (ocaml
    (>= 5.5.0))

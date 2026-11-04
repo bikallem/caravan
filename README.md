@@ -1,10 +1,13 @@
 # caravan
 
-An HTTP/1.1 server, client and WebSocket library for OCaml 5, built on
-[weft](https://github.com/bikallem/weft). weft is a concurrency library
-with fibers, structured concurrency, cancellation, CML events and a
-deterministic simulator. The design leaves room for HTTP/2, HTTP/3 and
-a Traefik-like reverse proxy.
+A web programming library for OCaml 5, built on
+[weft](https://github.com/bikallem/weft). caravan has an HTTP/1.1
+server, client and WebSocket, and on top of them a framework layer
+similar to ASP.NET Core: routing, middleware, sessions, authentication,
+compression, static files and TLS. weft is a concurrency library with
+fibers, structured concurrency, cancellation, CML events and a
+deterministic simulator: the test host of caravan runs a whole
+application in that simulator.
 
 ```ocaml
 let () =
@@ -18,24 +21,44 @@ world of weft for the OS of the build: Linux, macOS, FreeBSD or Windows.
 On another system, `Weft_os.run` raises `Failure`. The build compiles
 this example (examples/dune).
 
-> **Status:** the HTTP/1.1 server, the client and WebSocket are complete
-> but young, and their API can change. There is no proxy yet.
+> **Status:** the server, the client, WebSocket and the framework
+> layer are complete but young, and their API can change. HTTP/2,
+> HTTP/3 and a reverse proxy are not there yet.
+
+## Libraries
+
+Each part is a library. Use only the libraries that you need: the
+optional dependencies are necessary only for the library that uses
+them.
+
+| Library | Content | Optional dependencies |
+|---|---|---|
+| `caravan` | The HTTP/1.1 server, requests, responses, handlers, middleware, cookies, queries, forms and file uploads | |
+| `caravan.client` | The HTTP/1.1 client | |
+| `caravan.websocket` | WebSocket for the server (RFC 6455) | |
+| `caravan.router` | Routes, path parameters, 405 with `Allow`, groups | |
+| `caravan.middleware` | Forwarded fields, request IDs, access log, CORS, error page, HTTPS redirect, HSTS, cross-origin protection, rate limit, concurrency limit, health checks, cache headers | |
+| `caravan.session` | Sessions, signed cookies, CSRF tokens | digestif, eqaf, mirage-crypto-rng |
+| `caravan.auth` | JWT, bearer and cookie schemes, users, policies | the dependencies of `caravan.session`, and mirage-crypto-pk, mirage-crypto-ec, x509, yojson, zarith |
+| `caravan.compress` | gzip and deflate responses, decompression of request bodies | decompress |
+| `caravan.static` | Static files with ETag, conditional requests and ranges | |
+| `caravan.tls` | The TLS server, with ALPN | tls, x509, domain-name, mirage-crypto-rng |
+| `caravan.testing` | A test host: it runs a handler stack and the client in the weft simulator, with no sockets | |
 
 caravan and weft are not on opam. Get them from their repositories, or
-use the package `caravan` of the Nix flake. Then add the libraries to
-the dune stanza of your executable:
+use the package `caravan` of the Nix flake, which has all the optional
+dependencies. Then add the libraries to the dune stanza of your
+executable:
 
 ```dune
 (executable
  (name main)
- (libraries caravan weft weft.os))
+ (libraries caravan caravan.router caravan.middleware weft weft.os))
 ```
-
-Add `caravan.client` for the client and `caravan.websocket` for
-WebSocket.
 
 ## Contents
 
+- [Libraries](#libraries)
 - [What the server does](#what-the-server-does)
 - [Routing](#routing)
 - [Middleware](#middleware)

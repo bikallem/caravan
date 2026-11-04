@@ -141,7 +141,7 @@
             ];
             doCheck = false;
             meta = {
-              description = "HTTP/1.1 server, client and WebSocket for OCaml 5, built on weft";
+              description = "A web programming library for OCaml 5, built on weft";
               homepage = "https://github.com/bikallem/caravan";
               license = pkgs.lib.licenses.mpl20;
             };
