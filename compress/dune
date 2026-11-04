@@ -1,0 +1,12 @@
+; The compression of responses. Optional: dune builds it only if decompress is
+; installed.
+
+(library
+ (name caravan_compress)
+ (public_name caravan.compress)
+ (optional)
+ (libraries caravan decompress.de decompress.gz decompress.zl)
+ (instrumentation
+  (backend ppx_windtrap.mutate))
+ (instrumentation
+  (backend ppx_windtrap.coverage)))

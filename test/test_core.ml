@@ -3176,14 +3176,14 @@ let accept_error_tests =
 
 (* The source rules. The libraries caravan, caravan.client, caravan.websocket,
    caravan.router, caravan.middleware, caravan.static, caravan.tls,
-   caravan.session and caravan.auth must use only weft for the time, the I/O and
-   the domains, so that they run in each world of weft. The scan reads the .ml
-   files of src, client, websocket, router, middleware, static, tls, session and
-   auth as text. It also reads caravan.testing (testing), which can also use the
-   simulator of weft (Weft_sim). The guard of test/nounix links each module of
-   the nine libraries, and forbids unix, threads and the worlds. The scan also
-   forbids the parts of the stdlib that the guard cannot find, for example
-   Sys.time and Domain. *)
+   caravan.session, caravan.auth and caravan.compress must use only weft for the
+   time, the I/O and the domains, so that they run in each world of weft. The
+   scan reads the .ml files of src, client, websocket, router, middleware,
+   static, tls, session, auth and compress as text. It also reads
+   caravan.testing (testing), which can also use the simulator of weft
+   (Weft_sim). The guard of test/nounix links each module of the ten libraries,
+   and forbids unix, threads and the worlds. The scan also forbids the parts of
+   the stdlib that the guard cannot find, for example Sys.time and Domain. *)
 
 (* The texts that the libraries must not contain. The first text is the name of
    the old effects library, in two parts, so that a search for that name in src,
@@ -3426,7 +3426,8 @@ let source_tests =
           let all =
             files "src" @ files "client" @ files "websocket" @ files "router"
             @ files "middleware" @ files "static" @ files "tls"
-            @ files "session" @ files "auth" @ files "testing"
+            @ files "session" @ files "auth" @ files "compress"
+            @ files "testing"
           in
           List.iter
             (fun file ->
@@ -3443,6 +3444,7 @@ let source_tests =
             ; "session/caravan_session.ml"
             ; "auth/caravan_auth.ml"
             ; "auth/json.ml"
+            ; "compress/caravan_compress.ml"
             ; "testing/caravan_testing.ml" ] ;
           let found =
             List.concat_map

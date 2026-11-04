@@ -63,7 +63,8 @@
   (glob_files ../static/*.ml)
   (glob_files ../tls/*.ml)
   (glob_files ../session/*.ml)
-  (glob_files ../auth/*.ml)))
+  (glob_files ../auth/*.ml)
+  (glob_files ../compress/*.ml)))
 
 ; The hosts of the numeric tests of Resolver, shared by test_client and
 ; test_numeric_unix.
@@ -178,3 +179,19 @@
   mirage-crypto-rng
   x509
   zarith))
+
+(test
+ (name test_compress)
+ (modules test_compress)
+ (libraries
+  caravan
+  caravan.compress
+  caravan.static
+  caravan.testing
+  sim_support
+  weft
+  weft.sim
+  windtrap
+  decompress.de
+  decompress.gz
+  decompress.zl))
