@@ -139,3 +139,16 @@
     -f
     %{dep:section.awk}
     %{dep:../README.md}))))
+
+; The example of the "TLS" section of README.md, as readme_tls.ml.
+
+(executable
+ (name readme_tls)
+ (modules readme_tls)
+ (libraries caravan caravan.tls tls x509 mirage-crypto-rng.unix weft weft.os))
+
+(rule
+ (action
+  (with-stdout-to
+   readme_tls.ml
+   (run awk -v "section=TLS" -f %{dep:section.awk} %{dep:../README.md}))))

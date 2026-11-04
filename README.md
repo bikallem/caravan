@@ -84,8 +84,8 @@ let handler = Handler.compose [auth] hello
 `examples/middleware.ml` has a full example.
 
 The libraries `caravan`, `caravan.client`, `caravan.websocket`,
-`caravan.router`, `caravan.middleware` and `caravan.static` depend on no
-world of weft.
+`caravan.router`, `caravan.middleware`, `caravan.static` and
+`caravan.tls` depend on no world of weft.
 They run in each world, for example the OS world
 (`Weft.run (module Weft_os)`) and the simulator of weft
 (`Weft_sim.run`). `caravan.testing` runs only in the simulator.
@@ -339,6 +339,46 @@ let app handler =
 - With `caravan.router`, `Caravan_static.dir ~root (Caravan_router.rest req)
   req` serves a route `/static/**`. `Caravan_static.file` serves one
   file.
+
+## TLS
+
+The optional `caravan.tls` library serves HTTPS with
+[ocaml-tls](https://github.com/mirleft/ocaml-tls), a TLS library in
+pure OCaml. Its engine does the handshake of each connection, then
+gives the TLS flow to the HTTP/1.1 engine:
+
+```ocaml
+let read_file path = In_channel.with_open_bin path In_channel.input_all
+
+let ok = function Ok v -> v | Error (`Msg m) -> failwith m
+
+let () =
+  (* The generator of the OS: safe on many domains. *)
+  Mirage_crypto_rng_unix.use_default () ;
+  let certs = ok (X509.Certificate.decode_pem_multiple (read_file "cert.pem")) in
+  let key = ok (X509.Private_key.decode_pem (read_file "key.pem")) in
+  let tls = ok (Tls.Config.server ~certificates:(`Single (certs, key)) ()) in
+  Caravan.Server.run
+    ~engine:(Caravan_tls.engine tls Caravan.Server.http1)
+    (module Weft_os)
+    (fun req -> Caravan.Response.string (Caravan.Request.scheme req))
+```
+
+- A request has the scheme `https`, and `Conn_info.alpn` tells the ALPN
+  protocol. The ALPN list of the configuration can have only
+  `http/1.1`, and its lowest version must be TLS 1.2 or later.
+- The handshake has the deadline `header_timeout`, and a stop of the
+  server ends it. A handshake that fails is not an error of the server:
+  the server reports nothing.
+- `Caravan_tls.server` and `Caravan_tls.client` do a handshake on any
+  `Caravan.Flow.t`, for example for a test or a proxy. The client checks
+  the `peer_name` of its `Tls.Config`: give one for each server on the
+  Internet.
+- A handshake can read at most 64 KiB. A session permits 64 small
+  records with no plaintext (for example a KeyUpdate), and one more for
+  each 16 KiB of plaintext.
+- A client that ends the TCP connection with no `close_notify` gives
+  `Flow.Closed` to a read: it can be a truncation.
 
 ## WebSocket
 
