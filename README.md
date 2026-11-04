@@ -39,7 +39,7 @@ them.
 | `caravan.router` | Routes, path parameters, 405 with `Allow`, groups | |
 | `caravan.middleware` | Forwarded fields, request IDs, access log, CORS, error page, HTTPS redirect, HSTS, cross-origin protection, rate limit, concurrency limit, health checks, cache headers | |
 | `caravan.session` | Sessions, signed cookies, CSRF tokens | digestif, eqaf, mirage-crypto-rng |
-| `caravan.auth` | JWT, bearer and cookie schemes, users, policies, OpenID Connect | the dependencies of `caravan.session`, and mirage-crypto-pk, mirage-crypto-ec, x509, yojson, zarith |
+| `caravan.auth` | JWT, bearer and cookie schemes, users, policies, OpenID Connect, codes by email | the dependencies of `caravan.session`, and mirage-crypto-pk, mirage-crypto-ec, x509, yojson, zarith |
 | `caravan.compress` | gzip and deflate responses, decompression of request bodies | decompress |
 | `caravan.static` | Static files with ETag, conditional requests and ranges | |
 | `caravan.tls` | The TLS server, with ALPN, and HTTPS for the client | tls, x509, domain-name, ipaddr, mirage-crypto-rng |
@@ -69,6 +69,7 @@ executable:
 - [Authentication](#authentication)
 - [Users and policies](#users-and-policies)
 - [OpenID Connect](#openid-connect)
+- [Codes by email](#codes-by-email)
 - [Compression](#compression)
 - [File uploads](#file-uploads)
 - [Static files](#static-files)
@@ -630,6 +631,44 @@ let routes client =
   with the nonce of the login.
 - Give each client its own redirect URI. The session cookie must be
   `SameSite=Lax` (the default) or `None`.
+
+## Codes by email
+
+`Caravan_auth.Code` signs a user in with a one-time code that your
+application sends to an address. caravan sends no mail: use SMTP, or the
+HTTP API of a mail service through `Caravan_client`.
+
+```ocaml
+let codes = Caravan_auth.Code.make ()
+
+(* POST /email *)
+let email req address =
+  ( match Caravan_auth.Code.start codes req ~address with
+  | Ok code -> send_in_background address code
+  | Error _wait -> () ) ;
+  page "We sent a code if the address is correct."
+
+(* POST /code *)
+let code req text =
+  match Caravan_auth.Code.check codes req text with
+  | Ok address -> Caravan_auth.sign_in req (find_or_make_user address) ; redirect "/"
+  | Error _ -> page "The code is not correct."
+```
+
+- A code has 8 digits and lives 10 minutes. The session keeps a salted
+  hash of it, with 5 attempts. A code works one time, and only in the
+  browser that asked for it.
+- `sends` limits the codes for each address (3, then one each 10
+  minutes), and `checks` limits the checks for each address over all
+  sessions (10, then one each hour). `check` takes a token before the
+  compare. Thus an attacker without the mailbox has about 0.009 % a
+  year for one address.
+- The limits are functions of a key: give your own, for example of a
+  store that all your processes share
+  (`Caravan_middleware.Rate_limit.Limiter` is the default).
+- Give the same response for known and unknown addresses, put a rate
+  limit on the two routes, and give a second way to sign in: an
+  attacker can keep the code sign-in of an address closed.
 
 ## Compression
 
