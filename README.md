@@ -412,6 +412,91 @@ let user req =
 - The JSON must be strict RFC 8259: no comments, no `NaN`, no
   duplicate member names.
 
+## Users and policies
+
+`Caravan_auth.middleware` finds the user of each request with a list of
+schemes, and `Caravan_auth.require` protects the routes:
+
+```ocaml
+let () = Mirage_crypto_rng_unix.use_default ()
+
+let session_key =
+  Caravan_session.Key.of_base64url (Sys.getenv "SESSION_KEY")
+
+let jwks =
+  match Caravan_auth.Jwt.Key.of_jwks (Sys.getenv "JWKS") with
+  | Ok keys -> keys
+  | Error e -> failwith e
+
+let bearer =
+  Caravan_auth.Scheme.bearer
+    ~issuer:(One_of ["https://id.example"])
+    ~audience:(One_of ["api://orders"])
+    ~keys:(fun () -> jwks)
+    ()
+
+let session = Caravan_auth.Scheme.session ~login:"/login" ()
+
+let routes =
+  Caravan_router.(
+    handler
+      [ get "/" (fun _ -> Caravan.Response.string "home")
+      ; post "/login" (fun req ->
+            (* Check the password of the form here. *)
+            Caravan_auth.sign_in req
+              (Caravan_auth.User.make ~roles:["admin"] "ada") ;
+            Caravan.Response.string "welcome" )
+      ; post "/logout" (fun req ->
+            Caravan_auth.sign_out req ;
+            Caravan.Response.string "bye" )
+      ; group
+          ~middleware:
+            [Caravan_auth.require ~policy:(Caravan_auth.role "admin") ()]
+          "/admin"
+          [get "" (fun _ -> Caravan.Response.string "admin")] ] )
+
+let app =
+  Caravan.Handler.compose
+    [ Caravan_middleware.Cross_origin.middleware ()
+    ; Caravan_session.middleware ~keys:[session_key]
+        ~store:(Caravan_session.memory_store ())
+        ()
+    ; Caravan_auth.middleware ~schemes:[session; bearer] ()
+    ; Caravan_session.Csrf.middleware
+        ~exempt:(fun req ->
+          Caravan.Request.path_only req = "/login"
+          ||
+          match Caravan_auth.user req with
+          | Some u -> Caravan_auth.User.scheme u = "Bearer"
+          | None -> false )
+        () ]
+    routes
+```
+
+- A scheme gives `Authenticated`, `No_credentials` (the next scheme)
+  or `Failed` (no user, and no other scheme). The schemes run at the
+  first call of `user`, `failure`, `challenge` or `require`: a public
+  `GET` costs no check. The user is that of the session at the start of
+  the request: a `sign_in` in the handler shows in the next request.
+  The middleware never refuses a request.
+- `require` gives the challenge of the scheme to a request with no
+  user, and 403 to a user that the policy refuses (`authenticated`,
+  `role`, `scope`, `all`, `any`). The first scheme gives the
+  challenge: here the session, with a 303 to the login page for the
+  navigation of a browser and a 401 for the other requests. On the
+  routes of an API, use `require ~challenge:"Bearer"`. A response of
+  the protected handler with no `Cache-Control` gets
+  `Cache-Control: private`.
+- `sign_in` gives the session a new ID. A second `sign_in` ends the
+  old session and its data. `User.scheme` is the scheme that
+  authenticated the user for this request: the bearer users are exempt
+  from the CSRF tokens, because a browser never sends a bearer token by
+  itself.
+- The login form is exempt from the CSRF tokens: an anonymous user has
+  no session yet. `Cross_origin` protects it, but a browser older than
+  2020 can send it from another site (a login CSRF).
+- After a login, redirect only to `Caravan_auth.return_path`.
+
 ## File uploads
 
 `Request.multipart` streams the parts of a `multipart/form-data` body,

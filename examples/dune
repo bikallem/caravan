@@ -201,3 +201,29 @@
     -f
     %{dep:section.awk}
     %{dep:../README.md}))))
+
+; The example of the "Users and policies" section of README.md, as
+; readme_users.ml.
+
+(executable
+ (name readme_users)
+ (modules readme_users)
+ (libraries
+  caravan
+  caravan.auth
+  caravan.session
+  caravan.router
+  caravan.middleware
+  mirage-crypto-rng.unix))
+
+(rule
+ (action
+  (with-stdout-to
+   readme_users.ml
+   (run
+    awk
+    -v
+    "section=Users and policies"
+    -f
+    %{dep:section.awk}
+    %{dep:../README.md}))))
