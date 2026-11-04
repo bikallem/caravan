@@ -76,8 +76,8 @@ val middleware :
       stream gets its compressed bytes in large blocks, never at each
       {!Caravan.Body.Writer.flush}. Thus streams are not compressed by default.
     - The handler must write its body from one fiber at a time: the encoder has
-      one state. A middleware after this one must write the body or close it:
-      the encoder slot is free only then.
+      one state. A middleware before this one (outside it) must write the body
+      or close it: the encoder slot is free only then.
     - The cost: about 770 KiB of memory and 0.1 to 0.2 ms for each compressed
       response, and about 17 to 35 MiB/s of input on one core at level 4. The
       encoder yields after each 4 KiB of input, thus the other fibers of the
