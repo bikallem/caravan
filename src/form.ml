@@ -11,14 +11,17 @@ let hex = function
   | _ ->
       -1
 
+(* [plain s i j] is [true] if [s.[i..j-1]] has no [+] and no [%]: its decode is
+   the same text. *)
+let rec plain s i j =
+  i = j || match s.[i] with '+' | '%' -> false | _ -> plain s (i + 1) j
+
 (* The decode of WHATWG of [s.[i..j-1]]. It is different from the decode of the
    router on purpose: here, [+] is a space and an incorrect [%] stays as it is.
    In a path, [+] is a [+] and the router refuses an incorrect [%]. *)
+
 let decode s i j =
-  let rec plain k =
-    k = j || match s.[k] with '+' | '%' -> false | _ -> plain (k + 1)
-  in
-  if plain i then String.sub s i (j - i)
+  if plain s i j then String.sub s i (j - i)
   else
     let b =
       Bytes.create
@@ -66,6 +69,39 @@ let parse s =
   List.rev (fold pair s [])
 
 let count s = fold (fun _ _ n -> n + 1) s 0
+
+(* [same s i name] is [true] if [s] has [name] at [i]. *)
+let same s i name =
+  let rec go k =
+    k = String.length name || (s.[i + k] = name.[k] && go (k + 1))
+  in
+  go 0
+
+let find_text name s =
+  let n = String.length s in
+  (* The value of the pair [s.[i..j-1]], if its name is [name]. A plain name is
+     compared in place, with no copy. *)
+  let pair i j =
+    let rec eq k = if k = j || s.[k] = '=' then k else eq (k + 1) in
+    let e = eq i in
+    let found =
+      if plain s i e then e - i = String.length name && same s i name
+      else String.equal (decode s i e) name
+    in
+    if not found then None
+    else if e = j then Some ""
+    else Some (decode s (e + 1) j)
+  in
+  let rec go start k =
+    if k = n || s.[k] = '&' then
+      match if k > start then pair start k else None with
+      | Some _ as v ->
+          v
+      | None ->
+          if k = n then None else go (k + 1) (k + 1)
+    else go start (k + 1)
+  in
+  go 0 0
 
 let digits = "0123456789ABCDEF"
 

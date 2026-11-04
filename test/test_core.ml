@@ -1511,7 +1511,15 @@ let form_tests =
           is_true (Form.mem "b" l) ;
           equal (option string) None (Form.find "A" l) ;
           equal (list string) [] (Form.find_all "A" l) ;
-          is_false (Form.mem "A" l) )
+          is_false (Form.mem "A" l) ;
+          let s = "a=1&&b&a+b=%2&a=2" in
+          equal (option string) (Some "1") (Form.find_text "a" s) ;
+          equal (option string) (Some "") (Form.find_text "b" s) ;
+          equal (option string) (Some "%2") (Form.find_text "a b" s) ;
+          equal (option string) None (Form.find_text "A" s) ;
+          equal (option string) None (Form.find_text "a" "") ;
+          equal (option string) (Some "x") (Form.find_text "ab" "a=1&ab=x") ;
+          equal (option string) None (Form.find_text "ab" "a=1&abc=x") )
     ; test "error_status and pp_error" (fun () ->
           List.iter
             (fun (e, code, name) ->
@@ -1536,7 +1544,17 @@ let form_props =
         (fun l -> equal pairs l (Form.parse (Form.encode l)))
     ; prop "count is the length of parse"
         (Gen.string_of ~size:(Gen.int_range 0 12) byte)
-        (fun s -> equal int (List.length (Form.parse s)) (Form.count s)) ]
+        (fun s -> equal int (List.length (Form.parse s)) (Form.count s))
+    ; prop "find_text is find of parse"
+        (Gen.pair
+           (Gen.of_list ~pp:Format.pp_print_string
+              [""; "a"; "b"; "ab"; "a b"; " "; "aa"; "%"; "%2"; "+"; "a+b"] )
+           (Gen.string_of ~size:(Gen.int_range 0 14)
+              (Gen.of_list ['a'; 'b'; '='; '&'; '+'; '%'; '2'; '0'; '5']) ) )
+        (fun (name, s) ->
+          equal ~msg:s (option string)
+            (Form.find name (Form.parse s))
+            (Form.find_text name s) ) ]
 
 let request_form_tests =
   group "Request forms"
@@ -1569,6 +1587,14 @@ let request_form_tests =
             ; ([], Error Form.Unsupported_media_type)
             ; ( [Form.media_type; Form.media_type]
               , Error Form.Unsupported_media_type ) ] )
+    ; test "the default limits of form" (fun () ->
+          let form text = Request.form (form_request (Body.of_string text)) in
+          let size n = "a=" ^ String.make (n - 2) 'x' in
+          is_true ~msg:"1 MiB" (Result.is_ok (form (size 1_048_576))) ;
+          equal form_result (Error Form.Too_large) (form (size 1_048_577)) ;
+          let pairs n = String.concat "&" (List.init n (fun _ -> "a")) in
+          is_true ~msg:"1000 pairs" (Result.is_ok (form (pairs 1000))) ;
+          equal form_result (Error Form.Too_many_fields) (form (pairs 1001)) )
     ; test "form with no Content-Type does not read the body" (fun () ->
           equal form_result (Error Form.Unsupported_media_type)
             (Request.form (form_request ~types:[] (raising Exit))) ;

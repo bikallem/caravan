@@ -53,6 +53,11 @@ val find_all : string -> t -> string list
 val mem : string -> t -> bool
 (** [mem name l] is [true] iff [l] has a pair with the name [name]. *)
 
+val find_text : string -> string -> string option
+(** [find_text name s] is [find name (parse s)], with no list: the search stops
+    at the first pair with the name [name]. It decodes only the names with [+]
+    or [%], and the value of the pair that it finds. *)
+
 (** {1:body Form bodies} *)
 
 val media_type : string
