@@ -14,6 +14,7 @@
   caravan
   caravan.client
   caravan.websocket
+  caravan.static
   server_support
   weft
   weft.linux

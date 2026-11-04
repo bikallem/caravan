@@ -3039,14 +3039,14 @@ let accept_error_tests =
     ]
 
 (* The source rules. The libraries caravan, caravan.client, caravan.websocket,
-   caravan.router and caravan.middleware must use only weft for the time, the
-   I/O and the domains, so that they run in each world of weft. The scan reads
-   the .ml files of src, client, websocket, router and middleware as text. It
-   also reads caravan.testing (testing), which can also use the simulator of
-   weft (Weft_sim). The guard of test/nounix links each module of the five
-   libraries, and forbids unix, threads and the worlds. The scan also forbids
-   the parts of the stdlib that the guard cannot find, for example Sys.time and
-   Domain. *)
+   caravan.router, caravan.middleware and caravan.static must use only weft for
+   the time, the I/O and the domains, so that they run in each world of weft.
+   The scan reads the .ml files of src, client, websocket, router, middleware
+   and static as text. It also reads caravan.testing (testing), which can also
+   use the simulator of weft (Weft_sim). The guard of test/nounix links each
+   module of the six libraries, and forbids unix, threads and the worlds. The
+   scan also forbids the parts of the stdlib that the guard cannot find, for
+   example Sys.time and Domain. *)
 
 (* The texts that the libraries must not contain. The first text is the name of
    the old effects library, in two parts, so that a search for that name in src,
@@ -3288,7 +3288,7 @@ let source_tests =
           in
           let all =
             files "src" @ files "client" @ files "websocket" @ files "router"
-            @ files "middleware" @ files "testing"
+            @ files "middleware" @ files "static" @ files "testing"
           in
           List.iter
             (fun file ->
@@ -3300,6 +3300,7 @@ let source_tests =
             ; "websocket/connection.ml"
             ; "router/caravan_router.ml"
             ; "middleware/caravan_middleware.ml"
+            ; "static/caravan_static.ml"
             ; "testing/caravan_testing.ml" ] ;
           let found =
             List.concat_map

@@ -644,6 +644,47 @@ let websocket_and_client_smoke ~domains () =
 
 (* The suite *)
 
+(* 13. Static files on the thread pool *)
+
+(* [static_files] writes a directory with Unix before the world, then serves it
+   with caravan.static: the reads go through the pool of weft. A file with mode
+   000 gives 404, and its body never leaves, unless the process is root (root
+   reads each file). *)
+let static_files ~domains () =
+  let dir = Filename.temp_dir "caravan_static" "" in
+  let data = String.init (100 * 1024) (fun i -> Char.chr (i mod 251)) in
+  let write name text =
+    Out_channel.with_open_bin (Filename.concat dir name) (fun oc ->
+        Out_channel.output_string oc text )
+  in
+  write "a.bin" data ;
+  write "secret" "secret" ;
+  Unix.chmod (Filename.concat dir "secret") 0 ;
+  Fun.protect ~finally:(fun () ->
+      Sys.remove (Filename.concat dir "a.bin") ;
+      Sys.remove (Filename.concat dir "secret") ;
+      Sys.rmdir dir )
+  @@ fun () ->
+  in_world ~domains
+  @@ fun () ->
+  let get segments =
+    let r = Caravan_static.dir ~root:dir segments (Request.make GET "/") in
+    match Response.kind r with
+    | Response.Body b ->
+        (Status.code (Response.status r), Body.to_string b)
+    | Response.Upgrade _ ->
+        fail "an upgrade"
+  in
+  let code, body = get ["a.bin"] in
+  equal int 200 code ;
+  is_true ~msg:"the bytes of a.bin" (String.equal data body) ;
+  equal int 404 (fst (get ["a.bin"; ""])) ;
+  equal int 404 (fst (get ["none"])) ;
+  if Unix.geteuid () <> 0 then equal int 404 (fst (get ["secret"])) ;
+  (* A special file is not a regular file. *)
+  let r = Caravan_static.dir ~root:"/dev" ["null"] (Request.make GET "/") in
+  equal int 404 (Status.code (Response.status r))
+
 let tests =
   [ ( "1. EADDRINUSE: a start on the port of a running server gives In_use"
     , in_use )
@@ -669,7 +710,8 @@ let tests =
   ; ( "11. smoke: keep-alive, a 1 MiB echo, a CONNECT tunnel and 50 clients"
     , http_smoke )
   ; ( "12. smoke: a WebSocket echo and close, a client GET and POST"
-    , websocket_and_client_smoke ) ]
+    , websocket_and_client_smoke )
+  ; ("13. static files on the thread pool, and EACCES", static_files) ]
 
 let on ~domains name =
   group name (List.map (fun (n, t) -> test n (t ~domains)) tests)

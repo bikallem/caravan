@@ -1,0 +1,10 @@
+; Static files: a handler and a middleware that serve the files of a directory.
+
+(library
+ (name caravan_static)
+ (public_name caravan.static)
+ (libraries caravan weft http-date)
+ (instrumentation
+  (backend ppx_windtrap.mutate))
+ (instrumentation
+  (backend ppx_windtrap.coverage)))
