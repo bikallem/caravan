@@ -9,6 +9,8 @@ type t =
 let make ~id ~peer ~local ?(scheme = `Http) ?alpn ?(stopping = Weft.never) () =
   {id; peer; local; scheme; alpn; stopping}
 
+let with_tls ?alpn c = {c with scheme= `Https; alpn}
+
 let id c = c.id
 
 let peer c = c.peer

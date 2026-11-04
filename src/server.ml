@@ -182,7 +182,9 @@ let server_body config engine handler (module L : LISTENER) l ~slots ~stop
       with Fiber.Scope_closed -> () ) ;
   Option.iter (fun (e, bt) -> Printexc.raise_with_backtrace e bt) !failure
 
-let start_with ?(config = Config.default) ?(engine = H1_server.serve) sw
+let http1 = H1_server.serve
+
+let start_with ?(config = Config.default) ?(engine = http1) sw
     (module L : LISTENER) l handler =
   match
     let addr = L.addr l in

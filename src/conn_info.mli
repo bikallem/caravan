@@ -19,6 +19,10 @@ val make :
     [alpn] is the protocol that TLS selected, if one. [stopping] is {!stopping},
     [Weft.never] by default. *)
 
+val with_tls : ?alpn:string -> t -> t
+(** [with_tls ~alpn c] is [c] with the scheme [`Https] and the ALPN protocol
+    [alpn]. A TLS engine gives it to the engine that it wraps. *)
+
 val id : t -> int
 (** [id c] is the number of [c] among the connections of the server. *)
 

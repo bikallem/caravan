@@ -11,6 +11,11 @@
 (** The type for running servers. *)
 type t
 
+val http1 : Engine.t
+(** [http1] is the HTTP/1.1 engine, the default engine of {!start}. An engine
+    that wraps another engine, for example the TLS engine of [caravan.tls], can
+    wrap it. *)
+
 val start :
   ?config:Config.t -> ?engine:Engine.t -> Weft.Fiber.scope -> Handler.t -> t
 (** [start ~config ~engine sw handler] listens on [config.addr] with
