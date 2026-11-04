@@ -44,7 +44,8 @@
   (eqaf :with-test)
   (mirage-crypto-pk :with-test)
   (yojson :with-test)
-  (zarith :with-test))
+  (zarith :with-test)
+  (decompress :with-test))
  (depopts
   ; caravan.tls
   (tls
@@ -59,7 +60,9 @@
   mirage-crypto-pk
   mirage-crypto-ec
   yojson
-  zarith)
+  zarith
+  ; caravan.compress
+  decompress)
  (conflicts
   (tls
    (< 2.1))))

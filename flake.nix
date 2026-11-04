@@ -114,6 +114,7 @@
                 ./tls
                 ./session
                 ./auth
+                ./compress
                 ./testing
                 ./LICENSE
                 ./README.md
@@ -135,6 +136,8 @@
               ocamlPackages.mirage-crypto-ec
               ocamlPackages.yojson
               ocamlPackages.zarith
+              # caravan.compress, an optional library.
+              ocamlPackages.decompress
             ];
             doCheck = false;
             meta = {
@@ -179,6 +182,8 @@
               mirage-crypto-pk
               yojson
               zarith
+              # caravan.compress (optional)
+              decompress
 
               # Test dependencies (windtrap here is the flake input, so use
               # ocamlPackages.windtrap)

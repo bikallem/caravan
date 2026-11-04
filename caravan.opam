@@ -25,6 +25,7 @@ depends: [
   "mirage-crypto-pk" {with-test}
   "yojson" {with-test}
   "zarith" {with-test}
+  "decompress" {with-test}
 ]
 depopts: [
   "tls" {>= "2.1"}
@@ -37,6 +38,7 @@ depopts: [
   "mirage-crypto-ec"
   "yojson"
   "zarith"
+  "decompress"
 ]
 conflicts: [
   "tls" {< "2.1"}
