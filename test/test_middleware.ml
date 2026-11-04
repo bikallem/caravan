@@ -175,6 +175,9 @@ let forwarded_tests =
             ; ("2001:DB8:0:0:0:0:0:1", "Ip 2001:db8::1 http -")
             ; ("2001:db8:0:0:1:0:0:1", "Ip 2001:db8::1:0:0:1 http -")
             ; ("1:0:2:3:4:5:6:7", "Ip 1:0:2:3:4:5:6:7 http -")
+            ; ("0:1:2:3:4:5:6:7", "Ip 0:1:2:3:4:5:6:7 http -")
+            ; ("[", "Unknown http -")
+            ; ("1.2.3.99999999999999999999", "Unknown http -")
             ; ("1:2:3:4:5:6:7:8", "Ip 1:2:3:4:5:6:7:8 http -")
             ; ("1:2:3:4:5:6:7:8:9", "Unknown http -")
             ; ("1:2:3:4:5:6:7::8", "Unknown http -")
@@ -514,14 +517,14 @@ let access_log_tests =
                     (Request.make
                        ~body:
                          (Body.of_writer (fun w ->
-                              Body.Writer.write_string w "ab" ;
+                              Body.Writer.write_string w "a" ;
                               Body.Writer.flush w ;
                               Weft.Time.sleep Mono (Weft.Span.ms 10) ;
-                              Body.Writer.write_string w "cdefgh" ) )
+                              Body.Writer.write_string w "bcdefgh" ) )
                        Method.POST "/" ) ) ) ;
           is_true
             ~msg:(String.concat ";" (shown l))
-            (failed_with "200 2 Failed" (shown l)) )
+            (failed_with "200 1 Failed" (shown l)) )
     ; test "a response that streams a request body that is cut short" (fun () ->
           let l = logger () in
           let req =
@@ -1072,31 +1075,31 @@ let cors_fields r =
 let made (_ : Handler.middleware) = ()
 
 let cors_tests =
-  let any = C.middleware ~origins:C.Any () in
-  let only = C.middleware ~origins:(C.Only [a]) () in
+  let any () = C.middleware ~origins:C.Any () in
+  let only () = C.middleware ~origins:(C.Only [a]) () in
   group "Cors"
     [ test "a request with no Origin" (fun () ->
           (* With Any, a cache can give the response to a CORS fetch: it has the
              constant fields, and no Vary. *)
-          let r, ran = cors any (reply "hi") in
+          let r, ran = cors (any ()) (reply "hi") in
           is_true ran ;
           equal
             (list (pair string string))
             [("Access-Control-Allow-Origin", "*")]
             (cors_fields r) ;
           equal (option string) None (field "vary" r) ;
-          let r, _ = cors only (reply "hi") in
+          let r, _ = cors (only ()) (reply "hi") in
           equal (list (pair string string)) [] (cors_fields r) ;
           equal (option string) (Some "Origin") (field "vary" r) )
     ; test "Any gives *" (fun () ->
-          let r, _ = cors ~fields:[origin a] any (reply "hi") in
+          let r, _ = cors ~fields:[origin a] (any ()) (reply "hi") in
           equal (option string) (Some "*")
             (field "access-control-allow-origin" r) ;
           equal (option string) None (field "vary" r) )
     ; test "Only compares whole origins" (fun () ->
           let allowed o =
             field "access-control-allow-origin"
-              (fst (cors ~fields:[origin o] only (reply "")))
+              (fst (cors ~fields:[origin o] (only ()) (reply "")))
           in
           equal (option string) (Some "https://A.example")
             (allowed "https://A.example") ;
@@ -1135,13 +1138,28 @@ let cors_tests =
               ~headers:(Headers.of_list [("Access-Control-Allow-Origin", "*")])
               ""
           in
-          let r, _ = cors ~fields:[origin a] only h in
+          let r, _ = cors ~fields:[origin a] (only ()) h in
           equal
             (list (pair string string))
             [("Access-Control-Allow-Origin", a)]
             (cors_fields r) ;
-          let r, _ = cors ~fields:[origin "https://evil.example"] only h in
-          equal (list (pair string string)) [] (cors_fields r) )
+          let r, _ = cors ~fields:[origin "https://evil.example"] (only ()) h in
+          equal (list (pair string string)) [] (cors_fields r) ;
+          (* Only the prefix access-control- marks a CORS field. *)
+          let kept =
+            [("Bccess-Control-Allow-Origin", "*"); ("Access-Control", "x")]
+          in
+          let r, _ =
+            cors
+              ~fields:[origin "https://evil.example"]
+              (only ())
+              (fun _ -> Response.string ~headers:(Headers.of_list kept) "")
+          in
+          List.iter
+            (fun (n, v) ->
+              equal ~msg:n (option string) (Some v)
+                (field (String.lowercase_ascii n) r) )
+            kept )
     ; test "a preflight" (fun () ->
           let mw =
             C.middleware ~origins:(C.Only [a])
@@ -1234,7 +1252,7 @@ let cors_tests =
           equal status Status.ok (Response.status r) )
     ; test "an OPTIONS that is not a preflight" (fun () ->
           let r, ran =
-            cors ~meth:Method.OPTIONS ~fields:[origin a] only (reply "o")
+            cors ~meth:Method.OPTIONS ~fields:[origin a] (only ()) (reply "o")
           in
           is_true ran ;
           equal (option string) (Some a) (field "access-control-allow-origin" r) )
@@ -1243,24 +1261,25 @@ let cors_tests =
             Response.string ~headers:(Headers.of_list [("Vary", v)]) ""
           in
           let vary v =
-            field "vary" (fst (cors ~fields:[origin a] only (vary_reply v)))
+            field "vary"
+              (fst (cors ~fields:[origin a] (only ()) (vary_reply v)))
           in
           equal (option string) (Some "Accept-Encoding, Origin")
             (vary "Accept-Encoding") ;
           equal (option string) (Some "origin") (vary "origin") ;
           equal (option string) (Some "*") (vary "*") ;
           let r, _ =
-            cors ~fields:[origin a] only (vary_reply "Accept-Encoding")
+            cors ~fields:[origin a] (only ()) (vary_reply "Accept-Encoding")
           in
           equal int 1
             (List.length (Headers.find_all "vary" (Response.headers r))) )
     ; test "an upgrade and a HEAD" (fun () ->
           let r, _ =
-            cors ~fields:[origin a] only (fun _ -> Response.upgrade ignore)
+            cors ~fields:[origin a] (only ()) (fun _ -> Response.upgrade ignore)
           in
           equal (option string) (Some a) (field "access-control-allow-origin" r) ;
           let r, _ =
-            cors ~meth:Method.HEAD ~fields:[origin a] only (reply "x")
+            cors ~meth:Method.HEAD ~fields:[origin a] (only ()) (reply "x")
           in
           equal (option string) (Some a) (field "access-control-allow-origin" r) )
     ; test "a page of Error_page gets the fields" (fun () ->
@@ -1269,7 +1288,7 @@ let cors_tests =
             Weft_sim.run (fun _ ->
                 cors
                   ~fields:[origin a]
-                  (fun next -> only (page next))
+                  (fun next -> (only ()) (page next))
                   (fun _ -> failwith "x") )
           in
           equal status Status.internal_server_error (Response.status r) ;
@@ -1493,7 +1512,7 @@ let cors_tests =
           let r, _ = preflight_to mw a "GET" in
           equal (option string) (Some "true")
             (field "access-control-allow-credentials" r) ;
-          let r, _ = preflight_to only a "GET" in
+          let r, _ = preflight_to (only ()) a "GET" in
           equal (option string) None
             (field "access-control-allow-credentials" r) )
     ; test "the removal keeps the other fields" (fun () ->
@@ -1507,7 +1526,7 @@ let cors_tests =
                    ; ("Access-Control-Max-Age", "4") ] )
               ""
           in
-          let r, _ = cors ~fields:[origin "https://evil.example"] only h in
+          let r, _ = cors ~fields:[origin "https://evil.example"] (only ()) h in
           equal
             (list (pair string string))
             [("Acc", "1"); ("X-Long-Field-Name-1", "2")]

@@ -18,11 +18,14 @@ module Forwarded = struct
     | [_; _; _; _] as parts
       when List.for_all
              (fun p ->
-               p <> ""
-               && String.length p <= 3
-               && String.for_all is_digit p
+               p <> "" && String.for_all is_digit p
                && (p = "0" || p.[0] <> '0')
-               && int_of_string p <= 255 )
+               &&
+               match int_of_string_opt p with
+               | Some n ->
+                   n <= 255
+               | None ->
+                   false )
              parts ->
         Some (List.map int_of_string parts)
     | _ ->
@@ -93,14 +96,22 @@ module Forwarded = struct
           (cd land 0xff)
     | g ->
         let a = Array.of_list g in
-        let best = ref (-1, 0) and run = ref (-1, 0) in
+        let best =
+          ref
+            ( (-1 [@mutate off "the start is read only after a run sets it"])
+            , (0 [@mutate off "a best run of one zero gives no \"::\""]) )
+        and run =
+          ref ((-1 [@mutate off "the start of an empty run is not read"]), 0)
+        in
         Array.iteri
           (fun i x ->
             if x = 0 then (
               let start, len = !run in
               run := if len = 0 then (i, 1) else (start, len + 1) ;
               if snd !run > snd !best then best := !run )
-            else run := (-1, 0) )
+            else
+              run :=
+                ((-1 [@mutate off "the start of an empty run is not read"]), 0) )
           a ;
         let start, len = !best in
         let b = Buffer.create 39 in
@@ -152,7 +163,7 @@ module Forwarded = struct
     let v6 ip =
       match ipv6 ip with Some g -> Ip (text_of_ipv6 g) | None -> Unknown
     in
-    if n > 0 && v.[0] = '[' then
+    if String.starts_with ~prefix:"[" v then
       match String.index_opt v ']' with
       | Some i ->
           let after = String.sub v (i + 1) (n - i - 1) in
@@ -599,11 +610,9 @@ module Cors = struct
 
   (* [valid_port p] is [true] for 1 to 65535 with no leading zero. *)
   let valid_port p =
-    p <> ""
-    && String.length p <= 5
-    && String.for_all is_digit p
+    p <> "" && String.for_all is_digit p
     && p.[0] <> '0'
-    && int_of_string p <= 65535
+    && match int_of_string_opt p with Some n -> n <= 65535 | None -> false
 
   (* [valid_host h] is [true] for a name of letters, digits, '.', '-' and '_',
      or an IPv6 literal in brackets in the form that a browser sends (RFC
