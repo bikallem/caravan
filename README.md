@@ -39,7 +39,7 @@ them.
 | `caravan.router` | Routes, path parameters, 405 with `Allow`, groups | |
 | `caravan.middleware` | Forwarded fields, request IDs, access log, CORS, error page, HTTPS redirect, HSTS, cross-origin protection, rate limit, concurrency limit, health checks, cache headers | |
 | `caravan.session` | Sessions, signed cookies, CSRF tokens | digestif, eqaf, mirage-crypto-rng |
-| `caravan.auth` | JWT, bearer and cookie schemes, users, policies | the dependencies of `caravan.session`, and mirage-crypto-pk, mirage-crypto-ec, x509, yojson, zarith |
+| `caravan.auth` | JWT, bearer and cookie schemes, users, policies, OpenID Connect | the dependencies of `caravan.session`, and mirage-crypto-pk, mirage-crypto-ec, x509, yojson, zarith |
 | `caravan.compress` | gzip and deflate responses, decompression of request bodies | decompress |
 | `caravan.static` | Static files with ETag, conditional requests and ranges | |
 | `caravan.tls` | The TLS server, with ALPN, and HTTPS for the client | tls, x509, domain-name, ipaddr, mirage-crypto-rng |
@@ -68,6 +68,7 @@ executable:
 - [CSRF](#csrf)
 - [Authentication](#authentication)
 - [Users and policies](#users-and-policies)
+- [OpenID Connect](#openid-connect)
 - [Compression](#compression)
 - [File uploads](#file-uploads)
 - [Static files](#static-files)
@@ -558,6 +559,45 @@ let app =
   no session yet. `Cross_origin` protects it, but a browser older than
   2020 can send it from another site (a login CSRF).
 - After a login, redirect only to `Caravan_auth.return_path`.
+
+## OpenID Connect
+
+`Caravan_auth.Oidc` is for the sign-in with an OpenID provider, for
+example Google. `Oidc.Provider.discover` reads the discovery document of
+the issuer, and `Oidc.verify_id_token` checks an ID token with the keys
+of the provider:
+
+```ocaml
+let ok = function Ok v -> v | Error (`Msg m) -> failwith m
+
+let () =
+  Mirage_crypto_rng_unix.use_default () ;
+  let tls =
+    Caravan_tls.https
+      (ok (Tls.Config.client ~authenticator:(ok (Ca_certs.authenticator ())) ()))
+  in
+  Weft.run (module Weft_os) @@ fun () ->
+  Caravan_client.run ~tls @@ fun client ->
+  match Caravan_auth.Oidc.Provider.discover client "https://accounts.google.com" with
+  | Error e -> prerr_endline e
+  | Ok google ->
+      (* In a handler: [token] is the ID token of the provider. *)
+      let check token =
+        Caravan_auth.Oidc.verify_id_token google ~client_id:"123.apps" token
+      in
+      ignore check
+```
+
+- The provider keeps a cache of its keys: for the `max-age` of the
+  response, from 5 minutes to 24 hours. One load at a time, with a
+  deadline of 10 s. A failed load keeps the old keys. A token of an
+  unknown key loads the keys again, at most once a minute.
+- `verify_id_token` checks the signature, `iss`, `aud`, `exp`, `azp`,
+  `sub` and, if you give it, the nonce. It refuses an access token
+  (`typ: at+jwt`).
+- The tokens of the "Sign in with Google" button have one of two
+  issuers: give `~issuers:["https://accounts.google.com";
+  "accounts.google.com"]`.
 
 ## Compression
 
