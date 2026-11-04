@@ -127,7 +127,7 @@ let app =
 The `caravan.middleware` library has middleware for the requests that
 come through a reverse proxy, request IDs, an access log, CORS, an
 error page, the HTTPS redirect, HSTS, a protection against CSRF, a
-rate limit and a concurrency limit:
+rate limit, a concurrency limit, health checks and cache headers:
 
 ```ocaml
 open Caravan_middleware
@@ -197,14 +197,23 @@ let app handler =
   `every` span, and refuses the other requests with 429 and
   `Retry-After`. `Concurrency_limit` serves at most `limit` requests at
   the same time, and refuses the others with 503.
+- `Health.middleware ~path:"/health" checks` runs the checks in
+  parallel, each with a timeout, and answers 200 (`Healthy`,
+  `Degraded`) or 503 (`Unhealthy`). Put it before the redirect and the
+  limits, so that a probe gets the true status.
+- `Cache_control.make` builds a checked `Cache-Control` value, and
+  `Cache_control.middleware` adds it to the cacheable responses with no
+  field. A response for one user (`Authorization`, `Cookie`,
+  `Set-Cookie`) gets the private form of a value for a shared cache.
 - The order: `Forwarded` first (it gives the scheme of the client), then
   `Request_id` and `Access_log` (so that each redirect and each refusal
-  has a log entry), then `Hsts`, `Https_redirect` and `Cors`, then the
-  limits, `Error_page` and `Cross_origin` (a refusal gets its CORS
-  fields, and a preflight takes no token), then the sessions and the
-  router. Add `Retry-After` to the `expose_headers` of `Cors`. A
-  middleware that changes the path goes after
-  `Https_redirect`, so that the redirect keeps the path of the client.
+  has a log entry), then `Health`, then `Hsts`, `Https_redirect` and
+  `Cors`, then the limits, `Error_page` and `Cross_origin` (a refusal
+  gets its CORS fields, and a preflight takes no token), then the
+  compression and `Cache_control`, then the sessions and the router.
+  Add `Retry-After` to the `expose_headers` of `Cors`. A middleware
+  that changes the path goes after `Https_redirect`, so that the
+  redirect keeps the path of the client.
 
 ## Queries and forms
 
