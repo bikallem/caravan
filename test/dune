@@ -62,7 +62,8 @@
   (glob_files ../middleware/*.ml)
   (glob_files ../static/*.ml)
   (glob_files ../tls/*.ml)
-  (glob_files ../session/*.ml)))
+  (glob_files ../session/*.ml)
+  (glob_files ../auth/*.ml)))
 
 ; The hosts of the numeric tests of Resolver, shared by test_client and
 ; test_numeric_unix.
@@ -156,3 +157,21 @@
   windtrap
   digestif
   mirage-crypto-rng))
+
+(test
+ (name test_auth)
+ (modules test_auth)
+ (libraries
+  caravan
+  caravan.auth
+  tls_support
+  sim_support
+  weft
+  weft.sim
+  windtrap
+  digestif
+  mirage-crypto-pk
+  mirage-crypto-ec
+  mirage-crypto-rng
+  x509
+  zarith))

@@ -1,0 +1,21 @@
+; Authentication. Optional: dune builds it only if its crypto libraries and
+; yojson are installed.
+
+(library
+ (name caravan_auth)
+ (public_name caravan.auth)
+ (optional)
+ (libraries
+  caravan
+  weft
+  digestif
+  eqaf
+  mirage-crypto-pk
+  mirage-crypto-ec
+  x509
+  yojson
+  zarith)
+ (instrumentation
+  (backend ppx_windtrap.mutate))
+ (instrumentation
+  (backend ppx_windtrap.coverage)))
