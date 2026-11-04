@@ -12,6 +12,7 @@
   weft
   digestif
   eqaf
+  mirage-crypto-rng
   mirage-crypto-pk
   mirage-crypto-ec
   x509

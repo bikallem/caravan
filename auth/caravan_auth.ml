@@ -1030,17 +1030,27 @@ module Oidc = struct
 
   let minute = Span.s 60
 
-  (* An https URL that the client accepts: a host, a port of 1 to 65535 and no
-     user information. Also no fragment, and no space or control character. *)
-  let is_https u =
-    String.starts_with ~prefix:"https://" (String.lowercase_ascii u)
-    && String.for_all (fun c -> c > ' ' && c < '\x7f' && c <> '#') u
-    &&
-    match Caravan_client.Private.parse_url u with
+  (* [parse u] is the scheme (in lowercase) and the authority of a URL that the
+     client accepts: [http] or [https], a host, a port of 1 to 65535 and no user
+     information. Also no fragment, and no space or control character. *)
+  let parse u =
+    if String.for_all (fun c -> c > ' ' && c < '\x7f' && c <> '#') u then
+      match Caravan_client.Private.parse_url u with
+      | scheme, authority, _ ->
+          Some (scheme, authority)
+      | exception (Invalid_argument _ | Caravan_client.Error _) ->
+          None
+    else None
+
+  let is_https u = match parse u with Some ("https", _) -> true | _ -> false
+
+  (* [json_string name members] is the string member [name], if any. *)
+  let json_string name members =
+    match List.assoc_opt name members with
+    | Some (`String s) ->
+        Some s
     | _ ->
-        true
-    | exception Invalid_argument _ ->
-        false
+        None
 
   (* An issuer: an https URL with no query (OIDC Discovery §3). *)
   let good_issuer u = is_https u && not (String.contains u '?')
@@ -1059,26 +1069,26 @@ module Oidc = struct
   (* The size limit of a document of the provider. *)
   let max_document = 65536
 
-  (* [get_text ~timeout ~max http url] is the response and the body of a GET of
-     [url], with one deadline for all of it. *)
-  let get_text ~timeout ~max http url =
+  (* [fetch ~timeout ~max http ?headers ?body meth url] is the response, its
+     status and its body, with one deadline for all of it. *)
+  let fetch ~timeout ~max http ?(headers = []) ?body meth url =
     match
       Fiber.with_timeout Mono timeout (fun () ->
+          let scheme, authority, path = Caravan_client.Private.parse_url url in
           let resp =
-            Caravan_client.get
-              ~headers:
-                (Caravan.Headers.of_list [("Accept", "application/json")])
-              http url
+            Caravan_client.request http
+              (Caravan.Request.make ~scheme ~authority
+                 ~headers:
+                   (Caravan.Headers.of_list
+                      (("Accept", "application/json") :: headers) )
+                 ?body meth path )
           in
-          let body = Caravan_client.body resp in
+          let b = Caravan_client.body resp in
           Fun.protect
-            ~finally:(fun () -> Caravan.Body.close body)
+            ~finally:(fun () -> Caravan.Body.close b)
             (fun () ->
-              match Caravan.Status.code (Response.status resp) with
-              | 200 ->
-                  Ok (resp, Caravan.Body.to_string ~max body)
-              | code ->
-                  Error (Printf.sprintf "%s: status %d" url code) ) )
+              let code = Caravan.Status.code (Response.status resp) in
+              Ok (resp, code, Caravan.Body.to_string ~max b) ) )
     with
     | r ->
         r
@@ -1088,6 +1098,17 @@ module Oidc = struct
         Error (url ^ ": " ^ Printexc.to_string e)
     | exception Caravan.Body.Too_large ->
         Error (url ^ ": the body is too large")
+
+  (* [get_text ~timeout ~max http url] is the response and the body of a GET of
+     [url] with the status 200. *)
+  let get_text ~timeout ~max http url =
+    match fetch ~timeout ~max http Caravan.Method.GET url with
+    | Ok (resp, 200, text) ->
+        Ok (resp, text)
+    | Ok (_, code, _) ->
+        Error (Printf.sprintf "%s: status %d" url code)
+    | Error e ->
+        Error e
 
   (* The time that a JWK Set stays fresh: the [max-age] of [Cache-Control], 5
      min to 24 h. With no [max-age], or with [no-cache] or [no-store]: 1 h. *)
@@ -1447,4 +1468,427 @@ module Oidc = struct
         Error (Jwt e)
     | Ok c ->
         check_id_token ?nonce ~client_id c
+  (* {2 The login and the callback} *)
+
+  type auth = No_secret | Basic of string | Post of string
+
+  type client =
+    { provider: Provider.t
+    ; id: string
+    ; auth: auth
+    ; redirect_uri: string
+    ; scope: string
+    ; leeway: Span.t option
+    ; login_timeout: int  (** Seconds. *)
+    ; extra: (string * string) list }
+
+  (* The parameters that [login] sets, or that change the checks. *)
+  let reserved =
+    [ "response_type"
+    ; "client_id"
+    ; "redirect_uri"
+    ; "scope"
+    ; "state"
+    ; "nonce"
+    ; "code_challenge"
+    ; "code_challenge_method"
+    ; "max_age"
+    ; "request"
+    ; "request_uri"
+    ; "response_mode" ]
+
+  (* An https URL, or an http URL of a loopback host (RFC 8252 §7.3). *)
+  let good_redirect u =
+    match parse u with
+    | Some ("https", _) ->
+        true
+    | Some ("http", authority) ->
+        let a = String.lowercase_ascii authority in
+        List.exists
+          (fun h -> a = h || String.starts_with ~prefix:(h ^ ":") a)
+          ["localhost"; "127.0.0.1"; "[::1]"]
+    | _ ->
+        false
+
+  (* The default scope is openid, email and profile: [client] puts openid
+     first. *)
+  let client ?(scope = ["email"; "profile"]) ?secret ?auth ?leeway
+      ?(login_timeout = Span.s 600) ?(extra = []) ~provider ~id ~redirect_uri ()
+      =
+    let bad m = invalid_arg ("Caravan_auth.Oidc.client: " ^ m) in
+    if id = "" then bad "the client ID is empty" ;
+    if not (good_redirect redirect_uri) then
+      bad "the redirect URI is not https, or http of a loopback host" ;
+    if Span.compare login_timeout (Span.s 1) < 0 then
+      bad "the login timeout is less than 1 s" ;
+    Option.iter
+      (fun l -> if Span.compare l Span.zero < 0 then bad "a negative leeway")
+      leeway ;
+    List.iter
+      (fun (n, _) ->
+        if List.mem n reserved then bad ("the parameter " ^ n ^ " is reserved") )
+      extra ;
+    List.iter
+      (fun s ->
+        if s = "" || not (String.for_all (fun c -> c > ' ' && c < '\x7f') s)
+        then bad "a scope is empty, or has a space or a control character" )
+      scope ;
+    let scope =
+      String.concat " "
+        (if List.mem "openid" scope then scope else "openid" :: scope)
+    in
+    let auth =
+      match (secret, auth) with
+      | None, _ ->
+          No_secret
+      | Some s, Some `Basic ->
+          Basic s
+      | Some s, Some `Post ->
+          Post s
+      | Some s, None -> (
+        (* RFC 8414 §2: client_secret_basic if the provider does not tell. *)
+        match Provider.auth_methods provider with
+        | None ->
+            Basic s
+        | Some l when List.mem "client_secret_basic" l ->
+            Basic s
+        | Some l when List.mem "client_secret_post" l ->
+            Post s
+        | Some _ ->
+            bad
+              "the provider gives neither client_secret_basic nor \
+               client_secret_post" )
+    in
+    { provider
+    ; id
+    ; auth
+    ; redirect_uri
+    ; scope
+    ; leeway
+    ; login_timeout=
+        Int64.to_int (Int64.div (Span.to_ns login_timeout) 1_000_000_000L)
+    ; extra }
+
+  (* A login that waits for its callback. *)
+  type pending =
+    { issuer: string
+    ; client_id: string
+    ; expires: int  (** Posix seconds: the login timeout of its client. *)
+    ; state: string
+    ; nonce: string
+    ; verifier: string
+    ; return: string }
+
+  (* The pending logins of a session, the newest first, in one value: the fields
+     of a login with '|' between them, and ',' between the logins. Each field is
+     base64url or digits: no '|' or ','. *)
+  let key = "caravan.oidc"
+
+  let b64_encode = Base64.encode ~url:true ~pad:false
+
+  let encode_pending p =
+    String.concat "|"
+      [ b64_encode p.issuer
+      ; b64_encode p.client_id
+      ; string_of_int p.expires
+      ; p.state
+      ; p.nonce
+      ; p.verifier
+      ; b64_encode p.return ]
+
+  let decode_pending s =
+    match String.split_on_char '|' s with
+    | [i; c; t; state; nonce; verifier; r] -> (
+      match (b64_decode i, b64_decode c, int_of_string_opt t, b64_decode r) with
+      | Some issuer, Some client_id, Some expires, Some return ->
+          Some {issuer; client_id; expires; state; nonce; verifier; return}
+      | _ ->
+          None )
+    | _ ->
+        None
+
+  let now_s () = int_of_float (Time.posix_to_unix_s (Time.now Posix))
+
+  (* The pending logins of the session that did not expire. *)
+  let pendings req ~now =
+    match Caravan_session.Private.find key req with
+    | Some v ->
+        List.filter
+          (fun p -> now < p.expires)
+          (List.filter_map decode_pending (String.split_on_char ',' v))
+    | None ->
+        []
+
+  let save req = function
+    | [] ->
+        Caravan_session.Private.remove key req
+    | l ->
+        Caravan_session.Private.set key
+          (String.concat "," (List.map encode_pending l))
+          req
+
+  (* The most pending logins of a session, and the longest return path. *)
+  let max_pending = 4
+
+  let max_return = 1024
+
+  let random () = b64_encode (Mirage_crypto_rng.generate 32)
+
+  let no_cache =
+    [("Cache-Control", "no-store"); ("Referrer-Policy", "no-referrer")]
+
+  let login ?return c req =
+    let return =
+      match return with Some r -> Some r | None -> return_path req
+    in
+    let return =
+      match return with
+      | Some r when is_local_path r && String.length r <= max_return ->
+          r
+      | _ ->
+          "/"
+    in
+    let now = now_s () in
+    let p =
+      { issuer= Provider.issuer c.provider
+      ; client_id= c.id
+      ; expires= now + c.login_timeout
+      ; state= random ()
+      ; nonce= random ()
+      ; verifier= random ()
+      ; return }
+    in
+    save req (List.take max_pending (p :: pendings req ~now)) ;
+    let challenge =
+      b64_encode Digestif.SHA256.(to_raw_string (digest_string p.verifier))
+    in
+    let params =
+      [ ("response_type", "code")
+      ; ("client_id", c.id)
+      ; ("redirect_uri", c.redirect_uri)
+      ; ("scope", c.scope)
+      ; ("state", p.state)
+      ; ("nonce", p.nonce)
+      ; ("code_challenge", challenge)
+      ; ("code_challenge_method", "S256") ]
+      @ c.extra
+    in
+    let endpoint = Provider.authorization_endpoint c.provider in
+    let sep = if String.contains endpoint '?' then "&" else "?" in
+    Response.empty ~status:Caravan.Status.see_other
+      ~headers:
+        (Caravan.Headers.of_list
+           ( ("Location", endpoint ^ sep ^ Caravan.Form.encode params)
+           :: no_cache ) )
+      ()
+
+  type tokens =
+    { id_token: string
+    ; access_token: string option
+    ; expires_in: int option
+    ; subject: string
+    ; claims: Jwt.claims }
+
+  type failure =
+    | No_login
+    | Expired
+    | Denied of string * string option
+    | Bad_response of string
+    | Token of string
+    | Id_token of error
+
+  let pp_failure ppf = function
+    | No_login ->
+        Format.pp_print_string ppf "No_login"
+    | Expired ->
+        Format.pp_print_string ppf "Expired"
+    | Denied (e, d) ->
+        Format.fprintf ppf "Denied (%S, %a)" e
+          (Format.pp_print_option
+             ~none:(fun ppf () -> Format.pp_print_string ppf "None")
+             (fun ppf -> Format.fprintf ppf "Some %S") )
+          d
+    | Bad_response m ->
+        Format.fprintf ppf "Bad_response %S" m
+    | Token m ->
+        Format.fprintf ppf "Token %S" m
+    | Id_token e ->
+        Format.fprintf ppf "Id_token (%a)" pp_error e
+
+  (* [form_name s] is [s] encoded as a name of a form: the text of the pair
+     ([s], "") with no "=" at its end. *)
+  let form_name s =
+    let e = Caravan.Form.encode [(s, "")] in
+    String.sub e 0 (String.length e - 1)
+
+  (* The JSON of a token response (RFC 6749 §5.1 and §5.2). *)
+  let token_response status text =
+    match (status, Json.parse text) with
+    | 200, Ok (`Assoc m) -> (
+      match (json_string "id_token" m, json_string "token_type" m) with
+      | None, _ ->
+          Error (Bad_response "the token response has no id_token")
+      | Some id_token, Some t when String.lowercase_ascii t = "bearer" ->
+          let expires_in =
+            match List.assoc_opt "expires_in" m with
+            | Some (`Int n) ->
+                Some n
+            | _ ->
+                None
+          in
+          Ok (id_token, json_string "access_token" m, expires_in)
+      | Some _, _ ->
+          Error (Bad_response "the token type is not Bearer") )
+    | 200, _ ->
+        Error (Bad_response "the token response is not a JSON object")
+    | status, json ->
+        let code =
+          match json with
+          | Ok (`Assoc m) ->
+              Option.fold ~none:"" ~some:(( ^ ) ": ") (json_string "error" m)
+          | _ ->
+              ""
+        in
+        Error (Token (Printf.sprintf "status %d%s" status code))
+
+  (* The token request of the code flow (RFC 6749 §4.1.3, RFC 7636 §4.5). *)
+  let token_request c ~code ~verifier =
+    let base =
+      [ ("grant_type", "authorization_code")
+      ; ("code", code)
+      ; ("redirect_uri", c.redirect_uri)
+      ; ("code_verifier", verifier) ]
+    in
+    let form, headers =
+      match c.auth with
+      | No_secret ->
+          (base @ [("client_id", c.id)], [])
+      | Post s ->
+          (base @ [("client_id", c.id); ("client_secret", s)], [])
+      | Basic s ->
+          (* RFC 6749 §2.3.1: the two parts are form-urlencoded first. *)
+          let pair = form_name c.id ^ ":" ^ form_name s in
+          let url =
+            (false
+            [@mutate
+              off
+                "a form-encoded text has no > ? ~ or DEL: its base64 has no + \
+                 or /"] )
+          in
+          ( base
+          , [("Authorization", "Basic " ^ Base64.encode ~url ~pad:true pair)] )
+    in
+    let p = c.provider in
+    match
+      fetch ~timeout:p.timeout ~max:max_document p.http
+        ~headers:
+          (("Content-Type", "application/x-www-form-urlencoded") :: headers)
+        ~body:(Caravan.Body.of_string (Caravan.Form.encode form))
+        Caravan.Method.POST p.token_endpoint
+    with
+    | Error e ->
+        Error (Token e)
+    | Ok (_, status, text) ->
+        token_response status text
+
+  let default_failed _ _ =
+    Response.string ~status:Caravan.Status.bad_request
+      ~headers:(Caravan.Headers.of_list no_cache)
+      "Sign-in failed\n"
+
+  (* [Referrer-Policy: no-referrer] on a response of the callback: its URL has
+     the code. *)
+  let no_referrer resp =
+    let h = Response.headers resp in
+    if Caravan.Headers.mem "referrer-policy" h then resp
+    else
+      Response.with_headers
+        (Caravan.Headers.add "Referrer-Policy" "no-referrer" h)
+        resp
+
+  (* [take c req q] is the pending login of the [state] of [q], for [c]. It goes
+     from the session at once (one use), with the expired logins. The state
+     comes first: no other parameter is read for a request with no login. *)
+  let take c req q =
+    match Caravan.Form.find "state" q with
+    | None ->
+        Error No_login
+    | Some state -> (
+        let issuer = Provider.issuer c.provider in
+        let mine p =
+          p.issuer = issuer && p.client_id = c.id && Eqaf.equal p.state state
+        in
+        let now = now_s () in
+        (* Read all the logins, also the expired ones: an expired login of the
+           state gives [Expired]. *)
+        let all =
+          match Caravan_session.Private.find key req with
+          | Some v ->
+              List.filter_map decode_pending (String.split_on_char ',' v)
+          | None ->
+              []
+        in
+        match List.partition mine all with
+        | [], _ ->
+            Error No_login
+        | p :: _, rest ->
+            save req (List.filter (fun q -> now < q.expires) rest) ;
+            if now < p.expires then Ok p else Error Expired )
+
+  (* The checks of a callback, after the login: RFC 9207 §2.4 (iss), the error
+     of the provider, the code, the token request, the ID token. *)
+  let complete c q p =
+    let issuer = Provider.issuer c.provider in
+    let* () =
+      match Caravan.Form.find "iss" q with
+      | Some i when i <> issuer ->
+          Error (Bad_response "the iss parameter is not the issuer")
+      | None when Provider.iss_parameter c.provider ->
+          Error (Bad_response "no iss parameter")
+      | _ ->
+          Ok ()
+    in
+    let* () =
+      match Caravan.Form.find "error" q with
+      | Some e ->
+          Error (Denied (e, Caravan.Form.find "error_description" q))
+      | None ->
+          Ok ()
+    in
+    let* code =
+      match Caravan.Form.find "code" q with
+      | None | Some "" ->
+          Error (Bad_response "no code")
+      | Some code ->
+          Ok code
+    in
+    let* id_token, access_token, expires_in =
+      token_request c ~code ~verifier:p.verifier
+    in
+    let* claims =
+      Result.map_error
+        (fun e -> Id_token e)
+        (verify_id_token ?leeway:c.leeway ~nonce:p.nonce c.provider
+           ~client_id:c.id id_token )
+    in
+    (* [verify_id_token] refuses a token with no [sub]. *)
+    let subject = Option.value ~default:"" (Jwt.subject claims) in
+    Ok {id_token; access_token; expires_in; subject; claims}
+
+  let callback ?(failed = default_failed) c f req =
+    if not (Caravan.Method.equal (Caravan.Request.meth req) Caravan.Method.GET)
+    then
+      Response.string ~status:Caravan.Status.method_not_allowed
+        ~headers:(Caravan.Headers.of_list [("Allow", "GET")])
+        ""
+    else
+      let q = Caravan.Request.query_params req in
+      match
+        let* p = take c req q in
+        Result.map (fun t -> (p, t)) (complete c q p)
+      with
+      | Ok (p, tokens) ->
+          no_referrer (f req tokens ~return:p.return)
+      | Error e ->
+          no_referrer (failed req e)
 end

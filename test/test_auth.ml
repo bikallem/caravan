@@ -2035,11 +2035,20 @@ type idp =
   ; mutable paths: string list
         (** The paths of the requests, the last first. *)
   ; mutable accepts: string list  (** The Accept fields, the last first. *)
-  ; loads: int Atomic.t }
+  ; loads: int Atomic.t
+  ; mutable codes: (string * grant) list  (** The codes that it gave. *)
+  ; mutable token_calls: (string option * Caravan.Form.t) list
+        (** The Authorization field and the form of each token request, the last
+            first. *)
+  ; mutable token_reply: (int * string) option
+        (** A status and a body in place of the normal token response. *)
+  ; mutable nonce: string option  (** A nonce in place of that of the login. *)
+  }
 
-(* [doc ?drop members] is a discovery document: the default members, with
-   [members] in place of those of the same name, and with no [drop]. The values
-   are JSON texts. *)
+(* What a code is for. *)
+and grant =
+  {g_nonce: string; challenge: string; client_id: string; redirect_uri: string}
+
 (* [json_object ~defaults members] is a JSON object of [defaults], with
    [members] in place of those of the same name. A value [""] removes the
    member. The values are JSON texts. *)
@@ -2078,7 +2087,28 @@ let new_idp () =
   ; gate= None
   ; paths= []
   ; accepts= []
-  ; loads= Atomic.make 0 }
+  ; loads= Atomic.make 0
+  ; codes= []
+  ; token_calls= []
+  ; token_reply= None
+  ; nonce= None }
+
+(* An ID token of the fake provider (see [json_object] for [members]). *)
+let id_token ?(kid = "ec1") ?(alg = "ES256") ?(sign = es) ?(typ = "JWT") members
+    =
+  let payload =
+    json_object
+      ~defaults:
+        [ ("iss", Printf.sprintf "%S" issuer)
+        ; ("aud", {|"app"|})
+        ; ("sub", {|"ada"|})
+        ; ("exp", Printf.sprintf "%.0f" (oidc_t0 +. 1_000_000.))
+        ; ("iat", Printf.sprintf "%.0f" oidc_t0) ]
+      members
+  in
+  token
+    ~header:(Printf.sprintf {|{"alg":"%s","kid":"%s","typ":"%s"}|} alg kid typ)
+    sign payload
 
 let idp_handler idp req =
   let path = Caravan.Request.path_only req in
@@ -2104,12 +2134,41 @@ let idp_handler idp req =
       Caravan.Response.string ~headers
         ~status:(Caravan.Status.v idp.jwks_status)
         idp.jwks
+  | "/token" -> (
+      let form = Result.get_ok (Caravan.Request.form req) in
+      let authorization =
+        Caravan.Headers.find "authorization" (Caravan.Request.headers req)
+      in
+      idp.token_calls <- (authorization, form) :: idp.token_calls ;
+      let f n = Option.value ~default:"" (Caravan.Form.find n form) in
+      match idp.token_reply with
+      | Some (status, body) ->
+          Caravan.Response.string ~status:(Caravan.Status.v status) body
+      | None -> (
+        match List.assoc_opt (f "code") idp.codes with
+        | Some g
+          when f "grant_type" = "authorization_code"
+               && f "redirect_uri" = g.redirect_uri
+               && b64 (sha256 (f "code_verifier")) = g.challenge ->
+            let nonce = Option.value idp.nonce ~default:g.g_nonce in
+            let t =
+              id_token
+                [ ("nonce", Printf.sprintf "%S" nonce)
+                ; ("aud", Printf.sprintf "%S" g.client_id) ]
+            in
+            Caravan.Response.string
+              (Printf.sprintf
+                 {|{"access_token":"at","token_type":"Bearer","expires_in":3600,"id_token":"%s"}|}
+                 t )
+        | _ ->
+            Caravan.Response.string ~status:Caravan.Status.bad_request
+              {|{"error":"invalid_grant"}|} ) )
   | _ ->
       Caravan.Response.string ~status:Caravan.Status.not_found ""
 
 (* [with_idp ?idp f] runs [f t http idp] with the fake provider and a client
    with HTTPS, at [oidc_t0]. The guard is 3 days of virtual time. *)
-let with_idp ?(idp = new_idp ()) f =
+let with_idp ?(idp = new_idp ()) ?app f =
   let scfg, ccfg =
     Tls_support.configs ~client_peer:false ~names:["idp.example"]
       ~time:(fun () -> Ptime.of_float_s (Time.posix_to_unix_s (Time.now Posix)))
@@ -2118,30 +2177,25 @@ let with_idp ?(idp = new_idp ()) f =
   T.run
     ~guard:(Span.s (3 * 86400))
     ~engine:(Caravan_tls.engine scfg Caravan.Server.http1)
-    (idp_handler idp)
+    (fun req ->
+      match app with
+      | Some app
+        when not
+               (List.mem
+                  (Caravan.Request.path_only req)
+                  [ "/.well-known/openid-configuration"
+                  ; "/jwks"
+                  ; "/token"
+                  ; "/authorize" ] ) ->
+          app req
+      | _ ->
+          idp_handler idp req )
     (fun t ->
       Weft_sim.set_posix (T.sim t) (Time.posix_of_unix_s oidc_t0) ;
       Weft_sim.set_dns (T.sim t) "idp.example" (Addresses ["127.0.0.1"]) ;
       C.run ~tls:(Caravan_tls.https ccfg) (fun http -> f t http idp) )
 
 let discover http = Result.get_ok (P.discover http issuer)
-
-(* An ID token of the fake provider (see [json_object] for [members]). *)
-let id_token ?(kid = "ec1") ?(alg = "ES256") ?(sign = es) ?(typ = "JWT") members
-    =
-  let payload =
-    json_object
-      ~defaults:
-        [ ("iss", Printf.sprintf "%S" issuer)
-        ; ("aud", {|"app"|})
-        ; ("sub", {|"ada"|})
-        ; ("exp", Printf.sprintf "%.0f" (oidc_t0 +. 1_000_000.))
-        ; ("iat", Printf.sprintf "%.0f" oidc_t0) ]
-      members
-  in
-  token
-    ~header:(Printf.sprintf {|{"alg":"%s","kid":"%s","typ":"%s"}|} alg kid typ)
-    sign payload
 
 let oidc_result =
   Testable.make
@@ -2599,6 +2653,625 @@ let oidc_tests =
               equal oidc_result (Ok ()) (verify p (id_token [])) ;
               equal int 1 (Atomic.get idp.loads) ) ) ]
 
+(* {2 The login and the callback} *)
+
+(* A browser: the client and the session cookie. *)
+type browser = {http: C.t; mutable cookie: string option}
+
+(* [visit b ?meth path] sends a request to the test host, with the cookie of
+   [b], and keeps the cookie of the response. It gives the response and its
+   body. *)
+let visit b ?(meth = Caravan.Method.GET) path =
+  let headers =
+    Caravan.Headers.of_list
+      (Option.fold ~none:[] ~some:(fun c -> [("Cookie", c)]) b.cookie)
+  in
+  let resp =
+    C.request b.http
+      (Caravan.Request.make ~scheme:"https" ~authority:"idp.example:80" ~headers
+         meth path )
+  in
+  let body = Body.to_string (C.body resp) in
+  ( match Caravan.Headers.find "set-cookie" (Caravan.Response.headers resp) with
+  | Some sc -> (
+    match Caravan.Cookie.parse_set_cookie sc with
+    | Some (_, "") ->
+        b.cookie <- None
+    | Some (n, v) ->
+        b.cookie <- Some (n ^ "=" ^ v)
+    | None ->
+        () )
+  | None ->
+      () ) ;
+  (resp, body)
+
+let header name resp =
+  Option.value ~default:""
+    (Caravan.Headers.find name (Caravan.Response.headers resp))
+
+let code_of resp = Caravan.Status.code (Caravan.Response.status resp)
+
+(* The query of the Location of [resp]. *)
+let location_query resp =
+  let l = header "location" resp in
+  match String.index_opt l '?' with
+  | Some i ->
+      Caravan.Form.parse (String.sub l (i + 1) (String.length l - i - 1))
+  | None ->
+      []
+
+let param name q = Option.value ~default:"" (Caravan.Form.find name q)
+
+(* [authorize idp resp] is what the provider does after the login of [resp]: it
+   keeps a code for the parameters, and gives the code and the state. *)
+let authorize idp resp =
+  let q = location_query resp in
+  let code = Printf.sprintf "code%d" (List.length idp.codes) in
+  idp.codes <-
+    ( code
+    , { g_nonce= param "nonce" q
+      ; challenge= param "code_challenge" q
+      ; client_id= param "client_id" q
+      ; redirect_uri= param "redirect_uri" q } )
+    :: idp.codes ;
+  (code, param "state" q)
+
+let callback_path ?(path = "/callback") ?(extra = []) (code, state) =
+  path ^ "?" ^ Caravan.Form.encode ([("code", code); ("state", state)] @ extra)
+
+(* The state of a test of the flow: the browser, the fake provider, and the
+   tokens that the application got. *)
+type app = {b: browser; idp: idp; seen: O.tokens option ref}
+
+(* [new_state b] starts a login, and gives its state. *)
+let new_state b =
+  let resp, _ = visit b "/login" in
+  param "state" (location_query resp)
+
+let redirect_uri = issuer ^ "/callback"
+
+(* [with_app ?idp ?client f] runs [f t browser idp] with the fake provider and
+   an application on the same host: /login, /callback (the function of the
+   application signs the user in and keeps the tokens in [seen]), and /me (the
+   user). A failure of the callback gives a 400 with the failure. [client] makes
+   the client of the provider. *)
+let with_app ?idp
+    ?(client = fun p -> O.client ~provider:p ~id:"app" ~redirect_uri ())
+    ?(other =
+      fun p ->
+        O.client ~provider:p ~id:"other"
+          ~redirect_uri:(issuer ^ "/callback-other")
+          ()) ?(headers = Caravan.Headers.empty) f =
+  let stack = ref (fun _ -> Caravan.Response.string "no app") in
+  let seen = ref None in
+  with_idp ?idp
+    ~app:(fun req -> !stack req)
+    (fun _ http idp ->
+      let p = discover http in
+      let c = client p in
+      let signed_in req (tokens : O.tokens) ~return =
+        seen := Some tokens ;
+        Caravan_auth.sign_in req (Caravan_auth.User.make tokens.subject) ;
+        Caravan.Response.empty ~status:Caravan.Status.see_other
+          ~headers:(Caravan.Headers.of_list [("Location", return)])
+          ()
+      in
+      let failed _ f =
+        Caravan.Response.string ~status:Caravan.Status.bad_request ~headers
+          (Format.asprintf "%a" O.pp_failure f)
+      in
+      (* An other client of the same provider, on the same session. *)
+      let other = other p in
+      let app req =
+        match Caravan.Request.path_only req with
+        | "/login" ->
+            O.login c req
+        | "/callback" ->
+            O.callback ~failed c signed_in req
+        | "/login-other" ->
+            O.login other req
+        | "/callback-other" ->
+            O.callback ~failed other signed_in req
+        | "/me" -> (
+          match Caravan_auth.user req with
+          | Some u ->
+              Caravan.Response.string (Caravan_auth.User.id u)
+          | None ->
+              Caravan.Response.string ~status:Caravan.Status.unauthorized "" )
+        | _ ->
+            Caravan.Response.string ~status:Caravan.Status.not_found ""
+      in
+      stack :=
+        Caravan.Handler.compose
+          [ Caravan_session.middleware
+              ~keys:[Caravan_session.Key.generate ()]
+              ~store:(Caravan_session.memory_store ())
+              ()
+          ; Caravan_auth.middleware ~schemes:[Caravan_auth.Scheme.session ()] ()
+          ]
+          app ;
+      f {b= {http; cookie= None}; idp; seen} )
+
+(* A login and its callback; the callback response and its body. *)
+let login_and_callback ?(login = "/login") ?extra b idp =
+  let resp, _ = visit b login in
+  visit b (callback_path ?extra (authorize idp resp))
+
+let flow_tests =
+  group "OpenID Connect: the login and the callback"
+    [ test "a login, the callback, then the user is signed in" (fun () ->
+          with_app (fun {b; idp; seen} ->
+              let resp, _ = visit b "/login?return=/me" in
+              equal int 303 (code_of resp) ;
+              equal string "no-store" (header "cache-control" resp) ;
+              equal string "no-referrer" (header "referrer-policy" resp) ;
+              let l = header "location" resp in
+              is_true ~msg:l
+                (String.starts_with ~prefix:(issuer ^ "/authorize?") l) ;
+              let q = location_query resp in
+              equal (list string) ~msg:"the parameters"
+                [ "response_type"
+                ; "client_id"
+                ; "redirect_uri"
+                ; "scope"
+                ; "state"
+                ; "nonce"
+                ; "code_challenge"
+                ; "code_challenge_method" ]
+                (List.map fst q) ;
+              equal string "code" (param "response_type" q) ;
+              equal string "app" (param "client_id" q) ;
+              equal string redirect_uri (param "redirect_uri" q) ;
+              equal string "openid email profile" (param "scope" q) ;
+              equal string "S256" (param "code_challenge_method" q) ;
+              List.iter
+                (fun n -> equal int ~msg:n 43 (String.length (param n q)))
+                ["state"; "nonce"; "code_challenge"] ;
+              let resp, _ = visit b (callback_path (authorize idp resp)) in
+              equal int 303 (code_of resp) ;
+              equal string "/me" (header "location" resp) ;
+              equal string "no-referrer" (header "referrer-policy" resp) ;
+              ( match !seen with
+              | Some (t : O.tokens) ->
+                  equal (option string) (Some "at") t.access_token ;
+                  equal (option int) (Some 3600) t.expires_in ;
+                  equal (option string) (Some "ada") (J.subject t.claims) ;
+                  is_true (String.length t.id_token > 0)
+              | None ->
+                  fail "no tokens" ) ;
+              let _, me = visit b "/me" in
+              equal string "ada" me ;
+              (* The token request of a public client. *)
+              match idp.token_calls with
+              | [(auth, form)] ->
+                  equal (option string) None auth ;
+                  equal (list string)
+                    [ "grant_type"
+                    ; "code"
+                    ; "redirect_uri"
+                    ; "code_verifier"
+                    ; "client_id" ]
+                    (List.map fst form)
+              | _ ->
+                  fail "one token request" ) )
+    ; test "a second callback of a login gives No_login" (fun () ->
+          with_app (fun {b; idp; _} ->
+              let resp, _ = visit b "/login" in
+              let path = callback_path (authorize idp resp) in
+              equal int 303 (code_of (fst (visit b path))) ;
+              let resp, body = visit b path in
+              equal int 400 (code_of resp) ;
+              equal string "No_login" body ;
+              equal string "no-referrer" (header "referrer-policy" resp) ) )
+    ; test "a callback with no state or an unknown state gives No_login"
+        (fun () ->
+          with_app (fun {b; idp; _} ->
+              let resp, _ = visit b "/login" in
+              let code, _ = authorize idp resp in
+              equal string "No_login" (snd (visit b ("/callback?code=" ^ code))) ;
+              equal string "No_login"
+                (snd (visit b (callback_path (code, "other")))) ;
+              (* The login stays. *)
+              let resp, _ = visit b (callback_path (authorize idp resp)) in
+              equal int 303 (code_of resp) ) )
+    ; test "a login older than login_timeout gives Expired" (fun () ->
+          with_app
+            ~client:(fun p ->
+              O.client ~login_timeout:(Span.s 60) ~provider:p ~id:"app"
+                ~redirect_uri () )
+            (fun {b; idp; _} ->
+              let resp, _ = visit b "/login" in
+              let g = authorize idp resp in
+              Time.sleep Mono (Span.s 59) ;
+              let resp2, _ = visit b "/login" in
+              let g2 = authorize idp resp2 in
+              Time.sleep Mono (Span.s 1) ;
+              equal string "Expired" (snd (visit b (callback_path g))) ;
+              equal int 303 (code_of (fst (visit b (callback_path g2)))) ) )
+    ; test "the default login timeout is 10 min" (fun () ->
+          with_app (fun {b; idp; _} ->
+              let g1 = authorize idp (fst (visit b "/login")) in
+              Time.sleep Mono (Span.s 1) ;
+              let g2 = authorize idp (fst (visit b "/login")) in
+              Time.sleep Mono (Span.s 599) ;
+              equal string "Expired" (snd (visit b (callback_path g1))) ;
+              equal int 303 (code_of (fst (visit b (callback_path g2)))) ) )
+    ; test "an error of the provider gives Denied" (fun () ->
+          with_app (fun {b; _} ->
+              let callback q =
+                snd (visit b ("/callback?" ^ Caravan.Form.encode q))
+              in
+              equal string {|Denied ("access_denied", Some "no")|}
+                (callback
+                   [ ("error", "access_denied")
+                   ; ("error_description", "no")
+                   ; ("state", new_state b) ] ) ;
+              equal string {|Denied ("x", None)|}
+                (callback [("error", "x"); ("state", new_state b)]) ;
+              equal string {|Bad_response "no code"|}
+                (callback [("state", new_state b)]) ;
+              equal string {|Bad_response "no code"|}
+                (callback [("code", ""); ("state", new_state b)]) ;
+              (* The state comes first. *)
+              equal string "No_login"
+                (callback [("error", "x"); ("error_description", "y")]) ;
+              equal string "No_login"
+                (callback [("error", "x"); ("state", "unknown")]) ) )
+    ; test "a failed callback uses up its login" (fun () ->
+          with_app (fun {b; idp; _} ->
+              let again setup =
+                let resp, _ = visit b "/login" in
+                let g = authorize idp resp in
+                setup () ;
+                let first = snd (visit b (callback_path g)) in
+                idp.token_reply <- None ;
+                idp.nonce <- None ;
+                (first, snd (visit b (callback_path g)))
+              in
+              equal (pair string string) ~msg:"token"
+                ({|Token "status 400: invalid_grant"|}, "No_login")
+                (again (fun () ->
+                     idp.token_reply <- Some (400, {|{"error":"invalid_grant"}|}) )
+                ) ;
+              equal (pair string string) ~msg:"id token"
+                ("Id_token (Bad_nonce)", "No_login")
+                (again (fun () -> idp.nonce <- Some "other")) ;
+              let state = new_state b in
+              let denied () =
+                snd
+                  (visit b
+                     ( "/callback?"
+                     ^ Caravan.Form.encode [("error", "x"); ("state", state)] ) )
+              in
+              equal string {|Denied ("x", None)|} (denied ()) ;
+              equal string "No_login" (denied ()) ) )
+    ; test "a login removes the expired logins" (fun () ->
+          with_app (fun {b; idp; _} ->
+              let g = authorize idp (fst (visit b "/login")) in
+              Time.sleep Mono (Span.s 600) ;
+              ignore (visit b "/login") ;
+              (* Not Expired: the login is gone. *)
+              equal string "No_login" (snd (visit b (callback_path g))) ) )
+    ; test "the expiry of a login is that of its client" (fun () ->
+          with_app
+            ~client:(fun p ->
+              O.client ~login_timeout:(Span.s 60) ~provider:p ~id:"app"
+                ~redirect_uri () )
+            (fun {b; idp; _} ->
+              let other = authorize idp (fst (visit b "/login-other")) in
+              Time.sleep Mono (Span.s 120) ;
+              equal int 303 (code_of (fst (login_and_callback b idp))) ;
+              equal int 303
+                (code_of
+                   (fst (visit b (callback_path ~path:"/callback-other" other))) ) ) )
+    ; test "a callback keeps the logins of the other client" (fun () ->
+          with_app (fun {b; idp; _} ->
+              let other = authorize idp (fst (visit b "/login-other")) in
+              equal int 303 (code_of (fst (login_and_callback b idp))) ;
+              equal int 303
+                (code_of
+                   (fst (visit b (callback_path ~path:"/callback-other" other))) ) ) )
+    ; test "a failure response keeps its Referrer-Policy" (fun () ->
+          with_app
+            ~headers:
+              (Caravan.Headers.of_list [("Referrer-Policy", "same-origin")])
+            (fun {b; _} ->
+              let resp, _ = visit b "/callback?state=x" in
+              equal string "same-origin" (header "referrer-policy" resp) ) )
+    ; test "a token response with no access_token" (fun () ->
+          with_app (fun {b; idp; seen} ->
+              let resp, _ = visit b "/login" in
+              let g = authorize idp resp in
+              let nonce = (snd (List.hd idp.codes)).g_nonce in
+              idp.token_reply <-
+                Some
+                  ( 200
+                  , Printf.sprintf
+                      {|{"token_type":"Bearer","id_token":"%s","expires_in":"x"}|}
+                      (id_token [("nonce", Printf.sprintf "%S" nonce)]) ) ;
+              equal int 303 (code_of (fst (visit b (callback_path g)))) ;
+              match !seen with
+              | Some t ->
+                  equal (option string) None t.access_token ;
+                  equal (option int) None t.expires_in ;
+                  equal string "ada" t.subject
+              | None ->
+                  fail "no tokens" ) )
+    ; test "a bad token response gives Token or Bad_response" (fun () ->
+          with_app (fun {b; idp; _} ->
+              List.iter
+                (fun (reply, expected) ->
+                  idp.token_reply <- reply ;
+                  equal string expected (snd (login_and_callback b idp)) )
+                [ ( Some (400, {|{"error":"invalid_grant"}|})
+                  , {|Token "status 400: invalid_grant"|} )
+                ; (Some (500, "x"), {|Token "status 500"|})
+                ; (Some (401, "[1]"), {|Token "status 401"|})
+                ; (Some (401, {|{"error":1}|}), {|Token "status 401"|})
+                ; ( Some (200, "x")
+                  , {|Bad_response "the token response is not a JSON object"|}
+                  )
+                ; ( Some (200, "[]")
+                  , {|Bad_response "the token response is not a JSON object"|}
+                  )
+                ; ( Some (200, {|{"token_type":"Bearer"}|})
+                  , {|Bad_response "the token response has no id_token"|} )
+                ; ( Some (200, {|{"token_type":"Bearer","id_token":1}|})
+                  , {|Bad_response "the token response has no id_token"|} )
+                ; ( Some (200, {|{"token_type":"mac","id_token":"x"}|})
+                  , {|Bad_response "the token type is not Bearer"|} )
+                ; ( Some (200, {|{"id_token":"x"}|})
+                  , {|Bad_response "the token type is not Bearer"|} )
+                ; ( Some (200, String.make 70000 ' ')
+                  , {|Token "https://idp.example:80/token: the body is too large"|}
+                  ) ] ;
+              (* The type is case-insensitive; expires_in can be absent. *)
+              idp.token_reply <- None ;
+              let resp, _ = visit b "/login" in
+              let g = authorize idp resp in
+              let nonce = (snd (List.hd idp.codes)).g_nonce in
+              idp.token_reply <-
+                Some
+                  ( 200
+                  , Printf.sprintf {|{"token_type":"bEaReR","id_token":"%s"}|}
+                      (id_token [("nonce", Printf.sprintf "%S" nonce)]) ) ;
+              equal int 303 (code_of (fst (visit b (callback_path g)))) ) )
+    ; test "an ID token with the nonce of an other login gives Bad_nonce"
+        (fun () ->
+          with_app (fun {b; idp; _} ->
+              idp.nonce <- Some "other" ;
+              equal string "Id_token (Bad_nonce)"
+                (snd (login_and_callback b idp)) ) )
+    ; test "a session keeps the 4 newest logins" (fun () ->
+          (* The oldest of the 5 logins is gone; the next oldest works. *)
+          with_app (fun {b; idp; _} ->
+              let gs =
+                List.init 5 (fun _ -> authorize idp (fst (visit b "/login")))
+              in
+              equal string "No_login"
+                (snd (visit b (callback_path (List.nth gs 0)))) ;
+              equal int 303
+                (code_of (fst (visit b (callback_path (List.nth gs 1))))) ) )
+    ; test "the return path" (fun () ->
+          with_app (fun {b; idp; _} ->
+              let return path =
+                let resp, _ = visit b path in
+                header "location"
+                  (fst (visit b (callback_path (authorize idp resp))))
+              in
+              equal string "/" (return "/login") ;
+              equal string "/" (return "/login?return=//evil.example") ;
+              equal string "/" (return "/login?return=https://evil.example") ;
+              equal string "/a,b|c%2C"
+                (return
+                   ("/login?" ^ Caravan.Form.encode [("return", "/a,b|c%2C")]) ) ;
+              let long = "/" ^ String.make 1023 'x' in
+              equal string long
+                (return ("/login?" ^ Caravan.Form.encode [("return", long)])) ;
+              equal string "/"
+                (return
+                   ("/login?" ^ Caravan.Form.encode [("return", long ^ "x")]) ) ) )
+    ; test "a return path cannot add a login (login CSRF)" (fun () ->
+          (* An attacker knows the state, the nonce and the verifier of a login
+             that a return path would add. *)
+          with_app (fun {b; _} ->
+              let b64 = B64.encode ~url:true ~pad:false in
+              let forged =
+                String.concat "|"
+                  [ b64 issuer
+                  ; b64 "app"
+                  ; Printf.sprintf "%.0f" oidc_t0
+                  ; "S"
+                  ; "N"
+                  ; "V"
+                  ; b64 "/" ]
+              in
+              ignore
+                (visit b
+                   ("/login?" ^ Caravan.Form.encode [("return", "/x," ^ forged)]) ) ;
+              equal string "No_login" (snd (visit b (callback_path ("c", "S")))) ) )
+    ; test "a state of an other client gives No_login" (fun () ->
+          with_app (fun {b; idp; _} ->
+              let resp, _ = visit b "/login" in
+              let g = authorize idp resp in
+              let other = callback_path ~path:"/callback-other" g in
+              equal string "No_login" (snd (visit b other)) ;
+              (* The login of the client stays. *)
+              equal int 303 (code_of (fst (visit b (callback_path g)))) ) )
+    ; test "the iss parameter must be the issuer" (fun () ->
+          with_app (fun {b; idp; _} ->
+              equal string
+                {|Bad_response "the iss parameter is not the issuer"|}
+                (snd
+                   (login_and_callback
+                      ~extra:[("iss", "https://evil.example")]
+                      b idp ) ) ;
+              equal int 303
+                (code_of
+                   (fst (login_and_callback ~extra:[("iss", issuer)] b idp)) ) ) ;
+          let idp = new_idp () in
+          idp.document <-
+            doc [("authorization_response_iss_parameter_supported", "true")] ;
+          with_app ~idp (fun {b; idp; _} ->
+              equal string {|Bad_response "no iss parameter"|}
+                (snd (login_and_callback b idp)) ;
+              equal int 303
+                (code_of
+                   (fst (login_and_callback ~extra:[("iss", issuer)] b idp)) ) ) )
+    ; test "the secret goes as auth tells" (fun () ->
+          let calls ?auth ?methods () =
+            let idp = new_idp () in
+            Option.iter
+              (fun m ->
+                idp.document <-
+                  doc [("token_endpoint_auth_methods_supported", m)] )
+              methods ;
+            with_app ~idp
+              ~client:(fun p ->
+                O.client ~secret:"s:é" ?auth ~provider:p ~id:"app id"
+                  ~redirect_uri () )
+              (fun {b; idp; _} ->
+                ignore (login_and_callback b idp) ;
+                match idp.token_calls with
+                | [(a, form)] ->
+                    ( Option.value a ~default:"none"
+                    , List.filter_map
+                        (fun (n, v) ->
+                          if n = "client_id" || n = "client_secret" then
+                            Some (n ^ "=" ^ v)
+                          else None )
+                        form )
+                | _ ->
+                    ("calls", []) )
+          in
+          let basic =
+            "Basic " ^ B64.encode ~url:false ~pad:true "app+id:s%3A%C3%A9"
+          in
+          equal
+            (pair string (list string))
+            ~msg:"default" (basic, []) (calls ()) ;
+          equal
+            (pair string (list string))
+            ~msg:"basic listed" (basic, [])
+            (calls ~methods:{|["client_secret_post","client_secret_basic"]|} ()) ;
+          equal
+            (pair string (list string))
+            ~msg:"post listed"
+            ("none", ["client_id=app id"; "client_secret=s:é"])
+            (calls ~methods:{|["client_secret_post"]|} ()) ;
+          equal
+            (pair string (list string))
+            ~msg:"post"
+            ("none", ["client_id=app id"; "client_secret=s:é"])
+            (calls ~auth:`Post ()) ;
+          equal
+            (pair string (list string))
+            ~msg:"basic" (basic, [])
+            (calls ~auth:`Basic ~methods:{|["client_secret_post"]|} ()) )
+    ; test "extra parameters and an endpoint with a query" (fun () ->
+          let idp = new_idp () in
+          idp.document <-
+            doc
+              [ ( "authorization_endpoint"
+                , Printf.sprintf "%S" (issuer ^ "/authorize?tenant=t") ) ] ;
+          with_app ~idp
+            ~client:(fun p ->
+              O.client ~scope:["email"]
+                ~extra:[("prompt", "select_account")]
+                ~provider:p ~id:"app" ~redirect_uri () )
+            (fun {b; _} ->
+              let resp, _ = visit b "/login" in
+              let q = location_query resp in
+              equal string "t" (param "tenant" q) ;
+              equal string "select_account" (param "prompt" q) ;
+              equal string "openid email" (param "scope" q) ) )
+    ; test "the callback needs GET" (fun () ->
+          with_app (fun {b; _} ->
+              List.iter
+                (fun m ->
+                  let resp, _ = visit b ~meth:m "/callback?state=x" in
+                  equal int 405 (code_of resp) ;
+                  equal string "GET" (header "allow" resp) )
+                [Caravan.Method.POST; Caravan.Method.HEAD] ) )
+    ; test "client refuses bad arguments" (fun () ->
+          with_idp (fun _ http _ ->
+              let p = discover http in
+              let is_invalid = function
+                | Invalid_argument _ ->
+                    true
+                | _ ->
+                    false
+              in
+              let make ?(id = "app") ?(redirect_uri = redirect_uri) ?scope
+                  ?secret ?leeway ?login_timeout ?extra ?(provider = p) () =
+                ignore
+                  ( O.client ?scope ?secret ?leeway ?login_timeout ?extra
+                      ~provider ~id ~redirect_uri ()
+                    : O.client )
+              in
+              make () ;
+              List.iter
+                (fun u -> make ~redirect_uri:u ())
+                [ "http://localhost/cb"
+                ; "http://LOCALHOST:8080/cb"
+                ; "http://127.0.0.1:9/cb"
+                ; "http://[::1]/cb" ] ;
+              List.iter
+                (fun (label, f) -> raises_match ~msg:label is_invalid f)
+                [ ("empty id", fun () -> make ~id:"" ())
+                ; ( "http"
+                  , fun () -> make ~redirect_uri:"http://app.example/cb" () )
+                ; ( "http localhost.example"
+                  , fun () ->
+                      make ~redirect_uri:"http://localhost.example/cb" () )
+                ; ("ftp", fun () -> make ~redirect_uri:"ftp://localhost/cb" ())
+                ; ( "fragment"
+                  , fun () -> make ~redirect_uri:"http://localhost/#f" () )
+                ; ( "bad URL"
+                  , fun () -> make ~redirect_uri:"http://localhost:0/" () )
+                ; ( "login timeout"
+                  , fun () -> make ~login_timeout:(Span.ms 999) () )
+                ; ("leeway", fun () -> make ~leeway:(Span.of_ns (-1L)) ())
+                ; ("empty scope", fun () -> make ~scope:[""] ())
+                ; ("scope with a space", fun () -> make ~scope:["a b"] ())
+                ; ("scope with DEL", fun () -> make ~scope:["a\x7f"] ())
+                ; ( "redirect with a space"
+                  , fun () -> make ~redirect_uri:"http://localhost/a b" () )
+                ; ( "redirect with DEL"
+                  , fun () -> make ~redirect_uri:"http://localhost/a\x7f" () )
+                ; ( "reserved"
+                  , fun () -> make ~extra:[("prompt", "x"); ("nonce", "n")] ()
+                  )
+                ; ("max_age", fun () -> make ~extra:[("max_age", "1")] ())
+                ; ( "no secret method"
+                  , fun () ->
+                      make ~secret:"s"
+                        ~provider:
+                          (P.make ~auth_methods:["private_key_jwt"] ~issuer
+                             ~authorization_endpoint:(issuer ^ "/a")
+                             ~token_endpoint:(issuer ^ "/t")
+                             ~jwks_uri:(issuer ^ "/k") http )
+                        () ) ] ;
+              make ~login_timeout:(Span.s 1) ~leeway:Span.zero
+                ~extra:[("prompt", "x")]
+                () ) )
+    ; test "pp_failure" (fun () ->
+          equal (list string)
+            [ "No_login"
+            ; "Expired"
+            ; {|Denied ("e", Some "d")|}
+            ; {|Bad_response "m"|}
+            ; {|Token "m"|}
+            ; "Id_token (Missing_nonce)" ]
+            (List.map
+               (Format.asprintf "%a" O.pp_failure)
+               [ O.No_login
+               ; Expired
+               ; Denied ("e", Some "d")
+               ; Bad_response "m"
+               ; Token "m"
+               ; Id_token Missing_nonce ] ) ) ]
+
 let () =
   Mirage_crypto_rng.set_default_generator
     (Mirage_crypto_rng.create ~seed:"caravan auth tests"
@@ -2616,4 +3289,5 @@ let () =
        ; bearer_tests
        ; policy_tests
        ; session_tests
-       ; oidc_tests ] )
+       ; oidc_tests
+       ; flow_tests ] )

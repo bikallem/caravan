@@ -622,8 +622,177 @@ module Oidc : sig
       that other client: it gives [Bad_azp].
 
       Google signs the tokens of its button with two issuer texts:
-      [~issuers:["https://accounts.google.com"; "accounts.google.com"]].
+      [~issuers:["https://accounts.google.com"; "accounts.google.com"]]. The
+      button "Sign in with Google" sends an ID token in a form, with no code
+      flow. Use its popup mode: the JavaScript callback of the page sends the
+      token in a POST of the same origin, with a CSRF token
+      ({!Caravan_session.Csrf}). Then check the token with these issuers and a
+      nonce that the page gave to the button. In the redirect mode, the browser
+      sends a cross-site POST, with no session cookie: only the cookie
+      [g_csrf_token] protects it, and a host of a sibling domain can set that
+      cookie. Prefer the code flow ({!login}).
 
       @raise Invalid_argument as {!Jwt.verify}, for example for [issuers = []].
   *)
+
+  (** {2:flow The login and the callback}
+
+      The authorization code flow with PKCE (OIDC Core §3.1, RFC 7636): {!login}
+      sends the browser to the provider, and the provider sends it back to
+      {!callback} with a code. The callback gets the tokens, checks the ID
+      token, and calls a function of the application. That function finds or
+      makes the user, calls {!Caravan_auth.sign_in}, and gives the response.
+
+      {[
+      let google =
+        Caravan_auth.Oidc.client ~secret ~provider ~id:"123.apps"
+          ~redirect_uri:"https://app.example/auth/callback" ()
+
+      let signed_in req (t : Caravan_auth.Oidc.tokens) ~return =
+        let user =
+          find_or_make_user t.subject (Caravan_auth.Jwt.string "email" t.claims)
+        in
+        Caravan_auth.sign_in req user ;
+        Caravan.Response.empty ~status:Caravan.Status.see_other
+          ~headers:(Caravan.Headers.of_list [("Location", return)])
+          ()
+
+      let routes =
+        Caravan_router.
+          [ get "/auth/login" (Caravan_auth.Oidc.login google)
+          ; get "/auth/callback" (Caravan_auth.Oidc.callback google signed_in)
+          ]
+      ]}
+
+      The two handlers need the middleware of [caravan.session]. Each login
+      makes a session if the request has none: put a rate limit on the login
+      route ([Caravan_middleware.Rate_limit]). The session cookie must be
+      [SameSite=Lax] (the default) or [None]: with [Strict], the browser does
+      not send it with the redirect of the provider, and the callback gives
+      [No_login].
+
+      Give each client its own redirect URI: the callback finds only the logins
+      of its client (RFC 9700 §4.4.2). Two requests of one session at the same
+      time can lose a change of the other: the session middleware writes all the
+      data of the session at the end of a request. Thus two logins at the same
+      time can lose one login, and two callbacks of one login at the same time
+      can both find it. The provider refuses the second use of a code (RFC 6749
+      §4.1.2). *)
+
+  (** The type for a client of a provider: its registration. *)
+  type client
+
+  val client :
+       ?scope:string list
+    -> ?secret:string
+    -> ?auth:[`Basic | `Post]
+    -> ?leeway:Weft.Span.t
+    -> ?login_timeout:Weft.Span.t
+    -> ?extra:(string * string) list
+    -> provider:Provider.t
+    -> id:string
+    -> redirect_uri:string
+    -> unit
+    -> client
+  (** [client ~provider ~id ~redirect_uri ()] is the client [id] of [provider].
+      - [scope] (default [["openid"; "email"; "profile"]]) gets [openid] if it
+        does not have it.
+      - [secret] is the client secret. With no secret, the client is public:
+        PKCE protects the code, and the token request has only [client_id].
+      - [auth] is how the secret goes: [`Basic] (the [Authorization] field) or
+        [`Post] (the form). The default: [`Basic], unless the provider lists
+        [client_secret_post] and not [client_secret_basic] (see
+        {!Provider.auth_methods}).
+      - [leeway] is that of {!verify_id_token}.
+      - [login_timeout] (default 10 min) is the time from {!login} to
+        {!callback}.
+      - [extra] are more parameters of the authorization request, for example
+        [["prompt", "select_account"]].
+
+      An [http] redirect URI is for a native app on the same host. RFC 8252 §8.3
+      recommends [127.0.0.1] or [[::1]], not [localhost].
+
+      @raise Invalid_argument
+        if [id] is empty; [redirect_uri] is not [https], or [http] of
+        [localhost], [127.0.0.1] or [[::1]] (RFC 8252 §7.3); [login_timeout] is
+        less than 1 s; [leeway] is negative; a scope is empty or has a space or
+        a control character; [extra] has a parameter that {!login} sets or that
+        changes the checks ([response_type], [client_id], [redirect_uri],
+        [scope], [state], [nonce], [code_challenge], [code_challenge_method],
+        [max_age], [request], [request_uri], [response_mode]); or the provider
+        lists neither [client_secret_basic] nor [client_secret_post] for a
+        client with a secret and no [auth]. *)
+
+  val login : ?return:string -> client -> Caravan.Handler.t
+  (** [login c] is a handler that starts a login: a [303] to the authorization
+      endpoint, with [response_type=code], [client_id], [redirect_uri], [scope],
+      [state], [nonce], [code_challenge] (S256) and the [extra] parameters. The
+      response has [Cache-Control: no-store] and [Referrer-Policy: no-referrer].
+      - It keeps the login in the session: a random state, nonce and PKCE
+        verifier (32 bytes each), the time, and the return path. A session keeps
+        at most 4 logins, the newest. Logins in more tabs give [No_login] to the
+        oldest. A callback removes only its login: the other logins stay after a
+        sign-in that keeps the data of the session (see
+        {!Caravan_auth.sign_in}).
+      - The return path is [return], else {!Caravan_auth.return_path}, else
+        ["/"]. A path that is not a path of this site, or that has more than 1
+        KiB, becomes ["/"].
+
+      @raise Invalid_argument
+        as {!Caravan_session.set}, for example with no session middleware. *)
+
+  (** The tokens of a callback. *)
+  type tokens =
+    { id_token: string  (** The text of the ID token. *)
+    ; access_token: string option
+    ; expires_in: int option  (** The life of the access token, in seconds. *)
+    ; subject: string
+          (** The [sub] claim of the ID token: the ID of the user at the
+              provider. With the issuer, it is the key of an account. *)
+    ; claims: Jwt.claims  (** The claims of the checked ID token. *) }
+
+  (** The type for the failures of a callback. *)
+  type failure =
+    | No_login
+        (** No login of the session has the [state] of the callback, for this
+            client: for example a callback that comes two times, a login of
+            another browser, or a login that 4 newer logins pushed out. *)
+    | Expired  (** The login is older than [login_timeout]. *)
+    | Denied of string * string option
+        (** The provider sent [error] (for example [access_denied]) and
+            [error_description]. *)
+    | Bad_response of string
+        (** The callback has no code, its [iss] is not the issuer (RFC 9207), or
+            the token response is not correct. *)
+    | Token of string
+        (** The token request failed: the network, a timeout, or a status other
+            than 200 (with the [error] of the response). *)
+    | Id_token of error  (** {!verify_id_token} refused the ID token. *)
+
+  val pp_failure : Format.formatter -> failure -> unit
+
+  val callback :
+       ?failed:(Caravan.Request.t -> failure -> Caravan.Response.t)
+    -> client
+    -> (Caravan.Request.t -> tokens -> return:string -> Caravan.Response.t)
+    -> Caravan.Handler.t
+  (** [callback c f] is the handler of the redirect URI of [c]:
+      - A method other than [GET]: [405].
+      - The [state] parameter comes first: with no login of this state and
+        client, the result is [No_login], and no other parameter is read.
+      - The login goes from the session at once, with the expired logins.
+      - If the callback has [iss], it must be the issuer. If the provider tells
+        that it sends [iss] ({!Provider.iss_parameter}), it must be there.
+      - An [error] parameter gives [Denied].
+      - The token request: a [POST] of the code, the redirect URI and the PKCE
+        verifier to the token endpoint, with the secret as [auth] tells, and the
+        deadline of the provider. The response must be [200] with a JSON object
+        of at most 64 KiB, with [id_token] and a [token_type] of [Bearer].
+      - {!verify_id_token} with the nonce of the login.
+      - Then [f req tokens ~return], with the return path of the login.
+
+      [failed] gives the response of a failure: by default a [400] with no
+      detail. The texts of [Denied] come from the query: escape them in HTML.
+      Each response gets [Referrer-Policy: no-referrer] if it has none: the URL
+      of the callback has the code. *)
 end
