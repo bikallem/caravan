@@ -90,7 +90,7 @@ let with_client_flow ?write ?on_write_timeout sim f =
       Flow.close server ;
       Flow.close client )
   @@ fun () ->
-  let conn = Conn.make ~id:0 ~host:"a" ~port:80 client in
+  let conn = Conn.make ~id:0 ~scheme:`Http ~host:"a" ~port:80 client in
   f ~scope ~server ~writers ~conn ~taken:counted.read_bytes
 
 (* [conn_in sim f] gives [f] a connection of [with_client_flow]. *)
@@ -840,7 +840,7 @@ let exchange_tests =
           let writers = Writers.make scope in
           Writers.stop writers ;
           Writers.wait writers ;
-          let conn = Conn.make ~id:0 ~host:"a" ~port:80 client
+          let conn = Conn.make ~id:0 ~scheme:`Http ~host:"a" ~port:80 client
           and releases = ref []
           and closes = Atomic.make 0 in
           let source =
@@ -1166,7 +1166,7 @@ let exchange_tests =
           with_client_flow sim
           @@ fun ~scope ~server ~writers ~conn ~taken:_ ->
           let flow, nones = none_counted conn.flow in
-          let conn = Conn.make ~id:0 ~host:"a" ~port:80 flow
+          let conn = Conn.make ~id:0 ~scheme:`Http ~host:"a" ~port:80 flow
           and releases = ref [] in
           let r = Buf_reader.of_flow server in
           let s =
@@ -1494,7 +1494,7 @@ let exchange_tests =
           Server_support.with_flows sim
           @@ fun ~server:_ ~client ->
           let writers = Fiber.scope (fun s -> Writers.make s) in
-          let conn = Conn.make ~id:0 ~host:"a" ~port:80 client
+          let conn = Conn.make ~id:0 ~scheme:`Http ~host:"a" ~port:80 client
           and releases = ref []
           and closes = Atomic.make 0 in
           let source =
@@ -1711,7 +1711,7 @@ let exchange_tests =
           Server_support.with_flows sim
           @@ fun ~server:_ ~client ->
           let writers = Fiber.scope (fun s -> Writers.make s) in
-          let conn = Conn.make ~id:0 ~host:"a" ~port:80 client
+          let conn = Conn.make ~id:0 ~scheme:`Http ~host:"a" ~port:80 client
           and releases = ref [] in
           let source =
             Body.of_source ~length:3
@@ -1863,7 +1863,7 @@ let resolver_tests =
 
 (* A request through a pool, as the client makes it. *)
 let pooled pool writers ?(config = Client_config.default) ~port r =
-  let c, _ = Pool.checkout pool ~host:"127.0.0.1" ~port in
+  let c, _ = Pool.checkout pool ~scheme:`Http ~host:"127.0.0.1" ~port in
   Exchange.run config writers c
     ~on_release:(fun c ~reusable -> Pool.release pool c ~reusable)
     r
@@ -1883,7 +1883,12 @@ let with_pool ?config ?(client_config = Client_config.default) ?engine
   Fiber.scope
   @@ fun s ->
   let writers = Writers.make s in
-  let pool = Pool.make client_config in
+  let pool =
+    Pool.make
+      ~connect:(fun ~scheme:_ ~host ~port ->
+        Connect.connect client_config ~host ~port )
+      client_config
+  in
   Fun.protect ~finally:(fun () ->
       Pool.close pool ; Writers.stop writers ; Writers.wait writers )
   @@ fun () -> f pool writers (server_port server)
@@ -1915,7 +1920,7 @@ let is_closed f = Atomic.get f.closes > 0
    connects. *)
 let fake_pool ?(config = Client_config.default) () =
   let made = ref [] in
-  let connect ~host:_ ~port:_ =
+  let connect ~scheme:_ ~host:_ ~port:_ =
     let f = fake () in
     made := f :: !made ;
     f.flow
@@ -1952,7 +1957,9 @@ let pool_tests =
           check_settled sim ~msg:"the connection is back in the pool" (fun () ->
               Pool.idle_hosts pool = 1 ) ;
           let sent = String.init 9000 (fun i -> Char.chr (97 + (i mod 26))) in
-          let c, tag = Pool.checkout pool ~host:"127.0.0.1" ~port in
+          let c, tag =
+            Pool.checkout pool ~scheme:`Http ~host:"127.0.0.1" ~port
+          in
           is_true ~msg:"the same connection" (tag = `Reused) ;
           let resp =
             Exchange.run Client_config.default writers c
@@ -2010,28 +2017,28 @@ let pool_tests =
           @@ fun sim ->
           let pool, made = fake_pool () in
           let idle = Client_config.default.idle_timeout in
-          let c, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          let c, _ = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
           Pool.release pool c ~reusable:true ;
           Sim_support.advance sim (Span.s 4) ;
-          let c', kind = Pool.checkout pool ~host:"A" ~port:80 in
+          let c', kind = Pool.checkout pool ~scheme:`Http ~host:"A" ~port:80 in
           is_true ~msg:"reused at 4 s" (kind = `Reused && c'.Conn.id = c.Conn.id) ;
           Pool.release pool c' ~reusable:true ;
           Sim_support.advance sim (Span.of_ns (Int64.pred (Span.to_ns idle))) ;
-          let c', kind = Pool.checkout pool ~host:"a" ~port:80 in
+          let c', kind = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
           is_true ~msg:"reused at idle_timeout - 1 ns" (kind = `Reused) ;
           Pool.release pool c' ~reusable:true ;
           Sim_support.advance sim idle ;
-          let _, kind = Pool.checkout pool ~host:"a" ~port:80 in
+          let _, kind = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
           is_true ~msg:"new at idle_timeout" (kind = `New) ;
           equal (list bool) [true; false] (List.map is_closed (made ())) )
     ; test "a connection of age idle_timeout is stale" (fun () ->
           Sim_support.manual
           @@ fun sim ->
           let pool, made = fake_pool () in
-          let c, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          let c, _ = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
           Pool.release pool c ~reusable:true ;
           Sim_support.advance sim Client_config.default.idle_timeout ;
-          let _, kind = Pool.checkout pool ~host:"a" ~port:80 in
+          let _, kind = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
           is_true ~msg:"new at idle_timeout" (kind = `New) ;
           equal (list bool) [true; false] (List.map is_closed (made ())) )
     ; test "max_idle_per_host keeps at most that number" (fun () ->
@@ -2043,12 +2050,14 @@ let pool_tests =
               ()
           in
           let cs =
-            List.init 3 (fun _ -> fst (Pool.checkout pool ~host:"a" ~port:80))
+            List.init 3 (fun _ ->
+                fst (Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80) )
           in
           List.iter (fun c -> Pool.release pool c ~reusable:true) cs ;
           equal (list bool) [false; false; true] (List.map is_closed (made ())) ;
           let kinds =
-            List.init 3 (fun _ -> snd (Pool.checkout pool ~host:"a" ~port:80))
+            List.init 3 (fun _ ->
+                snd (Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80) )
           in
           equal (list bool) [true; true; false]
             (List.map (fun k -> k = `Reused) kinds) ;
@@ -2057,13 +2066,13 @@ let pool_tests =
           Sim_support.run
           @@ fun _ ->
           let pool, made = fake_pool () in
-          let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
-          let _b, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          let a, _ = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
+          let _b, _ = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
           Pool.release pool a ~reusable:true ;
           Pool.close pool ;
           equal (list bool) [true; true] (List.map is_closed (made ())) ;
           raises_match is_invalid_arg (fun () ->
-              Pool.checkout pool ~host:"a" ~port:80 ) )
+              Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 ) )
     ; test "two pools close their connections in one order" (fun () ->
           (* The tables of a pool are not random: thus a replay of a seed is
              exact. 16 connections are idle, and 16 are in use. *)
@@ -2071,7 +2080,7 @@ let pool_tests =
             Sim_support.run
             @@ fun _ ->
             let closed = ref [] in
-            let connect ~host ~port:_ =
+            let connect ~scheme:_ ~host ~port:_ =
               Flow.make
                 ~read:(fun _ _ _ -> 0)
                 ~read_now:(fun _ _ _ -> None)
@@ -2083,7 +2092,9 @@ let pool_tests =
             let pool = Pool.make ~connect Client_config.default in
             let conns =
               List.init 32 (fun i ->
-                  fst (Pool.checkout pool ~host:(string_of_int i) ~port:80) )
+                  fst
+                    (Pool.checkout pool ~scheme:`Http ~host:(string_of_int i)
+                       ~port:80 ) )
             in
             List.iteri
               (fun i c -> if i < 16 then Pool.release pool c ~reusable:true)
@@ -2098,8 +2109,8 @@ let pool_tests =
           Sim_support.manual
           @@ fun sim ->
           let pool, made = fake_pool () in
-          let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
-          let b, _ = Pool.checkout pool ~host:"b" ~port:80 in
+          let a, _ = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
+          let b, _ = Pool.checkout pool ~scheme:`Http ~host:"b" ~port:80 in
           Pool.release pool a ~reusable:true ;
           Sim_support.advance sim (Span.s 3) ;
           Pool.release pool b ~reusable:true ;
@@ -2124,19 +2135,19 @@ let pool_tests =
           (* Thus a run of the simulator does not depend on the runs before
              it. *)
           let a, _ = fake_pool () and b, _ = fake_pool () in
-          let ca, _ = Pool.checkout a ~host:"a" ~port:80 in
-          let ca', _ = Pool.checkout a ~host:"a" ~port:80 in
+          let ca, _ = Pool.checkout a ~scheme:`Http ~host:"a" ~port:80 in
+          let ca', _ = Pool.checkout a ~scheme:`Http ~host:"a" ~port:80 in
           equal (list int) [0; 1] [ca.Conn.id; ca'.Conn.id] ;
-          let cb, _ = Pool.checkout b ~host:"a" ~port:80 in
+          let cb, _ = Pool.checkout b ~scheme:`Http ~host:"a" ~port:80 in
           equal int 0 cb.Conn.id )
     ; test "the pool keeps no empty list of a host" (fun () ->
           Sim_support.manual
           @@ fun sim ->
           let pool, _ = fake_pool () in
-          let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          let a, _ = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
           Pool.release pool a ~reusable:true ;
           equal int 1 (Pool.idle_hosts pool) ;
-          let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          let a, _ = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
           equal int 0 (Pool.idle_hosts pool) ;
           Pool.release pool a ~reusable:true ;
           Sim_support.advance sim (Span.s 6) ;
@@ -2149,15 +2160,15 @@ let pool_tests =
           let pool, made = fake_pool () in
           Pool.close pool ;
           raises_match is_invalid_arg (fun () ->
-              Pool.checkout ~reuse:false pool ~host:"a" ~port:80 ) ;
+              Pool.checkout ~reuse:false pool ~scheme:`Http ~host:"a" ~port:80 ) ;
           raises_match is_invalid_arg (fun () ->
-              Pool.checkout pool ~host:"a" ~port:80 ) ;
+              Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 ) ;
           equal int 0 (List.length (made ())) )
     ; test "a connect during close is closed" (fun () ->
           Sim_support.run
           @@ fun _ ->
           let pool = ref None and flows = ref [] in
-          let connect ~host:_ ~port:_ =
+          let connect ~scheme:_ ~host:_ ~port:_ =
             let f = fake () in
             flows := f :: !flows ;
             Pool.close (Option.get !pool) ;
@@ -2165,7 +2176,7 @@ let pool_tests =
           in
           pool := Some (Pool.make ~connect Client_config.default) ;
           raises_match is_invalid_arg (fun () ->
-              Pool.checkout (Option.get !pool) ~host:"a" ~port:80 ) ;
+              Pool.checkout (Option.get !pool) ~scheme:`Http ~host:"a" ~port:80 ) ;
           equal (list bool) [true] (List.map is_closed !flows) )
     ; test "race: checkout, release and reap on 4 domains" (fun () ->
           (* 8 fibers on 4 domains use the pool at the same time. A sleep
@@ -2184,7 +2195,7 @@ let pool_tests =
             let l = Atomic.get made in
             if not (Atomic.compare_and_set made l (x :: l)) then add x
           in
-          let connect ~host ~port:_ =
+          let connect ~scheme:_ ~host ~port:_ =
             let f = fake () in
             add (host, f) ;
             f.flow
@@ -2193,7 +2204,7 @@ let pool_tests =
           let worker i () =
             for step = 1 to 20 do
               let host = if (i + step) mod 2 = 0 then "a" else "b" in
-              let c, _ = Pool.checkout pool ~host ~port:80 in
+              let c, _ = Pool.checkout pool ~scheme:`Http ~host ~port:80 in
               Time.sleep Mono (Span.ms (((i * 7) + (step * 3)) mod 5)) ;
               Pool.release pool c ~reusable:((i + step) mod 3 <> 0) ;
               if step mod 5 = 0 then Pool.reap pool
@@ -2225,18 +2236,18 @@ let pool_tests =
           Sim_support.run
           @@ fun _ ->
           let pool, made = fake_pool () in
-          let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          let a, _ = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
           Pool.release pool a ~reusable:true ;
           Atomic.set (List.hd (made ())).server_closed true ;
-          let _, kind = Pool.checkout pool ~host:"a" ~port:80 in
+          let _, kind = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
           is_true ~msg:"a new connection" (kind = `New) ;
           equal int ~msg:"in use" 1 (Pool.in_use pool) )
     ; test "a release leaves the connections in use" (fun () ->
           Sim_support.run
           @@ fun _ ->
           let pool, _ = fake_pool () in
-          let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
-          let b, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          let a, _ = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
+          let b, _ = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
           equal int 2 (Pool.in_use pool) ;
           Pool.release pool a ~reusable:true ;
           Pool.release pool b ~reusable:false ;
@@ -2245,8 +2256,8 @@ let pool_tests =
           Sim_support.run
           @@ fun _ ->
           let pool, _ = fake_pool () in
-          let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
-          let _b, _ = Pool.checkout pool ~host:"b" ~port:80 in
+          let a, _ = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
+          let _b, _ = Pool.checkout pool ~scheme:`Http ~host:"b" ~port:80 in
           Pool.release pool a ~reusable:true ;
           Pool.close pool ;
           equal (pair int int) ~msg:"idle hosts, in use" (0, 0)
@@ -2255,9 +2266,9 @@ let pool_tests =
           Sim_support.run
           @@ fun _ ->
           let pool, made = fake_pool () in
-          let a, _ = Pool.checkout pool ~host:"a" ~port:80 in
+          let a, _ = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
           Pool.release pool a ~reusable:true ;
-          let _, kind = Pool.checkout pool ~host:"a" ~port:80 in
+          let _, kind = Pool.checkout pool ~scheme:`Http ~host:"a" ~port:80 in
           is_true ~msg:"reused" (kind = `Reused) ;
           Pool.close pool ;
           equal (list bool) [true] (List.map is_closed (made ())) ) ]
@@ -2331,7 +2342,7 @@ module Pool_system = struct
 
   let make () =
     let fakes = ref [] and connects = ref 0 in
-    let connect ~host:_ ~port:_ =
+    let connect ~scheme:_ ~host:_ ~port:_ =
       incr connects ;
       let f = fake () in
       fakes := f :: !fakes ;
@@ -2343,7 +2354,7 @@ module Pool_system = struct
     {pool= Pool.make ~connect config; fakes; connects}
 
   let checkout p =
-    let c, _ = Pool.checkout p.pool ~host:"a" ~port:80 in
+    let c, _ = Pool.checkout p.pool ~scheme:`Http ~host:"a" ~port:80 in
     owners := (c, p) :: List.filter (fun (c', _) -> c' != c) !owners ;
     c
 
@@ -3011,16 +3022,33 @@ let api_tests =
                 "Invalid_argument"
             | exception e ->
                 Printexc.to_string e ) )
-    ; test "a request with the scheme https gives Unsupported" (fun () ->
+    ; test "an https request with no ~tls gives Unsupported" (fun () ->
+          Sim_support.run
+          @@ fun sim ->
+          let fds = Weft_sim.open_fds sim and closes = Atomic.make 0 in
+          C.run
+          @@ fun client ->
+          (* A connect to this port gives Error (Connect _). *)
+          equal string
+            "Caravan_client.Error: unsupported: https needs the ~tls of the \
+             client"
+            (error_text (fun () ->
+                 C.request client
+                   (Request.with_scheme `Https
+                      (at_port ~meth:Method.POST ~body:(abc_source ~closes ())
+                         refused_port "/" ) ) ) ) ;
+          equal int ~msg:"the body closed" 1 (Atomic.get closes) ;
+          equal int ~msg:"no fd opened" fds (Weft_sim.open_fds sim) )
+    ; test "a scheme other than http and https gives Unsupported" (fun () ->
           Sim_support.run
           @@ fun _ ->
           C.run
           @@ fun client ->
-          (* A connect to this port gives Error (Connect _). *)
-          equal string "Caravan_client.Error: unsupported: the scheme https"
+          equal string "Caravan_client.Error: unsupported: the scheme ftp"
             (error_text (fun () ->
                  C.request client
-                   (Request.with_scheme `Https (at_port refused_port "/")) ) ) )
+                   (Request.make ~scheme:"ftp" ~authority:"127.0.0.1:9"
+                      Method.GET "/" ) ) ) )
     ; test "request after close raises Invalid_argument" (fun () ->
           Sim_support.run
           @@ fun _ ->
@@ -3143,8 +3171,8 @@ let api_tests =
     ; test "get parses URLs" (fun () ->
           let show url =
             match C.Private.parse_url url with
-            | a, p ->
-                Printf.sprintf "%s => %s %s" url a p
+            | s, a, p ->
+                Printf.sprintf "%s => %s %s %s" url s a p
             | exception C.Error e ->
                 Printf.sprintf "%s => %s" url (Printexc.to_string (C.Error e))
             | exception Invalid_argument _ ->
@@ -3160,6 +3188,10 @@ let api_tests =
                   ; "http://[::1]:8080/x"
                   ; "http://a:/"
                   ; "https://a"
+                  ; "HTTPS://A.example:443/x"
+                  ; "https://a:80/"
+                  ; "http://a:443/"
+                  ; "https://[::1]:443?q"
                   ; "ftp://x"
                   ; "http://"
                   ; "http://u@a/"
@@ -3178,13 +3210,17 @@ let api_tests =
                   ; "http:///p" ] ) )
           @@ __POS_OF__
                {|
-            http://a.example => a.example /
-            HTTP://a.example:8080/p?q#f => a.example:8080 /p?q
-            http://a.example?x=1 => a.example /?x=1
-            http://[::1]:80/ => [::1] /
-            http://[::1]:8080/x => [::1]:8080 /x
-            http://a:/ => a /
-            https://a => Caravan_client.Error: unsupported: the scheme https
+            http://a.example => http a.example /
+            HTTP://a.example:8080/p?q#f => http a.example:8080 /p?q
+            http://a.example?x=1 => http a.example /?x=1
+            http://[::1]:80/ => http [::1] /
+            http://[::1]:8080/x => http [::1]:8080 /x
+            http://a:/ => http a /
+            https://a => https a /
+            HTTPS://A.example:443/x => https A.example /x
+            https://a:80/ => https a:80 /
+            http://a:443/ => http a:443 /
+            https://[::1]:443?q => https [::1] /?q
             ftp://x => Caravan_client.Error: unsupported: the scheme ftp
             http:// => Invalid_argument
             http://u@a/ => Invalid_argument
@@ -3192,11 +3228,11 @@ let api_tests =
             http://a:0/ => Invalid_argument
             http://a:8x/ => Invalid_argument
             a.example/p => Invalid_argument
-            http://a:1/ => a:1 /
-            http://a:65535/ => a:65535 /
+            http://a:1/ => http a:1 /
+            http://a:65535/ => http a:65535 /
             http://a:65536/ => Invalid_argument
             http://a:+80/ => Invalid_argument
-            http://a:9/ => a:9 /
+            http://a:9/ => http a:9 /
             http://[::1/ => Invalid_argument
             http://:80/ => Invalid_argument
             http:a.example/p => Invalid_argument
@@ -3937,6 +3973,235 @@ let timed_tests =
           equal Server_support.span ~msg:"at once" Span.zero
             (Time.diff Mono (Time.now Mono) t0) ) ]
 
+(* HTTPS with a fake TLS hook. The hooks here do no TLS: caravan.client does not
+   depend on ocaml-tls. test_tls has the tests with Caravan_tls.https. *)
+
+(* [wrap ?read_now tcp] is [tcp], with [read_now] in place of its read_now. *)
+let wrap ?read_now tcp =
+  let read_now = Option.value read_now ~default:(Flow.read_now tcp) in
+  Flow.make ~read:(Flow.read tcp) ~read_now ~write:(Flow.write tcp)
+    ~readable:(Flow.readable tcp)
+    ~shutdown_send:(fun () -> Flow.shutdown_send tcp)
+    ~close:(fun () -> Flow.close tcp)
+    ~reset:(fun () -> Flow.reset tcp)
+    ~set_read_deadline:(Flow.set_read_deadline tcp)
+    ~set_write_deadline:(Flow.set_write_deadline tcp)
+    ~set_read_timeout:(Flow.set_read_timeout tcp)
+    ~set_write_timeout:(Flow.set_write_timeout tcp)
+    ()
+
+(* A hook that gives the TCP flow, with no TLS. *)
+let plain ~host:_ tcp = Ok (wrap tcp)
+
+let https_tests =
+  group "HTTPS with a TLS hook"
+    [ test "the hook gets the host in lowercase, and the port is 443" (fun () ->
+          Sim_support.run
+          @@ fun sim ->
+          Weft_sim.set_dns sim "example.com" (Addresses ["10.0.0.1"]) ;
+          let seen = ref [] in
+          let tls ~host _ =
+            seen := host :: !seen ;
+            Error "stop"
+          in
+          with_listener (Net.Tcp ("10.0.0.1", 443))
+          @@ fun () ->
+          with_listener (Net.Tcp ("::1", 8443))
+          @@ fun () ->
+          C.run ~tls
+          @@ fun client ->
+          List.iter
+            (fun url ->
+              equal string ~msg:url "Caravan_client.Error: TLS failure: stop"
+                (error_text (fun () -> C.get client url)) )
+            ["https://Example.COM/"; "https://[::1]:8443/x"] ;
+          equal (list string) ["example.com"; "[::1]"] (List.rev !seen) )
+    ; test "a scheme in uppercase uses the hook" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          let calls = Atomic.make 0 in
+          let tls ~host:_ _ = Atomic.incr calls ; Error "stop" in
+          with_listener (Net.Tcp ("10.0.0.1", 443))
+          @@ fun () ->
+          C.run ~tls
+          @@ fun client ->
+          ignore
+            (error_text (fun () ->
+                 C.request client
+                   (Request.make ~scheme:"HTTPS" ~authority:"10.0.0.1"
+                      Method.GET "/" ) ) ) ;
+          equal int 1 (Atomic.get calls) )
+    ; test "http and https to one host and port use different connections"
+        (fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          Server_support.with_server ~handler:id_handler
+          @@ fun server ->
+          C.run ~tls:plain
+          @@ fun client ->
+          let port = server_port server in
+          let id scheme =
+            text
+              (C.request client (Request.with_scheme scheme (at_port port "/")))
+          in
+          let a = id `Http in
+          let b = id `Https in
+          is_true ~msg:"two connections" (a <> b) ;
+          equal (list string) ~msg:"each reused" [a; b] [id `Http; id `Https] )
+    ; test "an Error of the hook gives Error (Tls _) and closes the flow"
+        (fun () ->
+          Sim_support.run
+          @@ fun sim ->
+          with_listener (Net.Tcp ("10.0.0.1", 443))
+          @@ fun () ->
+          Weft_sim.settle sim ;
+          let fds = Weft_sim.open_fds sim in
+          C.run ~tls:(fun ~host:_ _ -> Error "bad")
+          @@ fun client ->
+          equal string "Caravan_client.Error: TLS failure: bad"
+            (error_text (fun () -> C.get client "https://10.0.0.1/")) ;
+          Weft_sim.settle sim ;
+          equal int ~msg:"open fds" fds (Weft_sim.open_fds sim) )
+    ; test "an exception of the hook closes the flow" (fun () ->
+          Sim_support.run
+          @@ fun sim ->
+          with_listener (Net.Tcp ("10.0.0.1", 443))
+          @@ fun () ->
+          Weft_sim.settle sim ;
+          let fds = Weft_sim.open_fds sim in
+          C.run ~tls:(fun ~host:_ _ -> failwith "hook")
+          @@ fun client ->
+          equal string "Failure(\"hook\")"
+            (error_text (fun () -> C.get client "https://10.0.0.1/")) ;
+          Weft_sim.settle sim ;
+          equal int ~msg:"open fds" fds (Weft_sim.open_fds sim) )
+    ; test "a Net.Error of the hook gives Error (Connect _)" (fun () ->
+          Sim_support.run
+          @@ fun sim ->
+          with_listener (Net.Tcp ("10.0.0.1", 443))
+          @@ fun () ->
+          Weft_sim.settle sim ;
+          let fds = Weft_sim.open_fds sim in
+          C.run ~tls:(fun ~host:_ _ ->
+              raise (Net.Error (Other "ETIMEDOUT", "read")) )
+          @@ fun client ->
+          equal string "Caravan_client.Error: cannot connect: ETIMEDOUT"
+            (error_text (fun () -> C.get client "https://10.0.0.1/")) ;
+          Weft_sim.settle sim ;
+          equal int ~msg:"open fds" fds (Weft_sim.open_fds sim) )
+    ; test "a failed handshake does not try the next address" (fun () ->
+          Sim_support.run
+          @@ fun sim ->
+          Weft_sim.set_dns sim lookup_host (Addresses ["10.0.0.1"; "10.0.0.2"]) ;
+          let calls = Atomic.make 0 in
+          with_listener (Net.Tcp ("10.0.0.1", 443))
+          @@ fun () ->
+          with_listener (Net.Tcp ("10.0.0.2", 443))
+          @@ fun () ->
+          C.run ~tls:(fun ~host:_ _ -> Atomic.incr calls ; Error "bad")
+          @@ fun client ->
+          ignore (error_text (fun () -> C.get client ("https://" ^ lookup_host))) ;
+          equal int 1 (Atomic.get calls) )
+    ; test "the handshake has the deadline of the connect" (fun () ->
+          Sim_support.run
+          @@ fun sim ->
+          with_listener (Net.Tcp ("10.0.0.1", 443))
+          @@ fun () ->
+          Weft_sim.settle sim ;
+          let fds = Weft_sim.open_fds sim in
+          let config = {Client_config.default with connect_timeout= Span.s 1} in
+          C.run ~config ~tls:(fun ~host:_ _ -> sync never)
+          @@ fun client ->
+          equal string "Caravan_client.Error: connect timeout"
+            (error_text (fun () -> C.get client "https://10.0.0.1/")) ;
+          Weft_sim.settle sim ;
+          equal int ~msg:"open fds" fds (Weft_sim.open_fds sim) )
+    ; test "a cancel in the handshake closes the flow" (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_listener (Net.Tcp ("10.0.0.1", 443))
+          @@ fun () ->
+          Weft_sim.settle sim ;
+          let fds = Weft_sim.open_fds sim and entered = Ivar.create () in
+          C.run ~tls:(fun ~host:_ _ -> fill entered ; sync never)
+          @@ fun client ->
+          Fiber.scope
+          @@ fun s ->
+          let c =
+            Sim_support.call ~name:"caller" s (fun () ->
+                C.get client "https://10.0.0.1/" )
+          in
+          wait entered ;
+          Sim_support.cancel c ;
+          raises Promise.Cancelled (fun () -> ignore (await c)) ;
+          Weft_sim.settle sim ;
+          equal int ~msg:"open fds" fds (Weft_sim.open_fds sim) )
+    ; test "a Net.Error in the check of an idle connection makes it stale"
+        (fun () ->
+          (* For example ETIMEDOUT after a failed keepalive. *)
+          Sim_support.run
+          @@ fun _ ->
+          Server_support.with_server ~handler:id_handler
+          @@ fun server ->
+          let armed = Atomic.make false and flows = Atomic.make 0 in
+          let tls ~host:_ tcp =
+            let first = Atomic.fetch_and_add flows 1 = 0 in
+            Ok
+              (wrap
+                 ~read_now:(fun b o l ->
+                   if first && Atomic.get armed then
+                     raise (Net.Error (Other "ETIMEDOUT", "read"))
+                   else Flow.read_now tcp b o l )
+                 tcp )
+          in
+          C.run ~tls
+          @@ fun client ->
+          let port = server_port server in
+          let get () =
+            text
+              (C.request client (Request.with_scheme `Https (at_port port "/")))
+          in
+          let a = get () in
+          Atomic.set armed true ;
+          let b = get () in
+          is_true ~msg:"a new connection" (a <> b) ;
+          equal int ~msg:"two connections" 2 (Atomic.get flows) )
+    ; test "a cancel in the check of an idle connection closes it" (fun () ->
+          (* The read_now of a TLS flow can wait for a lock: a cancel can come
+             in the check. *)
+          Sim_support.manual
+          @@ fun sim ->
+          Server_support.with_server ~handler:id_handler
+          @@ fun server ->
+          let armed = Atomic.make false and entered = Ivar.create () in
+          let tls ~host:_ tcp =
+            Ok
+              (wrap
+                 ~read_now:(fun b o l ->
+                   if Atomic.get armed then (fill entered ; sync never)
+                   else Flow.read_now tcp b o l )
+                 tcp )
+          in
+          Weft_sim.settle sim ;
+          let fds = Weft_sim.open_fds sim in
+          C.run ~tls
+          @@ fun client ->
+          let port = server_port server in
+          let get () =
+            text
+              (C.request client (Request.with_scheme `Https (at_port port "/")))
+          in
+          ignore (get ()) ;
+          Atomic.set armed true ;
+          Fiber.scope
+          @@ fun s ->
+          let c = Sim_support.call ~name:"caller" s get in
+          wait entered ;
+          Sim_support.cancel c ;
+          raises Promise.Cancelled (fun () -> ignore (await c)) ;
+          Weft_sim.settle sim ;
+          equal int ~msg:"open fds" fds (Weft_sim.open_fds sim) ) ]
+
 let () =
   exit
     (Windtrap.run "client"
@@ -3945,4 +4210,5 @@ let () =
        ; pool_tests
        ; pool_stateful
        ; api_tests
+       ; https_tests
        ; timed_tests ] )

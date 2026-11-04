@@ -5,6 +5,7 @@ type t =
   | Truncated
   | Bad_response of string
   | Unsupported of string
+  | Tls of string
 
 exception Error of t
 
@@ -27,6 +28,8 @@ let to_string = function
       "bad response: " ^ s
   | Unsupported s ->
       "unsupported: " ^ s
+  | Tls s ->
+      "TLS failure: " ^ s
 
 let () =
   Printexc.register_printer (function

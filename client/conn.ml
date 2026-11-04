@@ -1,5 +1,6 @@
 type t =
   { flow: Caravan.Flow.t
+  ; scheme: [`Http | `Https]
   ; host: string
   ; port: int
   ; id: int
@@ -23,11 +24,12 @@ type t =
 (* The size of the read and the write buffer of a connection. *)
 let buffer_size = 4096
 
-(* [make ~id ~host ~port flow] is a connection. The pool gives [id], unique in
-   the pool: a counter of each pool, thus a run does not depend on the runs
-   before it. *)
-let make ~id ~host ~port flow =
+(* [make ~id ~scheme ~host ~port flow] is a connection. The pool gives [id],
+   unique in the pool: a counter of each pool, thus a run does not depend on the
+   runs before it. *)
+let make ~id ~scheme ~host ~port flow =
   { flow
+  ; scheme
   ; host
   ; port
   ; id

@@ -2,7 +2,7 @@ module Cfg = Config
 open Weft
 open Caravan
 
-(* The idle connections of each (host, port), the newest first, and the
+(* The idle connections of each (scheme, host, port), the newest first, and the
    connections in use. A stdlib Mutex protects them. This is the only stdlib
    lock of caravan.
 
@@ -20,9 +20,9 @@ open Caravan
    deferred release runs in a cancelled job fiber. *)
 type t =
   { config: Cfg.t
-  ; connect: host:string -> port:int -> Flow.t
+  ; connect: scheme:[`Http | `Https] -> host:string -> port:int -> Flow.t
   ; lock: Mutex.t
-  ; idle: (string * int, Conn.t list) Hashtbl.t
+  ; idle: ([`Http | `Https] * string * int, Conn.t list) Hashtbl.t
   ; in_use: (int, Conn.t) Hashtbl.t
   ; next_id: int Atomic.t  (** The id of the next connection. *)
   ; mutable closed: bool }
@@ -30,14 +30,7 @@ type t =
 (* The tables are not randomized: with [OCAMLRUNPARAM=R], a random hash would
    change the order of the closes of [close], thus a replay of a seed would not
    be exact. *)
-let make ?connect config =
-  let connect =
-    match connect with
-    | Some c ->
-        c
-    | None ->
-        fun ~host ~port -> Connect.connect config ~host ~port
-  in
+let make ~connect config =
   { config
   ; connect
   ; lock= Mutex.create ()
@@ -68,6 +61,13 @@ let too_old t ~now (c : Conn.t) =
   | None ->
       false
 
+let discard t (c : Conn.t) =
+  Mutex.protect t.lock (fun () -> Hashtbl.remove t.in_use c.id) ;
+  Flow.close c.flow
+
+(* [c] is in use. A [Net.Error] of the read, for example ETIMEDOUT after a
+   failed keepalive, makes [c] stale. If the read raises an other exception, for
+   example a cancel in the state lock of a TLS flow, [c] closes. *)
 let stale t c =
   too_old t ~now:(Time.now Mono) c
   ||
@@ -76,17 +76,18 @@ let stale t c =
       false
   | Some _ ->
       true
-  | exception Flow.Closed ->
+  | exception (Flow.Closed | Net.Error _) ->
       true
-
-let discard t (c : Conn.t) =
-  Mutex.protect t.lock (fun () -> Hashtbl.remove t.in_use c.id) ;
-  Flow.close c.flow
+  | exception e ->
+      let bt = Printexc.get_raw_backtrace () in
+      discard t c ;
+      Printexc.raise_with_backtrace e bt
 
 let is_closed t = Mutex.protect t.lock (fun () -> t.closed)
 
-let rec checkout ?(reuse = true) t ~host ~port =
-  let key = (String.lowercase_ascii host, port) in
+let rec checkout ?(reuse = true) t ~scheme ~host ~port =
+  let host = String.lowercase_ascii host in
+  let key = (scheme, host, port) in
   match
     if reuse then take t key
     else if is_closed t then Error.refuse_closed ()
@@ -94,15 +95,15 @@ let rec checkout ?(reuse = true) t ~host ~port =
   with
   | Some c when stale t c ->
       discard t c ;
-      checkout ~reuse t ~host ~port
+      checkout ~reuse t ~scheme ~host ~port
   | Some c ->
       (c, `Reused)
   | None ->
-      let flow = t.connect ~host ~port in
+      let flow = t.connect ~scheme ~host ~port in
       let c =
         Conn.make
           ~id:(Atomic.fetch_and_add t.next_id 1)
-          ~host:(fst key) ~port flow
+          ~scheme ~host ~port flow
       in
       let added =
         Mutex.protect t.lock (fun () ->
@@ -118,7 +119,7 @@ let release t (c : Conn.t) ~reusable =
   let kept =
     Mutex.protect t.lock (fun () ->
         Hashtbl.remove t.in_use c.id ;
-        let key = (c.host, c.port) in
+        let key = (c.scheme, c.host, c.port) in
         let idle = Option.value ~default:[] (Hashtbl.find_opt t.idle key) in
         if
           reusable && (not t.closed)

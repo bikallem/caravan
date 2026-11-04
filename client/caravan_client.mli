@@ -11,14 +11,15 @@
         print_string (Caravan.Body.to_string (Caravan_client.body resp)) )
     ]}
 
-    The client keeps idle connections for each host and port. The writer of a
-    request body belongs to the client, not to the fiber that makes the request:
-    a request returns its response when the response head comes, while the
-    request body continues. Thus a server handler can forward a request and
+    The client keeps idle connections for each scheme, host and port. The writer
+    of a request body belongs to the client, not to the fiber that makes the
+    request: a request returns its response when the response head comes, while
+    the request body continues. Thus a server handler can forward a request and
     stream the two bodies at the same time.
 
-    Version 1 sends HTTP/1.1 over TCP to [http] URLs only. It has no TLS, no
-    proxy support, no redirects, no cookies and no content codings.
+    The client sends HTTP/1.1 to [http] URLs, and to [https] URLs with the
+    [~tls] of {!make} or {!run} (see {!tls}). It has no proxy support, no
+    redirects, no cookies and no content codings.
 
     Code that uses the client runs in a weft fiber.
 
@@ -33,7 +34,8 @@ module Config : sig
   (** All the time limits are on the [Mono] clock of the world. *)
   type t = Config.t =
     { connect_timeout: Weft.Span.t
-          (** The time limit of the lookup and all the connects. *)
+          (** The time limit of the lookup, all the connects and the TLS
+              handshake. *)
     ; response_timeout: Weft.Span.t
           (** The time limit from the end of the request to the end of the
               response head. *)
@@ -48,7 +50,8 @@ module Config : sig
               client closes older idle connections each half of this time, but
               not more often than each 10 ms. A checkout does not take one. *)
     ; max_idle_per_host: int
-          (** The maximum number of idle connections for each host and port. *)
+          (** The maximum number of idle connections for each scheme, host and
+              port. *)
     ; max_status_line: int  (** The size limit of the status line. *)
     ; max_header_bytes: int  (** The size limit of the response fields. *)
     ; max_header_count: int  (** The limit of the number of response fields. *)
@@ -72,7 +75,14 @@ type error = Error.t =
           idempotent request is safe. *)
   | Truncated  (** The response body ended too early, or with a reset. *)
   | Bad_response of string  (** The response is not correct HTTP/1.1. *)
-  | Unsupported of string  (** For example [https], or a protocol switch. *)
+  | Unsupported of string
+      (** For example a scheme other than [http] and [https], [https] with no
+          [~tls], or a protocol switch. *)
+  | Tls of string
+      (** The TLS handshake failed, for example the check of the certificate.
+          The text tells the cause. A retry does not help for a failed check of
+          the certificate. A connection that ends during the handshake also
+          gives [Tls]. *)
 
 (** The exception for errors. *)
 exception Error of error
@@ -80,10 +90,31 @@ exception Error of error
 (** The type for clients. *)
 type t
 
-val make : ?config:Config.t -> Weft.Fiber.scope -> t
-(** [make ~config sw] is a client in the scope [sw]. It forks one daemon fiber
-    in [sw]. That fiber runs the scope of the client: the writers of request
-    bodies and the timer that closes old idle connections. {!close} ends it.
+(** The type for the TLS handshake of the client on a new TCP flow, for [https]
+    URLs. [Caravan_tls.https] of the library [caravan.tls] gives one: see its
+    example.
+
+    [host] is the host of the URL in lowercase: a name, an IPv4 address, or an
+    IPv6 address in brackets. [Ok flow] is the TLS flow on the TCP flow. [Error]
+    tells the cause of a failure, and the request raises [Error (Tls _)]. After
+    [Error] or an exception, the client closes the TCP flow. The handshake has
+    the deadline of [connect_timeout]. A connection is for one scheme: [http]
+    and [https] to the same host and port use different connections.
+
+    Over TLS, {!close}, the end of an idle connection and a connection that
+    cannot stay close the TCP flow with no [close_notify]. A response body that
+    ends with the connection (no [Content-Length], not chunked) needs a
+    [close_notify] of the server: the end of the TCP stream with no
+    [close_notify] gives [Error Truncated] (RFC 9112 §9.8). Many servers close
+    in this way. *)
+type tls = host:string -> Caravan.Flow.t -> (Caravan.Flow.t, string) result
+
+val make : ?config:Config.t -> ?tls:tls -> Weft.Fiber.scope -> t
+(** [make ~config ~tls sw] is a client in the scope [sw]. With no [tls], a
+    request to an [https] URL raises [Error (Unsupported _)]. It forks one
+    daemon fiber in [sw]. That fiber runs the scope of the client: the writers
+    of request bodies and the timer that closes old idle connections. {!close}
+    ends it.
 
     If all the other fibers of [sw] end first, [sw] cancels the daemon. Then the
     client closes as with {!close}: request bodies that still go stop with no
@@ -96,15 +127,15 @@ val make : ?config:Config.t -> Weft.Fiber.scope -> t
 
     @raise Weft.Fiber.Scope_closed if [sw] ended or is cancelled. *)
 
-val run : ?config:Config.t -> (t -> 'a) -> 'a
-(** [run ~config f] makes a client, calls [f] with it, and closes it, also when
-    [f] raises. At the end of [f], a request body can still go, for example when
-    its response ended first. [run] waits for such bodies for at most
-    [config.close_grace], then cancels them and returns. During this time, a new
-    {!request} raises [Invalid_argument] before a connect (a request that starts
-    at the same time as the grace can connect first), and no retry occurs. [run]
-    makes its own scope. A cancel of the caller ends the grace at once, and
-    [run] then raises [Weft.Fiber.Cancelled].
+val run : ?config:Config.t -> ?tls:tls -> (t -> 'a) -> 'a
+(** [run ~config ~tls f] makes a client (see {!make}), calls [f] with it, and
+    closes it, also when [f] raises. At the end of [f], a request body can still
+    go, for example when its response ended first. [run] waits for such bodies
+    for at most [config.close_grace], then cancels them and returns. During this
+    time, a new {!request} raises [Invalid_argument] before a connect (a request
+    that starts at the same time as the grace can connect first), and no retry
+    occurs. [run] makes its own scope. A cancel of the caller ends the grace at
+    once, and [run] then raises [Weft.Fiber.Cancelled].
 
     @raise Weft.Fiber.Cancelled
       if the caller is cancelled, also before the client starts. *)
@@ -125,8 +156,9 @@ val close : t -> unit
 
 val request : t -> Caravan.Request.t -> Caravan.Response.t
 (** [request t req] sends [req] and gives the response when its head comes:
-    - The scheme of [req] must be [http], and [req] must have an authority:
-      [host], [host:port] or [[ipv6]:port]. The port is 80 by default.
+    - The scheme of [req] must be [http] or [https] (in any case), and [req]
+      must have an authority: [host], [host:port] or [[ipv6]:port]. The port is
+      80 for [http] and 443 for [https] by default. For [https], see {!tls}.
     - The body of [req] goes while the caller reads the response. The head goes
       first, before the producer of the body runs: the producer can wait for the
       response. If the response tells that the connection closes, the rest of
@@ -189,8 +221,8 @@ val with_response : t -> Caravan.Request.t -> (Caravan.Response.t -> 'a) -> 'a
 
 val get : ?headers:Caravan.Headers.t -> t -> string -> Caravan.Response.t
 (** [get t url] is the response to a [GET] of [url]:
-    [http://host[:port][/path][?query][#fragment]]. The scheme can be in any
-    case, and the fragment does not go.
+    [scheme://host[:port][/path][?query][#fragment]], with the scheme [http] or
+    [https]. The scheme can be in any case, and the fragment does not go.
 
     @raise Error with [Unsupported] for a different scheme.
     @raise Invalid_argument
@@ -210,7 +242,7 @@ module Private : sig
   module Connect = Connect
   module Pool = Pool
 
-  val parse_url : string -> string * string
+  val parse_url : string -> string * string * string
 
   val reap_interval : Config.t -> Weft.Span.t
 end

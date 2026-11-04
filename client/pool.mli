@@ -2,17 +2,29 @@
 
 type t
 
-val make : ?connect:(host:string -> port:int -> Caravan.Flow.t) -> Config.t -> t
-(* [connect] is for tests. By default, [connect] is Connect.connect. The age of
-   the idle connections is on the [Mono] clock of the world. *)
+val make :
+     connect:
+       (scheme:[`Http | `Https] -> host:string -> port:int -> Caravan.Flow.t)
+  -> Config.t
+  -> t
+(* [make ~connect config] is a pool that makes its connections with [connect],
+   for example Connect.connect. The age of the idle connections is on the [Mono]
+   clock of the world. *)
 
 val checkout :
-  ?reuse:bool -> t -> host:string -> port:int -> Conn.t * [`New | `Reused]
-(* [checkout t ~host ~port] is the newest idle connection of the host (in
-   lowercase) and the port that is not stale, else a new connection. A
-   connection is stale when its age is [idle_timeout] or more, or when a read
-   without a wait gives the end of the input, a byte, or a reset. A stale
-   connection closes: if it has unread data, the peer gets a reset. With
+     ?reuse:bool
+  -> t
+  -> scheme:[`Http | `Https]
+  -> host:string
+  -> port:int
+  -> Conn.t * [`New | `Reused]
+(* [checkout t ~scheme ~host ~port] is the newest idle connection of the scheme,
+   the host (in lowercase) and the port that is not stale, else a new
+   connection. [connect] gets the host in lowercase. A connection is stale when
+   its age is [idle_timeout] or more, or when a read without a wait gives the
+   end of the input, a byte, or a reset. A stale connection closes: if it has
+   unread data, the peer gets a reset. If the check raises (a TLS flow can wait
+   for a lock in it, and a cancel can come), the connection closes. With
    [~reuse:false], always a new connection. @raise Invalid_argument after
    [close]. *)
 

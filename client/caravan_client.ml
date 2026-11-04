@@ -12,13 +12,16 @@ type error = Error.t =
   | Truncated
   | Bad_response of string
   | Unsupported of string
+  | Tls of string
 
 exception Error = Error.Error
 
 open Weft
 module Cancel = Caravan.Private.Cancel
 
-type t = {config: Config.t; writers: Writers.t; pool: Pool.t}
+type tls = Connect.tls
+
+type t = {config: Config.t; writers: Writers.t; pool: Pool.t; https: bool}
 
 (* Half of [idle_timeout], and 10 ms or more: a short [idle_timeout] does not
    make a busy loop. *)
@@ -32,8 +35,17 @@ let reap_interval (config : Config.t) =
 (* The reaper closes the idle connections that are too old. It is a daemon of
    the scope of the writers: [close] cancels it, and the end of the jobs ends
    it. *)
-let make ?(config = Config.default) sw =
-  let pool = Pool.make config in
+let make ?(config = Config.default) ?tls sw =
+  (* [request] refuses an [https] request with no [tls]: [Option.get] never
+     raises. *)
+  let connect ~scheme ~host ~port =
+    match scheme with
+    | `Http ->
+        Connect.connect config ~host ~port
+    | `Https ->
+        Connect.connect ~tls:(Option.get tls) config ~host ~port
+  in
+  let pool = Pool.make ~connect config in
   (* A cancel of [sw] is a close too. *)
   let writers = Writers.make ~on_stop:(fun () -> Pool.close pool) sw in
   let half = reap_interval config in
@@ -42,13 +54,13 @@ let make ?(config = Config.default) sw =
       while true do
         Time.sleep Mono half ; Pool.reap pool
       done ) ;
-  {config; writers; pool}
+  {config; writers; pool; https= Option.is_some tls}
 
 let close t = Writers.stop t.writers ; Pool.close t.pool
 
-let run ?config f =
+let run ?config ?tls f =
   Fiber.scope (fun s ->
-      match make ?config s with
+      match make ?config ?tls s with
       | exception Fiber.Scope_closed ->
           (* The scope [s] is new, so only a cancel of the caller closes it. *)
           Cancel.scope_closed ()
@@ -68,13 +80,13 @@ let run ?config f =
               finish () ;
               Printexc.raise_with_backtrace e bt ) )
 
-(* [host[:port]], with an IPv6 host in brackets. An empty port is 80. *)
-let host_port authority =
+(* [host[:port]], with an IPv6 host in brackets. An empty port is [default]. *)
+let host_port ~default authority =
   let invalid () =
     invalid_arg ("Caravan_client: invalid authority " ^ authority)
   in
   let port s =
-    if s = "" then 80
+    if s = "" then default
     else
       match int_of_string_opt s with
       | Some p
@@ -93,20 +105,31 @@ let host_port authority =
         and rest =
           String.sub authority (i + 1) (String.length authority - i - 1)
         in
-        if rest = "" then (host, 80)
+        if rest = "" then (host, default)
         else if rest.[0] = ':' then
           (host, port (String.sub rest 1 (String.length rest - 1)))
         else invalid ()
   else
     match String.rindex_opt authority ':' with
     | None ->
-        if authority = "" then invalid () else (authority, 80)
+        if authority = "" then invalid () else (authority, default)
     | Some i ->
         let host = String.sub authority 0 i in
         if host = "" then invalid () ;
         ( host
         , port (String.sub authority (i + 1) (String.length authority - i - 1))
         )
+
+(* [scheme_port s] is the scheme [s] (in any case, RFC 3986 §3.1) and its
+   default port. *)
+let scheme_port s =
+  match String.lowercase_ascii s with
+  | "http" ->
+      (`Http, 80)
+  | "https" ->
+      (`Https, 443)
+  | _ ->
+      Error.fail (Unsupported ("the scheme " ^ s))
 
 (* RFC 9110 §9.2.2. *)
 let idempotent m =
@@ -117,10 +140,10 @@ let idempotent m =
    [Pool.close] on a different domain, or a different fiber calls [close]. Then
    the caller gets [Fiber.Cancelled], not the refusal. [Cancel.check] is a sync,
    thus it is outside the lock of the pool. *)
-let checkout ?reuse t ~host ~port =
+let checkout ?reuse t ~scheme ~host ~port =
   match
     if Writers.is_stopping t.writers then Error.refuse_closed () ;
-    Pool.checkout ?reuse t.pool ~host ~port
+    Pool.checkout ?reuse t.pool ~scheme ~host ~port
   with
   | c ->
       c
@@ -132,10 +155,11 @@ let checkout ?reuse t ~host ~port =
 let request t req =
   (* If [request] raises before the exchange, the body of the request closes
      here. A second close does nothing. *)
-  let host, port, c, kind =
+  let scheme, host, port, c, kind =
     try
-      if Request.scheme req <> "http" then
-        Error.fail (Unsupported ("the scheme " ^ Request.scheme req)) ;
+      let scheme, default = scheme_port (Request.scheme req) in
+      if scheme = `Https && not t.https then
+        Error.fail (Unsupported "https needs the ~tls of the client") ;
       let authority =
         match Request.authority req with
         | Some a ->
@@ -143,12 +167,12 @@ let request t req =
         | None ->
             invalid_arg "Caravan_client.request: the request has no authority"
       in
-      let host, port = host_port authority in
+      let host, port = host_port ~default authority in
       (* A bad request, and a request during the grace of [run], raise before a
          connect. *)
       Caravan.Private.H1_write.check_request req ;
-      let c, kind = checkout t ~host ~port in
-      (host, port, c, kind)
+      let c, kind = checkout t ~scheme ~host ~port in
+      (scheme, host, port, c, kind)
     with e ->
       let bt = Printexc.get_raw_backtrace () in
       (try Body.close (Request.body req) with _ -> ()) ;
@@ -171,7 +195,7 @@ let request t req =
         && Body.length (Request.body req) = Some 0
         && not (Writers.is_stopping t.writers)
       then begin
-        let c, _ = checkout ~reuse:false t ~host ~port in
+        let c, _ = checkout ~reuse:false t ~scheme ~host ~port in
         Exchange.run t.config t.writers c ~on_release:release
           (Request.with_body Body.empty req)
       end
@@ -195,7 +219,7 @@ let with_response t req f =
       (try Body.close (body resp) with _ -> ()) ;
       Printexc.raise_with_backtrace e bt
 
-(* http://host[:port][/path][?query][#fragment] *)
+(* scheme://host[:port][/path][?query][#fragment], for http and https. *)
 let parse_url url =
   let invalid () = invalid_arg ("Caravan_client: invalid URL " ^ url) in
   let i =
@@ -204,7 +228,7 @@ let parse_url url =
   let scheme = String.lowercase_ascii (String.sub url 0 i) in
   let rest = String.sub url (i + 1) (String.length url - i - 1) in
   if not (String.starts_with ~prefix:"//" rest) then invalid () ;
-  if scheme <> "http" then Error.fail (Unsupported ("the scheme " ^ scheme)) ;
+  let _, default = scheme_port scheme in
   let rest = String.sub rest 2 (String.length rest - 2) in
   let rest =
     match String.index_opt rest '#' with
@@ -225,18 +249,18 @@ let parse_url url =
   let authority = String.sub rest 0 cut
   and path = String.sub rest cut (String.length rest - cut) in
   if authority = "" || String.contains authority '@' then invalid () ;
-  let host, port = host_port authority in
+  let host, port = host_port ~default authority in
   let authority =
-    if port = 80 then host else Printf.sprintf "%s:%d" host port
+    if port = default then host else Printf.sprintf "%s:%d" host port
   in
   let path =
     if path = "" then "/" else if path.[0] = '?' then "/" ^ path else path
   in
-  (authority, path)
+  (scheme, authority, path)
 
 let get ?(headers = Headers.empty) t url =
-  let authority, path = parse_url url in
-  request t (Request.make ~authority ~headers Method.GET path)
+  let scheme, authority, path = parse_url url in
+  request t (Request.make ~scheme ~authority ~headers Method.GET path)
 
 module Private = struct
   module Conn = Conn
