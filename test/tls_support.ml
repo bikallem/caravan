@@ -6,7 +6,7 @@ let dn cn =
   [ X509.Distinguished_name.(
       Relative_distinguished_name.singleton (CN (Common_name.v cn)) ) ]
 
-let pki ?(ips = []) () =
+let pki ?(names = ["localhost"]) ?(ips = []) () =
   let valid_from = ptime 1_577_836_800.
   and valid_until = ptime 2_208_988_800. in
   let ca_key = X509.Private_key.generate `P256 in
@@ -27,7 +27,7 @@ let pki ?(ips = []) () =
   let leaf =
     Result.get_ok
       (X509.Signing_request.sign
-         (ok (X509.Signing_request.create (dn "localhost") key))
+         (ok (X509.Signing_request.create (dn (List.hd names)) key))
          ~valid_from ~valid_until
          ~extensions:
            X509.Extension.(
@@ -35,12 +35,11 @@ let pki ?(ips = []) () =
              |> add Subject_alt_name
                   ( false
                   , X509.General_name.(
-                      let names = singleton DNS ["localhost"] in
-                      if ips = [] then names
+                      let dns = singleton DNS names in
+                      if ips = [] then dns
                       else
-                        add IP
-                          (List.map (fun a -> Ipaddr.to_octets a) ips)
-                          names ) )
+                        add IP (List.map (fun a -> Ipaddr.to_octets a) ips) dns )
+                  )
              |> add Ext_key_usage (false, [`Server_auth])
              |> add Basic_constraints (true, (false, None)) )
          ca_key ca_dn )
@@ -50,8 +49,8 @@ let pki ?(ips = []) () =
 let localhost = Domain_name.(host_exn (of_string_exn "localhost"))
 
 let configs ?(server_alpn = ["http/1.1"]) ?client_alpn ?(peer_name = localhost)
-    ?(client_peer = true) ?ips ~time () =
-  let ca, leaf, key = pki ?ips () in
+    ?(client_peer = true) ?names ?ips ~time () =
+  let ca, leaf, key = pki ?names ?ips () in
   let server =
     ok
       (Tls.Config.server

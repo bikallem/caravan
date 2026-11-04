@@ -231,7 +231,10 @@ module Jwt = struct
     | Bad_audience ->
         Format.pp_print_string ppf "Bad_audience"
 
-  type claims = {payload: string; members: (string * Yojson.Safe.t) list}
+  (* [access_token]: the [typ] of the header is [at+jwt]. [Oidc] refuses an
+     access token. *)
+  type claims =
+    {payload: string; members: (string * Yojson.Safe.t) list; access_token: bool}
 
   let alg_of_name = function
     | "HS256" ->
@@ -247,15 +250,16 @@ module Jwt = struct
 
   (* [jwt] or [at+jwt] (RFC 9068), ASCII case-insensitive, with an optional
      [application/] (RFC 7515 §4.1.9). *)
-  let good_typ t =
+  let typ_name t =
     let t = String.lowercase_ascii t in
     let prefix = "application/" in
-    let t =
-      if String.starts_with ~prefix t then
-        String.sub t (String.length prefix)
-          (String.length t - String.length prefix)
-      else t
-    in
+    if String.starts_with ~prefix t then
+      String.sub t (String.length prefix)
+        (String.length t - String.length prefix)
+    else t
+
+  let good_typ t =
+    let t = typ_name t in
     t = "jwt" || t = "at+jwt"
 
   (* [signs key input digest signature] is [true] if [signature] is a signature
@@ -403,7 +407,7 @@ module Jwt = struct
           Ok ()
     in
     let* kid = optional "kid" members in
-    Ok (alg, kid)
+    Ok (alg, kid, Option.map typ_name typ = Some "at+jwt")
 
   (* The most keys of the alg that a token with no kid tries, when no key has no
      kid: an identity provider that sends no kid has one or two keys in a
@@ -463,7 +467,7 @@ module Jwt = struct
               | None ->
                   Error (Malformed "a part is not base64url")
               | Some header_text -> (
-                  let* alg, kid = header header_text in
+                  let* alg, kid, access_token = header header_text in
                   match candidates alg kid keys with
                   | [] ->
                       Error No_key
@@ -498,7 +502,7 @@ module Jwt = struct
                                 check_claims ~leeway ~require_exp ~issuer
                                   ~audience members
                               in
-                              Ok {payload; members} ) ) ) )
+                              Ok {payload; members; access_token} ) ) ) )
         | _ ->
             Error (Malformed "not three parts") )
 
@@ -1015,3 +1019,432 @@ let require ?(policy = authenticated) ?challenge () next req =
             (Caravan.Headers.add "Cache-Control" "private" h)
             r
       else forbid req
+
+(* {1 OpenID Connect} *)
+
+module Oidc = struct
+  open Weft
+  module Response = Caravan.Response
+
+  let ( let* ) = Result.bind
+
+  let minute = Span.s 60
+
+  (* An https URL that the client accepts: a host, a port of 1 to 65535 and no
+     user information. Also no fragment, and no space or control character. *)
+  let is_https u =
+    String.starts_with ~prefix:"https://" (String.lowercase_ascii u)
+    && String.for_all (fun c -> c > ' ' && c < '\x7f' && c <> '#') u
+    &&
+    match Caravan_client.Private.parse_url u with
+    | _ ->
+        true
+    | exception Invalid_argument _ ->
+        false
+
+  (* An issuer: an https URL with no query (OIDC Discovery §3). *)
+  let good_issuer u = is_https u && not (String.contains u '?')
+
+  (* The state of the key cache. [fresh_until = None]: a load at the next need.
+     It is [None] before the first load, and also for an overflow of [Time.add],
+     which real times of the mono clock cannot give. *)
+  type state =
+    { keys: Jwt.Key.t list
+    ; fresh_until: Clock.mono option
+    ; last_load: Clock.mono option
+    ; last_error: string option }
+
+  let no_state = {keys= []; fresh_until= None; last_load= None; last_error= None}
+
+  (* The size limit of a document of the provider. *)
+  let max_document = 65536
+
+  (* [get_text ~timeout ~max http url] is the response and the body of a GET of
+     [url], with one deadline for all of it. *)
+  let get_text ~timeout ~max http url =
+    match
+      Fiber.with_timeout Mono timeout (fun () ->
+          let resp =
+            Caravan_client.get
+              ~headers:
+                (Caravan.Headers.of_list [("Accept", "application/json")])
+              http url
+          in
+          let body = Caravan_client.body resp in
+          Fun.protect
+            ~finally:(fun () -> Caravan.Body.close body)
+            (fun () ->
+              match Caravan.Status.code (Response.status resp) with
+              | 200 ->
+                  Ok (resp, Caravan.Body.to_string ~max body)
+              | code ->
+                  Error (Printf.sprintf "%s: status %d" url code) ) )
+    with
+    | r ->
+        r
+    | exception Fiber.Timeout ->
+        Error (url ^ ": timeout")
+    | exception (Caravan_client.Error _ as e) ->
+        Error (url ^ ": " ^ Printexc.to_string e)
+    | exception Caravan.Body.Too_large ->
+        Error (url ^ ": the body is too large")
+
+  (* The time that a JWK Set stays fresh: the [max-age] of [Cache-Control], 5
+     min to 24 h. With no [max-age], or with [no-cache] or [no-store]: 1 h. *)
+  let fresh_for resp =
+    let default = Span.s 3600 in
+    match Caravan.Headers.find "cache-control" (Response.headers resp) with
+    | None ->
+        default
+    | Some v -> (
+        let ds =
+          List.map
+            (fun d -> String.lowercase_ascii (String.trim d))
+            (String.split_on_char ',' v)
+        in
+        let prefix = "max-age=" in
+        let p = String.length prefix in
+        (* The value saturates at 24 h: no overflow. *)
+        let seconds n =
+          String.fold_left
+            (fun a c -> Int.min 86400 ((a * 10) + Char.code c - 48))
+            0 n
+        in
+        let age d =
+          if String.starts_with ~prefix d then
+            let n = String.sub d p (String.length d - p) in
+            if n <> "" && String.for_all (fun c -> c >= '0' && c <= '9') n then
+              Some (seconds n)
+            else None
+          else None
+        in
+        if List.mem "no-cache" ds || List.mem "no-store" ds then default
+        else
+          match List.find_map age ds with
+          | Some n ->
+              Span.s (Int.max 300 n)
+          | None ->
+              default )
+
+  module Provider = struct
+    type t =
+      { issuer: string
+      ; authorization_endpoint: string
+      ; token_endpoint: string
+      ; jwks_uri: string
+      ; auth_methods: string list option
+      ; iss_parameter: bool
+      ; http: Caravan_client.t
+      ; timeout: Span.t
+      ; state: state Atomic.t
+      ; loading: state Ivar.t option Atomic.t }
+
+    let bad fn m = invalid_arg (Printf.sprintf "Caravan_auth.Oidc.%s: %s" fn m)
+
+    let check_timeout fn timeout =
+      if Span.compare timeout Span.zero <= 0 then
+        bad fn "the timeout is not positive"
+
+    let make_unchecked ~timeout ~auth_methods ~iss_parameter ~issuer
+        ~authorization_endpoint ~token_endpoint ~jwks_uri http =
+      { issuer
+      ; authorization_endpoint
+      ; token_endpoint
+      ; jwks_uri
+      ; auth_methods
+      ; iss_parameter
+      ; http
+      ; timeout
+      ; state= Atomic.make no_state
+      ; loading= Atomic.make None }
+
+    let make ?(timeout = Span.s 10) ?auth_methods ?(iss_parameter = false)
+        ~issuer ~authorization_endpoint ~token_endpoint ~jwks_uri http =
+      check_timeout "Provider.make" timeout ;
+      if not (good_issuer issuer) then
+        bad "Provider.make" "the issuer is not an https URL with no query" ;
+      List.iter
+        (fun (name, u) ->
+          if not (is_https u) then
+            bad "Provider.make" (name ^ " is not an https URL") )
+        [ ("authorization_endpoint", authorization_endpoint)
+        ; ("token_endpoint", token_endpoint)
+        ; ("jwks_uri", jwks_uri) ] ;
+      make_unchecked ~timeout ~auth_methods ~iss_parameter ~issuer
+        ~authorization_endpoint ~token_endpoint ~jwks_uri http
+
+    (* The members of a discovery document (OIDC Discovery §3). *)
+    let of_document ~timeout ~issuer http m =
+      let str name =
+        match List.assoc_opt name m with
+        | Some (`String s) ->
+            Ok s
+        | Some _ ->
+            Error (name ^ " is not a string")
+        | None ->
+            Error ("no " ^ name)
+      in
+      let url name =
+        let* u = str name in
+        if is_https u then Ok u else Error (name ^ " is not an https URL")
+      in
+      let strs name =
+        match List.assoc_opt name m with
+        | None ->
+            Ok None
+        | Some (`List l) -> (
+          match string_list l with
+          | Some l ->
+              Ok (Some l)
+          | None ->
+              Error (name ^ " is not a list of strings") )
+        | Some _ ->
+            Error (name ^ " is not a list of strings")
+      in
+      let* iss = str "issuer" in
+      (* §4.3: the same text, byte for byte. *)
+      let* () =
+        if iss = issuer then Ok ()
+        else Error ("the issuer of the document is " ^ iss)
+      in
+      let* authorization_endpoint = url "authorization_endpoint" in
+      let* token_endpoint = url "token_endpoint" in
+      let* jwks_uri = url "jwks_uri" in
+      let* types = strs "response_types_supported" in
+      let* () =
+        match types with
+        | Some l when List.mem "code" l ->
+            Ok ()
+        | _ ->
+            Error "the provider does not give the response type code"
+      in
+      let* methods = strs "code_challenge_methods_supported" in
+      let* () =
+        match methods with
+        | Some l when not (List.mem "S256" l) ->
+            Error "the provider does not give the PKCE method S256"
+        | _ ->
+            Ok ()
+      in
+      let* auth_methods = strs "token_endpoint_auth_methods_supported" in
+      let* iss_parameter =
+        match
+          List.assoc_opt "authorization_response_iss_parameter_supported" m
+        with
+        | None ->
+            Ok false
+        | Some (`Bool b) ->
+            Ok b
+        | Some _ ->
+            Error
+              "authorization_response_iss_parameter_supported is not a boolean"
+      in
+      Ok
+        (make_unchecked ~timeout ~auth_methods ~iss_parameter ~issuer
+           ~authorization_endpoint ~token_endpoint ~jwks_uri http )
+
+    let discover ?(timeout = Span.s 10) ?(max_length = max_document) http issuer
+        =
+      check_timeout "Provider.discover" timeout ;
+      if max_length < 1 then bad "Provider.discover" "max_length is less than 1" ;
+      if not (good_issuer issuer) then
+        Error "the issuer is not an https URL with no query"
+      else
+        (* §4.1: one terminating "/" goes before the path. *)
+        let base =
+          if String.ends_with ~suffix:"/" issuer then
+            String.sub issuer 0 (String.length issuer - 1)
+          else issuer
+        in
+        match
+          get_text ~timeout ~max:max_length http
+            (base ^ "/.well-known/openid-configuration")
+        with
+        | Error e ->
+            Error e
+        | Ok (_, text) -> (
+          match Json.parse text with
+          | Error e ->
+              Error ("the document: " ^ e)
+          | Ok (`Assoc m) ->
+              of_document ~timeout ~issuer http m
+          | Ok _ ->
+              Error "the document is not an object" )
+
+    let issuer t = t.issuer
+
+    let authorization_endpoint t = t.authorization_endpoint
+
+    let token_endpoint t = t.token_endpoint
+
+    let auth_methods t = t.auth_methods
+
+    let iss_parameter t = t.iss_parameter
+
+    (* [load t] is the state after a load of the JWK Set. A failure keeps the
+       keys, and the next load comes after 1 min. *)
+    let load t =
+      let r =
+        match
+          get_text ~timeout:t.timeout ~max:max_document t.http t.jwks_uri
+        with
+        | Error e ->
+            Error e
+        | Ok (resp, text) -> (
+          match Jwt.Key.of_jwks text with
+          | Error e ->
+              Error ("the JWK Set: " ^ e)
+          | Ok [] ->
+              Error "the JWK Set has no key that caravan can use"
+          | Ok keys ->
+              Ok (keys, fresh_for resp) )
+        | exception e ->
+            (* [get_text] catches the errors of the network: this is for an
+               other exception of the client or of TLS. *)
+            Error (t.jwks_uri ^ ": " ^ Printexc.to_string e)
+      in
+      let now = Time.now Mono in
+      match r with
+      | Ok (keys, span) ->
+          { keys
+          ; fresh_until= Time.add Mono now span
+          ; last_load= Some now
+          ; last_error= None }
+      | Error e ->
+          (* The next load after 1 min, but keys that are fresh for longer stay
+             fresh. *)
+          let old = Atomic.get t.state in
+          let retry = Time.add Mono now minute in
+          let fresh_until =
+            match (old.fresh_until, retry) with
+            | Some u, Some r
+              when ( Span.compare (Time.diff Mono u r) Span.zero
+                   > 0 )
+                   [@mutate off "u = r: the two branches give the same time"] ->
+                Some u
+            | _ ->
+                retry
+          in
+          {old with fresh_until; last_load= Some now; last_error= Some e}
+
+    (* [refresh t ~seen] loads the keys, one load at a time: a caller during a
+       load waits for its result. [seen] is the state that made the caller load:
+       if a load of an other caller ended after it, that state is the result,
+       with no new load. The load is in a shield: a caller that leaves does not
+       stop it for the others. The shield also sets the state and fills the
+       Ivar, thus a cancel of the loader cannot leave the waiters with no
+       result. *)
+    let rec refresh t ~seen =
+      match Atomic.get t.loading with
+      | Some ivar ->
+          sync (Ivar.read ivar)
+      | None ->
+          let ivar = Ivar.create () in
+          if not (Atomic.compare_and_set t.loading None (Some ivar)) then
+            refresh t ~seen
+          else
+            Fiber.shield (fun () ->
+                let now = Atomic.get t.state in
+                let st = if now != seen then now else load t in
+                Atomic.set t.state st ;
+                Atomic.set t.loading None ;
+                Ivar.fill ivar st ;
+                st )
+
+    let is_fresh st now =
+      match st.fresh_until with
+      | Some u ->
+          Span.compare (Time.diff Mono u now) Span.zero > 0
+      | None ->
+          false
+
+    let current t =
+      let st = Atomic.get t.state in
+      if is_fresh st (Time.now Mono) then st else refresh t ~seen:st
+
+    (* A new key after a rotation: one load each minute at most. *)
+    let can_reload st =
+      match st.last_load with
+      | Some l ->
+          Span.compare (Time.diff Mono (Time.now Mono) l) minute >= 0
+      | None ->
+          true
+
+    let keys t = (current t).keys
+  end
+
+  type error =
+    | Jwt of Jwt.error
+    | Missing_nonce
+    | Bad_nonce
+    | Bad_azp
+    | Keys of string
+
+  let pp_error ppf = function
+    | Jwt e ->
+        Format.fprintf ppf "Jwt (%a)" Jwt.pp_error e
+    | Missing_nonce ->
+        Format.pp_print_string ppf "Missing_nonce"
+    | Bad_nonce ->
+        Format.pp_print_string ppf "Bad_nonce"
+    | Bad_azp ->
+        Format.pp_print_string ppf "Bad_azp"
+    | Keys m ->
+        Format.fprintf ppf "Keys %S" m
+
+  (* OIDC Core §2 and §3.1.3.7, after [Jwt.verify]. *)
+  let check_id_token ?nonce ~client_id (c : Jwt.claims) =
+    let* () =
+      (* An access token is not an ID token (RFC 8725 §3.11). *)
+      if c.access_token then Error (Jwt (Unsupported "typ at+jwt")) else Ok ()
+    in
+    let* () =
+      match Jwt.subject c with
+      | None | Some "" ->
+          Error (Jwt (Missing "sub"))
+      | Some _ ->
+          Ok ()
+    in
+    let* () =
+      match Jwt.string "azp" c with
+      | Some a when a <> client_id ->
+          Error Bad_azp
+      | None when List.length (Jwt.audience c) > 1 ->
+          Error Bad_azp
+      | _ ->
+          Ok ()
+    in
+    match nonce with
+    | None ->
+        Ok c
+    | Some n -> (
+      match Jwt.string "nonce" c with
+      | None ->
+          Error Missing_nonce
+      | Some m ->
+          if Eqaf.equal n m then Ok c else Error Bad_nonce )
+
+  let verify_id_token ?leeway ?nonce ?issuers (p : Provider.t) ~client_id token
+      =
+    let issuers = Option.value issuers ~default:[p.issuer] in
+    let verify (st : state) =
+      Jwt.verify ?leeway ~issuer:(One_of issuers) ~audience:(One_of [client_id])
+        ~keys:st.keys token
+    in
+    let st = Provider.current p in
+    let st, r =
+      match verify st with
+      | Error No_key when Provider.can_reload st ->
+          let st = Provider.refresh p ~seen:st in
+          (st, verify st)
+      | r ->
+          (st, r)
+    in
+    match r with
+    | Error No_key when st.keys = [] ->
+        Error (Keys (Option.value st.last_error ~default:"no key"))
+    | Error e ->
+        Error (Jwt e)
+    | Ok c ->
+        check_id_token ?nonce ~client_id c
+end

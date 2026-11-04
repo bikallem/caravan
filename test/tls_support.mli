@@ -3,12 +3,14 @@
 *)
 
 val pki :
-     ?ips:Ipaddr.t list
+     ?names:string list
+  -> ?ips:Ipaddr.t list
   -> unit
   -> X509.Certificate.t * X509.Certificate.t * X509.Private_key.t
-(** [pki ~ips ()] is a new CA, a leaf certificate for [localhost] and the
-    addresses [ips] (default none) that the CA signed, and the key of the leaf.
-    The certificates are valid from 2020 to 2040. *)
+(** [pki ~names ~ips ()] is a new CA, a leaf certificate for the DNS names
+    [names] (default [["localhost"]], not empty) and the addresses [ips]
+    (default none) that the CA signed, and the key of the leaf. The certificates
+    are valid from 2020 to 2040. *)
 
 val localhost : [`host] Domain_name.t
 
@@ -17,6 +19,7 @@ val configs :
   -> ?client_alpn:string list
   -> ?peer_name:[`host] Domain_name.t
   -> ?client_peer:bool
+  -> ?names:string list
   -> ?ips:Ipaddr.t list
   -> time:(unit -> Ptime.t option)
   -> unit
@@ -25,4 +28,5 @@ val configs :
     leaf (ALPN [server_alpn], default [["http/1.1"]]) and a client configuration
     that trusts the CA at the time [time ()]. The peer name of the client is
     [peer_name] (default {!localhost}), or none with [~client_peer:false] (for
-    [Caravan_tls.https]). The leaf has the addresses [ips] (see {!pki}). *)
+    [Caravan_tls.https]). The leaf has the names [names] and the addresses [ips]
+    (see {!pki}). *)

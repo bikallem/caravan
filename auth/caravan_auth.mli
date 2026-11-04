@@ -81,8 +81,9 @@ module Jwt : sig
 
         [Error] if [text] has more than [max_length] bytes (default 64 KiB), is
         not strict JSON (see {!verify}), or is not an object with an array
-        [keys]. Load the keys at the start, or in the background, not in a
-        request: a large set takes milliseconds.
+        [keys]. A large set takes milliseconds: load the keys at the start, in
+        the background, or in a cache with one load at a time
+        ({!Oidc.Provider.keys}).
 
         @raise Invalid_argument if [max_length] is less than 1. *)
 
@@ -469,3 +470,160 @@ val require :
     @raise Invalid_argument
       for each request that did not go through {!middleware}, or if no scheme of
       the middleware has the name [challenge]. *)
+
+(** {1:oidc OpenID Connect} *)
+
+(** OpenID Connect 1.0: the provider of a relying party, and the check of an ID
+    token.
+
+    {[
+    let google client =
+      match
+        Caravan_auth.Oidc.Provider.discover client "https://accounts.google.com"
+      with
+      | Ok p ->
+          p
+      | Error e ->
+          failwith e
+
+    let user provider token =
+      match
+        Caravan_auth.Oidc.verify_id_token provider ~client_id:"123.apps" token
+      with
+      | Ok claims ->
+          Caravan_auth.Jwt.subject claims
+      | Error _ ->
+          None
+    ]}
+
+    The client must have HTTPS:
+    [Caravan_client.run ~tls:(Caravan_tls.https config)]. Each URL of a provider
+    is [https]. *)
+module Oidc : sig
+  (** An OpenID provider: its endpoints and a cache of its keys. *)
+  module Provider : sig
+    type t
+
+    val discover :
+         ?timeout:Weft.Span.t
+      -> ?max_length:int
+      -> Caravan_client.t
+      -> string
+      -> (t, string) result
+    (** [discover client issuer] gets the discovery document of [issuer] (OIDC
+        Discovery §4): a GET of [issuer], with no terminating ["/"], and then
+        [/.well-known/openid-configuration].
+        - [issuer] must be an [https] URL with a host, a port of 1 to 65535, no
+          user information, no query and no fragment, else [Error] with no
+          request.
+        - The document has the limit [max_length] (default 64 KiB) and one
+          deadline [timeout] (default 10 s) for all of the request. A status
+          other than 200 is an [Error].
+        - The document is strict JSON (see {!Jwt.verify}). Its [issuer] must be
+          equal to [issuer], byte for byte (§4.3). [authorization_endpoint],
+          [token_endpoint] and [jwks_uri] must be [https] URLs.
+          [response_types_supported] must contain [code].
+          [code_challenge_methods_supported], if there, must contain [S256].
+        - The function does not load the keys: the first need does.
+
+        The provider keeps [client] for the loads of its keys.
+
+        @raise Invalid_argument
+          if [timeout] is not positive or [max_length] is less than 1. *)
+
+    val make :
+         ?timeout:Weft.Span.t
+      -> ?auth_methods:string list
+      -> ?iss_parameter:bool
+      -> issuer:string
+      -> authorization_endpoint:string
+      -> token_endpoint:string
+      -> jwks_uri:string
+      -> Caravan_client.t
+      -> t
+    (** [make ~issuer ~authorization_endpoint ~token_endpoint ~jwks_uri client]
+        is a provider with no discovery. [auth_methods] and [iss_parameter] are
+        the members [token_endpoint_auth_methods_supported] and
+        [authorization_response_iss_parameter_supported] of a document.
+
+        @raise Invalid_argument
+          if a URL is not [https] (as for {!discover}), the issuer has a query,
+          or [timeout] is not positive. *)
+
+    val issuer : t -> string
+
+    val authorization_endpoint : t -> string
+
+    val token_endpoint : t -> string
+
+    val auth_methods : t -> string list option
+    (** The methods of client authentication at the token endpoint, if the
+        provider tells them. *)
+
+    val iss_parameter : t -> bool
+    (** [true] if the provider sends the [iss] parameter to the redirect URI
+        (RFC 9207). *)
+
+    val keys : t -> Jwt.Key.t list
+    (** [keys t] is the keys of the JWK Set of [t] ([jwks_uri]), from a cache:
+        - The keys stay fresh for the [max-age] of the [Cache-Control] of the
+          response, from 5 min to 24 h. With no [max-age], or with [no-cache] or
+          [no-store]: 1 h.
+        - After that time, the first need loads the keys again, in the request
+          that needs them. One load at a time: the other callers wait for its
+          result. A caller that is cancelled does not stop the load. The load
+          has the deadline [timeout] of the provider.
+        - A failed load keeps the old keys, and the next load comes after 1 min,
+          or when the old keys stop being fresh, if that is later. A failure is
+          a timeout, an error of the network, a status other than 200, more than
+          64 KiB, a set that {!Jwt.Key.of_jwks} refuses, or a set with no key
+          that caravan can use. *)
+  end
+
+  type error =
+    | Jwt of Jwt.error
+    | Missing_nonce  (** A nonce was expected, and the token has none. *)
+    | Bad_nonce  (** The nonce of the token is not the expected nonce. *)
+    | Bad_azp
+        (** The [azp] claim is not the client ID, or a token for more than one
+            audience has no [azp]. *)
+    | Keys of string
+        (** The provider has no key: the loads failed, with this cause. *)
+
+  val pp_error : Format.formatter -> error -> unit
+
+  val verify_id_token :
+       ?leeway:Weft.Span.t
+    -> ?nonce:string
+    -> ?issuers:string list
+    -> Provider.t
+    -> client_id:string
+    -> string
+    -> (Jwt.claims, error) result
+  (** [verify_id_token provider ~client_id token] checks an ID token (OIDC Core
+      §3.1.3.7):
+      - {!Jwt.verify} with the keys of the provider, the issuer of the provider
+        (or one of [issuers]), and the audience [client_id]. [exp] is necessary.
+        [leeway] is that of {!Jwt.verify}.
+      - [No_key]: if the last load of the keys is 1 min old or more, one more
+        load (a new key after a rotation), then one more check. Thus a token of
+        an unknown key costs at most one load each minute.
+      - A [typ] of [at+jwt] is refused: an access token is not an ID token (RFC
+        8725 §3.11). A token with no [sub], or an empty one, gives
+        [Jwt (Missing "sub")].
+      - [azp], if there, must be [client_id]. A token with more than one
+        audience must have [azp]. Other audiences are then permitted.
+      - With [nonce], the [nonce] claim must be equal to it. With no [nonce],
+        nothing stops a replay of a token that was taken: give a nonce if the
+        flow has one.
+
+      A token of an other client of the same project, for example a token that
+      an Android app of Google got for the web client, can have [azp] set to
+      that other client: it gives [Bad_azp].
+
+      Google signs the tokens of its button with two issuer texts:
+      [~issuers:["https://accounts.google.com"; "accounts.google.com"]].
+
+      @raise Invalid_argument as {!Jwt.verify}, for example for [issuers = []].
+  *)
+end

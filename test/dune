@@ -167,6 +167,9 @@
  (libraries
   caravan
   caravan.auth
+  caravan.client
+  caravan.tls
+  caravan.testing
   caravan.session
   caravan.router
   caravan.middleware
@@ -180,6 +183,9 @@
   mirage-crypto-ec
   mirage-crypto-rng
   x509
+  tls
+  ptime
+  domain-name
   zarith))
 
 (test

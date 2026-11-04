@@ -2009,6 +2009,596 @@ let session_tests =
               in
               equal int 200 (code r) ) ) ]
 
+(* {1 OpenID Connect} *)
+
+module O = Caravan_auth.Oidc
+module P = Caravan_auth.Oidc.Provider
+module C = Caravan_client
+module T = Caravan_testing
+
+(* The fake provider serves its documents over TLS on the test host
+   (127.0.0.1:80), with the name idp.example. *)
+let issuer = "https://idp.example:80"
+
+let oidc_t0 = 1_750_000_000.
+
+let minute_span = Span.s 60
+
+(* The state of the fake provider. *)
+type idp =
+  { mutable document: string
+  ; mutable document_status: int
+  ; mutable jwks: string
+  ; mutable jwks_status: int
+  ; mutable cache_control: string option
+  ; mutable gate: unit Ivar.t option  (** A load of /jwks waits for it. *)
+  ; mutable paths: string list
+        (** The paths of the requests, the last first. *)
+  ; mutable accepts: string list  (** The Accept fields, the last first. *)
+  ; loads: int Atomic.t }
+
+(* [doc ?drop members] is a discovery document: the default members, with
+   [members] in place of those of the same name, and with no [drop]. The values
+   are JSON texts. *)
+(* [json_object ~defaults members] is a JSON object of [defaults], with
+   [members] in place of those of the same name. A value [""] removes the
+   member. The values are JSON texts. *)
+let json_object ~defaults members =
+  let all =
+    List.filter (fun (n, _) -> not (List.mem_assoc n members)) defaults
+    @ members
+    |> List.filter (fun (_, v) -> v <> "")
+  in
+  "{"
+  ^ String.concat "," (List.map (fun (n, v) -> Printf.sprintf "%S:%s" n v) all)
+  ^ "}"
+
+(* [doc members] is a discovery document (see [json_object]). *)
+let doc members =
+  json_object
+    ~defaults:
+      [ ("issuer", Printf.sprintf "%S" issuer)
+      ; ("authorization_endpoint", Printf.sprintf "%S" (issuer ^ "/authorize"))
+      ; ("token_endpoint", Printf.sprintf "%S" (issuer ^ "/token"))
+      ; ("jwks_uri", Printf.sprintf "%S" (issuer ^ "/jwks"))
+      ; ("response_types_supported", {|["code"]|})
+      ; ("code_challenge_methods_supported", {|["S256"]|}) ]
+    members
+
+(* A JWK with a kid. *)
+let with_kid kid jwk =
+  Printf.sprintf {|{"kid":"%s",|} kid ^ String.sub jwk 1 (String.length jwk - 1)
+
+let new_idp () =
+  { document= doc []
+  ; document_status= 200
+  ; jwks= jwks [with_kid "ec1" jwk_ec; with_kid "rs1" jwk_rsa]
+  ; jwks_status= 200
+  ; cache_control= None
+  ; gate= None
+  ; paths= []
+  ; accepts= []
+  ; loads= Atomic.make 0 }
+
+let idp_handler idp req =
+  let path = Caravan.Request.path_only req in
+  idp.paths <- path :: idp.paths ;
+  idp.accepts <-
+    Option.value ~default:"none"
+      (Caravan.Headers.find "accept" (Caravan.Request.headers req))
+    :: idp.accepts ;
+  match path with
+  | "/.well-known/openid-configuration" ->
+      Caravan.Response.string
+        ~status:(Caravan.Status.v idp.document_status)
+        idp.document
+  | "/jwks" ->
+      Atomic.incr idp.loads ;
+      Option.iter (fun g -> sync (Ivar.read g)) idp.gate ;
+      let headers =
+        Caravan.Headers.of_list
+          (Option.fold ~none:[]
+             ~some:(fun v -> [("Cache-Control", v)])
+             idp.cache_control )
+      in
+      Caravan.Response.string ~headers
+        ~status:(Caravan.Status.v idp.jwks_status)
+        idp.jwks
+  | _ ->
+      Caravan.Response.string ~status:Caravan.Status.not_found ""
+
+(* [with_idp ?idp f] runs [f t http idp] with the fake provider and a client
+   with HTTPS, at [oidc_t0]. The guard is 3 days of virtual time. *)
+let with_idp ?(idp = new_idp ()) f =
+  let scfg, ccfg =
+    Tls_support.configs ~client_peer:false ~names:["idp.example"]
+      ~time:(fun () -> Ptime.of_float_s (Time.posix_to_unix_s (Time.now Posix)))
+      ()
+  in
+  T.run
+    ~guard:(Span.s (3 * 86400))
+    ~engine:(Caravan_tls.engine scfg Caravan.Server.http1)
+    (idp_handler idp)
+    (fun t ->
+      Weft_sim.set_posix (T.sim t) (Time.posix_of_unix_s oidc_t0) ;
+      Weft_sim.set_dns (T.sim t) "idp.example" (Addresses ["127.0.0.1"]) ;
+      C.run ~tls:(Caravan_tls.https ccfg) (fun http -> f t http idp) )
+
+let discover http = Result.get_ok (P.discover http issuer)
+
+(* An ID token of the fake provider (see [json_object] for [members]). *)
+let id_token ?(kid = "ec1") ?(alg = "ES256") ?(sign = es) ?(typ = "JWT") members
+    =
+  let payload =
+    json_object
+      ~defaults:
+        [ ("iss", Printf.sprintf "%S" issuer)
+        ; ("aud", {|"app"|})
+        ; ("sub", {|"ada"|})
+        ; ("exp", Printf.sprintf "%.0f" (oidc_t0 +. 1_000_000.))
+        ; ("iat", Printf.sprintf "%.0f" oidc_t0) ]
+      members
+  in
+  token
+    ~header:(Printf.sprintf {|{"alg":"%s","kid":"%s","typ":"%s"}|} alg kid typ)
+    sign payload
+
+let oidc_result =
+  Testable.make
+    ~pp:(fun ppf -> function
+      | Ok _ -> Format.pp_print_string ppf "Ok" | Error e -> O.pp_error ppf e )
+    ~equal:(fun a b ->
+      match (a, b) with
+      | Ok _, Ok _ ->
+          true
+      | Error (O.Keys _), Error (O.Keys _) ->
+          true
+      | Error a, Error b ->
+          a = b
+      | _ ->
+          false )
+
+let verify ?nonce ?issuers p t =
+  Result.map ignore (O.verify_id_token ?nonce ?issuers p ~client_id:"app" t)
+
+let keys_error = function
+  | Error (O.Keys m) ->
+      m
+  | Ok _ ->
+      "Ok"
+  | Error e ->
+      Format.asprintf "%a" O.pp_error e
+
+let contains s sub =
+  let n = String.length s and m = String.length sub in
+  let rec go i = i + m <= n && (String.sub s i m = sub || go (i + 1)) in
+  go 0
+
+let oidc_tests =
+  group "OpenID Connect"
+    [ test "discover gives the endpoints" (fun () ->
+          with_idp (fun _ http idp ->
+              let p = discover http in
+              equal string issuer (P.issuer p) ;
+              equal string (issuer ^ "/authorize") (P.authorization_endpoint p) ;
+              equal string (issuer ^ "/token") (P.token_endpoint p) ;
+              equal (option (list string)) None (P.auth_methods p) ;
+              is_false (P.iss_parameter p) ;
+              equal int ~msg:"no load of the keys" 0 (Atomic.get idp.loads) ;
+              equal ~msg:"keys load at the first need" int 2
+                (List.length (P.keys p)) ;
+              equal (list string)
+                ["application/json"; "application/json"]
+                idp.accepts ;
+              is_false ~msg:"make: no iss parameter"
+                (P.iss_parameter
+                   (P.make ~issuer ~authorization_endpoint:(issuer ^ "/a")
+                      ~token_endpoint:(issuer ^ "/t") ~jwks_uri:(issuer ^ "/k")
+                      http ) ) ;
+              idp.document <-
+                doc
+                  [ ( "token_endpoint_auth_methods_supported"
+                    , {|["client_secret_post"]|} )
+                  ; ("authorization_response_iss_parameter_supported", "true")
+                  ] ;
+              let p = discover http in
+              equal
+                (option (list string))
+                (Some ["client_secret_post"]) (P.auth_methods p) ;
+              is_true (P.iss_parameter p) ) )
+    ; test "discover refuses a bad document" (fun () ->
+          with_idp (fun _ http idp ->
+              List.iter
+                (fun (label, document, status, expected) ->
+                  idp.document <- document ;
+                  idp.document_status <- status ;
+                  match P.discover http issuer with
+                  | Ok _ ->
+                      fail (label ^ ": Ok")
+                  | Error e ->
+                      is_true ~msg:(label ^ ": " ^ e) (contains e expected) )
+                [ ( "another issuer"
+                  , doc [("issuer", Printf.sprintf "%S" (issuer ^ "/"))]
+                  , 200
+                  , "the issuer of the document is" )
+                ; ( "an http endpoint"
+                  , doc [("token_endpoint", {|"http://idp.example/token"|})]
+                  , 200
+                  , "token_endpoint is not an https URL" )
+                ; ("no jwks_uri", doc [("jwks_uri", "")], 200, "no jwks_uri")
+                ; ( "no code"
+                  , doc [("response_types_supported", {|["id_token"]|})]
+                  , 200
+                  , "response type code" )
+                ; ( "no response types"
+                  , doc [("response_types_supported", "")]
+                  , 200
+                  , "response type code" )
+                ; ( "no S256"
+                  , doc [("code_challenge_methods_supported", {|["plain"]|})]
+                  , 200
+                  , "S256" )
+                ; ("status 404", doc [], 404, "status 404")
+                ; ( "too large"
+                  , doc [("pad", Printf.sprintf "%S" (String.make 70000 'x'))]
+                  , 200
+                  , "too large" )
+                ; ("not JSON", "{issuer:1}", 200, "the document: not JSON")
+                ; ("not an object", "[]", 200, "not an object")
+                ; ( "issuer not a string"
+                  , doc [("issuer", "1")]
+                  , 200
+                  , "issuer is not a string" )
+                ; ( "a list of numbers"
+                  , doc [("response_types_supported", "[1]")]
+                  , 200
+                  , "not a list of strings" )
+                ; ( "not a list"
+                  , doc [("response_types_supported", {|"code"|})]
+                  , 200
+                  , "not a list of strings" )
+                ; ( "iss parameter not a boolean"
+                  , doc
+                      [ ( "authorization_response_iss_parameter_supported"
+                        , {|"yes"|} ) ]
+                  , 200
+                  , "not a boolean" ) ] ;
+              idp.document <- doc [] ;
+              idp.document_status <- 200 ;
+              (* The limit of the caller. *)
+              is_true (Result.is_error (P.discover ~max_length:100 http issuer)) ) )
+    ; test "discover refuses an issuer that is not https before a request"
+        (fun () ->
+          with_idp (fun _ http idp ->
+              List.iter
+                (fun i -> is_true ~msg:i (Result.is_error (P.discover http i)))
+                [ "http://idp.example:80"
+                ; "https://idp.example:80?x=1"
+                ; "https://idp.example:80#f"
+                ; "https://"
+                ; "https:///p"
+                ; "HTTPS://idp example"
+                ; "https://idp.example\x7f"
+                ; "https://u@idp.example:80"
+                ; "https://idp.example:99999"
+                ; "https://:80" ] ;
+              equal (list string) [] idp.paths ) )
+    ; test "discover removes one terminating slash for the URL" (fun () ->
+          with_idp (fun _ http idp ->
+              idp.document <-
+                doc [("issuer", Printf.sprintf "%S" (issuer ^ "/"))] ;
+              is_true (Result.is_ok (P.discover http (issuer ^ "/"))) ;
+              equal (list string)
+                ["/.well-known/openid-configuration"]
+                idp.paths ;
+              (* An issuer in uppercase scheme is https too. *)
+              idp.document <- doc [("issuer", {|"HTTPS://idp.example:80"|})] ;
+              is_true (Result.is_ok (P.discover http "HTTPS://idp.example:80")) ) )
+    ; test "make and discover refuse bad arguments" (fun () ->
+          with_idp (fun _ http _ ->
+              let is_invalid = function
+                | Invalid_argument _ ->
+                    true
+                | _ ->
+                    false
+              in
+              let make ?timeout ?(issuer = issuer)
+                  ?(authorization = issuer ^ "/a") ?(token = issuer ^ "/token")
+                  ?(jwks = issuer ^ "/k") () =
+                ignore
+                  ( P.make ?timeout ~issuer
+                      ~authorization_endpoint:authorization
+                      ~token_endpoint:token ~jwks_uri:jwks http
+                    : P.t )
+              in
+              make () ;
+              raises_match ~msg:"http authorization endpoint" is_invalid
+                (fun () -> make ~authorization:"http://idp.example/a" () ) ;
+              raises_match ~msg:"user information" is_invalid (fun () ->
+                  make ~jwks:"https://u@idp.example:80/jwks" () ) ;
+              raises_match ~msg:"http jwks_uri" is_invalid (fun () ->
+                  make ~jwks:"http://idp.example/k" () ) ;
+              is_true ~msg:"max_length 1"
+                (Result.is_error (P.discover ~max_length:1 http issuer)) ;
+              raises_match ~msg:"http" is_invalid (fun () ->
+                  make ~token:"http://idp.example/token" () ) ;
+              raises_match ~msg:"query" is_invalid (fun () ->
+                  make ~issuer:(issuer ^ "?a") () ) ;
+              raises_match ~msg:"http issuer" is_invalid (fun () ->
+                  make ~issuer:"http://idp.example" () ) ;
+              raises_match ~msg:"timeout" is_invalid (fun () ->
+                  make ~timeout:Span.zero () ) ;
+              raises_match ~msg:"discover timeout" is_invalid (fun () ->
+                  ignore (P.discover ~timeout:Span.zero http issuer) ) ;
+              raises_match ~msg:"max_length" is_invalid (fun () ->
+                  ignore (P.discover ~max_length:0 http issuer) ) ) )
+    ; test "verify_id_token accepts a good token" (fun () ->
+          with_idp (fun _ http _ ->
+              let p = discover http in
+              equal oidc_result (Ok ()) (verify p (id_token [])) ;
+              equal oidc_result (Ok ())
+                (verify p (id_token ~kid:"rs1" ~alg:"RS256" ~sign:(rs ()) [])) ;
+              match O.verify_id_token p ~client_id:"app" (id_token []) with
+              | Ok c ->
+                  equal (option string) (Some "ada") (J.subject c)
+              | Error _ ->
+                  fail "Ok" ) )
+    ; test "verify_id_token refuses bad claims" (fun () ->
+          with_idp (fun _ http _ ->
+              let p = discover http in
+              List.iter
+                (fun (label, expected, t) ->
+                  equal ~msg:label oidc_result expected (verify p t) )
+                [ ( "aud"
+                  , Error (O.Jwt Bad_audience)
+                  , id_token [("aud", {|"other"|})] )
+                ; ( "iss"
+                  , Error (O.Jwt Bad_issuer)
+                  , id_token [("iss", {|"https://other"|})] )
+                ; ( "exp"
+                  , Error (O.Jwt Expired)
+                  , id_token [("exp", Printf.sprintf "%.0f" (oidc_t0 -. 3600.))]
+                  )
+                ; ( "no exp"
+                  , Error (O.Jwt (Missing "exp"))
+                  , id_token [("exp", "")] )
+                ; ( "signature"
+                  , Error (O.Jwt Bad_signature)
+                  , id_token ~sign:(fun _ -> String.make 64 'x') [] )
+                ; ( "no sub"
+                  , Error (O.Jwt (Missing "sub"))
+                  , id_token [("sub", "")] )
+                ; ( "empty sub"
+                  , Error (O.Jwt (Missing "sub"))
+                  , id_token [("sub", {|""|})] )
+                ; ( "access token"
+                  , Error (O.Jwt (Unsupported "typ at+jwt"))
+                  , id_token ~typ:"at+jwt" [] )
+                ; ( "access token with a prefix"
+                  , Error (O.Jwt (Unsupported "typ at+jwt"))
+                  , id_token ~typ:"application/AT+JWT" [] ) ] ) )
+    ; test "verify_id_token checks the nonce" (fun () ->
+          with_idp (fun _ http _ ->
+              let p = discover http in
+              equal ~msg:"missing" oidc_result (Error O.Missing_nonce)
+                (verify ~nonce:"n1" p (id_token [])) ;
+              equal ~msg:"other" oidc_result (Error O.Bad_nonce)
+                (verify ~nonce:"n1" p (id_token [("nonce", {|"n2"|})])) ;
+              equal ~msg:"equal" oidc_result (Ok ())
+                (verify ~nonce:"n1" p (id_token [("nonce", {|"n1"|})])) ;
+              equal ~msg:"no nonce expected" oidc_result (Ok ())
+                (verify p (id_token [("nonce", {|"n2"|})])) ) )
+    ; test "verify_id_token checks azp" (fun () ->
+          with_idp (fun _ http _ ->
+              let p = discover http in
+              let two = ("aud", {|["app","other"]|}) in
+              equal ~msg:"two audiences, no azp" oidc_result (Error O.Bad_azp)
+                (verify p (id_token [two])) ;
+              equal ~msg:"azp other" oidc_result (Error O.Bad_azp)
+                (verify p (id_token [("azp", {|"other"|})])) ;
+              equal ~msg:"two audiences, azp" oidc_result (Ok ())
+                (verify p (id_token [two; ("azp", {|"app"|})])) ;
+              equal ~msg:"one audience, azp" oidc_result (Ok ())
+                (verify p (id_token [("azp", {|"app"|})])) ) )
+    ; test "verify_id_token accepts the issuers of the caller" (fun () ->
+          with_idp (fun _ http _ ->
+              let p = discover http in
+              let t = id_token [("iss", {|"idp.example"|})] in
+              equal oidc_result (Error (O.Jwt Bad_issuer)) (verify p t) ;
+              equal oidc_result (Ok ())
+                (verify ~issuers:[issuer; "idp.example"] p t) ) )
+    ; test "the keys stay fresh for max-age, from 5 min to 24 h" (fun () ->
+          (* [loads cc sleeps] is the number of loads after a check, then a
+             check after each sleep. *)
+          let loads cc sleeps =
+            let idp = new_idp () in
+            idp.cache_control <- cc ;
+            with_idp ~idp (fun _ http _ ->
+                let p = discover http in
+                ignore (verify p (id_token [])) ;
+                List.map
+                  (fun s ->
+                    Time.sleep Mono (Span.s s) ;
+                    ignore (verify p (id_token [])) ;
+                    Atomic.get idp.loads )
+                  sleeps )
+          in
+          equal ~msg:"default 1 h" (list int) [1; 2] (loads None [3599; 1]) ;
+          equal ~msg:"max-age=7200" (list int) [1; 2]
+            (loads (Some "public, Max-Age=7200") [7199; 1]) ;
+          equal ~msg:"max-age=1: 5 min" (list int) [1; 2]
+            (loads (Some "max-age=1") [299; 1]) ;
+          equal ~msg:"10 days: 24 h" (list int) [1; 2]
+            (loads (Some "max-age=864000") [86399; 1]) ;
+          equal ~msg:"leading zeros" (list int) [1; 2]
+            (loads (Some "max-age=0000000001") [299; 1]) ;
+          equal ~msg:"many digits: 24 h" (list int) [1; 2]
+            (loads (Some "max-age=99999999999") [86399; 1]) ;
+          equal ~msg:"no-store: 1 h" (list int) [1; 2]
+            (loads (Some "max-age=86400, no-store") [3599; 1]) ;
+          equal ~msg:"no-cache: 1 h" (list int) [1; 2]
+            (loads (Some "no-cache, max-age=86400") [3599; 1]) ;
+          equal ~msg:"bad max-age: 1 h" (list int) [1; 2]
+            (loads (Some "max-age=+7200, max-age=") [3599; 1]) )
+    ; test "a new kid loads the keys, at most once a minute" (fun () ->
+          with_idp (fun _ http idp ->
+              let p = discover http in
+              equal oidc_result (Ok ()) (verify p (id_token [])) ;
+              idp.jwks <- jwks [with_kid "ec2" jwk_ec] ;
+              (* Less than 1 min after the load: no load. *)
+              equal ~msg:"too soon" oidc_result (Error (O.Jwt No_key))
+                (verify p (id_token ~kid:"ec2" [])) ;
+              equal int 1 (Atomic.get idp.loads) ;
+              Time.sleep Mono minute_span ;
+              equal ~msg:"rotation" oidc_result (Ok ())
+                (verify p (id_token ~kid:"ec2" [])) ;
+              equal int 2 (Atomic.get idp.loads) ;
+              equal ~msg:"an unknown kid" oidc_result (Error (O.Jwt No_key))
+                (verify p (id_token ~kid:"ec9" [])) ;
+              equal int 2 (Atomic.get idp.loads) ) )
+    ; test "a failed load keeps the keys, and waits 1 min" (fun () ->
+          with_idp (fun _ http idp ->
+              let p = discover http in
+              equal oidc_result (Ok ()) (verify p (id_token [])) ;
+              idp.jwks_status <- 500 ;
+              Time.sleep Mono (Span.s 3600) ;
+              equal ~msg:"old keys" oidc_result (Ok ()) (verify p (id_token [])) ;
+              equal int 2 (Atomic.get idp.loads) ;
+              Time.sleep Mono (Span.s 59) ;
+              ignore (verify p (id_token [])) ;
+              equal ~msg:"no load before 1 min" int 2 (Atomic.get idp.loads) ;
+              Time.sleep Mono (Span.s 1) ;
+              idp.jwks_status <- 200 ;
+              ignore (verify p (id_token [])) ;
+              equal int 3 (Atomic.get idp.loads) ;
+              equal int 2 (List.length (P.keys p)) ;
+              (* A failed load also counts for the limit of 1 min. *)
+              idp.jwks_status <- 500 ;
+              Time.sleep Mono (Span.s 3600) ;
+              ignore (verify p (id_token [])) ;
+              equal int 4 (Atomic.get idp.loads) ;
+              equal ~msg:"no load after a failure" oidc_result
+                (Error (O.Jwt No_key))
+                (verify p (id_token ~kid:"ec9" [])) ;
+              equal int 4 (Atomic.get idp.loads) ) )
+    ; test "a failed reload keeps fresh keys fresh" (fun () ->
+          with_idp (fun _ http idp ->
+              let p = discover http in
+              equal oidc_result (Ok ()) (verify p (id_token [])) ;
+              Time.sleep Mono minute_span ;
+              idp.jwks_status <- 500 ;
+              equal oidc_result (Error (O.Jwt No_key))
+                (verify p (id_token ~kid:"ec9" [])) ;
+              equal int 2 (Atomic.get idp.loads) ;
+              Time.sleep Mono (Span.s 120) ;
+              equal oidc_result (Ok ()) (verify p (id_token [])) ;
+              equal ~msg:"the keys are fresh for 1 h" int 2
+                (Atomic.get idp.loads) ) )
+    ; test "with no keys, verify_id_token gives Keys with the cause" (fun () ->
+          List.iter
+            (fun (label, set, expected) ->
+              let idp = new_idp () in
+              set idp ;
+              with_idp ~idp (fun _ http _ ->
+                  let p = discover http in
+                  let m =
+                    keys_error
+                      (O.verify_id_token p ~client_id:"app" (id_token []))
+                  in
+                  is_true ~msg:(label ^ ": " ^ m) (contains m expected) ) )
+            [ ("status", (fun i -> i.jwks_status <- 503), "status 503")
+            ; ("not JSON", (fun i -> i.jwks <- "x"), "the JWK Set:")
+            ; ( "no usable key"
+              , (fun i -> i.jwks <- jwks [{|{"kty":"oct","k":"AAAA"}|}])
+              , "no key that caravan can use" )
+            ; ( "too large"
+              , (fun i -> i.jwks <- String.make 70000 ' ' ^ jwks [jwk_ec])
+              , "too large" ) ] )
+    ; test "a load that hangs ends at the timeout of the provider" (fun () ->
+          with_idp (fun _ http idp ->
+              let p =
+                P.make ~timeout:(Span.s 2) ~issuer
+                  ~authorization_endpoint:(issuer ^ "/authorize")
+                  ~token_endpoint:(issuer ^ "/token")
+                  ~jwks_uri:(issuer ^ "/jwks") http
+              in
+              idp.gate <- Some (Ivar.create ()) ;
+              let m =
+                keys_error (O.verify_id_token p ~client_id:"app" (id_token []))
+              in
+              is_true ~msg:m (contains m "timeout") ;
+              Option.iter (fun g -> Ivar.fill g ()) idp.gate ) )
+    ; test "the default timeout of a provider is 10 s" (fun () ->
+          with_idp (fun _ http idp ->
+              let elapsed p =
+                let gate = Ivar.create () in
+                idp.gate <- Some gate ;
+                let start = Time.now Mono in
+                ignore (O.verify_id_token p ~client_id:"app" (id_token [])) ;
+                let d = Time.diff Mono (Time.now Mono) start in
+                Ivar.fill gate () ;
+                idp.gate <- None ;
+                Span.to_ns d
+              in
+              let made =
+                P.make ~issuer ~authorization_endpoint:(issuer ^ "/a")
+                  ~token_endpoint:(issuer ^ "/t") ~jwks_uri:(issuer ^ "/jwks")
+                  http
+              in
+              equal int64 ~msg:"make" 10_000_000_000L (elapsed made) ;
+              equal int64 ~msg:"discover" 10_000_000_000L
+                (elapsed (discover http)) ) )
+    ; test "one load for callers at the same time" (fun () ->
+          with_idp (fun t http idp ->
+              let p = discover http in
+              let gate = Ivar.create () in
+              idp.gate <- Some gate ;
+              Fiber.scope (fun s ->
+                  let a =
+                    Sim_support.call ~name:"a" s (fun () ->
+                        verify p (id_token []) )
+                  in
+                  let b =
+                    Sim_support.call ~name:"b" s (fun () ->
+                        verify p (id_token []) )
+                  in
+                  T.settle t ;
+                  equal ~msg:"one load waits" int 1 (Atomic.get idp.loads) ;
+                  Ivar.fill gate () ;
+                  equal oidc_result (Ok ()) (Sim_support.await a) ;
+                  equal oidc_result (Ok ()) (Sim_support.await b) ) ;
+              equal int 1 (Atomic.get idp.loads) ) )
+    ; test "a cancel of the loader does not stop the load" (fun () ->
+          with_idp (fun t http idp ->
+              let p = discover http in
+              let gate = Ivar.create () in
+              idp.gate <- Some gate ;
+              Fiber.scope (fun s ->
+                  let a =
+                    Sim_support.call ~name:"a" s (fun () ->
+                        verify p (id_token []) )
+                  in
+                  T.settle t ;
+                  let b =
+                    Sim_support.call ~name:"b" s (fun () ->
+                        verify p (id_token []) )
+                  in
+                  T.settle t ;
+                  Sim_support.cancel a ;
+                  T.settle t ;
+                  Ivar.fill gate () ;
+                  equal oidc_result (Ok ()) (Sim_support.await b) ;
+                  (* The loader sees its cancel at its next wait, if it has one:
+                     it can end with the keys. *)
+                  match Sim_support.await a with
+                  | r ->
+                      equal oidc_result (Ok ()) r
+                  | exception Promise.Cancelled ->
+                      () ) ;
+              equal int 1 (Atomic.get idp.loads) ;
+              equal oidc_result (Ok ()) (verify p (id_token [])) ;
+              equal int 1 (Atomic.get idp.loads) ) ) ]
+
 let () =
   Mirage_crypto_rng.set_default_generator
     (Mirage_crypto_rng.create ~seed:"caravan auth tests"
@@ -2025,4 +2615,5 @@ let () =
        ; claims_tests
        ; bearer_tests
        ; policy_tests
-       ; session_tests ] )
+       ; session_tests
+       ; oidc_tests ] )
