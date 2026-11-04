@@ -182,3 +182,22 @@
   (with-stdout-to
    readme_csrf.ml
    (run awk -v "section=CSRF" -f %{dep:section.awk} %{dep:../README.md}))))
+
+; The example of the "Authentication" section of README.md, as readme_auth.ml.
+
+(executable
+ (name readme_auth)
+ (modules readme_auth)
+ (libraries caravan caravan.auth))
+
+(rule
+ (action
+  (with-stdout-to
+   readme_auth.ml
+   (run
+    awk
+    -v
+    "section=Authentication"
+    -f
+    %{dep:section.awk}
+    %{dep:../README.md}))))

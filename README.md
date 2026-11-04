@@ -369,6 +369,49 @@ let app =
 - Use `Csrf` only for the routes of the cookie sessions. A JSON API
   with a bearer token needs no token against CSRF.
 
+## Authentication
+
+The optional `caravan.auth` library verifies JSON Web Tokens, for
+example the bearer tokens of an identity provider:
+
+```ocaml
+(* The keys of the identity provider: its JWK Set, from the
+   configuration. *)
+let keys =
+  match Caravan_auth.Jwt.Key.of_jwks (Sys.getenv "JWKS") with
+  | Ok keys -> keys
+  | Error e -> failwith e
+
+(* The user of a request with "Authorization: Bearer <token>". The
+   name of the scheme is case-insensitive (RFC 9110 §11.1). *)
+let user req =
+  match Caravan.Headers.find "authorization" (Caravan.Request.headers req) with
+  | Some v
+    when String.starts_with ~prefix:"bearer " (String.lowercase_ascii v) -> (
+      let token = String.sub v 7 (String.length v - 7) in
+      match
+        Caravan_auth.Jwt.verify
+          ~issuer:(One_of ["https://id.example"])
+          ~audience:(One_of ["api://orders"])
+          ~keys token
+      with
+      | Ok claims -> Caravan_auth.Jwt.subject claims
+      | Error _ -> None )
+  | _ -> None
+```
+
+- The algorithms are HS256, RS256, ES256 and EdDSA (Ed25519). A key
+  has one algorithm, thus a token cannot choose another one. `none` is
+  always refused.
+- The keys come from a JWK Set, a PEM (a public key or a certificate),
+  or a secret of 32 bytes or more. A key never comes from a token.
+- `verify` checks the header and the signature first, then `exp`
+  (required by default) and `nbf` with a leeway of 60 s, then `iss`
+  and `aud`. The issuer and the audience are required arguments: `Any`
+  skips a check.
+- The JSON must be strict RFC 8259: no comments, no `NaN`, no
+  duplicate member names.
+
 ## File uploads
 
 `Request.multipart` streams the parts of a `multipart/form-data` body,
