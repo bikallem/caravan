@@ -110,6 +110,7 @@
                 ./websocket
                 ./router
                 ./middleware
+                ./static
                 ./testing
                 ./LICENSE
                 ./README.md
