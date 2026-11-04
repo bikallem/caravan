@@ -500,12 +500,14 @@ let app =
 ## Compression
 
 The optional `caravan.compress` library compresses the responses with
-gzip or deflate, with the pure OCaml library decompress:
+gzip or deflate, and decodes compressed request bodies, with the pure
+OCaml library decompress:
 
 ```ocaml
 let app handler =
   Caravan.Handler.compose
     [ Caravan_compress.middleware ~level:6 ()
+    ; Caravan_compress.decompress ~max_bytes:(4 * 1024 * 1024) ()
     ; Caravan_static.middleware ~root:"/srv/www" () ]
     handler
 ```
@@ -526,6 +528,10 @@ let app handler =
   0.2 ms while it goes out. At most 64 run at the same time
   (`max_active`): the other responses go out with no compression.
 - BREACH: do not compress a page with a secret and text of the client.
+- `decompress` decodes a request body with `Content-Encoding: gzip` or
+  `deflate` (zlib), with a limit of decoded bytes (1 MiB by default)
+  against zip bombs: 413 above it, 400 for a body that does not decode,
+  415 for another coding. Put it after `Error_page`.
 - For pure OCaml, add `checkseum.ocaml` to the libraries of your
   executable: the default checksums of decompress have C code.
 
