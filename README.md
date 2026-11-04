@@ -42,7 +42,7 @@ them.
 | `caravan.auth` | JWT, bearer and cookie schemes, users, policies | the dependencies of `caravan.session`, and mirage-crypto-pk, mirage-crypto-ec, x509, yojson, zarith |
 | `caravan.compress` | gzip and deflate responses, decompression of request bodies | decompress |
 | `caravan.static` | Static files with ETag, conditional requests and ranges | |
-| `caravan.tls` | The TLS server, with ALPN | tls, x509, domain-name, mirage-crypto-rng |
+| `caravan.tls` | The TLS server, with ALPN, and HTTPS for the client | tls, x509, domain-name, ipaddr, mirage-crypto-rng |
 | `caravan.testing` | A test host: it runs a handler stack and the client in the weft simulator, with no sockets | |
 
 caravan and weft are not on opam. Get them from their repositories, or
@@ -713,6 +713,8 @@ let () =
 - The handshake has the deadline `header_timeout`, and a stop of the
   server ends it. A handshake that fails is not an error of the server:
   the server reports nothing.
+- `Caravan_tls.https` gives HTTPS to `caravan.client` (see
+  [Client](#client)).
 - `Caravan_tls.server` and `Caravan_tls.client` do a handshake on any
   `Caravan.Flow.t`, for example for a test or a proxy. The client checks
   the `peer_name` of its `Tls.Config`: give one for each server on the
@@ -771,7 +773,7 @@ Caravan_client.with_response client
   (fun resp -> Caravan.Body.to_string (Caravan_client.body resp))
 ```
 
-- The client keeps idle connections for each host and port, and gives a
+- The client keeps idle connections for each scheme, host and port, and gives a
   connection back when the response body ends.
 - The request body goes while the caller reads the response. The writer
   of the body belongs to the client, not to the caller. Thus a server
@@ -782,8 +784,44 @@ Caravan_client.with_response client
 - Time limits for the connect, the response head, each read and each
   write. One retry of an idempotent request without a body when the
   server closed an idle connection.
-- Version 1 has no TLS, no proxy support, no redirects, no cookies and
-  no content codings.
+- `https` URLs need the `~tls` of `Caravan_client.run`. The function
+  `Caravan_tls.https` of the optional `caravan.tls` gives it (see the
+  example after this list).
+- The client has no proxy support, no redirects, no cookies and no
+  content codings.
+
+HTTPS, with the certificate authorities of the system from the
+[ca-certs](https://github.com/mirage/ca-certs) package:
+
+```ocaml
+let ok = function Ok v -> v | Error (`Msg m) -> failwith m
+
+let () =
+  Mirage_crypto_rng_unix.use_default () ;
+  let config =
+    ok (Tls.Config.client ~authenticator:(ok (Ca_certs.authenticator ())) ())
+  in
+  Weft.run (module Weft_os) @@ fun () ->
+  Caravan_client.run ~tls:(Caravan_tls.https config) @@ fun client ->
+  Caravan_client.with_response client
+    (Caravan.Request.make ~scheme:"https" ~authority:"example.com"
+       Caravan.Method.GET "/")
+    (fun resp -> print_string (Caravan.Body.to_string (Caravan_client.body resp)))
+```
+
+- For each connection, `Caravan_tls.https` takes the name or the
+  address of the URL. The client sends a name in SNI, and the
+  authenticator checks the name or the address of the certificate. Thus
+  the configuration must have no peer name, no IP address and no cached
+  session.
+- One deadline, `connect_timeout`, covers the DNS lookup, the TCP
+  connect and the TLS handshake. A failed handshake raises
+  `Caravan_client.Error (Tls _)`.
+- An `http` and an `https` connection to the same host and port are
+  different connections.
+- A response body that ends with the connection (no `Content-Length`,
+  not chunked) needs a `close_notify` of the server. Else the client
+  gives `Error Truncated`.
 
 ## Testing
 
