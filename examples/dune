@@ -120,3 +120,22 @@
     -f
     %{dep:section.awk}
     %{dep:../README.md}))))
+
+; The example of the "Static files" section of README.md, as readme_static.ml.
+
+(executable
+ (name readme_static)
+ (modules readme_static)
+ (libraries caravan caravan.static))
+
+(rule
+ (action
+  (with-stdout-to
+   readme_static.ml
+   (run
+    awk
+    -v
+    "section=Static files"
+    -f
+    %{dep:section.awk}
+    %{dep:../README.md}))))

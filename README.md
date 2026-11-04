@@ -84,7 +84,8 @@ let handler = Handler.compose [auth] hello
 `examples/middleware.ml` has a full example.
 
 The libraries `caravan`, `caravan.client`, `caravan.websocket`,
-`caravan.router` and `caravan.middleware` depend on no world of weft.
+`caravan.router`, `caravan.middleware` and `caravan.static` depend on no
+world of weft.
 They run in each world, for example the OS world
 (`Weft.run (module Weft_os)`) and the simulator of weft
 (`Weft_sim.run`). `caravan.testing` runs only in the simulator.
@@ -297,6 +298,44 @@ let upload req =
 - A file name comes from the client: it is not a safe path.
 - `Request.with_multipart` gives a request a multipart body, for the
   client or for a test.
+
+## Static files
+
+The `caravan.static` library serves the files of a directory. It reads
+them with `Weft.File`, on the thread pool of weft, thus a read does not
+stop the domain:
+
+```ocaml
+open Caravan
+
+(* /assets/app.css is the file public/app.css. Other paths go to the
+   handler. *)
+let app handler =
+  Handler.compose
+    [ Caravan_static.middleware ~prefix:"/assets" ~root:"public"
+        ~cache_control:(fun rel ->
+          if rel = "index.html" then Some "no-cache" else Some "max-age=3600" )
+        () ]
+    handler
+```
+
+- A response has `ETag`, `Last-Modified` and `X-Content-Type-Options:
+  nosniff`. `If-None-Match` and `If-Modified-Since` give `304`, and
+  `If-Match` and `If-Unmodified-Since` give `412`.
+- The middleware refuses `..`, `%2F`, a backslash, the reserved names
+  of Windows, and the names that start with a dot (`~dotfiles:true`
+  permits them). The rules are the same on each OS.
+- A directory gets its `index.html`. A path of a directory with an
+  `index.html` and with no `/` at the end gets a `301` to the path with
+  a `/`.
+- Each `GET` under the prefix, with a permitted path, costs one open
+  of a file on the pool, also when the handler gets the request. Thus give a prefix, or use
+  `Caravan_static.dir` on a route.
+- The library follows symbolic links: do not let a client make files in
+  the root.
+- With `caravan.router`, `Caravan_static.dir ~root (Caravan_router.rest req)
+  req` serves a route `/static/**`. `Caravan_static.file` serves one
+  file.
 
 ## WebSocket
 
