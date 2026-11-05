@@ -499,6 +499,44 @@ let jobs_on_domains ~domains () =
   equal int ~msg:"each accepted job ran or was reported" (Atomic.get accepted)
     (Atomic.get ran + Atomic.get lost)
 
+(* 16. Two durable queues on one memory store, on the domains: each job runs
+   exactly one time. *)
+let durable_on_domains ~domains () =
+  in_world ~domains
+  @@ fun () ->
+  let module D = Caravan_jobs.Durable in
+  let n = 400 in
+  let runs = Array.init n (fun _ -> Atomic.make 0) in
+  let st = D.memory_store () in
+  let j =
+    D.job ~name:"n" ~encode:string_of_int ~decode:int_of_string (fun _ i ->
+        Fiber.yield () ;
+        Atomic.incr runs.(i) )
+  in
+  let make () = D.create ~workers:4 ~poll:(Span.ms 1) ~jobs:[Job j] st in
+  let qa = make () and qb = make () in
+  Fiber.scope (fun sw ->
+      D.start qa sw ;
+      D.start qb sw ;
+      Fiber.scope (fun s ->
+          for k = 0 to 7 do
+            Fiber.fork s (fun () ->
+                for i = 0 to (n / 8) - 1 do
+                  let q = if i mod 2 = 0 then qa else qb in
+                  ignore (D.enqueue q j ((k * n / 8) + i))
+                done )
+          done ) ;
+      D.drain qa ;
+      D.drain qb ;
+      D.stop qa ;
+      D.stop qb ) ;
+  let wrong =
+    Array.to_list runs
+    |> List.mapi (fun i r -> (i, Atomic.get r))
+    |> List.filter (fun (_, c) -> c <> 1)
+  in
+  equal int ~msg:"jobs that did not run exactly one time" 0 (List.length wrong)
+
 (* 11. The HTTP/1.1 smoke test *)
 
 let mib = 1024 * 1024
@@ -789,7 +827,9 @@ let tests =
     , websocket_and_client_smoke )
   ; ("13. static files on the thread pool, and EACCES", static_files)
   ; ("14. TLS on loopback, with the generator of the OS", tls_get)
-  ; ("15. jobs on the domains during the stop of the queue", jobs_on_domains) ]
+  ; ("15. jobs on the domains during the stop of the queue", jobs_on_domains)
+  ; ("16. two durable queues on one store, on the domains", durable_on_domains)
+  ]
 
 let on ~domains name =
   group name (List.map (fun (n, t) -> test n (t ~domains)) tests)

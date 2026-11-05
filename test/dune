@@ -220,3 +220,17 @@
   weft
   weft.sim
   windtrap))
+
+; The suite of Caravan_jobs.Durable.
+
+(test
+ (name test_durable)
+ (modules test_durable)
+ (libraries
+  caravan
+  caravan.jobs
+  server_support
+  sim_support
+  weft
+  weft.sim
+  windtrap))

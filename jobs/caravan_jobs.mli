@@ -213,3 +213,324 @@ type stats =
 
 val stats : t -> stats
 (** [stats t] is the state of [t], for example for a health check. *)
+
+(** {1:durable Durable jobs} *)
+
+(** Jobs in a store of the application, for example a table of its database. A
+    job survives a restart, and many processes can share one store.
+
+    {[
+    let send_code =
+      Caravan_jobs.Durable.job ~name:"send_code"
+        ~encode:(fun (address, code) -> address ^ "\n" ^ code)
+        ~decode:(fun s ->
+          match String.split_on_char '\n' s with
+          | [address; code] ->
+              (address, code)
+          | _ ->
+              failwith "send_code: bad payload" )
+        (fun _info (address, code) -> Mail.send address code)
+
+    let jobs =
+      Caravan_jobs.Durable.create ~jobs:[Job send_code] (My_db.job_store db)
+
+    (* In a handler: *)
+    let _id = Caravan_jobs.Durable.enqueue jobs send_code (address, code)
+    ]}
+
+    A job runs at least one time. A worker holds a lease on its job and extends
+    it while the job runs. If the process stops with no grace (a crash), the
+    lease ends after at most [lease], and another process runs the job again.
+    Thus make each job safe to run again: {!info} gives a stable id, for example
+    for the idempotency key of a payment service.
+
+    A job type that changes the format of its payload must change its name too,
+    for example ["send_code.v2"]: during a deploy, the old processes do not
+    claim the names that they do not know. *)
+module Durable : sig
+  (** {2 Failures} *)
+
+  (** Why a job did not succeed. *)
+  type reason =
+    | Failed of exn * Printexc.raw_backtrace
+        (** The last attempt raised this exception. After the stop of the queue,
+            an attempt that raises gets its retry as usual: the store keeps it.
+        *)
+    | Discarded of exn * Printexc.raw_backtrace
+        (** The [on] of the retry policy gave [false]. *)
+    | Undecodable of exn * Printexc.raw_backtrace
+        (** [decode] raised at the last attempt. *)
+    | Abandoned
+        (** The claims of the job used all of its attempts with no result: each
+            attempt ended its process (a crash), or lost its lease. *)
+
+  type failure =
+    { name: string  (** The name of the job type. *)
+    ; id: string  (** The id that the store gave. *)
+    ; attempts: int  (** The claims of the job. *)
+    ; reason: reason }
+
+  (** {2 Job types} *)
+
+  (** What a job knows about its run. *)
+  type info =
+    { id: string  (** The id of the job in the store: the same at each run. *)
+    ; attempt: int  (** 1 for the first claim. *) }
+
+  (** A job type with an argument of type ['a]. *)
+  type 'a job
+
+  val job :
+       name:string
+    -> encode:('a -> string)
+    -> decode:(string -> 'a)
+    -> ?retry:retry
+    -> ?on_failure:('a -> failure -> unit)
+    -> (info -> 'a -> unit)
+    -> 'a job
+  (** [job ~name ~encode ~decode ~retry ~on_failure f] is a job type. The store
+      keeps [encode arg], and a worker runs [f info (decode payload)]. A
+      [decode] that raises follows the [retry] policy too (default [retry ()]):
+      [on] gets its exception. [on_failure] gets the jobs whose payload decoded,
+      before the [on_error] of the queue. *)
+
+  (** A job type of any argument, for the list of a queue. *)
+  type any = Job : 'a job -> any
+
+  (** {2 Stores} *)
+
+  (** A new job, for {!store} [push]. *)
+  type row =
+    { name: string
+    ; payload: string
+    ; due: Weft.Clock.posix  (** The job runs at this time or later. *) }
+
+  (** A job that a worker claimed. *)
+  type claim =
+    { id: string
+    ; name: string
+    ; payload: string
+    ; attempts: int  (** The claims, with this one. *)
+    ; lease: string  (** The token of this claim. *) }
+
+  (** The place of the jobs. The fields are the functions of {!val-store}: read
+      them to wrap a store, for example to count its calls. *)
+  type store = private
+    { push: row -> string
+    ; claim: names:string list -> max:int -> lease:Weft.Span.t -> claim list
+    ; extend: id:string -> lease:string -> Weft.Span.t -> bool
+    ; complete: id:string -> lease:string -> bool
+    ; retry: id:string -> lease:string -> due:Weft.Clock.posix -> bool
+    ; release: id:string -> lease:string -> bool
+    ; fail: id:string -> lease:string -> error:string -> bool
+    ; next_due: (names:string list -> Weft.Clock.posix option) option }
+
+  val store :
+       push:(row -> string)
+    -> claim:(names:string list -> max:int -> lease:Weft.Span.t -> claim list)
+    -> extend:(id:string -> lease:string -> Weft.Span.t -> bool)
+    -> complete:(id:string -> lease:string -> bool)
+    -> retry:(id:string -> lease:string -> due:Weft.Clock.posix -> bool)
+    -> release:(id:string -> lease:string -> bool)
+    -> fail:(id:string -> lease:string -> error:string -> bool)
+    -> ?next_due:(names:string list -> Weft.Clock.posix option)
+    -> unit
+    -> store
+  (** A store of the application. The contract:
+      - [push row] adds a job and gives its new id.
+      - [claim ~names ~max ~lease] takes at most [max] jobs whose name is in
+        [names], whose due time is now or before, and that have no live lease.
+        It takes them in the order of their due time, then of their [push]. For
+        each, it adds 1 to the attempts, makes a new lease token, and sets the
+        end of the lease to now + [lease]. "Now" is the clock of the store (for
+        example [now()] of the database), thus the lease does not depend on the
+        clocks of the processes. Two calls, also of two processes, never take
+        the same job while its lease lives. The claim must be committed when
+        [claim] returns.
+      - The other functions change a job only if it has the lease token [lease],
+        and give [true] then. Else they change nothing and give [false]: another
+        worker has the job, or it ended. No function adds a job.
+      - [extend ~id ~lease span] sets the end of the lease to now + [span].
+      - [complete] and [fail ~error] end the job: delete it, or keep it with a
+        state (for example a table of failed jobs).
+      - [retry ~due] removes the lease and sets the due time.
+      - [release] removes the lease and subtracts 1 from the attempts. The due
+        time stays.
+      - [next_due ~names] (optional) is the first time at which a job of [names]
+        can be claimed: its due time, or the end of its live lease. Only
+        {!drain} uses it.
+      - The functions must be safe on many domains. Their exceptions are
+        failures of the store: see {!create}. A function that blocks its domain
+        (a C library of a database) stops the fibers of that domain. Give each
+        function a timeout: a [claim] that does not return keeps {!stop} waiting
+        until a crash, and a call after a job runs in a shield.
+
+      With PostgreSQL, for example ([$n] are the parameters; a span goes to SQL
+      as [make_interval(secs => $n)], in seconds ([Weft.Span.to_ns] / 1e9)):
+      {v
+      CREATE TABLE jobs (
+        id bigserial PRIMARY KEY, name text NOT NULL, payload bytea NOT NULL,
+        due timestamptz NOT NULL, attempts int NOT NULL DEFAULT 0,
+        lease bigint, lease_until timestamptz);
+      CREATE INDEX jobs_due ON jobs (name, due, id);
+      CREATE SEQUENCE job_leases;
+
+      -- push
+      INSERT INTO jobs (name, payload, due)
+        VALUES ($1, $2, to_timestamp($3)) RETURNING id;
+
+      -- claim: $1 the names, $2 max, $3 the lease
+      WITH next AS MATERIALIZED (
+        SELECT id FROM jobs
+        WHERE name = ANY($1) AND due <= now()
+          AND (lease IS NULL OR lease_until <= now())
+        ORDER BY due, id LIMIT $2 FOR UPDATE SKIP LOCKED)
+      UPDATE jobs SET attempts = attempts + 1,
+        lease = nextval('job_leases'), lease_until = now() + make_interval(secs => $3)
+      FROM next WHERE jobs.id = next.id
+      RETURNING jobs.id, name, payload, attempts, lease;
+
+      -- extend: UPDATE jobs SET lease_until = now() + make_interval(secs => $3)
+      --   WHERE id = $1 AND lease = $2
+      -- complete, fail: DELETE FROM jobs WHERE id = $1 AND lease = $2
+      -- retry: UPDATE jobs SET lease = NULL, due = to_timestamp($3)
+      --   WHERE id = $1 AND lease = $2
+      -- release: UPDATE jobs SET lease = NULL, attempts = attempts - 1
+      --   WHERE id = $1 AND lease = $2
+      -- next_due: SELECT extract(epoch FROM min(CASE WHEN lease IS NOT NULL
+      --   AND lease_until > now() THEN lease_until ELSE due END))
+      --   FROM jobs WHERE name = ANY($1)
+      v}
+      A [Weft.Clock.posix] goes to SQL through [Weft.Time.posix_to_unix_s], and
+      back through [Weft.Time.posix_of_unix_s] (a float: do not compare two
+      converted times for equality). Use [bytea], not [text], if a payload can
+      contain a NUL byte. With SQLite (3.35 or later for [RETURNING]), claim in
+      [BEGIN IMMEDIATE], with WAL and a busy timeout. *)
+
+  val memory_store : unit -> store
+  (** [memory_store ()] keeps the jobs in the memory of the process, for tests.
+      It has [next_due]. Its [complete] and [fail] delete the job. Each claim
+      looks at all jobs: it is not for many jobs. *)
+
+  (** {2 Queues} *)
+
+  (** A queue: the workers of this process on a store. *)
+  type t
+
+  val create :
+       ?workers:int
+    -> ?poll:Weft.Span.t
+    -> ?lease:Weft.Span.t
+    -> ?on_error:(failure -> unit)
+    -> ?on_store_error:(exn -> unit)
+    -> jobs:any list
+    -> store
+    -> t
+  (** [create ~workers ~poll ~lease ~on_error ~on_store_error ~jobs store] is a
+      queue that runs the jobs of the types [jobs] from [store].
+      - At most [workers] jobs (default 4) run at the same time.
+      - When the store has no job for its free workers, the queue waits [poll]
+        (default 1 s, at most 1 h), with a jitter of 0 to 10 %, or until an
+        {!enqueue} with no delay or a {!wake} of this queue. Thus a delayed job,
+        or a job of another process, starts at most about [poll] after its due
+        time. Each {!start} gets a new seed of the jitters: the processes do not
+        claim at the same times.
+      - The leases last [lease] (default 60 s, from 1 s to 1 day). The queue
+        extends them each [lease / 3], also after the end of the grace of a
+        stop, until the jobs end. After a crash, the jobs wait at most [lease]
+        before another process runs them. If an extend gives [false], another
+        worker has the job: the queue cancels it.
+      - [on_error] gets each job that ended with no success (default: one line
+        on the standard error). It has the rules of the [on_error] of a
+        {!Caravan_jobs.t} queue.
+      - [on_store_error] gets each exception of the store (default: one line on
+        the standard error), with the same rules. After the failure [k] of
+        [claim] in a row (k = 1, 2, ...), the queue waits [poll * 2^(k-1)], at
+        most 1 min, less a jitter of 0 to 15 %. A claim that gives a job of an
+        unknown name, or more than [max] jobs, is a failure too: the queue
+        releases these jobs. After a failure at the end of a job, the lease ends
+        and the job runs again.
+
+      @raise Invalid_argument
+        if [workers] is less than 1, [poll] or [lease] is out of its range,
+        [jobs] is empty, or two job types have one name. *)
+
+  val row : ?delay:Weft.Span.t -> 'a job -> 'a -> row
+  (** [row ~delay job arg] is the row of a new job, due after [delay] (default:
+      now) on the POSIX clock of this process. Push it in a transaction of the
+      application, so that the job and the data of the application commit
+      together. Then call {!wake}.
+
+      @raise Invalid_argument
+        if [delay] is less than zero, or the due time is after the end of the
+        range of the clock. The exceptions of [encode] go out. *)
+
+  val enqueue : t -> ?delay:Weft.Span.t -> 'a job -> 'a -> string
+  (** [enqueue t ~delay job arg] pushes {!row} [~delay job arg] to the store of
+      [t], and gives the id. A job with no delay wakes [t]. It works also before
+      {!start} and after {!stop}: the store keeps the job. Call it from fiber
+      code.
+
+      [enqueue] has no limit: the store keeps each job. Limit the jobs that
+      clients can make, for example with the rate limit of [caravan.middleware].
+
+      @raise Invalid_argument as {!row}. The exceptions of the store go out. *)
+
+  val wake : t -> unit
+  (** [wake t] makes the queue claim now, for example after the commit of a
+      transaction with a new job. After a failure of the store, the queue waits
+      for its backoff first. *)
+
+  val start : t -> Weft.Fiber.scope -> unit
+  (** [start t sw] starts the queue in a new fiber of [sw].
+
+      @raise Invalid_argument if [t] started or stopped before.
+      @raise Weft.Fiber.Scope_closed
+        if [sw] ended or is cancelled. Then the queue is stopped.
+      @raise Weft.Fiber.Not_in_fiber outside fiber code. *)
+
+  val stop : ?grace:Weft.Span.t -> t -> unit
+  (** [stop ~grace t] stops [t] and waits until it ended. The queue claims no
+      more jobs. The running jobs get [grace] (default 10 s). Then the queue
+      cancels them, and gives them back to the store with [release]: they use no
+      attempt, and the next start (here or in another process) runs them. A job
+      that ignores its cancel keeps [stop] waiting. A job that catches the
+      cancel and returns succeeds. A cancel of the scope of {!start} (a crash)
+      releases no job: the leases end. A claim in progress at the end of the
+      grace ends, then the queue releases its jobs.
+
+      @raise Invalid_argument if a job of [t] calls it. *)
+
+  val drain : t -> unit
+  (** [drain t] waits until no job of [t] runs and the store has no job of the
+      types of [t], also the delayed jobs, the retries, and the jobs of a lease
+      that has not ended, or until [t] stopped. It looks at the store after each
+      change of [t], and at least each [poll]. It is for tests: in [Weft_sim],
+      the delays need no real time.
+
+      @raise Invalid_argument
+        if a job of [t] calls it, or if the store has no [next_due]. *)
+
+  val service : t -> Caravan.Server.service
+  (** [service t] is [t] as a service of {!Caravan.Server.run}. *)
+
+  (** One snapshot of a queue. [running] is the jobs that run at this time. The
+      other counts are totals of this process since {!create}. *)
+  type stats =
+    { state: state
+    ; running: int
+    ; succeeded: int
+    ; retried: int
+    ; failed: int
+    ; discarded: int
+    ; undecodable: int
+    ; abandoned: int
+    ; released: int
+          (** The jobs that the queue gave back to the store: at the end of the
+              grace of a stop, or after a failure of the queue. *)
+    ; lease_lost: int
+          (** The jobs that another worker took, after their lease ended. *)
+    ; store_errors: int }
+
+  val stats : t -> stats
+end

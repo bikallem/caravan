@@ -404,20 +404,18 @@ let in_job t name =
   if locked t (fun () -> Ids.mem t.worker_ids self) then
     invalid_arg (name ^ ": called in a job of the same queue")
 
+(* [due_after line fn d] is the time now + [d] on [line]. [fn] names the
+   function in the errors. *)
+let due_after line fn d =
+  if Span.compare d Span.zero < 0 then invalid_arg (fn ^ ": delay < 0") ;
+  match Time.add line (Time.now line) d with
+  | Some due ->
+      due
+  | None ->
+      invalid_arg (fn ^ ": the delay is too long")
+
 let enqueue t ?delay (j : 'a job) arg =
-  let due =
-    match delay with
-    | None ->
-        None
-    | Some d -> (
-        if Span.compare d Span.zero < 0 then
-          invalid_arg "Caravan_jobs.enqueue: delay < 0" ;
-        match Time.add Mono (Time.now Mono) d with
-        | Some due ->
-            Some due
-        | None ->
-            invalid_arg "Caravan_jobs.enqueue: the delay is too long" )
-  in
+  let due = Option.map (due_after Mono "Caravan_jobs.enqueue") delay in
   let result =
     locked t (fun () ->
         if t.state = `Stopping || t.state = `Stopped then Error `Stopped
@@ -508,3 +506,804 @@ let stats t =
       ; failed= t.failed
       ; discarded= t.discarded
       ; lost= t.lost } )
+
+module Durable = struct
+  type reason =
+    | Failed of exn * Printexc.raw_backtrace
+    | Discarded of exn * Printexc.raw_backtrace
+    | Undecodable of exn * Printexc.raw_backtrace
+    | Abandoned
+
+  type failure = {name: string; id: string; attempts: int; reason: reason}
+
+  type info = {id: string; attempt: int}
+
+  type 'a job =
+    { name: string
+    ; encode: 'a -> string
+    ; decode: string -> 'a
+    ; retry: retry
+    ; on_failure: 'a -> failure -> unit
+    ; run: info -> 'a -> unit }
+
+  let job ~name ~encode ~decode ?(retry = retry ())
+      ?(on_failure = fun _ _ -> ()) run =
+    {name; encode; decode; retry; on_failure; run}
+
+  type any = Job : 'a job -> any
+
+  type row = {name: string; payload: string; due: Clock.posix}
+
+  type claim =
+    {id: string; name: string; payload: string; attempts: int; lease: string}
+
+  type store =
+    { push: row -> string
+    ; claim: names:string list -> max:int -> lease:Span.t -> claim list
+    ; extend: id:string -> lease:string -> Span.t -> bool
+    ; complete: id:string -> lease:string -> bool
+    ; retry: id:string -> lease:string -> due:Clock.posix -> bool
+    ; release: id:string -> lease:string -> bool
+    ; fail: id:string -> lease:string -> error:string -> bool
+    ; next_due: (names:string list -> Clock.posix option) option }
+
+  let store ~push ~claim ~extend ~complete ~retry ~release ~fail ?next_due () =
+    {push; claim; extend; complete; retry; release; fail; next_due}
+
+  let before a b = Span.compare (Time.diff Posix a b) Span.zero < 0
+
+  (* The memory store. [lease] is the token and the end of the lease of the last
+     claim, until a [retry] or a [release]. *)
+  type mrow =
+    { mid: int
+    ; mname: string
+    ; mpayload: string
+    ; mutable mdue: Clock.posix
+    ; mutable mattempts: int
+    ; mutable lease: (string * Clock.posix) option }
+
+  (* The end of the live lease of [r], if it has one. *)
+  let lease_end now r =
+    match r.lease with
+    | Some (_, until) when before now until ->
+        Some until
+    | _ ->
+        None
+
+  let memory_store () =
+    let lock = Mutex.create () in
+    let rows = Hashtbl.create 64 and next = ref 0 in
+    let locked f = Mutex.protect lock f in
+    (* [owned ~id ~lease f] runs [f] on the row of [id] if its token is
+       [lease]. *)
+    let owned ~id ~lease f =
+      locked (fun () ->
+          match Option.bind (int_of_string_opt id) (Hashtbl.find_opt rows) with
+          | Some r when Option.map fst r.lease = Some lease ->
+              f r ; true
+          | _ ->
+              false )
+    in
+    let add now span =
+      match Time.add Posix now span with
+      | Some t ->
+          t
+      | None ->
+          invalid_arg "Caravan_jobs.Durable.memory_store: the lease is too long"
+    in
+    let push (row : row) =
+      locked (fun () ->
+          let i = !next in
+          incr next ;
+          Hashtbl.replace rows i
+            { mid= i
+            ; mname= row.name
+            ; mpayload= row.payload
+            ; mdue= row.due
+            ; mattempts= 0
+            ; lease= None } ;
+          string_of_int i )
+    in
+    let claim ~names ~max ~lease =
+      let now = Time.now Posix in
+      let until = add now lease in
+      locked (fun () ->
+          Hashtbl.fold
+            (fun _ r acc ->
+              if
+                List.mem r.mname names
+                && (not (before now r.mdue))
+                && lease_end now r = None
+              then r :: acc
+              else acc )
+            rows []
+          |> List.sort (fun a b ->
+              match Span.compare (Time.diff Posix a.mdue b.mdue) Span.zero with
+              | 0 ->
+                  Int.compare a.mid b.mid
+              | c ->
+                  c )
+          |> List.take max
+          |> List.map (fun r ->
+              let token = string_of_int !next in
+              incr next ;
+              r.lease <- Some (token, until) ;
+              r.mattempts <- r.mattempts + 1 ;
+              { id= string_of_int r.mid
+              ; name= r.mname
+              ; payload= r.mpayload
+              ; attempts= r.mattempts
+              ; lease= token } ) )
+    in
+    let extend ~id ~lease span =
+      let until = add (Time.now Posix) span in
+      owned ~id ~lease (fun r -> r.lease <- Some (lease, until))
+    in
+    let remove ~id ~lease =
+      owned ~id ~lease (fun r -> Hashtbl.remove rows r.mid)
+    in
+    let retry ~id ~lease ~due =
+      owned ~id ~lease (fun r ->
+          r.lease <- None ;
+          r.mdue <- due )
+    in
+    let release ~id ~lease =
+      owned ~id ~lease (fun r ->
+          r.lease <- None ;
+          r.mattempts <- r.mattempts - 1 )
+    in
+    let next_due ~names =
+      let now = Time.now Posix in
+      locked (fun () ->
+          Hashtbl.fold
+            (fun _ r acc ->
+              if List.mem r.mname names then
+                let t = Option.value (lease_end now r) ~default:r.mdue in
+                match acc with Some d when before d t -> acc | _ -> Some t
+              else acc )
+            rows None )
+    in
+    store ~push ~claim ~extend ~complete:remove ~retry ~release
+      ~fail:(fun ~id ~lease ~error:_ -> remove ~id ~lease)
+      ~next_due ()
+
+  (* A running job: its lease token, its fiber, the scope of its function, and
+     [lost] if the extender found that another worker has it. *)
+  type run =
+    { token: string
+    ; fiber: Fiber.Id.t
+    ; mutable scope: Fiber.scope option
+    ; mutable lost: bool }
+
+  type stats =
+    { state: state
+    ; running: int
+    ; succeeded: int
+    ; retried: int
+    ; failed: int
+    ; discarded: int
+    ; undecodable: int
+    ; abandoned: int
+    ; released: int
+    ; lease_lost: int
+    ; store_errors: int }
+
+  (* The state is in [lock], a mutex of the stdlib: no effect and no code of the
+     user runs while it is locked. [runs] has the leases that the extender
+     extends. [active] counts the job fibers, also during their last store call.
+     [seed] makes the jitters of each process different. *)
+  type t =
+    { store: store
+    ; poll: Span.t
+    ; lease: Span.t
+    ; on_error: failure -> unit
+    ; on_store_error: exn -> unit
+    ; jobs: (string, any) Hashtbl.t
+    ; names: string list
+    ; lock: Mutex.t
+    ; permits: Fiber.Semaphore.t
+    ; runs: (string, run) Hashtbl.t
+    ; mutable active: int
+    ; mutable state: state
+    ; mutable scope: Fiber.scope option
+    ; mutable cancel: bool
+    ; mutable wake: unit Ivar.t
+    ; mutable progress: unit Ivar.t
+    ; mutable seed: int
+    ; stopping: unit Ivar.t
+    ; ended: unit Ivar.t
+    ; mutable succeeded: int
+    ; mutable retried: int
+    ; mutable failed: int
+    ; mutable discarded: int
+    ; mutable undecodable: int
+    ; mutable abandoned: int
+    ; mutable released: int
+    ; mutable lease_lost: int
+    ; mutable store_errors: int }
+
+  let write_error (f : failure) =
+    let what =
+      match f.reason with
+      | Failed (e, _) ->
+          "failed: " ^ Printexc.to_string e
+      | Discarded (e, _) ->
+          "discarded: " ^ Printexc.to_string e
+      | Undecodable (e, _) ->
+          "undecodable: " ^ Printexc.to_string e
+      | Abandoned ->
+          "abandoned: its attempts ended with no result"
+    in
+    try
+      Printf.eprintf "caravan.jobs: %s %s after %d attempts, %s\n%!" f.name f.id
+        f.attempts what
+    with Sys_error _ -> ()
+
+  let write_store_error e =
+    try Printf.eprintf "caravan.jobs: store: %s\n%!" (Printexc.to_string e)
+    with Sys_error _ -> ()
+
+  let create ?(workers = 4) ?(poll = Span.s 1) ?(lease = Span.s 60)
+      ?(on_error = write_error) ?(on_store_error = write_store_error) ~jobs
+      store =
+    ( if workers < 1 then invalid_arg "Caravan_jobs.Durable.create: workers < 1"
+    )
+    [@mutate
+      off
+        "Fiber.Semaphore.create raises the same exception: the check gives a \
+         clear text"] ;
+    if (not (positive poll)) || Span.compare poll (Span.s 3600) > 0 then
+      invalid_arg "Caravan_jobs.Durable.create: poll is not in (0, 1 h]" ;
+    if
+      Span.compare lease (Span.s 1) < 0
+      || Span.compare lease (Span.s 86_400) > 0
+    then invalid_arg "Caravan_jobs.Durable.create: lease is not in [1 s, 1 day]" ;
+    if jobs = [] then invalid_arg "Caravan_jobs.Durable.create: no job type" ;
+    let table = Hashtbl.create 8 in
+    List.iter
+      (fun (Job j as any) ->
+        if Hashtbl.mem table j.name then
+          invalid_arg ("Caravan_jobs.Durable.create: two job types " ^ j.name) ;
+        Hashtbl.replace table j.name any )
+      jobs ;
+    { store
+    ; poll
+    ; lease
+    ; on_error
+    ; on_store_error
+    ; jobs= table
+    ; names= List.map (fun (Job j) -> j.name) jobs
+    ; lock= Mutex.create ()
+    ; permits= Fiber.Semaphore.create workers
+    ; runs= Hashtbl.create 8
+    ; active= 0
+    ; state= `Created
+    ; scope= None
+    ; cancel= false
+    ; wake= Ivar.create ()
+    ; progress= Ivar.create ()
+    ; seed= (0 [@mutate off "start sets the seed before its first use"])
+    ; stopping= Ivar.create ()
+    ; ended= Ivar.create ()
+    ; succeeded= 0
+    ; retried= 0
+    ; failed= 0
+    ; discarded= 0
+    ; undecodable= 0
+    ; abandoned= 0
+    ; released= 0
+    ; lease_lost= 0
+    ; store_errors= 0 }
+
+  let locked t f = Mutex.protect t.lock f
+
+  (* Under the lock: a new Ivar for the next progress, and the old one for a
+     fill after the unlock. *)
+  let take_progress t =
+    let p = t.progress in
+    t.progress <- Ivar.create () ;
+    p
+
+  let fill iv = ignore (Ivar.try_fill iv ())
+
+  let release_permits t n =
+    for _ = 1 to n do
+      Fiber.Semaphore.release t.permits
+    done
+
+  type count = Succeeded | Retried | Released | Lost | Ended of reason
+
+  let bump t c =
+    locked t (fun () ->
+        match c with
+        | Succeeded ->
+            t.succeeded <- t.succeeded + 1
+        | Retried ->
+            t.retried <- t.retried + 1
+        | Released ->
+            t.released <- t.released + 1
+        | Lost ->
+            t.lease_lost <- t.lease_lost + 1
+        | Ended (Failed _) ->
+            t.failed <- t.failed + 1
+        | Ended (Discarded _) ->
+            t.discarded <- t.discarded + 1
+        | Ended (Undecodable _) ->
+            t.undecodable <- t.undecodable + 1
+        | Ended Abandoned ->
+            t.abandoned <- t.abandoned + 1 )
+
+  let store_error t e =
+    locked t (fun () -> t.store_errors <- t.store_errors + 1) ;
+    Fiber.shield (fun () -> catch (fun () -> t.on_store_error e))
+
+  (* [settle t f ~ok] is a store call [f] on a claimed job, in a shield: a
+     cancel does not cut it. If [f] gives [true], [ok ()]. If it gives [false],
+     another worker has the job. A failure goes to [on_store_error]: the lease
+     of the job ends, and the job runs again. The result is the errors of the
+     hooks. *)
+  let settle t f ~ok =
+    match Fiber.shield f with
+    | true ->
+        ok ()
+    | false ->
+        bump t Lost ; []
+    | exception e ->
+        store_error t e
+
+  let counted t f c = settle t f ~ok:(fun () -> bump t c ; [])
+
+  let release_claim t (c : claim) =
+    counted t (fun () -> t.store.release ~id:c.id ~lease:c.lease) Released
+
+  let report t (f : failure) on_failure =
+    Fiber.shield (fun () ->
+        let a = catch on_failure in
+        a @ catch (fun () -> t.on_error f) )
+
+  (* The end of [c] with [reason]: [fail], then the reports. [hook] is an
+     exception of [on], to raise after them. *)
+  let end_job t (c : claim) reason ~error ~hook ~on_failure =
+    hook
+    @ settle t
+        (fun () -> t.store.fail ~id:c.id ~lease:c.lease ~error)
+        ~ok:(fun () ->
+          bump t (Ended reason) ;
+          let f = {name= c.name; id= c.id; attempts= c.attempts; reason} in
+          report t f (fun () -> on_failure f) )
+
+  (* A failure of the attempt of [c]: a retry, or the end with [last]. *)
+  let failed t (c : claim) policy e bt ~last ~on_failure =
+    let decision =
+      match policy.on e with
+      | false ->
+          `End (Discarded (e, bt), [])
+      | true -> (
+          let time =
+            if c.attempts >= policy.attempts then None
+            else
+              Time.add Posix (Time.now Posix)
+                (backoff policy ~id:(Hashtbl.hash c.id) ~n:c.attempts)
+          in
+          match time with
+          | Some due ->
+              `Retry due
+          | None ->
+              (* The last attempt, or a due time after the end of the clock. *)
+              `End (last (e, bt), []) )
+      | exception hook ->
+          `End (last (e, bt), [(hook, Printexc.get_raw_backtrace ())])
+    in
+    match decision with
+    | `Retry due ->
+        counted t (fun () -> t.store.retry ~id:c.id ~lease:c.lease ~due) Retried
+    | `End (reason, hook) ->
+        end_job t c reason ~error:(Printexc.to_string e) ~hook ~on_failure
+
+  exception Lease_lost
+
+  exception Grace_ended
+
+  (* The fiber of one claim. It holds one permit. *)
+  let run_claim t (c : claim) (Job j) () =
+    locked t (fun () -> t.active <- t.active + 1) ;
+    let errors =
+      Fun.protect
+        ~finally:(fun () ->
+          let p =
+            locked t (fun () ->
+                t.active <- t.active - 1 ;
+                take_progress t )
+          in
+          Fiber.Semaphore.release t.permits ;
+          fill p )
+        (fun () ->
+          if c.attempts > j.retry.attempts then
+            end_job t c Abandoned ~error:"abandoned" ~hook:[] ~on_failure:ignore
+          else
+            let r =
+              {token= c.lease; fiber= Fiber.self (); scope= None; lost= false}
+            in
+            locked t (fun () -> Hashtbl.replace t.runs c.id r) ;
+            (* The extender stops before the last store call. *)
+            let leave () =
+              locked t (fun () ->
+                  match Hashtbl.find_opt t.runs c.id with
+                  | Some r' when r' == r ->
+                      Hashtbl.remove t.runs c.id
+                  | _ ->
+                      () )
+            in
+            match j.decode c.payload with
+            | exception e ->
+                let bt = Printexc.get_raw_backtrace () in
+                leave () ;
+                failed t c j.retry e bt
+                  ~last:(fun (e, bt) -> Undecodable (e, bt))
+                  ~on_failure:ignore
+            | arg -> (
+                let outcome =
+                  match
+                    Fiber.scope (fun s ->
+                        if
+                          locked t (fun () ->
+                              r.scope <- Some s ;
+                              r.lost )
+                        then raise Lease_lost ;
+                        j.run {id= c.id; attempt= c.attempts} arg )
+                  with
+                  | () ->
+                      `Done
+                  | exception e ->
+                      `Raised (e, Printexc.get_raw_backtrace ())
+                in
+                leave () ;
+                if r.lost then (bump t Lost ; [])
+                else
+                  match outcome with
+                  | `Done ->
+                      counted t
+                        (fun () -> t.store.complete ~id:c.id ~lease:c.lease)
+                        Succeeded
+                  | `Raised _ when is_cancelled () ->
+                      (* The end of the grace: give the job back. A crash: no
+                         call, the lease ends. *)
+                      if locked t (fun () -> t.cancel) then release_claim t c
+                      else []
+                  | `Raised (e, bt) ->
+                      failed t c j.retry e bt
+                        ~last:(fun (e, bt) -> Failed (e, bt))
+                        ~on_failure:(fun f -> j.on_failure arg f) ) )
+    in
+    raise_first errors
+
+  (* The wait of the poller after a claim that did not fill its permits: [poll]
+     and a jitter of 0 to 10 %. *)
+  let jittered t polls =
+    let d = Span.to_ns t.poll in
+    Span.of_ns
+      (Int64.add d
+         (Int64.mul (Int64.div d 100L)
+            (Int64.of_int (Hashtbl.hash (t.seed, polls) mod 11)) ) )
+
+  (* The wait after the failure [k] of [claim] (k = 1, 2, ...): the backoff of a
+     retry, with [poll] as its base and 1 min as its max. *)
+  let store_backoff t k =
+    backoff {(retry ()) with base= t.poll; max= Span.s 60} ~id:t.seed ~n:k
+
+  (* [check t n claims] splits the result of a claim of [max = n]: the claims to
+     run, and the claims that the store must not give (a name that this queue
+     does not know, or more than [n]). *)
+  let check t n claims =
+    let rec go i ok bad = function
+      | [] ->
+          (List.rev ok, List.rev bad)
+      | (c : claim) :: rest -> (
+        match Hashtbl.find_opt t.jobs c.name with
+        | Some j when i < n ->
+            go (i + 1) ((c, j) :: ok) bad rest
+        | Some _ ->
+            go i ok ((c, "more than max jobs") :: bad) rest
+        | None ->
+            go i ok ((c, "the job type " ^ c.name) :: bad) rest )
+    in
+    go 0 [] [] claims
+
+  (* The poller: it claims for the free permits, and forks a fiber for each
+     claim. [k] counts the failures of the store in a row, and [polls] the
+     waits. *)
+  let rec poller t s ~k ~polls =
+    sync (choose [Fiber.Semaphore.acquire t.permits; Ivar.read t.stopping]) ;
+    (* After the stop, no claim. If the [choose] took a permit, the queue does
+       not need it: it stops. *)
+    if Option.is_none (Ivar.peek t.stopping) then (
+      (* The semaphore has [workers] permits: no more. *)
+      let rec more n =
+        if Fiber.Semaphore.try_acquire t.permits then more (n + 1) else n
+      in
+      let n = more 1 in
+      let wake = Ivar.create () in
+      locked t (fun () -> t.wake <- wake) ;
+      let wait events d =
+        sync (choose (Time.after Mono d :: Ivar.read t.stopping :: events))
+      in
+      let failure errors =
+        raise_first errors ;
+        (* A failing store: a wake does not end this wait. *)
+        wait [] (store_backoff t (k + 1)) ;
+        poller t s ~k:(k + 1) ~polls
+      in
+      (* The poller is not in the scope [s] of the jobs: the cancel of the end
+         of the grace does not cut its claim. A crash cuts it. *)
+      match t.store.claim ~names:t.names ~max:n ~lease:t.lease with
+      | exception (Fiber.Cancelled _ as e) when is_cancelled () ->
+          Printexc.raise_with_backtrace e (Printexc.get_raw_backtrace ())
+      | exception e ->
+          release_permits t n ;
+          failure (store_error t e)
+      | claims -> (
+          let ok, bad = check t n claims in
+          let errors =
+            List.concat_map
+              (fun ((c : claim), what) ->
+                (* A [false] is no lost lease: the store is wrong. *)
+                ( match
+                    Fiber.shield (fun () ->
+                        t.store.release ~id:c.id ~lease:c.lease )
+                  with
+                  | _ ->
+                      []
+                  | exception e ->
+                      store_error t e )
+                @ store_error t
+                    (Invalid_argument
+                       ("Caravan_jobs.Durable: the store gave " ^ what) ) )
+              bad
+          in
+          (* The scope [s] ends at the end of the grace, or at a failure of a
+             job fiber (a hook raised): give the jobs back, and the poller ends.
+             At a crash, the leases end. *)
+          let rec fork started = function
+            | [] ->
+                (started, [])
+            | ((c : claim), j) :: rest -> (
+              match
+                Fiber.fork ~name:"caravan.jobs.durable.job" s (run_claim t c j)
+              with
+              | () ->
+                  fork (started + 1) rest
+              | exception Fiber.Scope_closed ->
+                  ( started
+                  , if locked t (fun () -> t.cancel) || not (is_cancelled ())
+                    then
+                      List.concat_map
+                        (fun (c, _) -> release_claim t c)
+                        ((c, j) :: rest)
+                    else [] ) )
+          in
+          let started, released = fork 0 ok in
+          release_permits t (n - started) ;
+          match (bad, released) with
+          | _ :: _, _ ->
+              failure (errors @ released)
+          | [], _ :: _ ->
+              raise_first released
+          | [], [] when started < List.length ok ->
+              ()
+          | [], [] ->
+              if started < n then wait [Ivar.read wake] (jittered t polls) ;
+              poller t s ~k:0 ~polls:(polls + 1) ) )
+
+  (* The extender: each [lease / 3], it extends the lease of each running
+     job. *)
+  let rec extender t =
+    Time.sleep Mono (Span.of_ns (Int64.div (Span.to_ns t.lease) 3L)) ;
+    let runs =
+      locked t (fun () ->
+          Hashtbl.fold (fun id r acc -> (id, r) :: acc) t.runs [] )
+    in
+    List.iter
+      (fun (id, r) ->
+        match t.store.extend ~id ~lease:r.token t.lease with
+        | true ->
+            ()
+        | false ->
+            let scope =
+              locked t (fun () ->
+                  match Hashtbl.find_opt t.runs id with
+                  | Some r' when r' == r ->
+                      r.lost <- true ;
+                      r.scope
+                  | _ ->
+                      None )
+            in
+            Option.iter (fun s -> Fiber.cancel s Lease_lost) scope
+        | exception (Fiber.Cancelled _ as e) when is_cancelled () ->
+            Printexc.raise_with_backtrace e (Printexc.get_raw_backtrace ())
+        | exception e ->
+            raise_first (store_error t e) )
+      runs ;
+    extender t
+
+  (* The fiber of the queue. The jobs and the keeper run in the scope [s]: the
+     end of the grace cancels it. The poller and the extender run in [outer]:
+     the claim in progress ends, and the extender extends the jobs that ignore
+     that cancel, until they end. *)
+  let run t () =
+    let result =
+      catch (fun () ->
+          Fiber.scope (fun outer ->
+              Fiber.scope (fun s ->
+                  let cancel =
+                    locked t (fun () ->
+                        t.scope <- Some s ;
+                        t.cancel )
+                  in
+                  if not cancel then
+                    try
+                      let polled = Ivar.create () in
+                      Fiber.fork_daemon ~name:"caravan.jobs.durable.extender"
+                        outer (fun () -> extender t ) ;
+                      Fiber.fork ~name:"caravan.jobs.durable.poller" outer
+                        (fun () ->
+                          Fun.protect
+                            ~finally:(fun () -> fill polled)
+                            (fun () -> poller t s ~k:0 ~polls:0) ) ;
+                      (* It keeps [s] open while the poller runs. *)
+                      Fiber.fork ~name:"caravan.jobs.durable.keeper" s
+                        (fun () -> sync (Ivar.read polled) )
+                    with Fiber.Scope_closed -> () ) ) )
+    in
+    let p =
+      locked t (fun () ->
+          t.state <- `Stopped ;
+          take_progress t )
+    in
+    fill t.ended ; fill p ; raise_first result
+
+  let start t sw =
+    let seed = Hashtbl.hash (Time.now Mono) in
+    locked t (fun () ->
+        if t.state <> `Created then
+          invalid_arg "Caravan_jobs.Durable.start: the queue started or stopped" ;
+        t.seed <- seed ;
+        t.state <- `Running ) ;
+    match Fiber.fork ~name:"caravan.jobs.durable" sw (run t) with
+    | () ->
+        ()
+    | exception e ->
+        let bt = Printexc.get_raw_backtrace () in
+        let p =
+          locked t (fun () ->
+              t.state <- `Stopped ;
+              take_progress t )
+        in
+        fill t.ended ;
+        fill p ;
+        Printexc.raise_with_backtrace e bt
+
+  let in_job t name =
+    let self = Fiber.self () in
+    if
+      locked t (fun () ->
+          Hashtbl.fold
+            (fun _ r acc -> acc || Fiber.Id.equal r.fiber self)
+            t.runs false )
+    then invalid_arg (name ^ ": called in a job of the same queue")
+
+  let row ?delay (j : 'a job) arg =
+    let payload = j.encode arg in
+    let due =
+      match delay with
+      | None ->
+          Time.now Posix
+      | Some d ->
+          due_after Posix "Caravan_jobs.Durable.row" d
+    in
+    ({name= j.name; payload; due} : row)
+
+  (* A change of the store: [drain] looks at it again. *)
+  let progress t = fill (locked t (fun () -> take_progress t))
+
+  let wake t =
+    fill (locked t (fun () -> t.wake)) ;
+    progress t
+
+  let enqueue t ?delay j arg =
+    let id = t.store.push (row ?delay j arg) in
+    ( match delay with
+    | Some d when positive d ->
+        (* The job is not due: a claim now gets nothing. *)
+        progress t
+    | _ ->
+        wake t ) ;
+    id
+
+  let stop ?(grace = Span.s 10) t =
+    in_job t "Caravan_jobs.Durable.stop" ;
+    match
+      locked t (fun () ->
+          match t.state with
+          | `Created ->
+              t.state <- `Stopped ;
+              `Ended (take_progress t)
+          | `Running ->
+              t.state <- `Stopping ;
+              `Stop
+          | `Stopping | `Stopped ->
+              `Wait )
+    with
+    | `Ended p ->
+        fill t.ended ; fill p
+    | `Stop ->
+        fill t.stopping ;
+        sync (choose [Ivar.read t.ended; Time.after Mono grace]) ;
+        ( match
+            locked t (fun () ->
+                t.cancel <- true ;
+                t.scope )
+          with
+        | Some s ->
+            Fiber.cancel s Grace_ended
+        | None ->
+            () ) ;
+        sync (Ivar.read t.ended)
+    | `Wait ->
+        sync (Ivar.read t.ended)
+
+  let drain t =
+    in_job t "Caravan_jobs.Durable.drain" ;
+    let next_due =
+      match t.store.next_due with
+      | Some f ->
+          f
+      | None ->
+          invalid_arg "Caravan_jobs.Durable.drain: the store has no next_due"
+    in
+    let rec go () =
+      (* The store first: a job that ends after this read is still active, or
+         its end fills [progress]. *)
+      let next = next_due ~names:t.names in
+      let progress, active, state =
+        locked t (fun () -> (t.progress, t.active, t.state))
+      in
+      if state <> `Stopped then
+        let now = Time.now Posix in
+        match (active, next) with
+        | 0, None ->
+            ()
+        | _, next ->
+            let at =
+              match next with
+              | Some d when before now d ->
+                  [Time.at Posix d]
+              | Some _ ->
+                  (* A job is due: the poller must claim it now. *)
+                  fill (locked t (fun () -> t.wake)) ;
+                  []
+              | None ->
+                  []
+            in
+            (* Another queue can run the jobs: look again after [poll]. *)
+            sync (choose (Ivar.read progress :: Time.after Mono t.poll :: at)) ;
+            go ()
+    in
+    go ()
+
+  let service t =
+    Caravan.Server.service ~start:(start t) ~stop:(fun ~grace -> stop ~grace t)
+
+  let stats t =
+    locked t (fun () ->
+        { state= t.state
+        ; running= t.active
+        ; succeeded= t.succeeded
+        ; retried= t.retried
+        ; failed= t.failed
+        ; discarded= t.discarded
+        ; undecodable= t.undecodable
+        ; abandoned= t.abandoned
+        ; released= t.released
+        ; lease_lost= t.lease_lost
+        ; store_errors= t.store_errors } )
+end
