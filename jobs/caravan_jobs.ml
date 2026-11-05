@@ -1631,3 +1631,152 @@ module Schedule = struct
         in
         Option.bind (next_multiple ns_per_min after) day
 end
+
+exception Not_enqueued of [`Full | `Stopped]
+
+module Recurring = struct
+  type entry = {name: string; schedule: Schedule.t; action: Clock.posix -> unit}
+
+  let entry ~name schedule action = {name; schedule; action}
+
+  let job ~name schedule q j arg =
+    entry ~name schedule (fun tick ->
+        match enqueue q j (arg tick) with
+        | Ok () ->
+            ()
+        | Error e ->
+            raise (Not_enqueued e) )
+
+  let durable ~name schedule (q : Durable.t) j arg =
+    let (_ : Durable.row -> entry:string -> tick:Clock.posix -> string option) =
+      Durable.need "Caravan_jobs.Recurring.durable" "push_tick"
+        q.store.push_tick
+    in
+    entry ~name schedule (fun tick ->
+        ignore (Durable.enqueue_tick q ~entry:name ~tick j (arg tick)) )
+
+  type t =
+    { entries: entry list
+    ; on_error: string -> exn -> Printexc.raw_backtrace -> unit
+    ; lock: Mutex.t
+    ; mutable state: state
+    ; mutable scope: Fiber.scope option
+    ; entry_ids: unit Ids.t
+    ; stopping: unit Ivar.t
+    ; ended: unit Ivar.t }
+
+  let write_error name e _ =
+    try
+      Printf.eprintf "caravan.jobs: recurring %s: %s\n%!" name
+        (Printexc.to_string e)
+    with Sys_error _ -> ()
+
+  let create ?(on_error = write_error) entries =
+    let seen = Hashtbl.create 8 in
+    List.iter
+      (fun e ->
+        if Hashtbl.mem seen e.name then
+          invalid_arg ("Caravan_jobs.Recurring.create: two entries " ^ e.name) ;
+        Hashtbl.replace seen e.name () )
+      entries ;
+    { entries
+    ; on_error
+    ; lock= Mutex.create ()
+    ; state= `Created
+    ; scope= None
+    ; entry_ids= Ids.create 8
+    ; stopping= Ivar.create ()
+    ; ended= Ivar.create () }
+
+  let locked t f = Mutex.protect t.lock f
+
+  (* The fiber of an entry: it waits for the next tick, runs it one time, then
+     takes the next tick after the tick or after now, the later one. Thus a slow
+     action or a step of the clock skips the ticks that passed. *)
+  let rec loop t e after =
+    match Schedule.next e.schedule after with
+    | None ->
+        ()
+    | Some tick -> (
+        sync (choose [Time.at Posix tick; Ivar.read t.stopping]) ;
+        if Option.is_none (Ivar.peek t.stopping) then
+          match e.action tick with
+          | () ->
+              after_tick t e tick
+          | exception (Fiber.Cancelled _ as x) when is_cancelled () ->
+              Printexc.raise_with_backtrace x (Printexc.get_raw_backtrace ())
+          | exception x ->
+              let bt = Printexc.get_raw_backtrace () in
+              Fiber.shield (fun () -> t.on_error e.name x bt) ;
+              after_tick t e tick )
+
+  (* The wait for the first tick after the tick or after now. *)
+  and after_tick t e tick =
+    let now = Time.now Posix in
+    loop t e (if before tick now then now else tick)
+
+  let run t () =
+    let result =
+      catch (fun () ->
+          Fiber.scope (fun s ->
+              (* After a stop, the entries see [stopping] and end. *)
+              locked t (fun () -> t.scope <- Some s) ;
+              try
+                List.iter
+                  (fun e ->
+                    Fiber.fork ~name:"caravan.jobs.recurring" s (fun () ->
+                        let self = Fiber.self () in
+                        locked t (fun () -> Ids.replace t.entry_ids self ()) ;
+                        loop t e (Time.now Posix) ) )
+                  t.entries
+              with Fiber.Scope_closed -> () ) )
+    in
+    ignore (Ivar.try_fill t.ended ()) ;
+    raise_first result
+
+  let start t sw =
+    locked t (fun () ->
+        if t.state <> `Created then
+          invalid_arg "Caravan_jobs.Recurring.start: it started or stopped" ;
+        t.state <- `Running ) ;
+    match Fiber.fork ~name:"caravan.jobs.recurring" sw (run t) with
+    | () ->
+        ()
+    | exception e ->
+        let bt = Printexc.get_raw_backtrace () in
+        ignore (Ivar.try_fill t.ended ()) ;
+        Printexc.raise_with_backtrace e bt
+
+  let stop ?(grace = Span.s 10) t =
+    let self = Fiber.self () in
+    if locked t (fun () -> Ids.mem t.entry_ids self) then
+      invalid_arg "Caravan_jobs.Recurring.stop: called in an entry" ;
+    match
+      locked t (fun () ->
+          match t.state with
+          | `Created ->
+              t.state <- `Stopped ;
+              `Ended
+          | `Running ->
+              t.state <- `Stopping ;
+              `Stop
+          | `Stopping | `Stopped ->
+              `Wait )
+    with
+    | `Ended ->
+        ignore (Ivar.try_fill t.ended ())
+    | `Stop ->
+        ignore (Ivar.try_fill t.stopping ()) ;
+        sync (choose [Ivar.read t.ended; Time.after Mono grace]) ;
+        ( match locked t (fun () -> t.scope) with
+        | Some s ->
+            Fiber.cancel s Exit
+        | None ->
+            () ) ;
+        sync (Ivar.read t.ended)
+    | `Wait ->
+        sync (Ivar.read t.ended)
+
+  let service t =
+    Caravan.Server.service ~start:(start t) ~stop:(fun ~grace -> stop ~grace t)
+end

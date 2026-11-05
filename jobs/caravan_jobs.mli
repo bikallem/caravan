@@ -646,3 +646,112 @@ module Schedule : sig
       after the end of the range of the clock (the year 2262). A cron tick is at
       the start of its minute. *)
 end
+
+(** {1:recurring Recurring jobs} *)
+
+(** The exception of {!Recurring.job} when its queue refuses a job. *)
+exception Not_enqueued of [`Full | `Stopped]
+
+(** Jobs at the ticks of schedules.
+
+    {[
+    let nightly =
+      Caravan_jobs.Recurring.create
+        [ Caravan_jobs.Recurring.durable ~name:"report"
+            (Caravan_jobs.Schedule.cron "0 3 * * *") jobs report (fun tick ->
+              tick ) ]
+
+    let () =
+      Caravan.Server.run
+        ~services:
+          [ Caravan_jobs.Durable.service jobs
+          ; Caravan_jobs.Recurring.service nightly ]
+        (module Weft_os)
+        handler
+    ]}
+
+    Each process runs each entry. With {!durable}, the store keeps one job for
+    each tick, over all processes. Thus at each tick, each process makes one
+    store call for each entry. Give a new name to an entry with a new schedule:
+    during a deploy, the old and the new processes run the two schedules. *)
+module Recurring : sig
+  (** {2 Entries} *)
+
+  (** What runs at the ticks of a schedule. *)
+  type entry
+
+  val entry : name:string -> Schedule.t -> (Weft.Clock.posix -> unit) -> entry
+  (** [entry ~name schedule f] calls [f tick] at each tick of [schedule], in
+      each process. *)
+
+  val job :
+       name:string
+    -> Schedule.t
+    -> t
+    -> 'a job
+    -> (Weft.Clock.posix -> 'a)
+    -> entry
+  (** [job ~name schedule q job arg] enqueues [job (arg tick)] in the queue [q]
+      of this process at each tick: for work of each process, for example the
+      refresh of a cache. If [q] refuses the job, the error is {!Not_enqueued}.
+  *)
+
+  val durable :
+       name:string
+    -> Schedule.t
+    -> Durable.t
+    -> 'a Durable.job
+    -> (Weft.Clock.posix -> 'a)
+    -> entry
+  (** [durable ~name schedule q job arg] is {!Durable.enqueue_tick}
+      [q ~entry:name ~tick job (arg tick)] at each tick: one job for each tick,
+      over all the processes of the store. A process whose clock is late, or
+      that runs a tick late, gets no second job. The fastest clock decides the
+      time of the job, and a clock more than 5 min ahead makes no job (see
+      [push_tick]). [name] names the ticks in the store: it must be unique over
+      all the entries and the applications of the store, for example
+      ["billing.report"].
+
+      @raise Invalid_argument if the store of [q] has no [push_tick]. *)
+
+  (** {2 Services} *)
+
+  (** The fibers of a list of entries. *)
+  type t
+
+  val create :
+       ?on_error:(string -> exn -> Printexc.raw_backtrace -> unit)
+    -> entry list
+    -> t
+  (** [create ~on_error entries] runs each entry in a fiber of its own.
+      - The fiber waits for the next tick (on the POSIX clock: the wait follows
+        a step of the clock), runs it one time, then waits for the first tick
+        after the tick or after now, the later one. Thus a slow action, or a
+        step of the clock, skips the ticks that passed: there is no catch-up. A
+        tick that this process misses while it does not run is lost; with
+        {!durable}, another process can run it.
+      - If the action raises, [on_error name exn bt] gets it (default: one line
+        on the standard error), and the entry continues. [on_error] must not
+        raise: if it raises, the service fails. It must not wait.
+
+      @raise Invalid_argument if two entries have one name. *)
+
+  val start : t -> Weft.Fiber.scope -> unit
+  (** [start t sw] starts the fibers in a new fiber of [sw].
+
+      @raise Invalid_argument if [t] started or stopped before.
+      @raise Weft.Fiber.Scope_closed if [sw] ended or is cancelled. *)
+
+  val stop : ?grace:Weft.Span.t -> t -> unit
+  (** [stop ~grace t] stops [t] and waits until it ended. No tick starts. The
+      actions that run get [grace] (default 10 s), then a cancel. A cancel is no
+      error. A second call waits for the end of the first. Call it from fiber
+      code.
+
+      @raise Invalid_argument if an action or [on_error] of [t] calls it. *)
+
+  val service : t -> Caravan.Server.service
+  (** [service t] is [t] as a service of {!Caravan.Server.run}. Put it after its
+      queues in the list: the services stop in reverse order, thus it stops
+      before its queues. *)
+end

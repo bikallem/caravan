@@ -241,3 +241,17 @@
  (name test_schedule)
  (modules test_schedule)
  (libraries caravan.jobs weft windtrap))
+
+; The suite of Caravan_jobs.Recurring.
+
+(test
+ (name test_recurring)
+ (modules test_recurring)
+ (libraries
+  caravan
+  caravan.jobs
+  server_support
+  sim_support
+  weft
+  weft.sim
+  windtrap))
