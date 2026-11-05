@@ -1,0 +1,11 @@
+; HTML combinators: elements and attributes, with escaping and checks, rendered
+; into a Buffer.
+
+(library
+ (name caravan_html)
+ (public_name caravan.html)
+ (libraries caravan)
+ (instrumentation
+  (backend ppx_windtrap.mutate))
+ (instrumentation
+  (backend ppx_windtrap.coverage)))
