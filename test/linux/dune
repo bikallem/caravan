@@ -16,6 +16,7 @@
   caravan.websocket
   caravan.static
   caravan.tls
+  caravan.jobs
   tls_support
   mirage-crypto-rng
   mirage-crypto-rng.unix

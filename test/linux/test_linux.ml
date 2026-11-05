@@ -463,6 +463,42 @@ let dates ~domains () =
       done ) ;
   is_none ~msg:"a wrong date" ~pp:Format.pp_print_string (Atomic.get wrong)
 
+(* 15. 8 fibers enqueue jobs on the domains while the queue stops. Each job that
+   the queue accepted ran or was reported. *)
+let jobs_on_domains ~domains () =
+  in_world ~domains
+  @@ fun () ->
+  let ran = Atomic.make 0
+  and lost = Atomic.make 0
+  and accepted = Atomic.make 0 in
+  let q =
+    Caravan_jobs.create ~workers:4 ~on_error:(fun _ -> Atomic.incr lost) ()
+  in
+  let j =
+    Caravan_jobs.job ~name:"n" ~retry:Caravan_jobs.no_retry (fun () ->
+        Fiber.yield () ; Atomic.incr ran )
+  in
+  Fiber.scope (fun sw ->
+      Caravan_jobs.start q sw ;
+      for k = 0 to 7 do
+        Fiber.fork sw (fun () ->
+            for i = 1 to 2_000 do
+              let delay =
+                if (i + k) mod 5 = 0 then Some (Span.us i) else None
+              in
+              ( match Caravan_jobs.enqueue q ?delay j () with
+              | Ok () ->
+                  Atomic.incr accepted
+              | Error _ ->
+                  () ) ;
+              if i mod 100 = 0 then Fiber.yield ()
+            done )
+      done ;
+      Time.sleep Mono (Span.ms 1) ;
+      Caravan_jobs.stop ~grace:(Span.ms 1) q ) ;
+  equal int ~msg:"each accepted job ran or was reported" (Atomic.get accepted)
+    (Atomic.get ran + Atomic.get lost)
+
 (* 11. The HTTP/1.1 smoke test *)
 
 let mib = 1024 * 1024
@@ -752,7 +788,8 @@ let tests =
   ; ( "12. smoke: a WebSocket echo and close, a client GET and POST"
     , websocket_and_client_smoke )
   ; ("13. static files on the thread pool, and EACCES", static_files)
-  ; ("14. TLS on loopback, with the generator of the OS", tls_get) ]
+  ; ("14. TLS on loopback, with the generator of the OS", tls_get)
+  ; ("15. jobs on the domains during the stop of the queue", jobs_on_domains) ]
 
 let on ~domains name =
   group name (List.map (fun (n, t) -> test n (t ~domains)) tests)

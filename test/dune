@@ -1,5 +1,5 @@
 ; The suites of caravan. They run in the simulator of weft. The deps give the
-; source scan of test_core the files of the nine libraries.
+; source scan of test_core the files of the libraries.
 
 (tests
  (names
@@ -64,7 +64,8 @@
   (glob_files ../tls/*.ml)
   (glob_files ../session/*.ml)
   (glob_files ../auth/*.ml)
-  (glob_files ../compress/*.ml)))
+  (glob_files ../compress/*.ml)
+  (glob_files ../jobs/*.ml)))
 
 ; The hosts of the numeric tests of Resolver, shared by test_client and
 ; test_numeric_unix.
@@ -205,3 +206,17 @@
   decompress.de
   decompress.gz
   decompress.zl))
+
+; The suite of caravan.jobs.
+
+(test
+ (name test_jobs)
+ (modules test_jobs)
+ (libraries
+  caravan
+  caravan.jobs
+  server_support
+  sim_support
+  weft
+  weft.sim
+  windtrap))

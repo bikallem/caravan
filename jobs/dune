@@ -1,0 +1,10 @@
+; Background jobs in the process, with retries.
+
+(library
+ (name caravan_jobs)
+ (public_name caravan.jobs)
+ (libraries caravan weft)
+ (instrumentation
+  (backend ppx_windtrap.mutate))
+ (instrumentation
+  (backend ppx_windtrap.coverage)))

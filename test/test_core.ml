@@ -3295,6 +3295,11 @@ let allowed =
   [ (* The pool keeps a stdlib Mutex. No fiber code holds it across a sync, a
        world effect, or a call into weft or into a Flow. *)
     ("client/pool.ml", "Mutex.")
+  ; (* The queue of caravan.jobs keeps its state in a stdlib Mutex, with the
+       same rule as the pool. *)
+    ("jobs/caravan_jobs.ml", "Mutex.")
+  ; (* The default on_error of a queue writes to the standard error. *)
+    ("jobs/caravan_jobs.ml", "Printf.eprintf")
   ; (* The default on_error writes to the standard error (write_error). *)
     ("src/config.ml", "Printf.eprintf")
   ; (* caravan.testing runs the server and the client in the simulator. *)
@@ -3426,7 +3431,7 @@ let source_tests =
           let all =
             files "src" @ files "client" @ files "websocket" @ files "router"
             @ files "middleware" @ files "static" @ files "tls"
-            @ files "session" @ files "auth" @ files "compress"
+            @ files "session" @ files "auth" @ files "compress" @ files "jobs"
             @ files "testing"
           in
           List.iter
@@ -3445,6 +3450,7 @@ let source_tests =
             ; "auth/caravan_auth.ml"
             ; "auth/json.ml"
             ; "compress/caravan_compress.ml"
+            ; "jobs/caravan_jobs.ml"
             ; "testing/caravan_testing.ml" ] ;
           let found =
             List.concat_map
