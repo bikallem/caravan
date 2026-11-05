@@ -42,6 +42,7 @@ them.
 | `caravan.auth` | JWT, bearer and cookie schemes, users, policies, OpenID Connect, codes by email, passkeys | the dependencies of `caravan.session`, and mirage-crypto-pk, mirage-crypto-ec, x509, yojson, zarith |
 | `caravan.compress` | gzip and deflate responses, decompression of request bodies | decompress |
 | `caravan.static` | Static files with ETag, conditional requests and ranges | |
+| `caravan.jobs` | Background jobs in the process, with retries, that stop with the server | |
 | `caravan.tls` | The TLS server, with ALPN, and HTTPS for the client | tls, x509, domain-name, ipaddr, mirage-crypto-rng |
 | `caravan.testing` | A test host: it runs a handler stack and the client in the weft simulator, with no sockets | |
 
@@ -78,6 +79,7 @@ executable:
 - [TLS](#tls)
 - [WebSocket](#websocket)
 - [Client](#client)
+- [Background jobs](#background-jobs)
 - [Testing](#testing)
 - [Requirements](#requirements)
 - [Development](#development)
@@ -646,7 +648,7 @@ let codes = Caravan_auth.Code.make ()
 (* POST /email *)
 let email req address =
   ( match Caravan_auth.Code.start codes req ~address with
-  | Ok code -> send_in_background address code
+  | Ok code -> ignore (Caravan_jobs.enqueue jobs send_code (address, code))
   | Error _wait -> () ) ;
   page "We sent a code if the address is correct."
 
@@ -1039,6 +1041,54 @@ let () =
 - A response body that ends with the connection (no `Content-Length`,
   not chunked) needs a `close_notify` of the server. Else the client
   gives `Error Truncated`.
+
+## Background jobs
+
+`Caravan_jobs` runs work after the response, in fibers of the process,
+for example to send a mail. Give the queue to `Server.run` as a
+service: it starts before the server, and it stops after the server.
+
+```ocaml
+(* Your mail code: SMTP, or the HTTP API of a mail service. *)
+let send_mail ~to_ ~text = ignore (to_, text)
+
+let welcome : string Caravan_jobs.job =
+  Caravan_jobs.job ~name:"welcome"
+    ~on_failure:(fun address _ -> prerr_endline ("no welcome for " ^ address))
+    (fun address -> send_mail ~to_:address ~text:"Welcome!")
+
+let jobs = Caravan_jobs.create ~workers:8 ()
+
+let sign_up _req =
+  match Caravan_jobs.enqueue jobs welcome "ann@example.com" with
+  | Ok () ->
+      Caravan.Response.string "Welcome."
+  | Error (`Full | `Stopped) ->
+      Caravan.Response.string ~status:Caravan.Status.service_unavailable
+        "Try again later."
+
+let () =
+  Caravan.Server.run
+    ~services:[Caravan_jobs.service jobs]
+    (module Weft_os) sign_up
+```
+
+- A job that raises gets a retry after a backoff: 5 attempts, a wait
+  of 1 s that doubles each time, at most 5 min, less a jitter of up to
+  15 %. Give `~retry` for a different policy, or `Caravan_jobs.no_retry`.
+- `enqueue ~delay` runs a job later. `enqueue` never waits: when
+  `capacity` jobs wait (10 000 by default), it gives `` `Full ``.
+- The queue is not durable. At a stop, the server and the queue share
+  one grace (`shutdown_grace`). The handlers can enqueue during the
+  grace, and the workers run the jobs that wait until its end. Then
+  the queue cancels the jobs that run. Each job that did not succeed
+  goes to `on_failure` (with its argument) and to the `on_error` of
+  the queue (the standard error by default).
+- A job can run more than one time (a retry after a failure in its
+  middle). Make each job safe to run again.
+- `Caravan_jobs.stats` gives the counts, for example for a health check.
+  In a test, `Caravan_jobs.drain` waits for all jobs, also the delayed
+  ones, in virtual time.
 
 ## Testing
 

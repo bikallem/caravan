@@ -67,6 +67,26 @@
     %{dep:section.awk}
     %{dep:../README.md}))))
 
+; The example of the "Background jobs" section of README.md, as
+; readme_jobs.ml.
+
+(executable
+ (name readme_jobs)
+ (modules readme_jobs)
+ (libraries caravan caravan.jobs weft weft.os))
+
+(rule
+ (action
+  (with-stdout-to
+   readme_jobs.ml
+   (run
+    awk
+    -v
+    "section=Background jobs"
+    -f
+    %{dep:section.awk}
+    %{dep:../README.md}))))
+
 ; The example of the "Queries and forms" section of README.md, as
 ; readme_forms.ml.
 

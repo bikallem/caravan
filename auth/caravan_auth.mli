@@ -970,7 +970,8 @@ end
       let address = normalize (form_field "email" req) in
       ( match Caravan_auth.Code.start codes req ~address with
       | Ok code ->
-          send_in_background address code
+          (* A job of caravan.jobs: the response does not wait for the mail. *)
+          ignore (Caravan_jobs.enqueue jobs send_code (address, code))
       | Error _wait ->
           () ) ;
       (* The same response for each case: no hint of the accounts. *)
