@@ -414,8 +414,7 @@ let app =
     (fun req ->
       match Caravan.Request.meth req with
       | GET ->
-          Caravan.Response.string
-            ~headers:(Caravan.Headers.of_list [("Content-Type", "text/html")])
+          Caravan.Response.string ~content_type:"text/html; charset=utf-8"
             ( "<form method=post>\
                <input type=hidden name=_csrf value=\""
             ^ Caravan_session.Csrf.token req
