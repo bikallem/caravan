@@ -507,6 +507,9 @@ let stats t =
       ; discarded= t.discarded
       ; lost= t.lost } )
 
+(* [before a b]: the POSIX time [a] is before [b]. *)
+let before a b = Span.compare (Time.diff Posix a b) Span.zero < 0
+
 module Durable = struct
   type reason =
     | Failed of exn * Printexc.raw_backtrace
@@ -545,12 +548,23 @@ module Durable = struct
     ; retry: id:string -> lease:string -> due:Clock.posix -> bool
     ; release: id:string -> lease:string -> bool
     ; fail: id:string -> lease:string -> error:string -> bool
-    ; next_due: (names:string list -> Clock.posix option) option }
+    ; next_due: (names:string list -> Clock.posix option) option
+    ; push_unique: (row -> key:string -> string option) option
+    ; push_tick:
+        (row -> entry:string -> tick:Clock.posix -> string option) option }
 
-  let store ~push ~claim ~extend ~complete ~retry ~release ~fail ?next_due () =
-    {push; claim; extend; complete; retry; release; fail; next_due}
-
-  let before a b = Span.compare (Time.diff Posix a b) Span.zero < 0
+  let store ~push ~claim ~extend ~complete ~retry ~release ~fail ?next_due
+      ?push_unique ?push_tick () =
+    { push
+    ; claim
+    ; extend
+    ; complete
+    ; retry
+    ; release
+    ; fail
+    ; next_due
+    ; push_unique
+    ; push_tick }
 
   (* The memory store. [lease] is the token and the end of the lease of the last
      claim, until a [retry] or a [release]. *)
@@ -560,7 +574,8 @@ module Durable = struct
     ; mpayload: string
     ; mutable mdue: Clock.posix
     ; mutable mattempts: int
-    ; mutable lease: (string * Clock.posix) option }
+    ; mutable lease: (string * Clock.posix) option
+    ; mkey: string option }
 
   (* The end of the live lease of [r], if it has one. *)
   let lease_end now r =
@@ -569,6 +584,9 @@ module Durable = struct
         Some until
     | _ ->
         None
+
+  (* A tick of [push_tick] at most this time after the time of the store. *)
+  let tick_tolerance = Span.s 300
 
   let memory_store () =
     let lock = Mutex.create () in
@@ -591,18 +609,45 @@ module Durable = struct
       | None ->
           invalid_arg "Caravan_jobs.Durable.memory_store: the lease is too long"
     in
-    let push (row : row) =
+    let ticks = Hashtbl.create 8 in
+    (* Under the lock: a new job. *)
+    let add_row ?key (row : row) =
+      let i = !next in
+      incr next ;
+      Hashtbl.replace rows i
+        { mid= i
+        ; mname= row.name
+        ; mpayload= row.payload
+        ; mdue= row.due
+        ; mattempts= 0
+        ; lease= None
+        ; mkey= key } ;
+      string_of_int i
+    in
+    let push row = locked (fun () -> add_row row) in
+    (* The keys of the jobs that exist: (name, key). *)
+    let keys = Hashtbl.create 8 in
+    let push_unique (row : row) ~key =
       locked (fun () ->
-          let i = !next in
-          incr next ;
-          Hashtbl.replace rows i
-            { mid= i
-            ; mname= row.name
-            ; mpayload= row.payload
-            ; mdue= row.due
-            ; mattempts= 0
-            ; lease= None } ;
-          string_of_int i )
+          if Hashtbl.mem keys (row.name, key) then None
+          else (
+            Hashtbl.replace keys (row.name, key) () ;
+            Some (add_row ~key row) ) )
+    in
+    let push_tick row ~entry ~tick =
+      (* After the end of the range of the clock: no limit. *)
+      let limit = Time.add Posix (Time.now Posix) tick_tolerance in
+      locked (fun () ->
+          match Hashtbl.find_opt ticks entry with
+          | _ when Option.fold ~none:false ~some:(fun l -> before l tick) limit
+            ->
+              (* A clock far ahead: no tick, else it blocks the entry. *)
+              None
+          | Some last when not (before last tick) ->
+              None
+          | _ ->
+              Hashtbl.replace ticks entry tick ;
+              Some (add_row row) )
     in
     let claim ~names ~max ~lease =
       let now = Time.now Posix in
@@ -640,7 +685,9 @@ module Durable = struct
       owned ~id ~lease (fun r -> r.lease <- Some (lease, until))
     in
     let remove ~id ~lease =
-      owned ~id ~lease (fun r -> Hashtbl.remove rows r.mid)
+      owned ~id ~lease (fun r ->
+          Hashtbl.remove rows r.mid ;
+          Option.iter (fun k -> Hashtbl.remove keys (r.mname, k)) r.mkey )
     in
     let retry ~id ~lease ~due =
       owned ~id ~lease (fun r ->
@@ -665,7 +712,7 @@ module Durable = struct
     in
     store ~push ~claim ~extend ~complete:remove ~retry ~release
       ~fail:(fun ~id ~lease ~error:_ -> remove ~id ~lease)
-      ~next_due ()
+      ~next_due ~push_unique ~push_tick ()
 
   (* A running job: its lease token, its fiber, the scope of its function, and
      [lost] if the extender found that another worker has it. *)
@@ -1209,14 +1256,41 @@ module Durable = struct
     fill (locked t (fun () -> t.wake)) ;
     progress t
 
-  let enqueue t ?delay j arg =
-    let id = t.store.push (row ?delay j arg) in
-    ( match delay with
+  (* A new job: a wake of the poller if it is due now. *)
+  let pushed t delay =
+    match delay with
     | Some d when positive d ->
         (* The job is not due: a claim now gets nothing. *)
         progress t
     | _ ->
-        wake t ) ;
+        wake t
+
+  let enqueue t ?delay j arg =
+    let id = t.store.push (row ?delay j arg) in
+    pushed t delay ; id
+
+  (* [need fn field f]: the optional function [f] of the store, for [fn]. *)
+  let need fn field = function
+    | Some f ->
+        f
+    | None ->
+        invalid_arg (fn ^ ": the store has no " ^ field)
+
+  let enqueue_unique t ?delay ~key j arg =
+    let push =
+      need "Caravan_jobs.Durable.enqueue_unique" "push_unique"
+        t.store.push_unique
+    in
+    let id = push (row ?delay j arg) ~key in
+    if Option.is_some id then pushed t delay ;
+    id
+
+  let enqueue_tick t ~entry ~tick j arg =
+    let push =
+      need "Caravan_jobs.Durable.enqueue_tick" "push_tick" t.store.push_tick
+    in
+    let id = push (row j arg) ~entry ~tick in
+    if Option.is_some id then wake t ;
     id
 
   let stop ?(grace = Span.s 10) t =
@@ -1254,11 +1328,7 @@ module Durable = struct
   let drain t =
     in_job t "Caravan_jobs.Durable.drain" ;
     let next_due =
-      match t.store.next_due with
-      | Some f ->
-          f
-      | None ->
-          invalid_arg "Caravan_jobs.Durable.drain: the store has no next_due"
+      need "Caravan_jobs.Durable.drain" "next_due" t.store.next_due
     in
     let rec go () =
       (* The store first: a job that ends after this read is still active, or

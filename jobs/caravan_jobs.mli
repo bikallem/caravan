@@ -314,7 +314,8 @@ module Durable : sig
     ; lease: string  (** The token of this claim. *) }
 
   (** The place of the jobs. The fields are the functions of {!val-store}: read
-      them to wrap a store, for example to count its calls. *)
+      them to wrap a store, for example to count its calls. A wrapper must give
+      each optional function too, else the functions that need it raise. *)
   type store = private
     { push: row -> string
     ; claim: names:string list -> max:int -> lease:Weft.Span.t -> claim list
@@ -323,7 +324,11 @@ module Durable : sig
     ; retry: id:string -> lease:string -> due:Weft.Clock.posix -> bool
     ; release: id:string -> lease:string -> bool
     ; fail: id:string -> lease:string -> error:string -> bool
-    ; next_due: (names:string list -> Weft.Clock.posix option) option }
+    ; next_due: (names:string list -> Weft.Clock.posix option) option
+    ; push_unique: (row -> key:string -> string option) option
+    ; push_tick:
+        (row -> entry:string -> tick:Weft.Clock.posix -> string option) option
+    }
 
   val store :
        push:(row -> string)
@@ -334,6 +339,8 @@ module Durable : sig
     -> release:(id:string -> lease:string -> bool)
     -> fail:(id:string -> lease:string -> error:string -> bool)
     -> ?next_due:(names:string list -> Weft.Clock.posix option)
+    -> ?push_unique:(row -> key:string -> string option)
+    -> ?push_tick:(row -> entry:string -> tick:Weft.Clock.posix -> string option)
     -> unit
     -> store
   (** A store of the application. The contract:
@@ -359,6 +366,20 @@ module Durable : sig
       - [next_due ~names] (optional) is the first time at which a job of [names]
         can be claimed: its due time, or the end of its live lease. Only
         {!drain} uses it.
+      - [push_unique row ~key] (optional) adds the job only if the store has no
+        job of the same name and [key], and gives its id, or [None]. A job holds
+        its key from its push to its end: during its delay, its retries and its
+        run. Thus a unique key prevents a second job, but it is not a debounce:
+        a change during the run gets [None]. A store that keeps the ended jobs
+        must free their keys (see the SQL). Only {!enqueue_unique} uses it.
+      - [push_tick row ~entry ~tick] (optional), in one atomic step: if [tick]
+        is after the last tick of [entry] (or [entry] has no tick), it sets the
+        last tick of [entry] to [tick], adds the job and gives its id. Else it
+        gives [None]. The ticks do not depend on the life of the jobs. The store
+        must also give [None] for a tick after its own time plus a tolerance (5
+        min in the memory store and the SQL): else a process whose clock is far
+        ahead sets a future tick, and the entry gets no job in any process until
+        that time. Only {!enqueue_tick} uses it.
       - The functions must be safe on many domains. Their exceptions are
         failures of the store: see {!create}. A function that blocks its domain
         (a C library of a database) stops the fibers of that domain. Give each
@@ -400,6 +421,28 @@ module Durable : sig
       -- next_due: SELECT extract(epoch FROM min(CASE WHEN lease IS NOT NULL
       --   AND lease_until > now() THEN lease_until ELSE due END))
       --   FROM jobs WHERE name = ANY($1)
+
+      -- push_unique: a column "key text" (NULL for the other jobs: NULLs
+      -- are distinct) and a unique index. A store that keeps ended jobs
+      -- with a column "state" makes the index partial, and gives the
+      -- same predicate to ON CONFLICT.
+      CREATE UNIQUE INDEX jobs_key ON jobs (name, key);
+      INSERT INTO jobs (name, payload, due, key)
+        VALUES ($1, $2, to_timestamp($3), $4)
+        ON CONFLICT (name, key) DO NOTHING RETURNING id;
+
+      -- push_tick: $1 the entry, $2 the tick, then the job
+      CREATE TABLE job_ticks (
+        entry text PRIMARY KEY, last timestamptz NOT NULL);
+      WITH t AS (
+        INSERT INTO job_ticks SELECT $1, to_timestamp($2)
+          WHERE to_timestamp($2) <= now() + interval '5 minutes'
+        ON CONFLICT (entry) DO UPDATE SET last = EXCLUDED.last
+          WHERE job_ticks.last < EXCLUDED.last
+        RETURNING 1)
+      INSERT INTO jobs (name, payload, due)
+        SELECT $3, $4, to_timestamp($5) WHERE EXISTS (SELECT 1 FROM t)
+        RETURNING id;
       v}
       A [Weft.Clock.posix] goes to SQL through [Weft.Time.posix_to_unix_s], and
       back through [Weft.Time.posix_of_unix_s] (a float: do not compare two
@@ -475,6 +518,25 @@ module Durable : sig
       clients can make, for example with the rate limit of [caravan.middleware].
 
       @raise Invalid_argument as {!row}. The exceptions of the store go out. *)
+
+  val enqueue_unique :
+    t -> ?delay:Weft.Span.t -> key:string -> 'a job -> 'a -> string option
+  (** [enqueue_unique t ~delay ~key job arg] is {!enqueue}, but with
+      [push_unique ~key]: [None] if the store has a job of [job] and [key].
+
+      @raise Invalid_argument
+        as {!row}, or if the store has no [push_unique]. The exceptions of the
+        store go out. *)
+
+  val enqueue_tick :
+    t -> entry:string -> tick:Weft.Clock.posix -> 'a job -> 'a -> string option
+  (** [enqueue_tick t ~entry ~tick job arg] is {!enqueue} (due now), but with
+      [push_tick ~entry ~tick]: [None] if [entry] has a tick at [tick] or after.
+      {!Caravan_jobs.Recurring.durable} uses it.
+
+      @raise Invalid_argument
+        if the store has no [push_tick]. The exceptions of [encode] and of the
+        store go out. *)
 
   val wake : t -> unit
   (** [wake t] makes the queue claim now, for example after the commit of a

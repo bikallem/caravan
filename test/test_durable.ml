@@ -123,7 +123,7 @@ module Fake = struct
       ~fail:(fun ~id ~lease ~error ->
         op "fail" id (fun () -> inner.fail ~id ~lease ~error) )
       ~next_due:(fun ~names -> Option.get inner.next_due ~names)
-      ()
+      ?push_unique:inner.push_unique ?push_tick:inner.push_tick ()
 end
 
 (* The memory store, called directly. [at s] is [s] seconds after the start. *)
@@ -1513,6 +1513,139 @@ let review_tests =
               D.create ~lease:(Span.of_ns 86_400_000_000_001L) ~jobs:[a] st ) )
     ]
 
+(* Part (a) of J3: unique keys and ticks. *)
+let show_id = function None -> "None" | Some id -> "Some " ^ id
+
+let unique_tests =
+  group "Unique keys and ticks"
+    [ test "push_unique: a key of a name is held until the end of the job"
+        (fun () ->
+          with_store (fun st at set ->
+              let pu = Option.get st.push_unique in
+              let row name = ({name; payload= "p"; due= at 0} : D.row) in
+              let a = Option.get (pu (row "a") ~key:"k") in
+              equal string "None" (show_id (pu (row "a") ~key:"k")) ;
+              (* Another name, or another key: a new job. *)
+              is_true ~msg:"other name" (pu (row "b") ~key:"k" <> None) ;
+              is_true ~msg:"other key" (pu (row "a") ~key:"k2" <> None) ;
+              (* Held during the run and after a retry. *)
+              let c = one (claim st 1) in
+              equal string a c.id ;
+              equal string "None" (show_id (pu (row "a") ~key:"k")) ;
+              is_true ~msg:"retry" (st.retry ~id:a ~lease:c.lease ~due:(at 5)) ;
+              equal string "None" (show_id (pu (row "a") ~key:"k")) ;
+              set 5 ;
+              let c = List.find (fun (c : D.claim) -> c.id = a) (claim st 5) in
+              is_true ~msg:"complete" (st.complete ~id:a ~lease:c.lease) ;
+              (* The key is free after the end. *)
+              is_true ~msg:"free" (pu (row "a") ~key:"k" <> None) ) )
+    ; test "push_tick: only a tick after the last tick of the entry" (fun () ->
+          with_store (fun st at _ ->
+              let pt = Option.get st.push_tick in
+              let row = ({name= "a"; payload= "p"; due= at 0} : D.row) in
+              let push entry tick = show_id (pt row ~entry ~tick:(at tick)) in
+              equal string "Some 0" (push "e" 10) ;
+              equal string "None" (push "e" 10) ;
+              equal string "None" (push "e" 9) ;
+              equal string "Some 1" (push "e" 11) ;
+              equal string "Some 2" (push "f" 10) ;
+              (* The tick holds also after the end of its job. *)
+              let c = one (claim st 1) in
+              is_true ~msg:"complete" (st.complete ~id:c.id ~lease:c.lease) ;
+              equal string "None" (push "e" 11) ) )
+    ; test "push_tick: a tick more than 5 min after the store time: None"
+        (fun () ->
+          with_store (fun st at _ ->
+              let pt = Option.get st.push_tick in
+              let row = ({name= "a"; payload= "p"; due= at 0} : D.row) in
+              let push entry tick = show_id (pt row ~entry ~tick:(at tick)) in
+              equal string "None" (push "e" 301) ;
+              equal string "Some 0" (push "e" 300) ) )
+    ; test "push_tick near the end of the range of the clock: no limit"
+        (fun () ->
+          S.manual (fun sim ->
+              let last =
+                Option.get
+                  (Time.add Posix (Time.posix_of_unix_s 0.)
+                     (Span.of_ns (Int64.sub Int64.max_int 1_000_000_000L)) )
+              in
+              Weft_sim.set_posix sim last ;
+              let st = D.memory_store () in
+              let pt = Option.get st.push_tick in
+              let row = ({name= "a"; payload= "p"; due= last} : D.row) in
+              equal string "Some 0" (show_id (pt row ~entry:"e" ~tick:last)) ) )
+    ; test "push_unique: fail frees the key" (fun () ->
+          with_store (fun st at _ ->
+              let pu = Option.get st.push_unique in
+              let row = ({name= "a"; payload= "p"; due= at 0} : D.row) in
+              ignore (pu row ~key:"k") ;
+              let c = one (claim st 1) in
+              is_true ~msg:"fail" (st.fail ~id:c.id ~lease:c.lease ~error:"x") ;
+              is_true ~msg:"free" (pu row ~key:"k" <> None) ) )
+    ; test "enqueue_unique: Some, then None; a wake only if due" (fun () ->
+          S.manual (fun sim ->
+              let f = Fake.make () in
+              let st = Fake.store f (D.memory_store ()) in
+              let l = log () in
+              let j = text "a" (fun _ s -> add l s) in
+              let q = queue ~poll:(Span.s 3600) ~jobs:[Job j] st in
+              Fiber.scope (fun sw ->
+                  D.start q sw ;
+                  Weft_sim.settle sim ;
+                  let before = claims f in
+                  is_true ~msg:"delayed"
+                    ( D.enqueue_unique q ~delay:(Span.s 10) ~key:"d" j "d"
+                    <> None ) ;
+                  Weft_sim.settle sim ;
+                  equal int before (claims f) ;
+                  is_true ~msg:"first"
+                    (D.enqueue_unique q ~key:"k" j "x" <> None) ;
+                  equal string "None"
+                    (show_id (D.enqueue_unique q ~key:"k" j "y")) ;
+                  Weft_sim.settle sim ;
+                  equal (list string) ["x"] (lines l) ;
+                  (* After the end of the job, the key is free. *)
+                  is_true ~msg:"again"
+                    (D.enqueue_unique q ~key:"k" j "z" <> None) ;
+                  Weft_sim.settle sim ;
+                  equal (list string) ["x"; "z"] (lines l) ;
+                  D.stop q ) ) )
+    ; test "enqueue_tick: one job for each tick; a wake" (fun () ->
+          S.manual (fun sim ->
+              let st = D.memory_store () in
+              let l = log () in
+              let j = text "a" (fun _ s -> add l s) in
+              let q = queue ~poll:(Span.s 3600) ~jobs:[Job j] st in
+              Fiber.scope (fun sw ->
+                  D.start q sw ;
+                  Weft_sim.settle sim ;
+                  let tick = Time.now Posix in
+                  is_true ~msg:"first"
+                    (D.enqueue_tick q ~entry:"e" ~tick j "x" <> None) ;
+                  (* The push woke the poller. *)
+                  Weft_sim.settle sim ;
+                  equal (list string) ["x"] (lines l) ;
+                  equal string "None"
+                    (show_id (D.enqueue_tick q ~entry:"e" ~tick j "y")) ;
+                  Weft_sim.settle sim ;
+                  equal (list string) ["x"] (lines l) ;
+                  D.stop q ) ) )
+    ; test "a store with no push_unique or push_tick: Invalid_argument"
+        (fun () ->
+          S.run (fun _ ->
+              let m = D.memory_store () in
+              let st =
+                D.store ~push:m.push ~claim:m.claim ~extend:m.extend
+                  ~complete:m.complete ~retry:m.retry ~release:m.release
+                  ~fail:m.fail ()
+              in
+              let j = text "a" (fun _ _ -> ()) in
+              let q = queue ~jobs:[Job j] st in
+              invalid (fun () -> D.enqueue_unique q ~key:"k" j "x") ;
+              invalid (fun () ->
+                  D.enqueue_tick q ~entry:"e" ~tick:(Time.now Posix) j "x" ) ) )
+    ]
+
 let () =
   exit
     (Windtrap.run "durable"
@@ -1526,4 +1659,5 @@ let () =
        ; race_tests
        ; server_tests
        ; detail_tests
-       ; review_tests ] )
+       ; review_tests
+       ; unique_tests ] )
