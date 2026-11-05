@@ -1129,6 +1129,41 @@ let _id = Caravan_jobs.Durable.enqueue jobs send_code (address, code)
 - The store keeps each job: `Durable.enqueue` has no limit. Put a rate
   limit on the routes that make jobs.
 
+### Unique and recurring jobs
+
+`Durable.enqueue_unique ~key` adds a job only if the store has no job of
+the same name and key, for example one welcome mail for each user. The
+key is held from the push to the end of the job: it prevents a second
+job, but it is not a debounce.
+
+`Caravan_jobs.Recurring` runs jobs at the ticks of a schedule:
+`Schedule.every` (multiples of a span since 1970) or `Schedule.cron`
+(5 fields, names, macros such as `@daily`, UTC).
+
+```ocaml
+let nightly =
+  Caravan_jobs.Recurring.create
+    [ Caravan_jobs.Recurring.durable ~name:"report"
+        (Caravan_jobs.Schedule.cron "0 3 * * *")
+        jobs report (fun tick -> tick) ]
+
+let () =
+  Caravan.Server.run
+    ~services:
+      [Caravan_jobs.Durable.service jobs; Caravan_jobs.Recurring.service nightly]
+    (module Weft_os) handler
+```
+
+- Each process runs each entry. With `Recurring.durable`, the store
+  keeps the last tick of each entry: one job for each tick over all
+  processes, also from a process whose clock is late. Give each durable
+  entry a name that is unique in the store, for example
+  `"billing.report"`.
+- A tick that is late (a slow action, a step of the clock) runs one time,
+  then the entry waits for the next tick: there is no catch-up.
+- Put `Recurring` after its queues in `~services`, and give a new name
+  to an entry whose schedule changes.
+
 ## Testing
 
 The `caravan.testing` library runs a handler through the real server
