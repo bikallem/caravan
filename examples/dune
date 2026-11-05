@@ -267,3 +267,16 @@
     -f
     %{dep:section.awk}
     %{dep:../README.md}))))
+
+; The example of the "HTML" section of README.md, as readme_html.ml.
+
+(executable
+ (name readme_html)
+ (modules readme_html)
+ (libraries caravan caravan.html caravan.session))
+
+(rule
+ (action
+  (with-stdout-to
+   readme_html.ml
+   (run awk -v "section=HTML" -f %{dep:section.awk} %{dep:../README.md}))))

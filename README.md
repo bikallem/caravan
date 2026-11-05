@@ -42,6 +42,7 @@ them.
 | `caravan.auth` | JWT, bearer and cookie schemes, users, policies, OpenID Connect, codes by email, passkeys | the dependencies of `caravan.session`, and mirage-crypto-pk, mirage-crypto-ec, x509, yojson, zarith |
 | `caravan.compress` | gzip and deflate responses, decompression of request bodies | decompress |
 | `caravan.static` | Static files with ETag, conditional requests and ranges | |
+| `caravan.html` | HTML elements and attributes, with escaping and URL checks | |
 | `caravan.jobs` | Background jobs in the process, with retries, that stop with the server | |
 | `caravan.tls` | The TLS server, with ALPN, and HTTPS for the client | tls, x509, domain-name, ipaddr, mirage-crypto-rng |
 | `caravan.testing` | A test host: it runs a handler stack and the client in the weft simulator, with no sockets | |
@@ -63,6 +64,7 @@ executable:
 - [What the server does](#what-the-server-does)
 - [Routing](#routing)
 - [Middleware](#middleware)
+- [HTML](#html)
 - [Queries and forms](#queries-and-forms)
 - [Cookies](#cookies)
 - [Sessions](#sessions)
@@ -265,6 +267,59 @@ let app handler =
   Add `Retry-After` to the `expose_headers` of `Cors`. A middleware
   that changes the path goes after `Https_redirect`, so that the
   redirect keeps the path of the client.
+
+## HTML
+
+The `caravan.html` library builds HTML in OCaml code. `El` has the
+elements and `At` has the attributes. The library escapes text and
+attribute values, thus data of a user cannot make markup:
+
+```ocaml
+open Caravan_html
+
+let item (name, done_) =
+  El.li ~at:[At.classes ["item"; (if done_ then "done" else "")]] [txt name]
+
+let page ~user items =
+  list
+    [ doctype
+    ; El.html ~at:[At.lang "en"]
+        [ El.head [El.meta ~at:[At.v "charset" "utf-8"] (); El.title "Tasks"]
+        ; El.body
+            [ El.h1 [txtf "Tasks of %s" user]
+            ; El.ul (List.map item items)
+            ; El.a ~at:[At.href "/new"] [txt "New task"] ] ] ]
+
+let handler _req = response (page ~user:"<ada>" [("Write", true); ("Test", false)])
+
+(* The hidden input of Caravan_session.Csrf, for a form. *)
+let csrf_input req =
+  El.input
+    ~at:
+      [ At.type_ "hidden"
+      ; At.name "_csrf"
+      ; At.value (Caravan_session.Csrf.token req) ]
+    ()
+```
+
+- `response` sends `Content-Type: text/html; charset=utf-8`. The
+  escaping is safe only in UTF-8.
+- A URL attribute (`href`, `src`, `action`, the `hx-get` family of
+  htmx, ...) keeps only a relative URL or `http`, `https`, `mailto` and
+  `tel`. Other schemes, for example `javascript:`, become
+  `about:invalid#caravan`.
+- `At.v` refuses the names whose values run as script: `on*`, `srcdoc`,
+  `hx-on*`, the `_` of hyperscript and others. It also refuses an
+  `hx-vals`, `hx-headers` or `hx-request` value that is not empty and is
+  not a JSON object, and an `hx-trigger` value with a filter (`[`). Use
+  `At.unsafe` for a value of your code.
+- The attributes of other client frameworks (Alpine, Vue, Datastar, ...)
+  run their values as script. Do not give them data of a user.
+- `El.script` and `El.style` refuse a text that can close the element.
+  For data of a user, use `El.json_script`.
+- All classes of an element join. Another duplicate attribute raises
+  `Invalid_argument` when the code builds the element.
+- The library does not check the content model of HTML5.
 
 ## Queries and forms
 
