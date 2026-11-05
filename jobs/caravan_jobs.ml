@@ -1377,3 +1377,257 @@ module Durable = struct
         ; lease_lost= t.lease_lost
         ; store_errors= t.store_errors } )
 end
+
+module Schedule = struct
+  (* The values of a field of a cron expression. [star] is the Vixie rule: the
+     text of the field starts with "*". *)
+  type field = {values: bool array; star: bool}
+
+  type cron = {minute: field; hour: field; dom: field; month: field; dow: field}
+
+  type t = Every of int64 | Cron of cron
+
+  let ns_per_s = 1_000_000_000L
+
+  let epoch = Time.posix_of_unix_s 0.
+
+  let ns_of t = Span.to_ns (Time.diff Posix t epoch)
+
+  let of_ns n = Time.add Posix epoch (Span.of_ns n)
+
+  (* The floor of [a / b], for [b > 0]. *)
+  let floor_div a b =
+    let q = Int64.div a b in
+    if Int64.compare (Int64.rem a b) 0L < 0 then Int64.pred q else q
+
+  let every span =
+    let d = Span.to_ns span in
+    if
+      Int64.compare d ns_per_s < 0
+      || Int64.compare d (Int64.mul 86_400L ns_per_s) > 0
+      || Int64.rem d ns_per_s <> 0L
+    then
+      invalid_arg
+        "Caravan_jobs.Schedule.every: the span is not whole seconds from 1 s \
+         to 1 day" ;
+    Every d
+
+  let months =
+    [ "jan"
+    ; "feb"
+    ; "mar"
+    ; "apr"
+    ; "may"
+    ; "jun"
+    ; "jul"
+    ; "aug"
+    ; "sep"
+    ; "oct"
+    ; "nov"
+    ; "dec" ]
+
+  let days = ["sun"; "mon"; "tue"; "wed"; "thu"; "fri"; "sat"]
+
+  let is_digit c = c >= '0' && c <= '9'
+
+  (* [digits text] is the value of [text], digits only. *)
+  let digits text =
+    if text <> "" && String.for_all is_digit text then
+      (* At most 9 digits: no overflow. *)
+      if String.length text > 9 then Error (text ^ " is too large")
+      else Ok (int_of_string text)
+    else Error (Printf.sprintf "%S is not a number" text)
+
+  (* [number names first text] is the value of [text]: digits, or a name of
+     [names] (any case; the first name is [first]). *)
+  let number names first text =
+    match List.find_index (( = ) (String.lowercase_ascii text)) names with
+    | Some i ->
+        Ok (first + i)
+    | None ->
+        digits text
+
+  (* [cut c s]: the text of [s] before the first [c], and the rest after it. *)
+  let cut c s =
+    match String.index_opt s c with
+    | None ->
+        (s, None)
+    | Some i ->
+        (String.sub s 0 i, Some (String.sub s (i + 1) (String.length s - i - 1)))
+
+  let ( let* ) = Result.bind
+
+  (* [field ~name ~lo ~hi ~names text]: the values of one field. For the day of
+     the week, [hi] is 7, and 7 is Sunday (0). *)
+  let field ~name ~lo ~hi ~names text =
+    let values = Array.make (hi + 1) false in
+    let error fmt = Printf.ksprintf (fun m -> Error (name ^ ": " ^ m)) fmt in
+    let value s =
+      match number names lo s with
+      | Ok n when n >= lo && n <= hi ->
+          Ok n
+      | Ok n ->
+          error "%d is out of the range %d-%d" n lo hi
+      | Error m ->
+          error "%s" m
+    in
+    let item s =
+      let base, step = cut '/' s in
+      let* first, last =
+        if base = "*" then Ok (lo, hi)
+        else
+          match cut '-' base with
+          | a, Some b ->
+              let* a = value a in
+              let* b = value b in
+              if a > b then error "the range %s goes down" base else Ok (a, b)
+          | _, None -> (
+              let* a = value base in
+              match step with
+              | Some _ ->
+                  error "a step needs * or a range: %s" s
+              | None ->
+                  Ok (a, a) )
+      in
+      let* step =
+        match step with
+        | None ->
+            Ok 1
+        | Some n -> (
+          match digits n with
+          | Ok n when n >= 1 ->
+              Ok n
+          | Ok _ ->
+              error "the step of %s is zero" s
+          | Error m ->
+              error "%s" m )
+      in
+      let rec mark v =
+        if v <= last then (
+          values.(v) <- true ;
+          mark (v + step) )
+      in
+      mark first ; Ok ()
+    in
+    let rec items = function
+      | [] ->
+          Ok ()
+      | "" :: _ ->
+          error "an empty item in %S" text
+      | s :: rest ->
+          let* () = item s in
+          items rest
+    in
+    let* () = items (String.split_on_char ',' text) in
+    Ok {values; star= String.starts_with ~prefix:"*" text}
+
+  let macros =
+    [ ("@yearly", "0 0 1 1 *")
+    ; ("@annually", "0 0 1 1 *")
+    ; ("@monthly", "0 0 1 * *")
+    ; ("@weekly", "0 0 * * 0")
+    ; ("@daily", "0 0 * * *")
+    ; ("@midnight", "0 0 * * *")
+    ; ("@hourly", "0 * * * *") ]
+
+  (* The last day of each month, with 29 days for February. *)
+  let month_days = [|0; 31; 29; 31; 30; 31; 30; 31; 31; 30; 31; 30; 31|]
+
+  (* The day of the month and the day of the week: the Vixie rule. *)
+  let day_matches c ~day ~weekday =
+    if c.dom.star || c.dow.star then
+      c.dom.values.(day) && c.dow.values.(weekday)
+    else c.dom.values.(day) || c.dow.values.(weekday)
+
+  let of_string text =
+    let text = String.trim text in
+    let text =
+      Option.value
+        (List.assoc_opt (String.lowercase_ascii text) macros)
+        ~default:text
+    in
+    let fields =
+      String.map (function '\t' -> ' ' | c -> c) text
+      |> String.split_on_char ' '
+      |> List.filter (( <> ) "")
+    in
+    match fields with
+    | [minute; hour; dom; month; dow] ->
+        let* minute = field ~name:"minute" ~lo:0 ~hi:59 ~names:[] minute in
+        let* hour = field ~name:"hour" ~lo:0 ~hi:23 ~names:[] hour in
+        let* dom = field ~name:"day of the month" ~lo:1 ~hi:31 ~names:[] dom in
+        let* month = field ~name:"month" ~lo:1 ~hi:12 ~names:months month in
+        let* dow = field ~name:"day of the week" ~lo:0 ~hi:7 ~names:days dow in
+        if dow.values.(7) then dow.values.(0) <- true ;
+        let c = {minute; hour; dom; month; dow} in
+        (* With the AND rule and a restricted day of the month, a date must
+           exist: some month has the day (February with 29 days). *)
+        let possible =
+          c.dom.star || (not c.dow.star)
+          || List.exists
+               (fun m ->
+                 c.month.values.(m)
+                 && List.exists
+                      (fun d -> c.dom.values.(d))
+                      (List.init month_days.(m) (fun i -> i + 1)) )
+               (List.init 12 (fun i -> i + 1))
+        in
+        if possible then Ok (Cron c) else Error "the expression matches no date"
+    | _ ->
+        Error
+          (Printf.sprintf "%S: a cron expression has 5 fields, or is a macro"
+             text )
+
+  let cron text =
+    match of_string text with
+    | Ok t ->
+        t
+    | Error m ->
+        invalid_arg ("Caravan_jobs.Schedule.cron: " ^ m)
+
+  let ns_per_min = Int64.mul 60L ns_per_s
+
+  (* The first minute of a day that matches, from [h:m]. *)
+  let rec in_day c h m =
+    if h > 23 then None
+    else if m > 59 then in_day c (h + 1) 0
+    else if c.hour.values.(h) && c.minute.values.(m) then Some (h, m)
+    else if c.hour.values.(h) then in_day c h (m + 1)
+    else in_day c (h + 1) 0
+
+  (* [later p d]: [p] + [d] ns, or [None] after the end of the range. *)
+  let later p d = Time.add Posix p (Span.of_ns d)
+
+  (* The first multiple of [d] strictly after [after], or [None] after the end
+     of the range. [k * d] is after [after]: no underflow. *)
+  let next_multiple d after =
+    let k = Int64.succ (floor_div (ns_of after) d) in
+    if Int64.compare k (Int64.div Int64.max_int d) > 0 then None
+    else of_ns (Int64.mul k d)
+
+  let next t after =
+    match t with
+    | Every d ->
+        next_multiple d after
+    | Cron c ->
+        (* The minute after [after], then day by day from midnight. Each [p] is
+           at the start of a minute. A day has 1440 minutes: POSIX has no leap
+           second. *)
+        let rec day p =
+          let u = Time.to_utc p in
+          let now = (u.hour * 60) + u.minute in
+          let at k = later p (Int64.mul (Int64.of_int (k - now)) ns_per_min) in
+          let next_day () = Option.bind (at 1440) day in
+          if
+            c.month.values.(u.month)
+            && day_matches c ~day:u.day ~weekday:u.weekday
+          then
+            match in_day c u.hour u.minute with
+            | Some (h, m) ->
+                at ((h * 60) + m)
+            | None ->
+                next_day ()
+          else next_day ()
+        in
+        Option.bind (next_multiple ns_per_min after) day
+end

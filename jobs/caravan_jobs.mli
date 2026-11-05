@@ -596,3 +596,53 @@ module Durable : sig
 
   val stats : t -> stats
 end
+
+(** {1:schedule Schedules} *)
+
+(** When a recurring job runs: for {!Recurring}. All times are UTC. *)
+module Schedule : sig
+  (** A schedule. *)
+  type t
+
+  val every : Weft.Span.t -> t
+  (** [every span] ticks at the multiples of [span] since the POSIX epoch
+      (1970-01-01 00:00:00 UTC). Thus all processes compute the same ticks.
+      [every (Span.s 300)] ticks at :00, :05, ... of each hour. A span that does
+      not divide one hour or one day does not start at :00 of each hour or day:
+      for example [every (Span.s 420)] (7 min). Use {!cron} for times of the
+      calendar.
+
+      @raise Invalid_argument
+        if [span] is not whole seconds, or is not from 1 s to 1 day. *)
+
+  val cron : string -> t
+  (** [cron text] is a cron expression of 5 fields: the minute (0-59), the hour
+      (0-23), the day of the month (1-31), the month (1-12, or [jan]-[dec]), and
+      the day of the week (0-7 or [sun]-[sat]; 0 and 7 are Sunday), in UTC.
+      Spaces and tabs separate the fields.
+      - Each field is a list of items [x,y,...]. An item is [*], a number [n], a
+        range [a-b], or a step [*/n] or [a-b/n]. Names have any case, also in
+        ranges ([mon-fri]).
+      - The macros: [@yearly] and [@annually] ([0 0 1 1 *]), [@monthly]
+        ([0 0 1 * *]), [@weekly] ([0 0 * * 0]), [@daily] and [@midnight]
+        ([0 0 * * *]), [@hourly] ([0 * * * *]).
+      - The rule of Vixie cron for the days: a field that starts with [*] is not
+        restricted. If the day of the month and the day of the week are both
+        restricted, a day matches if one of them matches. Else the two must
+        match. Thus [0 0 1,15 * 1] is the 1st, the 15th and each Monday, and
+        [0 0 */2 * 1] is each Monday of an odd day.
+      - There is no [?], [L], [W], [#] or [@reboot].
+
+      @raise Invalid_argument
+        for a bad expression, with the field and the reason, or for an
+        expression that matches no date (for example [0 0 30 2 *]). *)
+
+  val of_string : string -> (t, string) result
+  (** [of_string text] is {!cron}, with an [Error] in place of the exception:
+      for a schedule from a configuration. *)
+
+  val next : t -> Weft.Clock.posix -> Weft.Clock.posix option
+  (** [next t time] is the first tick of [t] strictly after [time], or [None]
+      after the end of the range of the clock (the year 2262). A cron tick is at
+      the start of its minute. *)
+end

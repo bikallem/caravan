@@ -234,3 +234,10 @@
   weft
   weft.sim
   windtrap))
+
+; The suite of Caravan_jobs.Schedule.
+
+(test
+ (name test_schedule)
+ (modules test_schedule)
+ (libraries caravan.jobs weft windtrap))
