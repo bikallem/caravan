@@ -18,10 +18,12 @@ exception Grace_expired
 
 (* [stop] is full when the server starts to stop. Each connection waits on it:
    an Ivar adds a waiter in amortized O(1) (#11). [abort] is full after [abort].
-   Only the grace daemon reads it. *)
+   Only the grace daemon reads it. [stopped_at] is the time of the end of the
+   acceptor (a stop or a failure), for the grace of the services of {!run}. *)
 type t =
   { addr: Net.addr
   ; stop: unit Ivar.t
+  ; stopped_at: Clock.mono option Atomic.t
   ; abort: unit Ivar.t
   ; close_listener: unit -> unit
   ; open_connections: int Atomic.t
@@ -162,12 +164,14 @@ let grace (config : Config.t) ~conns ~abort () =
    again: weft makes it a cancel of [server]. A [Cancelled] of a different scope
    from [L.accept] is a failure of the listener as each other exception is. *)
 let server_body config engine handler (module L : LISTENER) l ~slots ~stop
-    ~abort ~count () =
+    ~stopped_at ~abort ~count () =
   let failure = ref None in
   Fiber.scope (fun conns ->
       ( match
           Fun.protect
             ~finally:(fun () ->
+              ignore
+                (Atomic.compare_and_set stopped_at None (Some (Time.now Mono))) ;
               ignore (Ivar.try_fill stop ()) ;
               L.close l )
             (fun () ->
@@ -196,14 +200,16 @@ let start_with ?(config = Config.default) ?(engine = http1) sw
     let slots = Fiber.Semaphore.create config.max_connections in
     let stop = Ivar.create () and abort = Ivar.create () in
     let count = Atomic.make 0 in
+    let stopped_at = Atomic.make None in
     let server =
       Fiber.fork_promise ~name:"caravan.server" sw
         (server_body config engine handler
            (module L)
-           l ~slots ~stop ~abort ~count )
+           l ~slots ~stop ~stopped_at ~abort ~count )
     in
     { addr
     ; stop
+    ; stopped_at
     ; abort
     ; close_listener= (fun () -> L.close l)
     ; open_connections= count
@@ -247,7 +253,9 @@ let wait t =
   | exception Promise.Cancelled ->
       ()
 
-let stop_on_signals t =
+(* [signals t ~on_abort] is {!stop_on_signals}. [on_abort] runs after the abort:
+   {!run} cancels its services there. *)
+let signals t ~on_abort =
   let signal =
     choose [Signal.received Signal.SIGINT; Signal.received Signal.SIGTERM]
   in
@@ -256,14 +264,159 @@ let stop_on_signals t =
     shutdown t ;
     ignore (sync signal) ) ;
   abort t ;
+  on_abort () ;
   Signal.unwatch Signal.SIGINT ;
   Signal.unwatch Signal.SIGTERM
 
-let run ?config ?engine ?domains ?(on_start = ignore) os handler =
+let stop_on_signals t = signals t ~on_abort:ignore
+
+type service = {start: Fiber.scope -> unit; stop: grace:Span.t -> unit}
+
+let service ~start ~stop = {start; stop}
+
+(* The reason of the cancel of the services at the second signal. *)
+exception Services_aborted
+
+let is_cancelled () =
+  match Fiber.check_cancel () with
+  | () ->
+      false
+  | exception Fiber.Cancelled _ ->
+      true
+
+let catch f =
+  match f () with
+  | () ->
+      []
+  | exception e ->
+      [(e, Printexc.get_raw_backtrace ())]
+
+(* [raise_with e more] raises [e], or [Multiple] if [more] is not empty. *)
+let raise_with (e, bt) more =
+  if more = [] then Printexc.raise_with_backtrace e bt
+  else raise (Fiber.Multiple ((e, bt) :: more))
+
+let raise_all = function [] -> () | x :: more -> raise_with x more
+
+(* Each stop runs, also after a stop that raised. [grace ()] is the grace of
+   each stop: the services share one grace, thus a stop gets what remains after
+   the stops before it. *)
+let stop_each services ~grace =
+  List.concat_map
+    (fun sv -> catch (fun () -> sv.stop ~grace:(grace ())))
+    services
+
+(* [start_each svc services] starts the services in list order. If a start
+   raises, the services that started stop in reverse order, with no grace. *)
+let start_each svc services =
+  let rec go started = function
+    | [] ->
+        ()
+    | sv :: rest -> (
+      match sv.start svc with
+      | () ->
+          go (sv :: started) rest
+      | exception e ->
+          let bt = Printexc.get_raw_backtrace () in
+          raise_with (e, bt) (stop_each started ~grace:(fun () -> Span.zero)) )
+  in
+  go [] services
+
+(* The grace that remains after the first stop of [t]: all parts of {!run} share
+   one grace. The end of the acceptor records the time of the stop: a
+   {!shutdown}, or a failure of the listener. *)
+let remaining (config : Config.t) t =
+  let now = Time.now Mono in
+  let t0 = Option.value (Atomic.get t.stopped_at) ~default:now in
+  let since = Span.to_ns (Time.diff Mono now t0) in
+  Span.of_ns (Int64.max 0L (Int64.sub (Span.to_ns config.shutdown_grace) since))
+
+(* The listener comes first: a failure of the bind starts no service. The
+   services run in the scope [svc], inside the scope of the server. Thus the
+   second signal cancels them, and a failure of a service stops the server with
+   its grace. *)
+let run_with ?(config = Config.default) ?engine ?domains ?(on_start = ignore)
+    ?(services = []) os (module L : LISTENER) listen handler =
   Weft.run ?domains ~signals:[Signal.SIGINT; Signal.SIGTERM] os (fun () ->
       Fiber.scope (fun sw ->
-          let s = start ?config ?engine sw handler in
-          Fiber.fork_daemon ~name:"caravan.signals" sw (fun () ->
-              stop_on_signals s ) ;
-          on_start s ;
-          wait s ) )
+          let l = listen () in
+          let server = ref None in
+          match
+            Fiber.scope (fun svc ->
+                ( try start_each svc services
+                  with e ->
+                    let bt = Printexc.get_raw_backtrace () in
+                    L.close l ;
+                    Printexc.raise_with_backtrace e bt ) ;
+                let s =
+                  match start_with ~config ?engine sw (module L) l handler with
+                  | s ->
+                      s
+                  | exception e ->
+                      let bt = Printexc.get_raw_backtrace () in
+                      raise_with (e, bt)
+                        (stop_each (List.rev services) ~grace:(fun () ->
+                             Span.zero ) )
+                in
+                server := Some s ;
+                Fiber.fork_daemon ~name:"caravan.signals" sw (fun () ->
+                    signals s ~on_abort:(fun () ->
+                        Fiber.cancel svc Services_aborted ) ) ;
+                on_start s ;
+                (* A failure of a service cancels [wait]: the [Cancelled] goes
+                   out, and the handler stops the server. *)
+                let waited =
+                  match wait s with
+                  | () ->
+                      []
+                  | exception (Fiber.Cancelled _ as e) when is_cancelled () ->
+                      Printexc.raise_with_backtrace e
+                        (Printexc.get_raw_backtrace ())
+                  | exception e ->
+                      [(e, Printexc.get_raw_backtrace ())]
+                in
+                (* The failure of [wait], if any, is in [waited]. *)
+                server := None ;
+                let stopped =
+                  stop_each (List.rev services) ~grace:(fun () ->
+                      remaining config s )
+                in
+                (* A cancel of [svc] during the stops (the second signal, or a
+                   failure of a service) makes the later stops raise
+                   [Cancelled]: in a cancelled scope, they are not errors. The
+                   other errors go out. With no other error, the scope gives its
+                   own result: the failure of the service, or the end of the
+                   run. *)
+                let errors =
+                  if is_cancelled () then
+                    waited
+                    @ List.filter
+                        (function Fiber.Cancelled _, _ -> false | _ -> true)
+                        stopped
+                  else waited @ stopped
+                in
+                raise_all errors )
+          with
+          | () ->
+              ()
+          | exception Fiber.Cancelled Services_aborted ->
+              Option.iter wait !server
+          | exception (Fiber.Cancelled _ as e) when is_cancelled () ->
+              (* The scope of the server is cancelled: no stop. A [Cancelled] of
+                 another scope is a failure: the next branch. *)
+              Printexc.raise_with_backtrace e (Printexc.get_raw_backtrace ())
+          | exception e -> (
+              let bt = Printexc.get_raw_backtrace () in
+              match !server with
+              | None ->
+                  Printexc.raise_with_backtrace e bt
+              | Some s ->
+                  shutdown s ;
+                  raise_with (e, bt) (catch (fun () -> wait s)) ) ) )
+
+let run ?(config = Config.default) ?engine ?domains ?on_start ?services os
+    handler =
+  run_with ~config ?engine ?domains ?on_start ?services os
+    (module Tcp.Listener)
+    (fun () -> Tcp.Listener.listen ~backlog:config.backlog config.addr)
+    handler

@@ -464,3 +464,22 @@ let with_server ?(config = config) ?engine ?(handler = handler) f =
           Server.abort server ;
           (try Server.wait server with _ -> ()) ;
           Printexc.raise_with_backtrace e bt )
+
+(* The simulator as a world of type [Weft.OS], for the tests of [Server.run].
+   [Sim_os] runs in manual mode, and [Sim_auto_os] in auto mode. They keep the
+   state of the simulation in [os_sim], so that a test can send a signal. *)
+let os_sim = ref None
+
+module Sim_os : Weft.OS = struct
+  let run ?slack:_ ?domains ?signals ?watchdog:_ main =
+    Weft_sim.run ~auto:false ?domains ?signals (fun sim ->
+        os_sim := Some sim ;
+        main () )
+end
+
+module Sim_auto_os : Weft.OS = struct
+  let run ?slack:_ ?domains ?signals ?watchdog:_ main =
+    Weft_sim.run ?domains ?signals (fun sim ->
+        os_sim := Some sim ;
+        main () )
+end

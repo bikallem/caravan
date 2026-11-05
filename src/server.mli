@@ -102,39 +102,74 @@ val stop_on_signals : t -> unit
       SIGTERM fails, it continues to watch SIGTERM. A signal that the world
       watches does not get its default action. *)
 
+(** {1:services Services} *)
+
+(** A background part of the application that starts and stops with the server
+    of {!run}, for example a queue of jobs (library [caravan.jobs]). *)
+type service
+
+val service :
+     start:(Weft.Fiber.scope -> unit)
+  -> stop:(grace:Weft.Span.t -> unit)
+  -> service
+(** [service ~start ~stop] is a service.
+    - [start sw] must not block: it forks the fibers of the service in [sw].
+    - [stop ~grace] blocks until the service ended. The work of the service gets
+      at most [grace] (it can be zero), then the service cancels it. A second
+      call does nothing. *)
+
 val run :
      ?config:Config.t
   -> ?engine:Engine.t
   -> ?domains:int
   -> ?on_start:(t -> unit)
+  -> ?services:service list
   -> (module Weft.OS)
   -> Handler.t
   -> unit
-(** [run ~config ~engine ~domains ~on_start (module O) handler] serves [handler]
-    in the world [O] until the process gets SIGINT (Ctrl-C) or SIGTERM:
+(** [run ~config ~engine ~domains ~on_start ~services (module O) handler] serves
+    [handler] in the world [O] until the process gets SIGINT (Ctrl-C) or
+    SIGTERM:
     + It calls [Weft.run ~domains ~signals:[SIGINT; SIGTERM] (module O)]. The
       world gives the default of [domains]: for the OS worlds of weft,
       [min 4 (Domain.recommended_domain_count ())].
+    + It binds the address. Then it starts the [services] in list order.
     + It {!start}s the server and calls [on_start] with it, for example to print
       its address.
     + It calls {!stop_on_signals} in a daemon fiber: the first signal stops the
       server with a grace, the second signal aborts it, and a third signal gets
       its default action.
+    + When the server stopped, it stops the [services] in reverse list order.
+      Thus put a service that gives work to another service after it in the
+      list.
+
+    The services and the requests share one grace, [config.shutdown_grace]. It
+    starts at the first {!shutdown}. The services run as usual while the
+    requests finish: a handler can give them work in its grace. Then each stop
+    gets the grace that remains at its start. The second signal also cancels the
+    services.
+
+    If a start raises, the services that started stop with no grace, and [run]
+    raises the exception. If a service fails (a fiber of it raises), the server
+    stops with its grace, the other services get a cancel, and [run] raises the
+    failure. Each stop runs, also after a stop that raised.
 
     [O] is usually [Weft_os] (library [weft.os]), the world of the OS that the
     build runs on, or a world of one OS, for example [Weft_linux]. The Windows
     world of weft gives Ctrl-C as SIGINT, but it never gives SIGTERM.
 
-    It returns when the server stopped. Then the world closes, and SIGINT and
-    SIGTERM get the action that they had before [run] (see the [close] of the
-    world). Call it outside fiber code.
+    It returns when the server and the services stopped. Then the world closes,
+    and SIGINT and SIGTERM get the action that they had before [run] (see the
+    [close] of the world). Call it outside fiber code.
 
     @raise Failure if [O] is [Weft_os] on a system that has no OS world of weft.
     @raise Weft.Net.Error
       if the address cannot be bound, if the accept of connections failed, or
       for an error of the OS for SIGINT or SIGTERM (see {!stop_on_signals}). An
       error for a signal cancels the scope of the server: the requests in
-      progress get no grace. *)
+      progress get no grace.
+    @raise Weft.Fiber.Multiple
+      if more than one of these raised: the wait of the server and the stops. *)
 
 (**/**)
 
@@ -172,3 +207,15 @@ val start_with :
     [(module L : LISTENER)] is a module-dependent argument (OCaml 5.5): the type
     of [listener] is the type [L.t] of the module. Production code gives
     [(module Tcp.Listener)]. *)
+
+val run_with :
+     ?config:Config.t
+  -> ?engine:Engine.t
+  -> ?domains:int
+  -> ?on_start:(t -> unit)
+  -> ?services:service list
+  -> (module Weft.OS)
+  -> (module L : LISTENER) -> (unit -> L.t) -> Handler.t -> unit
+(** [run_with ~config ~engine ~domains ~on_start ~services (module O) (module L)
+     listen handler] is {!run}, but it serves the listener of [listen ()]. It
+    calls [listen] in the world, before the services start. *)

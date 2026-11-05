@@ -527,18 +527,6 @@ let with_signal_server m f =
       f server ;
       Server.wait server )
 
-(* The simulator as a world of type [Weft.OS], for the test of [Server.run]. It
-   runs in manual mode and keeps the state of the simulation in [os_sim], so
-   that the test can send a signal. *)
-let os_sim = ref None
-
-module Sim_os : Weft.OS = struct
-  let run ?slack:_ ?domains ?signals ?watchdog:_ main =
-    Weft_sim.run ~auto:false ?domains ?signals (fun sim ->
-        os_sim := Some sim ;
-        main () )
-end
-
 let signal_tests =
   group "Signals"
     [ test "SIGTERM: the request in progress finishes, then the server ends"
@@ -651,6 +639,389 @@ let signal_tests =
             (signal_handler m) ;
           is_true ~msg:"on_start is called" !started ) ]
 
+(* The services of [Server.run]. A fake service adds its start and its stop to a
+   log. The handler of [gate_handler] fills [started], then waits for [gate]. *)
+
+exception Boom
+
+let fake_service ?(start = ignore) ?(stop = ignore) log name =
+  Server.service
+    ~start:(fun sw ->
+      log := ("start " ^ name) :: !log ;
+      start sw )
+    ~stop:(fun ~grace ->
+      log := Printf.sprintf "stop %s %Ld ns" name (Span.to_ns grace) :: !log ;
+      stop () )
+
+let gate_handler ~started ~gate _ =
+  ignore (Ivar.try_fill started ()) ;
+  sync (Ivar.read gate) ;
+  Response.string "done"
+
+let grace_config = {config with shutdown_grace= Span.s 10}
+
+exception Other_scope
+
+(* A listener whose [accept] raises the [Cancelled] of another scope: a failure
+   of the listener. *)
+module Foreign_cancel_listener = struct
+  type t = Tcp.Listener.t
+
+  let addr = Tcp.Listener.addr
+
+  let accept _ = raise (Fiber.Cancelled Other_scope)
+
+  let close = Tcp.Listener.close
+end
+
+let sim () = Option.get !os_sim
+
+(* A listener whose [accept] raises EBADF: the server stops, and its [wait]
+   raises the error. *)
+module Bad_fd_listener = struct
+  type t = Tcp.Listener.t
+
+  let addr = Tcp.Listener.addr
+
+  let accept _ = raise (Net.Error (Bad_fd, "Net.accept"))
+
+  let close = Tcp.Listener.close
+end
+
+(* [Sim_os] with no free fd: the bind of [Server.run] fails. *)
+module No_fds_os : Weft.OS = struct
+  let run ?slack:_ ?domains ?signals ?watchdog:_ main =
+    Weft_sim.run ~auto:false ?domains ?signals (fun sim ->
+        Weft_sim.set_fd_limit sim (Some 0) ;
+        main () )
+end
+
+let service_tests =
+  group "Server.run: services"
+    [ test "the services start first and stop last, with the grace that remains"
+        (fun () ->
+          let log = ref [] in
+          let started = Ivar.create () and gate = Ivar.create () in
+          Server.run ~config:grace_config ~engine:fake
+            ~services:[fake_service log "a"; fake_service log "b"]
+            ~on_start:(fun server ->
+              equal (list string) ["start a"; "start b"] (List.rev !log) ;
+              let flow, r = connect server in
+              Flow.write_string flow (get "/") ;
+              sync (Ivar.read started) ;
+              Weft_sim.signal (sim ()) Signal.SIGTERM ;
+              Weft_sim.settle (sim ()) ;
+              Sim_support.advance (sim ()) (Span.s 3) ;
+              equal (list string) ["start a"; "start b"] (List.rev !log) ;
+              Ivar.fill gate () ;
+              equal string {|200 "done" close|} (read_response r) ;
+              Flow.close flow )
+            (module Sim_os)
+            (gate_handler ~started ~gate) ;
+          equal (list string)
+            [ "start a"
+            ; "start b"
+            ; "stop b 7000000000 ns"
+            ; "stop a 7000000000 ns" ]
+            (List.rev !log) )
+    ; test "the requests took all of the grace: the services get zero"
+        (fun () ->
+          let log = ref [] in
+          let m = marks () in
+          Server.run ~config:grace_config ~engine:fake
+            ~services:[fake_service log "a"]
+            ~on_start:(fun server ->
+              let flow, _ = connect server in
+              Flow.write_string flow (get "/deaf") ;
+              sync (Ivar.read m.started) ;
+              Weft_sim.signal (sim ()) Signal.SIGTERM ;
+              Weft_sim.settle (sim ()) ;
+              (* /deaf takes 10 s after the end of the grace. *)
+              Sim_support.advance (sim ()) (Span.s 20) ;
+              Flow.close flow )
+            (module Sim_os)
+            (signal_handler m) ;
+          equal (list string) ["start a"; "stop a 0 ns"] (List.rev !log) )
+    ; test
+        "the listener fails: the services get the full grace, then both errors \
+         go out" (fun () ->
+          let log = ref [] in
+          match
+            Server.run_with ~config:grace_config ~engine:fake
+              ~services:[fake_service ~stop:(fun () -> raise Boom) log "a"]
+              (module Sim_os)
+              (module Bad_fd_listener)
+              (fun () -> Tcp.Listener.listen loopback)
+              (fun _ -> Response.string "x")
+          with
+          | () ->
+              fail "the run ended"
+          | exception Fiber.Multiple [(Net.Error (Bad_fd, _), _); (Boom, _)] ->
+              equal (list string)
+                ["start a"; "stop a 10000000000 ns"]
+                (List.rev !log)
+          | exception e ->
+              fail (Printexc.to_string e) )
+    ; test "an error of the signal fiber goes out alone, with no services"
+        (fun () ->
+          (* The world does not watch the signals: the wait of the signal fiber
+             raises. *)
+          let module No_signals_os : Weft.OS = struct
+            let run ?slack:_ ?domains ?signals:_ ?watchdog:_ main =
+              Weft_sim.run ~auto:false ?domains (fun _ -> main ())
+          end
+          in
+          match
+            Server.run ~config ~engine:fake
+              (module No_signals_os)
+              (fun _ -> Response.string "x")
+          with
+          | () ->
+              fail "the run ended"
+          | exception Invalid_argument _ ->
+              ()
+          | exception e ->
+              fail (Printexc.to_string e) )
+    ; test "the listener fails: the services share the grace" (fun () ->
+          let log = ref [] in
+          let slow () = Time.sleep Mono (Span.s 6) in
+          match
+            Server.run_with ~config:grace_config ~engine:fake
+              ~services:[fake_service log "a"; fake_service ~stop:slow log "b"]
+              (module Sim_auto_os)
+              (module Bad_fd_listener)
+              (fun () -> Tcp.Listener.listen loopback)
+              (fun _ -> Response.string "x")
+          with
+          | () ->
+              fail "the run ended"
+          | exception Net.Error (Bad_fd, _) ->
+              equal (list string)
+                [ "start a"
+                ; "start b"
+                ; "stop b 10000000000 ns"
+                ; "stop a 4000000000 ns" ]
+                (List.rev !log) )
+    ; test "a Cancelled of another scope from the listener: the stops run"
+        (fun () ->
+          let log = ref [] in
+          match
+            Server.run_with ~config:grace_config ~engine:fake
+              ~services:[fake_service log "a"]
+              (module Sim_os)
+              (module Foreign_cancel_listener)
+              (fun () -> Tcp.Listener.listen loopback)
+              (fun _ -> Response.string "x")
+          with
+          | () ->
+              fail "the run ended"
+          | exception Fiber.Cancelled Other_scope ->
+              equal (list string)
+                ["start a"; "stop a 10000000000 ns"]
+                (List.rev !log) )
+    ; test "the second signal: the error of an earlier stop goes out" (fun () ->
+          let log = ref [] in
+          let deaf () =
+            Weft_sim.signal (sim ()) Signal.SIGINT ;
+            sync never
+          in
+          raises Boom (fun () ->
+              Server.run ~config:grace_config ~engine:fake
+                ~services:
+                  [ fake_service ~stop:deaf log "a"
+                  ; fake_service ~stop:(fun () -> raise Boom) log "b" ]
+                ~on_start:(fun _ -> Weft_sim.signal (sim ()) Signal.SIGTERM)
+                (module Sim_os)
+                (fun _ -> Response.string "x") ) ;
+          equal (list string)
+            [ "start a"
+            ; "start b"
+            ; "stop b 10000000000 ns"
+            ; "stop a 10000000000 ns" ]
+            (List.rev !log) )
+    ; test "a stop raises the Cancelled of another scope: it goes out"
+        (fun () ->
+          let log = ref [] in
+          raises (Fiber.Cancelled Other_scope) (fun () ->
+              Server.run ~config:grace_config ~engine:fake
+                ~services:
+                  [ fake_service
+                      ~stop:(fun () -> raise (Fiber.Cancelled Other_scope))
+                      log "a" ]
+                ~on_start:(fun _ -> Weft_sim.signal (sim ()) Signal.SIGTERM)
+                (module Sim_os)
+                (fun _ -> Response.string "x") ) )
+    ; test "a failure of the bind starts no service" (fun () ->
+          let log = ref [] in
+          match
+            Server.run ~config ~engine:fake
+              ~services:[fake_service log "a"]
+              (module No_fds_os)
+              (fun _ -> Response.string "x")
+          with
+          | () ->
+              fail "the run ended"
+          | exception Net.Error _ ->
+              equal (list string) [] !log )
+    ; test "a start raises: the started services stop with no grace" (fun () ->
+          let log = ref [] in
+          raises Boom (fun () ->
+              Server.run ~config:grace_config ~engine:fake
+                ~services:
+                  [ fake_service log "a"
+                  ; fake_service log "b"
+                  ; fake_service ~start:(fun _ -> raise Boom) log "c"
+                  ; fake_service log "d" ]
+                ~on_start:(fun _ -> fail "the server started")
+                (module Sim_os)
+                (fun _ -> Response.string "x") ) ;
+          equal (list string)
+            ["start a"; "start b"; "start c"; "stop b 0 ns"; "stop a 0 ns"]
+            (List.rev !log) )
+    ; test "the server cannot start: the services stop with no grace" (fun () ->
+          let log = ref [] in
+          match
+            Server.run
+              ~config:{grace_config with max_connections= 0}
+              ~engine:fake
+              ~services:[fake_service log "a"; fake_service log "b"]
+              (module Sim_os)
+              (fun _ -> Response.string "x")
+          with
+          | () ->
+              fail "the run ended"
+          | exception Invalid_argument _ ->
+              equal (list string)
+                ["start a"; "start b"; "stop b 0 ns"; "stop a 0 ns"]
+                (List.rev !log) )
+    ; test "a stop raises: the other stops run, then the run raises" (fun () ->
+          let log = ref [] in
+          let stop_on_start server =
+            ignore server ;
+            Weft_sim.signal (sim ()) Signal.SIGTERM
+          in
+          raises Boom (fun () ->
+              Server.run ~config:grace_config ~engine:fake
+                ~services:
+                  [ fake_service log "a"
+                  ; fake_service ~stop:(fun () -> raise Boom) log "b" ]
+                ~on_start:stop_on_start
+                (module Sim_os)
+                (fun _ -> Response.string "x") ) ;
+          equal (list string)
+            [ "start a"
+            ; "start b"
+            ; "stop b 10000000000 ns"
+            ; "stop a 10000000000 ns" ]
+            (List.rev !log) ;
+          log := [] ;
+          match
+            Server.run ~config:grace_config ~engine:fake
+              ~services:
+                [ fake_service ~stop:(fun () -> raise Exit) log "a"
+                ; fake_service ~stop:(fun () -> raise Boom) log "b" ]
+              ~on_start:stop_on_start
+              (module Sim_os)
+              (fun _ -> Response.string "x")
+          with
+          | () ->
+              fail "the run ended"
+          | exception Fiber.Multiple [(Boom, _); (Exit, _)] ->
+              ()
+          | exception e ->
+              fail (Printexc.to_string e) )
+    ; test "a service fails: the server stops with its grace, the run raises"
+        (fun () ->
+          let log = ref [] in
+          let started = Ivar.create () and fail_now = Ivar.create () in
+          let failing sw =
+            Fiber.fork sw (fun () ->
+                sync (Ivar.read fail_now) ;
+                raise Boom )
+          in
+          (* The handler waits for the stop: a stop with a grace, not a
+             cancel. *)
+          let handler req =
+            Ivar.fill started () ;
+            match sync (Conn_info.stopping (Option.get (Request.conn req))) with
+            | () ->
+                log := "handler: stop" :: !log ;
+                Response.string "done"
+            | exception (Fiber.Cancelled _ as e) ->
+                log := "handler: cancel" :: !log ;
+                raise e
+          in
+          raises Boom (fun () ->
+              Server.run ~config:grace_config ~engine:fake
+                ~services:[fake_service ~start:failing log "a"]
+                ~on_start:(fun server ->
+                  let flow, _ = connect server in
+                  Flow.write_string flow (get "/") ;
+                  sync (Ivar.read started) ;
+                  Ivar.fill fail_now () )
+                (module Sim_os)
+                handler ) ;
+          equal (list string) ["start a"; "handler: stop"] (List.rev !log) ;
+          (* The same with the [Cancelled] of another scope as the failure. *)
+          log := [] ;
+          let started = Ivar.create () and fail_now = Ivar.create () in
+          let failing sw =
+            Fiber.fork sw (fun () ->
+                sync (Ivar.read fail_now) ;
+                raise (Fiber.Cancelled Other_scope) )
+          in
+          let handler req =
+            Ivar.fill started () ;
+            match sync (Conn_info.stopping (Option.get (Request.conn req))) with
+            | () ->
+                log := "handler: stop" :: !log ;
+                Response.string "done"
+            | exception (Fiber.Cancelled _ as e) ->
+                log := "handler: cancel" :: !log ;
+                raise e
+          in
+          ( match
+              Server.run ~config:grace_config ~engine:fake
+                ~services:[fake_service ~start:failing log "a"]
+                ~on_start:(fun server ->
+                  let flow, _ = connect server in
+                  Flow.write_string flow (get "/") ;
+                  sync (Ivar.read started) ;
+                  Ivar.fill fail_now () )
+                (module Sim_os)
+                handler
+            with
+          | () ->
+              fail "the run ended"
+          | exception Fiber.Cancelled Other_scope ->
+              () ) ;
+          equal (list string) ["start a"; "handler: stop"] (List.rev !log) )
+    ; test "the second signal cancels a service in its stop" (fun () ->
+          let log = ref [] in
+          let stopping = Ivar.create () in
+          let second sw =
+            Fiber.fork sw (fun () ->
+                sync (Ivar.read stopping) ;
+                Weft_sim.signal (sim ()) Signal.SIGINT )
+          in
+          let deaf_stop () =
+            Ivar.fill stopping () ;
+            match sync never with
+            | () ->
+                ()
+            | exception (Fiber.Cancelled _ as e) ->
+                log := "cancelled" :: !log ;
+                raise e
+          in
+          Server.run ~config:grace_config ~engine:fake
+            ~services:[fake_service ~start:second ~stop:deaf_stop log "a"]
+            ~on_start:(fun _ -> Weft_sim.signal (sim ()) Signal.SIGTERM)
+            (module Sim_os)
+            (fun _ -> Response.string "x") ;
+          equal (list string)
+            ["start a"; "stop a 10000000000 ns"; "cancelled"]
+            (List.rev !log) ) ]
+
 let () =
   exit
     (Windtrap.run "server"
@@ -658,4 +1029,5 @@ let () =
        ; upgrade_tests
        ; disconnect_tests
        ; stop_tests
-       ; signal_tests ] )
+       ; signal_tests
+       ; service_tests ] )
