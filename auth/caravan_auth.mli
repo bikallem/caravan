@@ -256,9 +256,11 @@ type outcome =
           no other scheme. The text is for logs. *)
 
 (** A way to find the user of a request. The functions that a scheme gets
-    ([authenticate], [keys], [user], [validate]):
-    - must not raise: their exception goes out of {!user}, {!failure},
-      {!challenge} or {!require}, and a later call runs the schemes again;
+    ([authenticate], [keys], [user], [validate], [lookup]):
+    - raise only for a failure that the server must answer with [500], for
+      example a failure of a store: their exception goes out of {!user},
+      {!failure}, {!challenge} or {!require}, and a later call runs the schemes
+      again;
     - can run two times for one request, when two fibers of the request ask for
       the user at the same time (the first result stays);
     - must not read the body of the request: they run at the first need, after a
@@ -280,8 +282,8 @@ module Scheme : sig
       failed.
 
       @raise Invalid_argument
-        if [name] is empty, ["Bearer"] or ["Session"]: the names of the schemes
-        of this library. *)
+        if [name] is empty, ["Bearer"] or ["Session"] (with no case): the names
+        of the schemes of this library. *)
 
   val bearer :
        ?realm:string
@@ -349,6 +351,162 @@ module Scheme : sig
         control character. *)
 end
 
+(** {1:api_keys API keys} *)
+
+(** API keys for a web API: the generation of a key, the hash to store, and a
+    scheme that finds the user of a key.
+
+    {[
+    let live = Caravan_auth.Api_key.format ~prefix:"myapp_"
+
+    (* At creation: show [k.key] to the user one time, store [k.hash]. *)
+    let k = Caravan_auth.Api_key.generate live
+
+    let api_key =
+      Caravan_auth.Api_key.scheme live ~lookup:(fun hash ->
+          match Db.find_key hash with
+          | Some row when not (Db.revoked row) ->
+              Ok (Caravan_auth.User.make ~roles:row.roles row.owner)
+          | Some _ ->
+              Error "a revoked key"
+          | None ->
+              Error "an unknown key" )
+
+    let api =
+      Caravan.Handler.compose
+        [ Caravan_auth.middleware ~schemes:[api_key; bearer] ()
+        ; Caravan_auth.require ~challenge:"ApiKey" () ]
+    ]}
+
+    A key is the prefix of its format and 43 base62 characters (256 bits). A
+    secret scanner finds a leaked key by its prefix. The client sends the key in
+    [Authorization: Bearer <key>] (RFC 6750: a bearer token does not need to be
+    a JWT), or in a field of the application, for example [X-API-Key].
+
+    The application stores only the hash: the lowercase hex of SHA-256 of the
+    whole key. A fast hash is correct for a key of 256 random bits: nobody can
+    find the key from its hash. The lookup is by the hash, thus the time of the
+    read of an index tells bits of the hash, not of the key. A hash is safe in a
+    log, a key is not. An attacker who can write to the database can add the
+    hash of a key that the attacker made. A hash with a secret of the server
+    stops this, but a lost secret ends all keys: this module does not do it.
+
+    The scheme never reads a key in the query of a URL: a query goes into logs
+    and into [Referer]. A browser never sends a key by itself, thus a request
+    with a key needs no CSRF token: exempt the scheme by its name (see
+    {!Caravan_auth.middleware}).
+
+    Each lookup is a read of the store, also for a random key. Put a rate limit
+    of each client before {!Caravan_auth.middleware}: it limits the reads of the
+    store. A rate limit of each user after it limits the work of each user (the
+    keys of one user share it):
+    {[
+    Caravan.Handler.compose
+      [ Caravan_middleware.Rate_limit.middleware ~burst:20 ~every:(Span.s 1) ()
+      ; Caravan_auth.middleware ~schemes:[api_key] ()
+      ; Caravan_middleware.Rate_limit.middleware ~burst:100 ~every:(Span.ms 100)
+          ~key:(fun req ->
+            Option.map Caravan_auth.User.id (Caravan_auth.user req) )
+          () ]
+    ]} *)
+module Api_key : sig
+  type format
+
+  val format : prefix:string -> format
+  (** [format ~prefix] is the form of the keys with [prefix], for example
+      ["myapp_"] or ["myapp_test_"]. The owner of a key is its text up to and
+      with its last [_] (base62 has no [_]): thus the formats ["myapp_"] and
+      ["myapp_test_"] can share one field. A token with a [.] is never a key of
+      a format: thus a JWT is never a key.
+
+      @raise Invalid_argument
+        if [prefix] is not 2 to 32 characters of [a-z], [0-9] and [_], with a
+        last [_]. *)
+
+  type created = {key: string; hash: string}
+
+  val generate : format -> created
+  (** [generate f] is a new key of [f] and its hash. Show the key to the user
+      one time, and store only the hash. The random bytes come from
+      [Mirage_crypto_rng]: initialize it at the start of the program. *)
+
+  val hash : format -> string -> string option
+  (** [hash f key] is the hash of [key], or [None] if [key] is not of the form
+      of [f]. For example, to revoke a key that a user gives. *)
+
+  (** The users of recent keys, in the memory of the process. *)
+  type cache
+
+  val cache : ?size:int -> Weft.Span.t -> cache
+  (** [cache ~size ttl] keeps the user of a key for [ttl] after its lookup:
+      during this time, the key does not cause a read of the store. Thus a
+      revoked or expired key works until its entry expires: call {!forget} after
+      the revocation is in the store (a lookup before it can put the key back),
+      and keep [ttl] short. A [forget] has an effect only in its process. Give a
+      cache to one scheme only: the cache does not call the [lookup] of a second
+      scheme. The cache keeps only users: an [Error] of the lookup is never kept
+      (random keys of the correct form never repeat, thus a negative cache does
+      not stop a flood). Two requests with one key at the same time can do two
+      lookups.
+
+      The cache keeps at most [size] (default 10_000) entries. An insert into a
+      full cache removes the expired entries, then the oldest, until at most
+      half of [size] stays.
+
+      @raise Invalid_argument
+        if [size] is less than 1, or [ttl] is not from 1 s to 1 h. *)
+
+  val forget : cache -> string -> unit
+  (** [forget c hash] removes the entry of [hash]. A lookup that started before
+      it does not put its result in [c]. *)
+
+  val scheme :
+       ?name:string
+    -> ?field:string
+    -> ?realm:string
+    -> ?cache:cache
+    -> lookup:(string -> (User.t, string) result)
+    -> format
+    -> Scheme.t
+  (** [scheme ~lookup f] is the scheme [name] (default ["ApiKey"]) of the keys
+      of [f].
+
+      [lookup hash] gives the user of the key with [hash], for example its
+      owner, with roles. It checks the expiry and the revocation of the key.
+      [Error m] gives [Failed m]. A failure of the store must raise (the server
+      sends [500]): with [Error], each client gets [401] and can discard a good
+      key. [lookup] gets the hash, never the key.
+
+      With no [field], the scheme reads [Authorization: Bearer <key>]:
+      - No field, a field of another scheme, or a token that is not of [f] (its
+        text up to and with its last [_] is not the prefix, or it has a [.], as
+        a JWT): [No_credentials], with no failure for a log. Thus put this
+        scheme before {!Scheme.bearer}: in the other order, the bearer scheme
+        gives [Failed] for a key.
+      - Two [Authorization] fields, or a malformed [Bearer] field: [Failed], the
+        same as {!Scheme.bearer}.
+      - A token of [f] that is not 43 base62 characters after the prefix:
+        [Failed].
+      - The challenge: the challenge of {!Scheme.bearer}, with [realm] (default
+        ["api"]).
+
+      With [field] (for example ["X-API-Key"]), the scheme reads only this
+      field:
+      - No field, or a value that is not of [f]: [No_credentials].
+      - Two fields: [Failed].
+      - The challenge: [401] with [WWW-Authenticate: <name> realm="<realm>"]
+        (RFC 9110 §11.6.1), and [error="invalid_token"] after a bad key.
+
+      With [cache], a key in the cache does not call [lookup].
+
+      @raise Invalid_argument
+        if [name] is empty, is not a token, or is ["Bearer"] or ["Session"]
+        (with no case); if [field] is not a valid field name, or is
+        [Authorization], [Proxy-Authorization] or [Cookie] (a browser sends a
+        cookie by itself); if [realm] has a quote, a backslash or a control
+        character. *)
+end
+
 val sign_in : Caravan.Request.t -> User.t -> unit
 (** [sign_in req u] puts [u] in the session of [req] for the scheme
     {!Scheme.session}. If the session has a user (also one that does not
@@ -380,12 +538,14 @@ val middleware : schemes:Scheme.t list -> unit -> Caravan.Handler.middleware
 
     The first scheme gives the challenge to a request with no credentials: put
     the session scheme first for a redirect to the login page, and use
-    [require ~challenge:"Bearer"] on the routes of an API.
+    [require ~challenge:"Bearer"] (or ["ApiKey"]) on the routes of an API.
 
     With the session scheme, a cross-site form can send the session cookie.
     Protect the routes with [Caravan_middleware.Cross_origin] first, and with
-    [Caravan_session.Csrf.middleware] after this middleware, with the bearer
-    users exempt (a browser never sends a bearer token by itself):
+    [Caravan_session.Csrf.middleware] after this middleware, with the users of
+    the bearer and API key schemes exempt (a browser never sends their
+    credentials by itself). Name the exempt schemes: a scheme of the application
+    can read a cookie.
     {[
     Caravan.Handler.compose
       [ Caravan_middleware.Cross_origin.middleware ()
@@ -395,7 +555,7 @@ val middleware : schemes:Scheme.t list -> unit -> Caravan.Handler.middleware
           ~exempt:(fun r ->
             match Caravan_auth.user r with
             | Some u ->
-                Caravan_auth.User.scheme u = "Bearer"
+                List.mem (Caravan_auth.User.scheme u) ["Bearer"; "ApiKey"]
             | None ->
                 false )
           () ]
@@ -1189,6 +1349,14 @@ end
 module Private : sig
   module Cbor = Cbor
   module Webauthn = Webauthn
+
+  val api_key_char : int -> char option
+
+  val api_key_cache_counts : Api_key.cache -> int * int
+  (** The count and the cardinal of the map. *)
+
+  val api_key_insert : Api_key.cache -> string -> Weft.Clock.mono -> unit
+  (** An insert of the user "x" at a time, with no effect. *)
 
   val key_of_cose : string -> (Jwt.Key.t * int, string) result
 

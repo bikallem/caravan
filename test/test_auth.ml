@@ -1372,6 +1372,563 @@ let bearer_tests =
               keys := [hs_key] ;
               equal string "ada Bearer admin,dev" (body (h req)) ) ) ]
 
+(* {1 API keys} *)
+
+module K = A.Api_key
+
+let ak = K.format ~prefix:"ak_"
+
+let k_ann = "ak_" ^ String.make 43 'a'
+
+let k_bob = "ak_" ^ String.make 42 'b' ^ "9"
+
+(* [key_n i] is a key of [ak] that ends with the character [i] of base62. *)
+let key_n i = "ak_" ^ String.make 42 'k' ^ String.make 1 "0123456789ABCDEF".[i]
+
+let invalid_arg_raised f =
+  raises_match (function Invalid_argument _ -> true | _ -> false) f
+
+(* [in_sim f] runs [f] in the simulator, with time for the caches. *)
+let in_sim f = Sim_support.run ~guard:(Span.s 10_000) (fun _ -> f ())
+
+(* [store ?calls keys] is a lookup of [keys] (the key and the user id): a user
+   with the role "api". [calls] gets each hash, in order. *)
+let store ?(calls = ref []) ?(format = ak) keys hash =
+  calls := hash :: !calls ;
+  match List.find_opt (fun (k, _) -> K.hash format k = Some hash) keys with
+  | Some (_, id) ->
+      Ok (A.User.make ~roles:["api"] id)
+  | None ->
+      Error "an unknown key"
+
+let ak_scheme ?name ?field ?cache ?calls ?(keys = [(k_ann, "ann")]) () =
+  K.scheme ?name ?field ?cache ~lookup:(store ?calls keys) ak
+
+(* [send ?schemes ?path fields] sends one request to [require] and [who]: the
+   body of [who] (["-"] if [require] refused), the failure and the response. *)
+let send ?(schemes = [ak_scheme ()]) ?(path = "/") fields =
+  let failure = ref None in
+  let r =
+    with_mw ~schemes
+      (fun req ->
+        failure := A.failure req ;
+        A.require () who req )
+      (get ~fields path)
+  in
+  ((if code r = 200 then body r else "-"), !failure, r)
+
+let outcome = Testable.(pair string (option (pair string string)))
+
+let counts = A.Private.api_key_cache_counts
+
+(* [cached keys] is a scheme with a cache of 60 s and a lookup of the keys in a
+   ref: the calls, the ref, the cache and the schemes. *)
+let cached keys =
+  let calls = ref [] and keys = ref keys in
+  let cache = K.cache (Span.s 60) in
+  ( calls
+  , keys
+  , cache
+  , [K.scheme ~cache ~lookup:(fun h -> store ~calls !keys h) ak] )
+
+let check_send ?schemes ?msg fields expected =
+  let b, f, _ = send ?schemes fields in
+  equal ?msg outcome expected (b, f)
+
+(* [sized ~size ~ttl] is a cache of [size] entries and [ttl] seconds, with the
+   keys [key_n i] of the users "u<i>": the calls, the cache and a request with
+   the key [i]. *)
+let sized ~size ~ttl =
+  let calls = ref [] in
+  let keys = List.init 16 (fun i -> (key_n i, "u" ^ string_of_int i)) in
+  let cache = K.cache ~size (Span.s ttl) in
+  let schemes = [K.scheme ~cache ~lookup:(store ~calls keys) ak] in
+  let req i =
+    check_send ~msg:(string_of_int i) ~schemes
+      [auth ("Bearer " ^ key_n i)]
+      ("u" ^ string_of_int i ^ " ApiKey api", None)
+  in
+  (calls, cache, req)
+
+let api_key_tests =
+  group "API keys"
+    [ test "the prefix of a format" (fun () ->
+          List.iter
+            (fun p -> invalid_arg_raised (fun () -> ignore (K.format ~prefix:p)))
+            [ ""
+            ; "_"
+            ; "a"
+            ; "ab"
+            ; "Ab_"
+            ; "a-b_"
+            ; "a b_"
+            ; "ab_c"
+            ; String.make 32 'a' ^ "_" ] ;
+          List.iter
+            (fun p -> ignore (K.format ~prefix:p))
+            ["a_"; "ab_"; "my_app_live_"; "0_"; String.make 31 'z' ^ "_"] )
+    ; test "generate: the form, and the hash of the whole key" (fun () ->
+          in_sim (fun () ->
+              let {K.key; hash} = K.generate ak in
+              equal int 46 (String.length key) ;
+              is_true ~msg:"prefix" (String.starts_with ~prefix:"ak_" key) ;
+              is_true ~msg:"base62"
+                (String.for_all
+                   (function
+                     | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' -> true | _ -> false )
+                   (String.sub key 3 43) ) ;
+              equal (option string) (Some hash) (K.hash ak key) ;
+              equal string Digestif.SHA256.(to_hex (digest_string key)) hash ;
+              let long = K.format ~prefix:"my_app_live_" in
+              let {K.key; _} = K.generate long in
+              equal int 55 (String.length key) ;
+              is_true ~msg:"long" (K.hash long key <> None) ) )
+    ; test "the hash: a known answer" (fun () ->
+          equal (option string)
+            (Some
+               "12d520e3cb21e47c78f15a9ab630ee3aecb493e74d8e6ee4a2d110e62ed0a388"
+            )
+            (K.hash (K.format ~prefix:"ab_") ("ab_" ^ String.make 43 'A')) )
+    ; test "each character comes from exactly 4 bytes" (fun () ->
+          let counts = Hashtbl.create 62 in
+          for b = 0 to 255 do
+            match A.Private.api_key_char b with
+            | Some c ->
+                is_true ~msg:(string_of_int b) (b < 248) ;
+                Hashtbl.replace counts c
+                  (1 + Option.value ~default:0 (Hashtbl.find_opt counts c))
+            | None ->
+                is_true ~msg:(string_of_int b) (b >= 248)
+          done ;
+          equal int 62 (Hashtbl.length counts) ;
+          Hashtbl.iter (fun c n -> equal ~msg:(String.make 1 c) int 4 n) counts )
+    ; test "2_000 keys: all different, the characters are uniform" (fun () ->
+          in_sim (fun () ->
+              let keys = List.init 2_000 (fun _ -> (K.generate ak).key) in
+              equal int 2_000 (List.length (List.sort_uniq compare keys)) ;
+              let counts = Hashtbl.create 62 in
+              List.iter
+                (fun k ->
+                  String.iteri
+                    (fun i c ->
+                      if i >= 3 then
+                        Hashtbl.replace counts c
+                          ( 1
+                          + Option.value ~default:0 (Hashtbl.find_opt counts c)
+                          ) )
+                    k )
+                keys ;
+              equal int 62 (Hashtbl.length counts) ;
+              (* 86_000 characters: a mean of 1387 and a standard deviation of
+                 37 for each. *)
+              Hashtbl.iter
+                (fun c n ->
+                  is_true
+                    ~msg:(Printf.sprintf "%c: %d" c n)
+                    (n > 1_200 && n < 1_580) )
+                counts ) )
+    ; test "hash: the keys of another form" (fun () ->
+          List.iter
+            (fun k -> equal ~msg:k (option string) None (K.hash ak k))
+            [ ""
+            ; "ak_"
+            ; "ak_" ^ String.make 42 'a'
+            ; "ak_" ^ String.make 44 'a'
+            ; "ak_" ^ String.make 42 'a' ^ "-"
+            ; "ak_" ^ String.make 42 'a' ^ "_"
+            ; "ak_" ^ String.make 42 'a' ^ "."
+            ; "ab_" ^ String.make 43 'a'
+            ; "xak_" ^ String.make 43 'a'
+            ; "AK_" ^ String.make 43 'a' ] ;
+          is_true ~msg:"good" (K.hash ak k_bob <> None) )
+    ; test "Authorization: the form of the field" (fun () ->
+          in_sim (fun () ->
+              let malformed =
+                Some ("ApiKey", "a malformed Authorization field")
+              in
+              let bad_key = Some ("ApiKey", "a malformed key") in
+              List.iter
+                (fun (v, expected) -> check_send ~msg:v [auth v] expected)
+                [ ("Bearer " ^ k_ann, ("ann ApiKey api", None))
+                ; ("bearer   " ^ k_ann, ("ann ApiKey api", None))
+                ; ("Basic YTpi", ("-", None))
+                ; ("Bearerx " ^ k_ann, ("-", None))
+                ; ("Bearer", ("-", malformed))
+                ; ("Bearer " ^ k_ann ^ " x", ("-", malformed))
+                ; ("Bearer xyz", ("-", None))
+                ; ("Bearer ab_" ^ String.make 43 'a', ("-", None))
+                ; ("Bearer ak_x_" ^ String.make 43 'a', ("-", None))
+                ; ("Bearer ak_" ^ String.make 42 'a', ("-", bad_key))
+                ; ("Bearer ak_" ^ String.make 44 'a', ("-", bad_key))
+                ; ("Bearer ak_" ^ String.make 42 'a' ^ "~", ("-", bad_key))
+                ; ( "Bearer ak_" ^ String.make 21 'a' ^ "." ^ String.make 21 'a'
+                  , ("-", None) )
+                ; ("Bearer " ^ k_bob, ("-", Some ("ApiKey", "an unknown key")))
+                ] ;
+              check_send [] ("-", None) ;
+              let b, f, _ = send ~path:("/?api_key=" ^ k_ann) [] in
+              equal outcome ("-", None) (b, f) ) )
+    ; test "Authorization: the challenges" (fun () ->
+          in_sim (fun () ->
+              let challenge fields =
+                let _, _, r = send fields in
+                equal int 401 (code r) ;
+                field "www-authenticate" r
+              in
+              equal (option string) (Some {|Bearer realm="api"|}) (challenge []) ;
+              equal (option string)
+                (Some {|Bearer realm="api", error="invalid_token"|})
+                (challenge [auth ("Bearer " ^ k_bob)]) ;
+              equal (option string)
+                (Some {|Bearer realm="api", error="invalid_token"|})
+                (challenge [auth ("Bearer ak_" ^ String.make 42 'a')]) ;
+              equal (option string)
+                (Some {|Bearer realm="api", error="invalid_request"|})
+                (challenge [auth "Bearer"]) ;
+              equal (option string)
+                (Some {|Bearer realm="api", error="invalid_request"|})
+                (challenge [auth ("Bearer " ^ k_ann); auth "Basic x"]) ;
+              let b, f, _ = send [auth ("Bearer " ^ k_ann); auth "Basic x"] in
+              equal outcome
+                ("-", Some ("ApiKey", "two Authorization fields"))
+                (b, f) ;
+              let r =
+                with_mw
+                  ~schemes:[K.scheme ~realm:"orders" ~lookup:(store []) ak]
+                  (A.require () who) (get "/")
+              in
+              equal (option string) (Some {|Bearer realm="orders"|})
+                (field "www-authenticate" r) ;
+              let _, _, r = send [auth ("Bearer " ^ k_ann)] in
+              equal int 200 (code r) ) )
+    ; test "with a JWT scheme: each token goes to its scheme" (fun () ->
+          at before (fun _ ->
+              let schemes = [ak_scheme (); bearer ()] in
+              check_send ~schemes
+                [auth ("Bearer " ^ user_token ())]
+                ("ada Bearer admin,dev", None) ;
+              check_send ~schemes
+                [auth ("Bearer " ^ k_ann)]
+                ("ann ApiKey api", None) ;
+              check_send ~schemes
+                [auth ("Bearer " ^ k_bob)]
+                ("-", Some ("ApiKey", "an unknown key")) ) )
+    ; test "a field of the application" (fun () ->
+          in_sim (fun () ->
+              let schemes = [ak_scheme ~field:"X-API-Key" ()] in
+              let x v = ("X-API-Key", v) in
+              check_send ~schemes [] ("-", None) ;
+              check_send ~schemes [x k_ann] ("ann ApiKey api", None) ;
+              check_send ~schemes [auth ("Bearer " ^ k_ann)] ("-", None) ;
+              check_send ~schemes [x ""] ("-", None) ;
+              check_send ~schemes [x "xyz"] ("-", None) ;
+              check_send ~schemes [x ("ak_a." ^ String.make 41 'a')] ("-", None) ;
+              check_send ~schemes
+                [x ("ak_" ^ String.make 42 'a')]
+                ("-", Some ("ApiKey", "a malformed key")) ;
+              check_send ~schemes
+                [x k_bob]
+                ("-", Some ("ApiKey", "an unknown key")) ;
+              check_send ~schemes
+                [x k_ann; x k_ann]
+                ("-", Some ("ApiKey", "two X-API-Key fields")) ;
+              let challenge fields =
+                let _, _, r = send ~schemes fields in
+                equal int 401 (code r) ;
+                field "www-authenticate" r
+              in
+              equal (option string) (Some {|ApiKey realm="api"|}) (challenge []) ;
+              equal (option string)
+                (Some {|ApiKey realm="api", error="invalid_token"|})
+                (challenge [x k_bob]) ;
+              equal (option string)
+                (Some {|ApiKey realm="api", error="invalid_request"|})
+                (challenge [x k_ann; x k_ann]) ;
+              let schemes = [ak_scheme ~name:"Key2" ~field:"X-API-Key" ()] in
+              let _, _, r = send ~schemes [] in
+              equal (option string) (Some {|Key2 realm="api"|})
+                (field "www-authenticate" r) ) )
+    ; test "two formats share one field" (fun () ->
+          in_sim (fun () ->
+              let test_f = K.format ~prefix:"ak_test_" in
+              let k_test = "ak_test_" ^ String.make 43 't' in
+              let test_scheme field =
+                K.scheme ~name:"Test" ?field
+                  ~lookup:(store ~format:test_f [(k_test, "tess")])
+                  test_f
+              in
+              List.iter
+                (fun field ->
+                  let fld v =
+                    match field with
+                    | None ->
+                        auth ("Bearer " ^ v)
+                    | Some f ->
+                        (f, v)
+                  in
+                  List.iter
+                    (fun schemes ->
+                      check_send ~schemes [fld k_ann] ("ann ApiKey api", None) ;
+                      check_send ~schemes [fld k_test] ("tess Test api", None) )
+                    [ [ak_scheme ?field (); test_scheme field]
+                    ; [test_scheme field; ak_scheme ?field ()] ] )
+                [None; Some "X-API-Key"] ) )
+    ; test "the arguments of scheme and cache" (fun () ->
+          let s ?name ?field ?realm () () =
+            ignore (K.scheme ?name ?field ?realm ~lookup:(store []) ak)
+          in
+          List.iter
+            (fun f -> invalid_arg_raised f)
+            [ s ~name:"" ()
+            ; s ~name:"Bearer" ()
+            ; s ~name:"BEARER" ()
+            ; s ~name:"Session" ()
+            ; s ~name:"session" ()
+            ; (fun () ->
+                ignore
+                  (A.Scheme.make ~name:"bearer"
+                     ~authenticate:(fun _ -> A.No_credentials)
+                     ~challenge:(fun ~failure:_ _ -> Response.string "") ) )
+            ; s ~name:"Api Key" ()
+            ; s ~field:"authorization" ()
+            ; s ~field:"Proxy-Authorization" ()
+            ; s ~field:"COOKIE" ()
+            ; s ~field:"X Key" ()
+            ; s ~field:"" ()
+            ; s ~realm:{|a"b|} ()
+            ; s ~realm:{|a\b|} ()
+            ; s ~realm:"a\nb" ()
+            ; (fun () -> ignore (K.cache ~size:0 (Span.s 60)))
+            ; (fun () -> ignore (K.cache (Span.ms 999)))
+            ; (fun () -> ignore (K.cache (Span.s 3601))) ] ;
+          s ~name:"Key-2" ~field:"X-API-Key" ~realm:"orders api" () () ;
+          ignore (K.cache ~size:1 (Span.s 1)) ;
+          ignore (K.cache (Span.s 3600)) )
+    ; test "lookup gets the hash, never the key" (fun () ->
+          in_sim (fun () ->
+              let calls = ref [] in
+              check_send
+                ~schemes:[ak_scheme ~calls ()]
+                [auth ("Bearer " ^ k_ann)]
+                ("ann ApiKey api", None) ;
+              equal (list string) [Option.get (K.hash ak k_ann)] !calls ) )
+    ; test "no cache: each request calls lookup" (fun () ->
+          in_sim (fun () ->
+              let calls = ref [] in
+              let schemes = [ak_scheme ~calls ()] in
+              for _ = 1 to 3 do
+                check_send ~schemes
+                  [auth ("Bearer " ^ k_ann)]
+                  ("ann ApiKey api", None)
+              done ;
+              equal int 3 (List.length !calls) ) )
+    ; test "the cache: a fixed time, no renewal at a hit" (fun () ->
+          in_sim (fun () ->
+              let calls, keys, _, schemes = cached [(k_ann, "ann")] in
+              let ann = [auth ("Bearer " ^ k_ann)] in
+              check_send ~schemes ann ("ann ApiKey api", None) ;
+              equal int 1 (List.length !calls) ;
+              (* The key is revoked: the entry stays until its time ends. *)
+              keys := [] ;
+              Time.sleep Mono (Span.s 30) ;
+              check_send ~schemes ann ("ann ApiKey api", None) ;
+              Time.sleep Mono (Span.ms 29_999) ;
+              check_send ~schemes ann ("ann ApiKey api", None) ;
+              equal int 1 (List.length !calls) ;
+              Time.sleep Mono (Span.ms 1) ;
+              check_send ~schemes ann ("-", Some ("ApiKey", "an unknown key")) ;
+              equal int 2 (List.length !calls) ) )
+    ; test "the cache keeps no Error" (fun () ->
+          in_sim (fun () ->
+              let calls, keys, cache, schemes = cached [] in
+              let ann = [auth ("Bearer " ^ k_ann)] in
+              check_send ~schemes ann ("-", Some ("ApiKey", "an unknown key")) ;
+              keys := [(k_ann, "ann")] ;
+              check_send ~schemes ann ("ann ApiKey api", None) ;
+              check_send ~schemes ann ("ann ApiKey api", None) ;
+              equal int 2 (List.length !calls) ;
+              equal (pair int int) (1, 1) (counts cache) ) )
+    ; test "forget" (fun () ->
+          in_sim (fun () ->
+              let calls, keys, cache, schemes =
+                cached [(k_ann, "ann"); (k_bob, "bob")]
+              in
+              let ann = [auth ("Bearer " ^ k_ann)] in
+              let bob = [auth ("Bearer " ^ k_bob)] in
+              check_send ~schemes ann ("ann ApiKey api", None) ;
+              check_send ~schemes bob ("bob ApiKey api", None) ;
+              keys := [(k_bob, "bob")] ;
+              K.forget cache (Option.get (K.hash ak k_ann)) ;
+              equal (pair int int) (1, 1) (counts cache) ;
+              (* A hash that is not in the cache. *)
+              K.forget cache (Option.get (K.hash ak (key_n 9))) ;
+              equal (pair int int) (1, 1) (counts cache) ;
+              check_send ~schemes ann ("-", Some ("ApiKey", "an unknown key")) ;
+              check_send ~schemes bob ("bob ApiKey api", None) ;
+              equal int 3 (List.length !calls) ) )
+    ; test "a lookup that started before forget does not insert" (fun () ->
+          in_sim (fun () ->
+              let calls = ref 0 in
+              let gate = Ivar.create () in
+              let cache = K.cache (Span.s 60) in
+              let schemes =
+                [ K.scheme ~cache
+                    ~lookup:(fun _ ->
+                      incr calls ;
+                      if !calls = 1 then sync (Ivar.read gate) ;
+                      Ok (A.User.make "ann") )
+                    ak ]
+              in
+              let ann = [auth ("Bearer " ^ k_ann)] in
+              Fiber.scope (fun s ->
+                  let a =
+                    Sim_support.call ~name:"a" s (fun () ->
+                        let b, _, _ = send ~schemes ann in
+                        b )
+                  in
+                  Time.sleep Mono (Span.ms 1) ;
+                  equal int 1 !calls ;
+                  K.forget cache (Option.get (K.hash ak k_ann)) ;
+                  Ivar.fill gate () ;
+                  equal string "ann ApiKey " (Sim_support.await a) ) ;
+              equal (pair int int) (0, 0) (counts cache) ;
+              (* A lookup with no forget during it puts the user in. *)
+              check_send ~schemes ann ("ann ApiKey ", None) ;
+              check_send ~schemes ann ("ann ApiKey ", None) ;
+              equal int 2 !calls ;
+              equal (pair int int) (1, 1) (counts cache) ) )
+    ; test "the size of the cache: the oldest go" (fun () ->
+          in_sim (fun () ->
+              let calls, cache, req = sized ~size:4 ~ttl:60 in
+              List.iter
+                (fun i ->
+                  req i ;
+                  Time.sleep Mono (Span.s 1) )
+                [0; 1; 2; 3] ;
+              equal (pair int int) (4, 4) (counts cache) ;
+              (* Full: the two newest stay, then the new one. *)
+              req 4 ;
+              equal (pair int int) (3, 3) (counts cache) ;
+              calls := [] ;
+              List.iter req [2; 3; 4] ;
+              equal int 0 (List.length !calls) ;
+              req 0 ;
+              equal int 1 (List.length !calls) ) )
+    ; test "the size of the cache: the cut of 10 entries" (fun () ->
+          in_sim (fun () ->
+              let calls, cache, req = sized ~size:10 ~ttl:60 in
+              for i = 0 to 9 do
+                req i ;
+                Time.sleep Mono (Span.s 1)
+              done ;
+              req 10 ;
+              (* The five newest stay, then the new one. *)
+              equal (pair int int) (6, 6) (counts cache) ;
+              calls := [] ;
+              List.iter req [5; 6; 7; 8; 9; 10] ;
+              equal int 0 (List.length !calls) ;
+              req 4 ;
+              equal int 1 (List.length !calls) ) )
+    ; test "the size of the cache: the expired go first" (fun () ->
+          in_sim (fun () ->
+              let calls, cache, req = sized ~size:4 ~ttl:10 in
+              (* Three entries with ages 12 s, 11 s and 10 s: all expired. *)
+              List.iter
+                (fun i ->
+                  req i ;
+                  Time.sleep Mono (Span.s 1) )
+                [0; 1; 2] ;
+              Time.sleep Mono (Span.s 9) ;
+              req 3 ;
+              equal (pair int int) (4, 4) (counts cache) ;
+              (* The three expired go, also the one with the age 10 s, the
+                 second of the order of age: one entry stays, then the new
+                 one. *)
+              req 4 ;
+              equal (pair int int) (2, 2) (counts cache) ;
+              calls := [] ;
+              List.iter req [3; 4] ;
+              equal int 0 (List.length !calls) ) )
+    ; test "the size of the cache: half of it live" (fun () ->
+          in_sim (fun () ->
+              let calls, cache, req = sized ~size:4 ~ttl:10 in
+              req 0 ;
+              req 1 ;
+              Time.sleep Mono (Span.s 11) ;
+              List.iter req [2; 3; 4] ;
+              (* At 4: two entries live, the half of the size: they stay. *)
+              equal (pair int int) (3, 3) (counts cache) ;
+              calls := [] ;
+              List.iter req [2; 3; 4] ;
+              equal int 0 (List.length !calls) ) )
+    ; test "the size of the cache: 1" (fun () ->
+          in_sim (fun () ->
+              let calls, cache, req = sized ~size:1 ~ttl:60 in
+              req 0 ;
+              req 1 ;
+              equal (pair int int) (1, 1) (counts cache) ;
+              req 1 ;
+              equal int 2 (List.length !calls) ;
+              req 0 ;
+              equal int 3 (List.length !calls) ) )
+    ; test "the size of the cache: a new lookup of an expired key" (fun () ->
+          in_sim (fun () ->
+              let calls, cache, req = sized ~size:2 ~ttl:1 in
+              for _ = 1 to 3 do
+                req 0 ;
+                req 1 ;
+                equal (pair int int) (2, 2) (counts cache) ;
+                Time.sleep Mono (Span.s 1)
+              done ;
+              equal int 6 (List.length !calls) ;
+              List.iter req [0; 1; 0; 1] ;
+              equal int 8 (List.length !calls) ;
+              equal (pair int int) (2, 2) (counts cache) ) )
+    ; test "race: requests on 4 virtual domains" (fun () ->
+          Sim_support.race ~seeds:20 (fun _ ->
+              let keys =
+                List.init 12 (fun i -> (key_n i, "u" ^ string_of_int i))
+              in
+              let cache = K.cache ~size:6 (Span.s 1) in
+              let schemes =
+                [ K.scheme ~cache
+                    ~lookup:(fun h -> Fiber.yield () ; store keys h)
+                    ak ]
+              in
+              Fiber.scope (fun s ->
+                  for f = 0 to 3 do
+                    Fiber.fork s (fun () ->
+                        for n = 0 to 49 do
+                          let i = ((f * 7) + n) mod 12 in
+                          check_send ~schemes
+                            [auth ("Bearer " ^ key_n i)]
+                            ("u" ^ string_of_int i ^ " ApiKey api", None) ;
+                          if n mod 10 = 0 then Time.sleep Mono (Span.ms 300)
+                        done )
+                  done ) ;
+              let count, cardinal = counts cache in
+              equal int cardinal count ;
+              is_true ~msg:"size" (count <= 6) ) )
+    ; test "insert and forget on 4 real domains" (fun () ->
+          (* The compare-and-set loops: a lost update loses an entry or a
+             forget. *)
+          let cache = K.cache ~size:100_000 (Span.s 60) in
+          let on_domains f =
+            List.iter Domain.join
+              (List.init 4 (fun d -> Domain.spawn (fun () -> f d)))
+          in
+          let hash d i = Printf.sprintf "%d-%d" d i in
+          on_domains (fun d ->
+              for i = 0 to 4_999 do
+                A.Private.api_key_insert cache (hash d i) (Clock.of_ns Mono 0L)
+              done ) ;
+          equal (pair int int) (20_000, 20_000) (counts cache) ;
+          on_domains (fun d ->
+              for i = 0 to 4_999 do
+                if i mod 2 = 0 then K.forget cache (hash d i)
+              done ) ;
+          equal (pair int int) (10_000, 10_000) (counts cache) ) ]
+
 let policy_tests =
   group "Policies"
     [ test "require and the policies" (fun () ->
@@ -5049,6 +5606,7 @@ let () =
        ; json_tests
        ; claims_tests
        ; bearer_tests
+       ; api_key_tests
        ; policy_tests
        ; session_tests
        ; oidc_tests

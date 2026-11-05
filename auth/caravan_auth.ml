@@ -720,11 +720,18 @@ module Scheme = struct
 
   let name s = s.name
 
+  (* A name of a scheme is case-insensitive (RFC 9110 §11.1). *)
+  let check_name fn name =
+    match String.lowercase_ascii name with
+    | "" | "bearer" | "session" ->
+        invalid_arg
+          ( "Caravan_auth." ^ fn
+          ^ ": an empty name, or the name of a scheme of this library" )
+    | _ ->
+        ()
+
   let make ~name ~authenticate ~challenge =
-    if name = "" || name = "Bearer" || name = "Session" then
-      invalid_arg
-        "Caravan_auth.Scheme.make: an empty name, or the name of a scheme of \
-         this library" ;
+    check_name "Scheme.make" name ;
     {name; authenticate; challenge}
 
   let is_token68 = function
@@ -765,6 +772,55 @@ module Scheme = struct
       if t = 6 || c = t || skip (fun c -> c = '=') c <> n then `Malformed
       else `Token (String.sub v t (n - t))
 
+  let check_realm fn realm =
+    if String.exists (fun c -> c = '"' || c = '\\' || is_ctl c) realm then
+      invalid_arg
+        ( "Caravan_auth." ^ fn
+        ^ ": the realm has a quote, a backslash or a control character" )
+
+  (* [token_challenge ~auth_scheme ~realm request_errors] is the challenge of
+     RFC 6750 §3: [401] with [WWW-Authenticate: <auth_scheme> realm="<realm>"],
+     and [error="invalid_request"] after a failure in [request_errors] (compared
+     physically), else [error="invalid_token"] after a failure. *)
+  let token_challenge ~auth_scheme ~realm request_errors ~failure _ =
+    let error =
+      match failure with
+      | None ->
+          ""
+      | Some m when List.memq m request_errors ->
+          {|, error="invalid_request"|}
+      | Some _ ->
+          {|, error="invalid_token"|}
+    in
+    Caravan.Response.string ~status:Caravan.Status.unauthorized
+      ~headers:
+        (Caravan.Headers.of_list
+           [ ( "WWW-Authenticate"
+             , auth_scheme ^ {| realm="|} ^ realm ^ {|"|} ^ error ) ] )
+      "Unauthorized\n"
+
+  (* [bearer_field req k] reads the field [Authorization] of [req] for the
+     scheme Bearer, and gives [k token] for a token. *)
+  let bearer_field req k =
+    match
+      Caravan.Headers.find_all "authorization" (Caravan.Request.headers req)
+    with
+    | [] ->
+        No_credentials
+    | _ :: _ :: _ ->
+        Failed two_fields
+    | [v] -> (
+      match parse v with
+      | `Other ->
+          No_credentials
+      | `Malformed ->
+          Failed malformed
+      | `Token t ->
+          k t )
+
+  let bearer_challenge ~realm =
+    token_challenge ~auth_scheme:"Bearer" ~realm [two_fields; malformed]
+
   let default_user roles_claim (claims : Jwt.claims) =
     match Jwt.subject claims with
     | None | Some "" ->
@@ -781,8 +837,7 @@ module Scheme = struct
   let bearer ?(realm = "api") ?leeway ?(roles_claim = "roles") ?user ~issuer
       ~audience ~keys () =
     let bad m = invalid_arg ("Caravan_auth.Scheme.bearer: " ^ m) in
-    if String.exists (fun c -> c = '"' || c = '\\' || is_ctl c) realm then
-      bad "the realm has a quote, a backslash or a control character" ;
+    check_realm "Scheme.bearer" realm ;
     ( match (issuer, audience) with
     | Jwt.One_of [], _ | _, Jwt.One_of [] ->
         bad "an empty list for issuer or audience"
@@ -797,20 +852,7 @@ module Scheme = struct
       match user with Some f -> f | None -> default_user roles_claim
     in
     let authenticate req =
-      match
-        Caravan.Headers.find_all "authorization" (Caravan.Request.headers req)
-      with
-      | [] ->
-          No_credentials
-      | _ :: _ :: _ ->
-          Failed two_fields
-      | [v] -> (
-        match parse v with
-        | `Other ->
-            No_credentials
-        | `Malformed ->
-            Failed malformed
-        | `Token token -> (
+      bearer_field req (fun token ->
           match Jwt.verify ?leeway ~issuer ~audience ~keys:(keys ()) token with
           | Error e ->
               Failed (Format.asprintf "%a" Jwt.pp_error e)
@@ -819,25 +861,9 @@ module Scheme = struct
             | Ok u ->
                 Authenticated u
             | Error m ->
-                Failed m ) ) )
+                Failed m ) )
     in
-    let challenge ~failure _ =
-      let error =
-        match failure with
-        | None ->
-            ""
-        | Some m when m == two_fields || m == malformed ->
-            {|, error="invalid_request"|}
-        | Some _ ->
-            {|, error="invalid_token"|}
-      in
-      Caravan.Response.string ~status:Caravan.Status.unauthorized
-        ~headers:
-          (Caravan.Headers.of_list
-             [("WWW-Authenticate", {|Bearer realm="|} ^ realm ^ {|"|} ^ error)] )
-        "Unauthorized\n"
-    in
-    {name= "Bearer"; authenticate; challenge}
+    {name= "Bearer"; authenticate; challenge= bearer_challenge ~realm}
 
   let member = "caravan.auth.user"
 
@@ -922,6 +948,245 @@ module Scheme = struct
             "Unauthorized\n"
     in
     {name= "Session"; authenticate; challenge}
+end
+
+(* {1 API keys} *)
+
+module Api_key = struct
+  type format = {prefix: string}
+
+  let format ~prefix =
+    let n = String.length prefix in
+    if
+      n < 2 || n > 32
+      || prefix.[n - 1] <> '_'
+      || not
+           (String.for_all
+              (function 'a' .. 'z' | '0' .. '9' | '_' -> true | _ -> false)
+              prefix )
+    then
+      invalid_arg
+        "Caravan_auth.Api_key.format: the prefix is not 2 to 32 characters of \
+         a-z, 0-9 and _, with a last _" ;
+    {prefix}
+
+  type created = {key: string; hash: string}
+
+  (* 43 base62 characters: 256.03 bits. *)
+  let length = 43
+
+  let alphabet =
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+  (* [char_of_byte b] is the character of the random byte [b], or [None] for 248
+     and more: 248 is 4 * 62, thus each character comes from 4 bytes. *)
+  let char_of_byte b = if b < 248 then Some alphabet.[b mod 62] else None
+
+  let is_base62 = function
+    | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' ->
+        true
+    | _ ->
+        false
+
+  let hex s = Digestif.SHA256.(to_hex (digest_string s))
+
+  let generate f =
+    let total = String.length f.prefix + length in
+    let b = Buffer.create total in
+    Buffer.add_string b f.prefix ;
+    while Buffer.length b < total do
+      String.iter
+        (fun c ->
+          match char_of_byte (Char.code c) with
+          | Some c when Buffer.length b < total ->
+              Buffer.add_char b c
+          | _ ->
+              () )
+        (Mirage_crypto_rng.generate
+           (64 [@mutate off "a count of random bytes: the loop draws more"]) )
+    done ;
+    let key = Buffer.contents b in
+    {key; hash= hex key}
+
+  (* [classify f t] is [`Key] if [t] is the prefix of [f] and [length] base62
+     characters. It is [`Other] if the text of [t] up to and with its last [_]
+     is not the prefix (base62 has no [_], thus the prefix of a key is exact),
+     or if [t] has a [.] (a JWT always has one). Else it is [`Malformed]. *)
+  let classify f t =
+    let p = String.length f.prefix and n = String.length t in
+    if not (String.starts_with ~prefix:f.prefix t) then `Other
+    else
+      let rec scan i base62 =
+        if i = n then if base62 && n = p + length then `Key else `Malformed
+        else
+          match t.[i] with
+          | '_' | '.' ->
+              `Other
+          | c ->
+              scan (i + 1) (base62 && is_base62 c)
+      in
+      scan p true
+
+  let hash f key =
+    match classify f key with `Key -> Some (hex key) | _ -> None
+
+  (* {2 The cache} *)
+
+  module M = Map.Make (String)
+
+  (* [gen] changes at each [forget]: a lookup that started before a [forget]
+     does not insert its result. [count] is the cardinal of [map]. *)
+  type state = {map: (User.t * Weft.Clock.mono) M.t; count: int; gen: int}
+
+  type cache = {ttl: Weft.Span.t; size: int; state: state Atomic.t}
+
+  let cache
+      ?(size = (10_000 [@mutate off "a size: a test would make 10_000 keys"]))
+      ttl =
+    let bad m = invalid_arg ("Caravan_auth.Api_key.cache: " ^ m) in
+    if size < 1 then bad "size is less than 1" ;
+    if
+      Weft.Span.compare ttl (Weft.Span.s 1) < 0
+      || Weft.Span.compare ttl (Weft.Span.s 3600) > 0
+    then bad "the time is not from 1 s to 1 h" ;
+    { ttl
+    ; size
+    ; state=
+        Atomic.make
+          { map= M.empty
+          ; count= 0
+          ; gen= (0 [@mutate off "only the equality of two values counts"]) } }
+
+  (* The age of an entry at [now], in ns. *)
+  let age now added = Weft.Span.to_ns (Weft.Time.diff Mono now added)
+
+  let fresh c now added =
+    Weft.Span.compare (Weft.Time.diff Mono now added) c.ttl < 0
+
+  let find c hash now =
+    match M.find_opt hash (Atomic.get c.state).map with
+    | Some (u, added) when fresh c now added ->
+        Some u
+    | _ ->
+        None
+
+  (* [evict c now s] removes the expired entries of [s], then the oldest until
+     at most half of the size stays. A sort of an int array finds the cut, as in
+     Rate_limit: the work serves the next [size / 2] inserts. *)
+  let evict c now s =
+    let live = M.filter (fun _ (_, added) -> fresh c now added) s.map in
+    let n = M.cardinal live in
+    let keep = c.size / 2 in
+    if n <= keep then {s with map= live; count= n}
+    else
+      let ages = Array.make n (0L [@mutate off "each cell is written next"]) in
+      let i = ref 0 in
+      M.iter
+        (fun _ (_, added) ->
+          ages.(!i) <- age now added ;
+          incr i )
+        live ;
+      Array.sort Int64.compare ages ;
+      (* The entries at [keep] and after in the order of age go. *)
+      let cut = ages.(keep) in
+      let map = M.filter (fun _ (_, added) -> age now added < cut) live in
+      {s with map; count= M.cardinal map}
+
+  let insert c gen hash u now =
+    let rec go () =
+      let s = Atomic.get c.state in
+      if s.gen = gen then
+        let present = M.mem hash s.map in
+        let s' =
+          if (not present) && s.count >= c.size then evict c now s else s
+        in
+        let count = if present then s'.count else s'.count + 1 in
+        if
+          not
+            (Atomic.compare_and_set c.state s
+               {s' with map= M.add hash (u, now) s'.map; count} )
+        then go ()
+    in
+    go ()
+
+  let forget c hash =
+    let rec go () =
+      let s = Atomic.get c.state in
+      let s' =
+        { map= M.remove hash s.map
+        ; count= (if M.mem hash s.map then s.count - 1 else s.count)
+        ; gen=
+            ( s.gen + 1 )
+            [@mutate off "only a change counts: s.gen - 1 is also a change"] }
+      in
+      if not (Atomic.compare_and_set c.state s s') then go ()
+    in
+    go ()
+
+  (* {2 The scheme} *)
+
+  let malformed_key = "a malformed key"
+
+  let scheme ?(name = "ApiKey") ?field ?(realm = "api") ?cache ~lookup f =
+    let bad m = invalid_arg ("Caravan_auth.Api_key.scheme: " ^ m) in
+    Scheme.check_name "Api_key.scheme" name ;
+    if not (String.for_all Caravan.Private.Token.is_tchar name) then
+      bad "the name is not a token" ;
+    Scheme.check_realm "Api_key.scheme" realm ;
+    ( match field with
+    | Some fd
+      when (not (Caravan.Headers.is_valid_name fd))
+           || List.mem
+                (String.lowercase_ascii fd)
+                ["authorization"; "proxy-authorization"; "cookie"] ->
+        bad
+          "a field that is not valid, Authorization, Proxy-Authorization or \
+           Cookie"
+    | _ ->
+        () ) ;
+    let of_lookup = function Ok u -> Authenticated u | Error m -> Failed m in
+    let check token =
+      match classify f token with
+      | `Other ->
+          No_credentials
+      | `Malformed ->
+          Failed malformed_key
+      | `Key -> (
+          let hash = hex token in
+          match cache with
+          | None ->
+              of_lookup (lookup hash)
+          | Some c -> (
+            match find c hash (Weft.Time.now Mono) with
+            | Some u ->
+                Authenticated u
+            | None ->
+                let gen = (Atomic.get c.state).gen in
+                let r = lookup hash in
+                Result.iter
+                  (fun u -> insert c gen hash u (Weft.Time.now Mono))
+                  r ;
+                of_lookup r ) )
+    in
+    match field with
+    | None ->
+        { Scheme.name
+        ; authenticate= (fun req -> Scheme.bearer_field req check)
+        ; challenge= Scheme.bearer_challenge ~realm }
+    | Some fd ->
+        let two = "two " ^ fd ^ " fields" in
+        let authenticate req =
+          match Caravan.Headers.find_all fd (Caravan.Request.headers req) with
+          | [] ->
+              No_credentials
+          | [v] ->
+              check v
+          | _ :: _ :: _ ->
+              Failed two
+        in
+        { Scheme.name
+        ; authenticate
+        ; challenge= Scheme.token_challenge ~auth_scheme:name ~realm [two] }
 end
 
 let sign_in req user =
@@ -2720,6 +2985,16 @@ end
 module Private = struct
   module Cbor = Cbor
   module Webauthn = Webauthn
+
+  let api_key_char = Api_key.char_of_byte
+
+  let api_key_cache_counts (c : Api_key.cache) =
+    let s = Atomic.get c.state in
+    (s.count, Api_key.M.cardinal s.map)
+
+  (* An insert with no effect, for a test on real domains. *)
+  let api_key_insert (c : Api_key.cache) hash now =
+    Api_key.insert c (Atomic.get c.state).gen hash (User.make "x") now
 
   let key_of_cose = Passkey_key.of_cose
 
