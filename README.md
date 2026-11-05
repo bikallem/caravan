@@ -71,6 +71,7 @@ executable:
 - [OpenID Connect](#openid-connect)
 - [Codes by email](#codes-by-email)
 - [Passkeys](#passkeys)
+- [API keys](#api-keys)
 - [Compression](#compression)
 - [File uploads](#file-uploads)
 - [Static files](#static-files)
@@ -720,6 +721,60 @@ In the browser, `PublicKeyCredential.parseCreationOptionsFromJSON` and
 - Read the body of a response with a limit of 64 KiB, and put a rate
   limit on the routes of the options: each one can make a session. Two
   copies of one response sent at the same time can both pass.
+
+## API keys
+
+`Caravan_auth.Api_key` makes keys for a web API, and finds the user of
+a key with its hash:
+
+```ocaml
+let live = Caravan_auth.Api_key.format ~prefix:"myapp_"
+
+(* POST /keys, for a signed-in user: show the key one time, store the
+   hash. *)
+let create_key user =
+  let k = Caravan_auth.Api_key.generate live in
+  store_key ~owner:user ~hash:k.hash ;
+  k.key
+
+let api_key =
+  Caravan_auth.Api_key.scheme live ~lookup:(fun hash ->
+      match find_key hash with
+      | Some row when not row.revoked ->
+          Ok (Caravan_auth.User.make ~roles:row.roles row.owner)
+      | Some _ -> Error "a revoked key"
+      | None -> Error "an unknown key" )
+
+let api =
+  Caravan.Handler.compose
+    [ (* Each client: this limits the reads of the store. *)
+      Caravan_middleware.Rate_limit.middleware ~burst:20 ~every:(Span.s 1) ()
+    ; Caravan_auth.middleware ~schemes:[api_key; bearer] ()
+    ; (* Each user: the keys of one user share it. *)
+      Caravan_middleware.Rate_limit.middleware ~burst:100
+        ~every:(Span.ms 100)
+        ~key:(fun req -> Option.map Caravan_auth.User.id (Caravan_auth.user req))
+        ()
+    ; Caravan_auth.require ~challenge:"ApiKey" () ]
+    routes
+```
+
+- A key is the prefix and 43 base62 characters (256 bits). A secret
+  scanner finds a leaked key by its prefix. The client sends
+  `Authorization: Bearer <key>`, or the field that `~field` gives (for
+  example `X-API-Key`). A key in the query of a URL is never read.
+- Store only the hash (SHA-256, in hex). The lookup checks the expiry
+  and the revocation, and must raise if the store fails: an `Error`
+  gives a 401, and a client can then discard a good key.
+- A token with a `.` is never a key. Thus a JWT is never a key, and the
+  API key scheme and the JWT scheme share `Authorization`: put the API
+  key scheme first. Two formats
+  (for example `myapp_` and `myapp_test_`) also share one field.
+- `Api_key.cache` keeps the user of a key for a short time. A revoked
+  key works until its entry expires: call `Api_key.forget` after the
+  revocation is in the store. Give a cache to one scheme only.
+- A browser never sends a key by itself: with a session scheme too,
+  exempt `"ApiKey"` from the CSRF tokens by its name.
 
 ## Compression
 
