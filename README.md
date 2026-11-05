@@ -1090,6 +1090,45 @@ let () =
   In a test, `Caravan_jobs.drain` waits for all jobs, also the delayed
   ones, in virtual time.
 
+### Durable jobs
+
+`Caravan_jobs.Durable` keeps the jobs in a store of your application,
+for example a table of its database. A job survives a restart, and
+many processes can share one store. You write the store: seven
+functions, with the SQL for PostgreSQL in the documentation of
+`Durable.store`. `Durable.memory_store` is for tests.
+
+```ocaml
+let send_code =
+  Caravan_jobs.Durable.job ~name:"send_code"
+    ~encode:(fun (address, code) -> address ^ "\n" ^ code)
+    ~decode:(fun s ->
+      match String.split_on_char '\n' s with
+      | [address; code] -> (address, code)
+      | _ -> failwith "send_code: bad payload" )
+    (fun _info (address, code) -> send_mail ~to_:address ~text:code)
+
+let jobs = Caravan_jobs.Durable.create ~jobs:[Job send_code] store
+
+(* In a handler: the store keeps the job, and a worker runs it. *)
+let _id = Caravan_jobs.Durable.enqueue jobs send_code (address, code)
+```
+
+- A worker holds a lease on its job, and extends it while the job runs.
+  After a crash, another process runs the job when its lease ends (60 s
+  by default). Thus a job runs at least one time: use `info.id` as an
+  idempotency key.
+- A queue claims only the names of its job types. Thus two queues can
+  share one store, and during a deploy an old process does not claim a
+  new type. Give a new name to a job type whose payload format changes.
+- At a stop, the queue gives the running jobs back to the store. They
+  use no attempt.
+- `Durable.row` gives the row of a job, for an insert in the
+  transaction of your application. Call `Durable.wake` after the
+  commit.
+- The store keeps each job: `Durable.enqueue` has no limit. Put a rate
+  limit on the routes that make jobs.
+
 ## Testing
 
 The `caravan.testing` library runs a handler through the real server
