@@ -148,7 +148,9 @@ compile the examples of this README.
   `Conn_info.stopping`. `Server.run` does this in an OS world of weft.
 - `Response.upgrade` hands the connection over after a `101 Switching
   Protocols` or a `2xx` to `CONNECT`, the basis for WebSocket and
-  tunnels.
+  tunnels. If the switch does not happen (a 500, a 503 while the server
+  stops, a client that left), its `?on_refused` function runs in place
+  of the upgrade, for example to close an upstream connection.
 - A handler whose client disconnects is cancelled, along with what it
   started, such as an upstream request.
 

@@ -581,7 +581,18 @@ let middleware ?(cookie = "__Host-session") ?(idle = Span.s 1800)
       else freeze ()
     in
     let st = freeze () in
-    let kept = save now st loaded in
+    let kept =
+      match save now st loaded with
+      | kept ->
+          kept
+      | exception e ->
+          (* The response goes nowhere: its body closes, or an upgrade releases
+             its setup. An exception of the release does not hide the error of
+             the store. *)
+          let bt = Printexc.get_raw_backtrace () in
+          (try Response.abandon response with _ -> ()) ;
+          Printexc.raise_with_backtrace e bt
+    in
     let expire () =
       if Option.is_some value then
         with_cookie (Cookie.expired template) response

@@ -20,5 +20,8 @@ type ctx =
     The engine runs in the fiber of the connection. It forks fibers only into
     scopes that it makes. An abort, the end of the shutdown grace and a cancel
     of the scope of the server raise [Weft.Fiber.Cancelled] at its next [sync].
-*)
+
+    For each upgrade response ({!Response.upgrade}) that the engine gets, it
+    runs the function of the upgrade or, on each path where it does not switch,
+    calls {!Response.abandon}. *)
 type t = ctx -> Flow.t -> Handler.t -> unit

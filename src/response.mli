@@ -61,10 +61,16 @@ val stream :
 (** [stream ~status ~headers ~length produce] is a response whose body [produce]
     writes, see {!Body.of_writer}. *)
 
-val upgrade : ?status:Status.t -> ?headers:Headers.t -> (Flow.t -> unit) -> t
-(** [upgrade ~status ~headers f] is a response that hands the connection to [f]
-    once its head is sent. [status] defaults to {!Status.switching_protocols}; a
-    [2xx] status is for accepting a [CONNECT] tunnel.
+val upgrade :
+     ?status:Status.t
+  -> ?headers:Headers.t
+  -> ?on_refused:(unit -> unit)
+  -> (Flow.t -> unit)
+  -> t
+(** [upgrade ~status ~headers ~on_refused f] is a response that hands the
+    connection to [f] once its head is sent, or calls [on_refused] if the switch
+    does not happen. [status] defaults to {!Status.switching_protocols}; a [2xx]
+    status is for accepting a [CONNECT] tunnel.
 
     [f] gets the connection's flow, starting with any bytes the client sent
     after its request, and without deadlines. The connection closes when [f]
@@ -90,11 +96,41 @@ val upgrade : ?status:Status.t -> ?headers:Headers.t -> (Flow.t -> unit) -> t
     can start after this last check, while the head is written or after the
     switch. Thus [f] must choose {!Conn_info.stopping} with its other actions.
 
-    Thus [f] runs only if the switch happens: on a [503], a [500], or a client
-    that left, it never runs. Put the setup that [f] must release (for example
-    the connection to an upstream of a tunnel) inside [f].
+    Thus [f] runs only if the switch happens. On each path where the switch does
+    not happen, the engine calls {!abandon} on the response, which calls
+    [on_refused] in place of [f], before the engine sends its error response: a
+    [500] for an upgrade that breaks the rules or for a body too large to drain,
+    a [503] while the server stops, a client that leaves before the switch, a
+    write of the head that fails, and a cancel of the connection. Thus for each
+    upgrade response that the engine gets, exactly one of [f] and [on_refused]
+    runs, if no other code called {!abandon} on it before. Use [on_refused] to
+    release a setup that the handler made before it gave the response, for
+    example the connection to the upstream of a tunnel, which the handler opens
+    first so that it can answer [502]. A setup that [f] makes itself needs no
+    [on_refused].
+
+    [on_refused] runs at most one time for a response value, also through its
+    copies ({!with_status}, {!with_headers}, ...): make a new upgrade response
+    for each request. It runs in a shield (see {!abandon}), thus it must not
+    wait. The engine reports an exception of [on_refused] as an error of the
+    handler, and continues.
 
     @raise Invalid_argument if [status] is neither [101] nor [2xx]. *)
+
+val abandon : t -> unit
+(** [abandon r] drops the response [r], which no one will send: it closes the
+    body of [r] ({!Body.close}), or calls the [on_refused] function of the
+    upgrade [r] (see {!upgrade}). It is idempotent: each of them runs at most
+    one time. It runs in [Weft.Fiber.shield], thus in a weft fiber, and it does
+    not see a cancel, also not that of [Server.abort]. An exception of the close
+    or of [on_refused] goes out of [abandon].
+
+    The HTTP/1.1 engine calls it for each upgrade that it does not switch, and
+    for a response that a cancelled handler gives. A middleware calls it when it
+    drops a response that the handler gave, with a different response or with an
+    exception.
+
+    @raise Weft.Fiber.Not_in_fiber outside a weft fiber. *)
 
 val status : t -> Status.t
 (** [status r] is the status of [r]. *)

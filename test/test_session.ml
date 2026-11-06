@@ -590,6 +590,90 @@ let session_tests =
                 (function Failure _ -> true | _ -> false)
                 (fun () -> ignore (h (req "/"))) ;
               equal int 0 (writes c) ) )
+    ; test "a store that fails after the handler abandons the response"
+        (fun () ->
+          sim (fun _ ->
+              let failing =
+                M.store
+                  ~find:(fun _ -> None)
+                  ~create:(fun _ _ ~expires:_ -> failwith "store")
+                  ~update:(fun _ _ ~expires:_ -> failwith "store")
+                  ~touch:(fun _ ~expires:_ -> failwith "store")
+                  ~remove:(fun _ -> failwith "store")
+              in
+              let refused = ref 0 in
+              let h =
+                mw failing (fun req ->
+                    M.set "a" "b" req ;
+                    Response.upgrade ~on_refused:(fun () -> incr refused) ignore )
+              in
+              raises (Failure "store") (fun () -> ignore (h (req "/"))) ;
+              equal int ~msg:"the upgrade" 1 !refused ;
+              (* A body response that goes nowhere closes. *)
+              let closes = ref 0 in
+              let h =
+                mw failing (fun req ->
+                    M.set "a" "b" req ;
+                    Response.make
+                      (Body.of_source
+                         ~close:(fun () -> incr closes)
+                         (fun _ _ _ -> 0) ) )
+              in
+              raises (Failure "store") (fun () -> ignore (h (req "/"))) ;
+              equal int ~msg:"the body" 1 !closes ) )
+    ; test "a release that fails does not hide the error of the store"
+        (fun () ->
+          sim (fun _ ->
+              let failing =
+                M.store
+                  ~find:(fun _ -> None)
+                  ~create:(fun _ _ ~expires:_ -> failwith "store")
+                  ~update:(fun _ _ ~expires:_ -> failwith "store")
+                  ~touch:(fun _ ~expires:_ -> failwith "store")
+                  ~remove:(fun _ -> failwith "store")
+              in
+              let h =
+                mw failing (fun req ->
+                    M.set "a" "b" req ;
+                    Response.upgrade
+                      ~on_refused:(fun () -> failwith "release")
+                      ignore )
+              in
+              raises (Failure "store") (fun () -> ignore (h (req "/"))) ) )
+    ; test "a cancel in a write of the store still releases the upgrade"
+        (fun () ->
+          sim (fun _ ->
+              let slow =
+                M.store
+                  ~find:(fun _ -> None)
+                  ~create:(fun _ _ ~expires:_ -> Time.sleep Mono (Span.s 1))
+                  ~update:(fun _ _ ~expires:_ -> ())
+                  ~touch:(fun _ ~expires:_ -> ())
+                  ~remove:(fun _ -> false)
+              in
+              let refused = ref 0 in
+              let h =
+                mw slow (fun req ->
+                    M.set "a" "b" req ;
+                    Response.upgrade
+                      ~on_refused:(fun () ->
+                        (* Outside a shield, this sleep raises the cancel. *)
+                        Time.sleep Mono (Span.ms 1) ;
+                        incr refused )
+                      ignore )
+              in
+              Fiber.scope (fun s ->
+                  let p =
+                    Fiber.fork_promise s (fun () -> ignore (h (req "/")))
+                  in
+                  Time.sleep Mono (Span.ms 10) ;
+                  Promise.cancel p ;
+                  match Promise.await p with
+                  | () ->
+                      ()
+                  | exception Promise.Cancelled ->
+                      () ) ;
+              equal int 1 !refused ) )
     ; test "an old key verifies, and the cookie is signed again" (fun () ->
           sim (fun _ ->
               let store, _, _ = counting () in
