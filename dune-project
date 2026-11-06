@@ -40,6 +40,7 @@
    (and
     :with-test
     (>= 2.1)))
+  (weft-tls :with-test)
   (digestif :with-test)
   (eqaf :with-test)
   (mirage-crypto-pk :with-test)
@@ -48,6 +49,7 @@
   (decompress :with-test))
  (depopts
   ; caravan.tls
+  weft-tls
   (tls
    (>= 2.1))
   x509

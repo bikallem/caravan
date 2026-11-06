@@ -33,15 +33,15 @@
         ]
       },
       "locked": {
-        "lastModified": 1793651569,
-        "narHash": "sha256-MtTrXApgWMrLGLXVIaZyrPtcPQM2jICvPOxmoNECZO4=",
-        "owner": "bikallem",
+        "lastModified": 1793997224,
+        "narHash": "sha256-3FGlgrTc5RS7iUXM1ejRKjqAdaHeKjfVNkW1YhuIzf4=",
+        "owner": "ocaml-caravanserai",
         "repo": "weft",
-        "rev": "9cd35c77ade8957ecda6778b04996dc6bed17512",
+        "rev": "6f05d1773e5d29e1882cfde378ee8349b896ce1a",
         "type": "github"
       },
       "original": {
-        "owner": "bikallem",
+        "owner": "ocaml-caravanserai",
         "repo": "weft",
         "type": "github"
       }

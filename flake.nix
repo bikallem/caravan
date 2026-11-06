@@ -11,7 +11,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     weft = {
-      url = "github:bikallem/weft";
+      url = "github:ocaml-caravanserai/weft";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.windtrap.follows = "windtrap";
     };
@@ -51,6 +51,8 @@
               final: prev: {
                 # Not on opam yet: the package of the weft flake.
                 weft = final.callPackage weft.lib.package { };
+                # The TLS flow of weft, for caravan.tls.
+                weft-tls = final.callPackage weft.lib.tlsPackage { };
 
                 # nixpkgs ships an older windtrap and no ppx_windtrap. The two
                 # packages of the windtrap flake use the OCaml of this scope.
@@ -125,6 +127,7 @@
               ocamlPackages.weft
               ocamlPackages.http-date
               # caravan.tls, an optional library.
+              ocamlPackages.weft-tls
               ocamlPackages.tls
               ocamlPackages.x509
               ocamlPackages.domain-name
@@ -171,6 +174,7 @@
 
               # caravan.tls (optional), and its tests: a seeded generator and
               # the test certificates.
+              ocamlPackages.weft-tls
               tls
               x509
               domain-name
