@@ -667,8 +667,11 @@ let google provider =
   Caravan_auth.Oidc.client ~secret:"..." ~provider ~id:"123.apps"
     ~redirect_uri:"https://app.example/auth/callback" ()
 
+(* The key of an account is the issuer and the subject. Never find or link
+   an account by the email claim. *)
 let signed_in req (t : Caravan_auth.Oidc.tokens) ~return =
-  let user = find_or_make_user t.subject (Caravan_auth.Jwt.string "email" t.claims) in
+  let issuer = Option.get (Caravan_auth.Jwt.issuer t.claims) in
+  let user = find_or_make_user ~issuer ~subject:t.subject in
   Caravan_auth.sign_in req user ;
   Caravan.Response.empty ~status:Caravan.Status.see_other
     ~headers:(Caravan.Headers.of_list [("Location", return)]) ()
