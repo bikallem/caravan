@@ -1,0 +1,12 @@
+; The code that the tests of the examples share. It is for tests only: an
+; example program does not use it.
+
+(library
+ (name example_support)
+ (modules jar page ws_client)
+ (libraries caravan caravan.testing caravan.websocket weft))
+
+(test
+ (name test)
+ (modules test)
+ (libraries example_support windtrap))

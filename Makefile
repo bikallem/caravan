@@ -41,7 +41,7 @@ mutate:
 
 coverage:
 	find _build -name '*.coverage' -delete
-	dune runtest --force --instrument-with ppx_windtrap.coverage
+	dune runtest test --force --instrument-with ppx_windtrap.coverage
 	dune exec windtrap -- coverage
 
 # The Autobahn WebSocket test suite, in a container: podman by default,

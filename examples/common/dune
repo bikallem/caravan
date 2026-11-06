@@ -1,0 +1,11 @@
+; The code that all examples share. It has no optional dependency.
+
+(library
+ (name example_common)
+ (modules example_common)
+ (libraries caravan weft weft.os))
+
+(test
+ (name test)
+ (modules test)
+ (libraries example_common weft windtrap))

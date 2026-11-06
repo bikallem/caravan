@@ -1,0 +1,52 @@
+; Stand-ins for the development of the examples. Never use them in production.
+
+(library
+ (name example_dev)
+ (modules dev_cert dev_jwt dev_key trust)
+ (libraries
+  caravan.session
+  tls
+  x509
+  ipaddr
+  ptime
+  mirage-crypto-ec
+  digestif
+  weft))
+
+(test
+ (name test)
+ (modules test)
+ (libraries
+  example_dev
+  caravan
+  caravan.client
+  caravan.tls
+  caravan.testing
+  tls
+  x509
+  ptime
+  mirage-crypto-rng
+  unix
+  weft
+  windtrap))
+
+; The tests of Dev_jwt: caravan.auth verifies its tokens.
+
+(test
+ (name test_dev_jwt)
+ (modules test_dev_jwt)
+ (libraries
+  example_dev
+  caravan.auth
+  mirage-crypto-rng
+  weft
+  weft.sim
+  windtrap))
+
+; The tests of Dev_key. They set SESSION_KEY in the environment of the test
+; process.
+
+(test
+ (name test_dev_key)
+ (modules test_dev_key)
+ (libraries example_dev caravan.session mirage-crypto-rng unix windtrap))

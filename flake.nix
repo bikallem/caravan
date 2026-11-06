@@ -190,6 +190,8 @@
               # ocamlPackages.windtrap)
               ocamlPackages.windtrap
               ocamlPackages.ppx_windtrap
+              # The tests of the examples use base64 directly.
+              base64
 
               # Dev tools
               ocaml-lsp
