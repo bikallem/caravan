@@ -11,4 +11,5 @@ val resolve : string -> string list
    once. Else Weft.Dns.resolve does the lookup on the name pool of the world. It
    is a cancellation point: a cancel ends the wait at once, but the lookup
    continues in its thread until getaddrinfo returns. @raise Error.Error
-   (Connect _) if the host has no address, or if the lookup fails. *)
+   (Connect _) if the host has no address, or if the lookup fails: then the text
+   names the host. *)

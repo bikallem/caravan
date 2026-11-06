@@ -1855,8 +1855,8 @@ let resolver_tests =
           Sim_support.run
           @@ fun _ ->
           equal string
-            "Caravan_client.Error: cannot connect: EINVAL: a NUL byte in a \
-             string"
+            "Caravan_client.Error: cannot connect: the lookup of a\\000b \
+             failed: EINVAL: a NUL byte in a string"
             (error_text (fun () -> Resolver.resolve "a\000b")) ) ]
 
 (* Pool *)
