@@ -30,7 +30,37 @@ let is_failure_x = function Failure m, _ -> m = "x" | _ -> false
 
 let request_tests =
   group "Requests"
-    [ test "get gives the reply" (fun () ->
+    [ test "a proxy handler keeps the Content-Length of a HEAD response"
+        (fun () ->
+          (* /proxy forwards the request to /up with the client of the run, and
+             gives the response of /up with its fields. *)
+          let client = ref None in
+          let handler req =
+            match Request.path_only req with
+            | "/up" ->
+                ok "hello"
+            | _ ->
+                let up =
+                  Caravan_client.request (Option.get !client)
+                    (Request.make ~authority:"127.0.0.1" (Request.meth req)
+                       "/up" )
+                in
+                Response.make ~headers:(Response.headers up)
+                  (Caravan_client.body up)
+          in
+          let get, head =
+            T.run handler (fun t ->
+                client := Some (T.client t) ;
+                let fetch meth =
+                  T.fetch t (Request.make ~authority:"127.0.0.1" meth "/proxy")
+                in
+                (fetch Method.GET, fetch Method.HEAD) )
+          in
+          equal string "hello" get.body ;
+          equal string "" head.body ;
+          equal (option string) (Some "5")
+            (Headers.find "content-length" head.headers) )
+    ; test "get gives the reply" (fun () ->
           let r = T.run (fun _ -> ok "hi") (fun t -> T.get t "/") in
           equal status Status.ok r.status ;
           equal string "hi" r.body ;

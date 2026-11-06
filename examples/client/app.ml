@@ -94,29 +94,6 @@ let request_headers req =
     (Headers.remove_hop_by_hop (Request.headers req))
     forwarding
 
-(* [head_length headers] is the Content-Length of [headers] if it is one value
-   of 1 to 18 ASCII digits. Else it is None. *)
-let head_length headers =
-  match Headers.find_all "content-length" headers with
-  | [v]
-    when String.length v >= 1
-         && String.length v <= 18
-         && String.for_all (function '0' .. '9' -> true | _ -> false) v ->
-      Some (int_of_string v)
-  | _ ->
-      None
-
-(* The body of the response to the client. The client gives a body of length 0
-   to a HEAD response. Thus for HEAD, the gateway gives a body with the
-   head_length of the upstream, or with no length: the server sends no body for
-   HEAD, and it takes the Content-Length from the body. *)
-let response_body req resp =
-  let body = C.body resp in
-  if Request.meth req = HEAD then (
-    Body.close body ;
-    Body.of_writer ?length:(head_length (Response.headers resp)) ignore )
-  else body
-
 let forward ~report ~client ~upstream req =
   let upstream_req =
     Request.make ~authority:upstream ~headers:(request_headers req)
@@ -124,10 +101,12 @@ let forward ~report ~client ~upstream req =
   in
   match C.request client upstream_req with
   | resp ->
-      (* The server reads the upstream body while it sends it. *)
+      (* The server reads the upstream body while it sends it. For HEAD, the
+         body has no bytes and no known length: the server sends the
+         Content-Length of the upstream (see Caravan.Response.make). *)
       Response.make ~status:(Response.status resp)
         ~headers:(Headers.remove_hop_by_hop (Response.headers resp))
-        (response_body req resp)
+        (C.body resp)
   | exception (C.Error e as exn) -> (
       report (Printexc.to_string exn) ;
       match e with

@@ -2806,6 +2806,10 @@ let api_tests =
             C.request client (at_port (port_of url) ~meth:Method.HEAD "/hello")
           in
           equal int 200 (status head) ;
+          (* No bytes and no known length: the headers keep the length. *)
+          equal (option int) None (Body.length (C.body head)) ;
+          equal (option string) (Some "5")
+            (Headers.find "content-length" (Response.headers head)) ;
           equal string "" (text head) ;
           equal string id0 (get_text client (url ^ "/id")) ;
           equal int 204 (status (C.get client (url ^ "/empty"))) ;

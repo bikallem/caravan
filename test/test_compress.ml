@@ -489,6 +489,56 @@ let compress_tests =
           let r = run ~request:(req ~meth:Method.HEAD ()) (html ()) in
           equal (option string) (Some "gzip") (compressed r) ;
           equal (option string) None (field "content-length" r) )
+    ; test
+        "a HEAD body of no known length takes its Content-Length: the fields \
+         of the GET" (fun () ->
+          (* The HEAD response of a proxy: no bytes, no known length, and the
+             Content-Length of the GET. *)
+          let head n _ =
+            Response.make
+              ~headers:
+                (Headers.of_list
+                   [ ("Content-Type", "text/html")
+                   ; ("Content-Length", string_of_int n) ] )
+              (Body.of_source (fun _ _ _ -> 0))
+          in
+          let r = run ~request:(req ~meth:Method.HEAD ()) (head 4000) in
+          equal (option string) (Some "gzip") (compressed r) ;
+          equal (option string) None (field "content-length" r) ;
+          (* Below min_size, as the GET: no coding, the length stays. *)
+          let r = run ~request:(req ~meth:Method.HEAD ()) (head 100) in
+          equal (option string) None (compressed r) ;
+          equal (option string) (Some "100") (field "content-length" r) ;
+          (* A GET stream: no coding (streams is false). *)
+          let r = run (head 4000) in
+          equal (option string) None (compressed r) ;
+          (* The field has the rule of the engine. *)
+          let head_with value _ =
+            Response.make
+              ~headers:
+                (Headers.of_list
+                   [("Content-Type", "text/html"); ("Content-Length", value)] )
+              (Body.of_source (fun _ _ _ -> 0))
+          in
+          let coding value =
+            compressed
+              (run ~request:(req ~meth:Method.HEAD ()) (head_with value))
+          in
+          equal (option string) (Some "gzip") (coding "4000, 4000") ;
+          List.iter
+            (fun v -> equal ~msg:v (option string) None (coding v))
+            ["+4000"; "0xFA0"; "4_000"; "4000, 4001"; String.make 19 '9'] ;
+          (* With streams, 18 digits are a length above max_size (no coding),
+             and 19 digits are no length: a stream (a coding). *)
+          let coding_streams value =
+            compressed
+              (run
+                 ~mw:(C.middleware ~streams:true ())
+                 ~request:(req ~meth:Method.HEAD ()) (head_with value) )
+          in
+          equal (option string) None (coding_streams (String.make 18 '9')) ;
+          equal (option string) (Some "gzip")
+            (coding_streams (String.make 19 '9')) )
     ; test "the old body is closed at each end" (fun () ->
           let closes = ref 0 in
           let h ?(fail = false) () _ =

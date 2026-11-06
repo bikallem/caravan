@@ -7,7 +7,9 @@ type framing =
           responses to [CONNECT], and upgrades. *)
   | Length_only of int
       (** A [Content-Length] field and no body: the response to a [HEAD] request
-          whose body length is known, and a 205 response ([Length_only 0]). *)
+          whose body length is known, or whose body has no known length and
+          whose handler gives one valid [Content-Length] value, and a 205
+          response ([Length_only 0]). *)
   | Length of int  (** A body of this length, with [Content-Length]. *)
   | Chunked  (** A chunked body, for HTTP/1.1 clients. *)
   | Close_delimited

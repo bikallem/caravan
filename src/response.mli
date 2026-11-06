@@ -16,6 +16,13 @@ val make : ?status:Status.t -> ?headers:Headers.t -> Body.t -> t
     {!Status.ok}, [headers] to {!Headers.empty}. The protocol engine adds
     framing fields such as [Content-Length]; handlers do not set them.
 
+    One exception: for a [HEAD] request, a body with no known length (for
+    example the body of a [HEAD] response of [caravan.client]) takes the
+    [Content-Length] of [headers], if each of its values is the same number of 1
+    to 18 digits. Thus a proxy that forwards a [HEAD] response keeps its length.
+    The statuses with no content (1xx, 204, 205, 304, and 2xx to [CONNECT]) keep
+    their own rules.
+
     [Upgrade] is a field of the connection. The engine sends it only on a [101]
     and on a [426] (Upgrade Required), whose [Upgrade] field must name the
     protocols to upgrade to (RFC 9110 15.5.22). A handler that forwards an

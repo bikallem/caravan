@@ -66,8 +66,11 @@ val middleware :
     [If-None-Match] to [W/"t"] before the handler, thus the handler compares the
     tags of its own bytes. The 304 of caravan.static has the [Content-Length] of
     its file, thus the size limits apply to it as to its 200; a 304 with no
-    [Content-Length] is a stream. [level] (0 to 9, default 4) is the level of
-    the two codings.
+    [Content-Length] is a stream. A [HEAD] response whose body has no known
+    length (for example the [HEAD] response of a proxy) takes its length from
+    [Content-Length] in the same way, thus it gets the fields of the [GET]. The
+    rule of the field is that of the engine: each value is the same number of 1
+    to 18 digits. [level] (0 to 9, default 4) is the level of the two codings.
 
     - [If-Match] never matches a weak ETag: give the routes that use it the
       attribute {!skip}. A handler that checks [If-None-Match] itself must use

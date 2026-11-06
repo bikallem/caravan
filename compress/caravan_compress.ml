@@ -363,13 +363,32 @@ let middleware ?(min_size = 2048) ?(max_size = 8 * 1024 * 1024)
     let coding () = Lazy.force coding in
     (* A response that the middleware would compress for some requests. The 304
        of caravan.static has the Content-Length of its file; the engine does not
-       send it. *)
+       send it. A HEAD response forwarded by a proxy has a body of no known
+       length and the Content-Length of its GET: the HEAD then gets the fields
+       of the GET. *)
+    let field_length () =
+      (* The rule of the engine for the Content-Length of a handler: each value
+         is the same number of 1 to 18 digits. *)
+      let valid s =
+        String.length s <= 18
+        && String.for_all (function '0' .. '9' -> true | _ -> false) s
+      in
+      match Headers.tokens "content-length" h with
+      | n :: rest when valid n && List.for_all (String.equal n) rest ->
+          Some (int_of_string n)
+      | _ ->
+          None
+    in
     let length () =
       match Response.kind resp with
-      | Response.Body b when code <> 304 ->
-          Body.length b
+      | Response.Body b when code <> 304 -> (
+        match Body.length b with
+        | None when Method.equal (Request.meth req) Method.HEAD ->
+            field_length ()
+        | l ->
+            l )
       | _ ->
-          Option.bind (Headers.find "content-length" h) int_of_string_opt
+          field_length ()
     in
     if skipped || code = 204 || code = 205 || code = 206 then resp
     else if not (in_limits (length ())) then resp

@@ -1782,6 +1782,17 @@ let show_framing_of ~meth ~version r =
 
 let stream_body = Response.stream ignore
 
+(* A stream with the Content-Length fields [values] of the handler. *)
+let cl values =
+  Response.stream
+    ~headers:
+      (Headers.of_list (List.map (fun v -> ("Content-Length", v)) values))
+    ignore
+
+let eighteen = String.make 18 '1'
+
+let nineteen = String.make 19 '1'
+
 let sized s = Response.string s
 
 let response_framing_tests =
@@ -1808,6 +1819,21 @@ let response_framing_tests =
                     ; ("GET 404 sized", GET, Http_1_1, st 404 (sized "nope"))
                     ; ("HEAD 200 sized", HEAD, Http_1_1, sized "hello")
                     ; ("HEAD 200 stream", HEAD, Http_1_1, stream_body)
+                    ; ("HEAD stream, length 7", HEAD, Http_1_1, cl ["7"])
+                    ; ("HEAD stream, 7, 7", HEAD, Http_1_1, cl ["7"; "7"])
+                    ; ("HEAD stream, 7, 8", HEAD, Http_1_1, cl ["7"; "8"])
+                    ; ("HEAD stream, list 7,7", HEAD, Http_1_1, cl ["7, 7"])
+                    ; ("HEAD stream, +7", HEAD, Http_1_1, cl ["+7"])
+                    ; ("HEAD stream, 18 digits", HEAD, Http_1_1, cl [eighteen])
+                    ; ("HEAD stream, 19 digits", HEAD, Http_1_1, cl [nineteen])
+                    ; ("HEAD stream, empty", HEAD, Http_1_1, cl [""])
+                    ; ( "HEAD sized, length 7"
+                      , HEAD
+                      , Http_1_1
+                      , Response.string
+                          ~headers:(Headers.of_list [("Content-Length", "7")])
+                          "hello" )
+                    ; ("GET stream, length 7", GET, Http_1_1, cl ["7"])
                     ; ("HEAD 304", HEAD, Http_1_1, st 304 (sized "x"))
                     ; ("GET 205 sized", GET, Http_1_1, st 205 (sized "x"))
                     ; ("HEAD 205 sized", HEAD, Http_1_1, st 205 (sized "x"))
@@ -1839,6 +1865,16 @@ let response_framing_tests =
             GET 404 sized              => length 4
             HEAD 200 sized             => length only 5
             HEAD 200 stream            => no body
+            HEAD stream, length 7      => length only 7
+            HEAD stream, 7, 7          => length only 7
+            HEAD stream, 7, 8          => no body
+            HEAD stream, list 7,7      => length only 7
+            HEAD stream, +7            => no body
+            HEAD stream, 18 digits     => length only 111111111111111111
+            HEAD stream, 19 digits     => no body
+            HEAD stream, empty         => no body
+            HEAD sized, length 7       => length only 5
+            GET stream, length 7       => chunked
             HEAD 304                   => no body
             GET 205 sized              => length only 0
             HEAD 205 sized             => length only 0

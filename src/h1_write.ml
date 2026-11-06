@@ -5,6 +5,20 @@ type framing =
   | Chunked
   | Close_delimited
 
+(* The Content-Length of the handler, if each of its values is the same number
+   of 1 to 18 digits. Else [None]. [Headers.tokens] drops the empty elements,
+   thus a value is never empty. *)
+let handler_length headers =
+  let valid s =
+    String.length s <= 18
+    && String.for_all (function '0' .. '9' -> true | _ -> false) s
+  in
+  match Headers.tokens "content-length" headers with
+  | n :: rest when valid n && List.for_all (String.equal n) rest ->
+      Some (int_of_string n)
+  | _ ->
+      None
+
 let framing ~meth ~version r =
   match Response.kind r with
   | Response.Upgrade _ ->
@@ -18,7 +32,19 @@ let framing ~meth ~version r =
            without a framing field to the close. *)
       else if code = 205 then Length_only 0
       else if Method.equal meth Method.HEAD then
-        match Body.length body with Some n -> Length_only n | None -> No_body
+        (* A body with no known length, for example the body of a HEAD response
+           of the client: the Content-Length of the handler, if it is valid. A
+           HEAD response has no body bytes, thus the field cannot change the
+           framing of the connection. *)
+        match Body.length body with
+        | Some n ->
+            Length_only n
+        | None -> (
+          match handler_length (Response.headers r) with
+          | Some n ->
+              Length_only n
+          | None ->
+              No_body )
       else
         match Body.length body with
         | Some n ->

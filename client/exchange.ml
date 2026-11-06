@@ -357,8 +357,15 @@ let run (config : Cfg.t) writers (conn : Conn.t) ~on_release req =
       (* After the release, [finish] does nothing. *)
       let close () = finish ~ended:false ; raise_pending () in
       if fr = No_body || fr = Fixed 0 then finish ~ended:true ;
+      (* A HEAD response has no body bytes, but its Content-Length tells the
+         length of the GET response. Thus its body has no known length, and a
+         server that forwards it sends that Content-Length (Response.make). *)
+      let length =
+        if Method.equal (Request.meth req) Method.HEAD then None
+        else Body.length inner
+      in
       let body =
-        Body.of_source ?length:(Body.length inner)
+        Body.of_source ?length
           ~trailers:(fun () -> Body.trailers inner)
           ~close read
       in

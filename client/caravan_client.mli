@@ -230,7 +230,9 @@ val get : ?headers:Caravan.Headers.t -> t -> string -> Caravan.Response.t
       1 to 65535. *)
 
 val body : Caravan.Response.t -> Caravan.Body.t
-(** [body resp] is the body of [resp]. *)
+(** [body resp] is the body of [resp]. The body of a response to [HEAD] has no
+    bytes and no known length ([Caravan.Body.length] gives [None]): its headers
+    keep the [Content-Length] of the server. *)
 
 (**/**)
 

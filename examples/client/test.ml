@@ -247,28 +247,6 @@ let () =
              equal status Status.ok r.status ;
              equal string "" r.body ;
              equal (option string) (Some "1048576") (header "content-length" r) )
-       ; test "head_length: one value of 1 to 18 digits, else None" (fun () ->
-             let length values =
-               App.head_length
-                 (Headers.of_list
-                    (List.map (fun v -> ("Content-Length", v)) values) )
-             in
-             equal (option int) (Some 5) (length ["5"]) ;
-             equal (option int) (Some 999_999_999_999_999_999)
-               (length [String.make 18 '9']) ;
-             List.iter
-               (fun values ->
-                 equal
-                   ~msg:(String.concat ", " values)
-                   (option int) None (length values) )
-               [ []
-               ; [""]
-               ; ["+5"]
-               ; ["-1"]
-               ; ["0x10"]
-               ; ["1_000"]
-               ; [String.make 19 '9']
-               ; ["5"; "5"] ] )
        ; test "a POST of 1 MiB goes through" (fun () ->
              let data = String.init mib (fun i -> Char.chr (i mod 251)) in
              let r =
