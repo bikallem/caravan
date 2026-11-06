@@ -89,7 +89,12 @@ let resolve host =
     match Dns.resolve host with
     | [] | (exception Net.Error (No_entry, _)) ->
         Error.fail (Connect ("no address for " ^ host))
+    (* The text names the lookup and the host: an error of getaddrinfo, for
+       example EAI_SYSTEM with its errno, tells neither. *)
     | exception Net.Error (e, _) ->
-        Error.fail (Connect (Error.net_text e))
+        Error.fail
+          (Connect
+             ( "the lookup of " ^ String.escaped host ^ " failed: "
+             ^ Error.net_text e ) )
     | addrs ->
         dedup addrs )
