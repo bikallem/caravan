@@ -1286,8 +1286,8 @@ flake.lock pin.
 
 The repository includes a Nix flake. Its dev shell provides OCaml 5.5,
 dune, weft, http-date, windtrap, ppx_windtrap, ocaml-lsp, utop,
-ocamlformat and odoc. `nix build` builds the caravan package (the six
-libraries, with no tests).
+ocamlformat and odoc. `nix build` builds the caravan package (all the
+libraries of the table in [Libraries](#libraries), with no tests).
 
 With [direnv](https://direnv.net) and
 [nix-direnv](https://github.com/nix-community/nix-direnv) installed,
