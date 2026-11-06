@@ -25,20 +25,30 @@ let files =
 
 let file rel = List.assoc rel files
 
-(* The root of the files in the simulator. *)
+(* The root of the files in the simulator. The paths of the simulator have '/'
+   on each OS: Filename uses '\\' on Windows, thus the test does not use it for
+   them. *)
 let root = "/srv/public"
+
+(* [parent path] is the directory of [path], a path of the simulator. *)
+let parent path =
+  match String.rindex_opt path '/' with
+  | Some 0 | None ->
+      "/"
+  | Some i ->
+      String.sub path 0 i
 
 let rec mkdirs dir =
   if dir <> "/" then (
-    mkdirs (Filename.dirname dir) ;
+    mkdirs (parent dir) ;
     try Weft.Dir.mkdir dir with Weft.Dir.Error (Exists, _) -> () )
 
 (* [copy ()] writes [files] under [root], in the simulator. *)
 let copy () =
   List.iter
     (fun (rel, data) ->
-      let path = Filename.concat root rel in
-      mkdirs (Filename.dirname path) ;
+      let path = root ^ "/" ^ rel in
+      mkdirs (parent path) ;
       let f = Weft.File.openfile [Write; Create; Truncate] path in
       Weft.File.write f data ; Weft.File.close f )
     files

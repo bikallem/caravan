@@ -44,10 +44,13 @@
 ; message. With JWKS or JWT_SECRET and no INTERNAL_TOKEN, any text of JWKS or
 ; JWT_SECRET gives this stop. A short INTERNAL_TOKEN also stops main in the
 ; development mode. timeout (of coreutils) stops main after 10 s: thus a
-; regression that starts the server cannot hang the build.
+; regression that starts the server cannot hang the build. The rule runs a
+; POSIX shell script, thus not on Windows, where (system) uses cmd.exe.
 
 (rule
  (alias runtest)
+ (enabled_if
+  (<> %{os_type} Win32))
  (action
   (system
    "stops() {\nwant=$1\nshift\nout=$(env -u INTERNAL_TOKEN -u JWKS -u JWT_SECRET \"$@\" timeout 10 %{exe:main.exe} 2>&1)\ncode=$?\ntest $code = 2 && test \"$out\" = \"$want\" && return\necho \"main with $*: exit code $code: $out\"\nexit 1\n}\nmissing='JWKS or JWT_SECRET is set, thus INTERNAL_TOKEN must be set too.'\nshort='INTERNAL_TOKEN must have 32 bytes or more.'\nstops \"$missing\" JWKS=x\nstops \"$missing\" JWT_SECRET=x\nstops \"$short\" JWKS=x INTERNAL_TOKEN=short\nstops \"$short\" INTERNAL_TOKEN=short\n")))

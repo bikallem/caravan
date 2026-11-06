@@ -333,6 +333,9 @@ let server_tests =
             ; {|Sys_error("Broken pipe")|} ]
             names )
     ; test "the default on_error ignores a broken stderr" (fun () ->
+          (* Windows has no SIGPIPE, and a write to a pipe with no reader gives
+             EPIPE there with no signal. *)
+          if Sys.win32 then skip ~reason:"no SIGPIPE on Windows" () ;
           let handler _ = failwith "handler" in
           let served =
             with_broken_stderr
