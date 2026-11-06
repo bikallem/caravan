@@ -1,0 +1,20 @@
+(library
+ (name example_websocket)
+ (modules app)
+ (libraries caravan caravan.websocket caravan.middleware caravan.html weft))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries example_websocket example_common))
+
+(test
+ (name test)
+ (modules test)
+ (libraries
+  example_websocket
+  example_support
+  caravan
+  caravan.testing
+  weft
+  windtrap))
