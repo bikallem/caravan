@@ -1,7 +1,7 @@
 # caravan
 
 A web programming library for OCaml 5, built on
-[weft](https://github.com/bikallem/weft). caravan has an HTTP/1.1
+[weft](https://github.com/ocaml-caravanserai/weft). caravan has an HTTP/1.1
 server, client and WebSocket, and on top of them a framework layer
 similar to ASP.NET Core: routing, middleware, sessions, authentication,
 compression, static files and TLS. weft is a concurrency library with
@@ -74,8 +74,13 @@ them.
 | `caravan.static` | Static files with ETag, conditional requests and ranges | |
 | `caravan.html` | HTML elements and attributes, with escaping and URL checks | |
 | `caravan.jobs` | Background jobs in the process, with retries, that stop with the server. Durable jobs in a store of the application, unique jobs, schedules (`every`, `cron`) and recurring jobs | |
-| `caravan.tls` | The TLS server, with ALPN, and HTTPS for the client | tls, x509, domain-name, ipaddr, mirage-crypto-rng |
+| `caravan.tls` | The TLS server, with ALPN, and HTTPS for the client | weft-tls, tls, x509, domain-name, ipaddr, mirage-crypto-rng |
 | `caravan.testing` | A test host: it runs a handler stack and the client in the weft simulator, with no sockets | |
+
+The byte streams come from weft. `Caravan.Flow` is `Weft_flow.Flow` of
+the library `weft.flow`, with `Flow.linger`, and `Caravan.Tcp` is
+`Weft_flow.Tcp`. The TLS flow of `caravan.tls` is that of the package
+`weft-tls` (`Weft_tls`).
 
 caravan and weft are not on opam. Get them from their repositories, or
 use the package `caravan` of the Nix flake, which has all the optional
@@ -1072,8 +1077,10 @@ let () =
 - `Caravan_tls.https` gives HTTPS to `caravan.client` (see
   [Client](#client)).
 - `Caravan_tls.server` and `Caravan_tls.client` do a handshake on any
-  `Caravan.Flow.t`, for example for a test or a proxy. The client checks
-  the `peer_name` of its `Tls.Config`: give one for each server on the
+  `Caravan.Flow.t`, for example for a test or a proxy. They are
+  `Weft_tls.server` and `Weft_tls.client` of the package `weft-tls`,
+  whose doc gives the rules of the TLS flow. The client checks the
+  `peer_name` of its `Tls.Config`: give one for each server on the
   Internet.
 - A handshake can read at most 64 KiB. A session permits 64 small
   records with no plaintext (for example a KeyUpdate), and one more for
@@ -1373,7 +1380,9 @@ let () =
 ## Requirements
 
 - OCaml >= 5.5.0
-- [weft](https://github.com/bikallem/weft) (not on opam)
+- [weft](https://github.com/ocaml-caravanserai/weft) (not on opam),
+  with the library `weft.flow`, and the package `weft-tls` for
+  `caravan.tls`
 - [http-date](https://ocaml.org/p/http-date/latest) >= 0.2
 - dune >= 3.20
 - For tests: windtrap and ppx_windtrap >= 0.2.0, from the fork
