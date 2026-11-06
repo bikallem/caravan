@@ -25,6 +25,11 @@ val protocol : t -> string option
    waits to go), or [c] is closed. *)
 val is_closing : t -> bool
 
+(* [is_own_closed c e] is [true] if [e] is a [Closed] exception that [c] raised.
+   A [Closed] of a different connection gives [false], also with the same code
+   and reason. *)
+val is_own_closed : t -> exn -> bool
+
 val recv : t -> message
 
 val send : t -> message -> unit

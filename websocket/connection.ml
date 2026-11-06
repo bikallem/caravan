@@ -97,16 +97,29 @@ let make ?protocol ?(max_message = 8 * 1024 * 1024) ?(close_timeout = Span.s 5)
   self := Some t ;
   t
 
+(* [Sys.opaque_identity] stops a compiler that inlines a constant code and
+   reason from making one static [Closed] value for all connections: then the
+   physical compare of [is_own_closed] would fail. *)
+let closed_exn code reason = Closed {code= Sys.opaque_identity code; reason}
+
 let is_closing t =
   Atomic.get t.closing <> None || Option.is_some (Ivar.peek t.closed)
 
 let check_closed t = Option.iter raise (Ivar.peek t.closed)
 
+(* The connection raises only two [Closed] values: the exception of [closing]
+   and that of [closed]. Thus a physical compare tells the [Closed] of [t] from
+   that of a different connection, also with the same code and reason. Each of
+   these values comes from [closed_exn]: a new block for each connection. *)
+let is_own_closed t e =
+  (match Atomic.get t.closing with Some x -> x == e | None -> false)
+  || match Ivar.peek t.closed with Some x -> x == e | None -> false
+
 (* If the connection is open, this function keeps [code] and [reason] as its
    [Closed] exception. Then it closes the flow and gives the exception that the
    connection keeps. *)
 let shut t code reason =
-  ignore (Ivar.try_fill t.closed (Closed {code; reason})) ;
+  ignore (Ivar.try_fill t.closed (closed_exn code reason)) ;
   Flow.close t.flow ;
   Option.get (Ivar.peek t.closed)
 
@@ -179,7 +192,7 @@ let linger t =
    we linger first. An idle peer leaves no unread input, thus an idle timeout
    does not linger. *)
 let fail ?(discard = true) t code reason =
-  if claim_close t (Closed {code; reason}) then
+  if claim_close t (closed_exn code reason) then
     (* A cancel in the wait to write or in the linger closes the connection
        too. *)
     Fun.protect
@@ -208,7 +221,7 @@ let peer_closed t payload =
         (code, reason)
   in
   let echo = String.sub payload 0 (Int.min 2 (String.length payload)) in
-  if claim_close t (Closed {code; reason}) then
+  if claim_close t (closed_exn code reason) then
     (* A cancel in the wait to write closes the connection too. *)
     Fun.protect
       ~finally:(fun () -> ignore (shut t code reason))
@@ -381,7 +394,7 @@ let close ?(code = 1000) ?(reason = "") t =
     (* Also if a different fiber started the close, for example to reply to the
        peer: we wait at most the close timeout. *)
     set_close_deadline t ;
-    if claim_close t (Closed {code; reason}) then
+    if claim_close t (closed_exn code reason) then
       write_close t (code_payload code ^ reason)
   end ;
   wait_closed t

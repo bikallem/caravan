@@ -62,9 +62,9 @@ let is_key key =
 (* Runs [f] on the connection. If [f] ends, we close the connection. If [f]
    raises, we close with 1011 and give the exception to the server. If the
    server cancels us, we do not close. A [Closed] is not an exception of [f]
-   only if our connection closes: else it comes from a different connection.
-   When [stopping] is ready, we close with 1001 (RFC 6455 §7.4.1: an endpoint
-   that goes away).
+   only if our connection raised it: else it comes from a different connection,
+   also when our connection closes at the same time. When [stopping] is ready,
+   we close with 1001 (RFC 6455 §7.4.1: an endpoint that goes away).
 
    The watch of [stopping] is a daemon of a local scope: the scope cancels it
    when [f] and the close end. A fork into the new scope raises [Scope_closed]
@@ -94,7 +94,7 @@ let run ?(stopping = Weft.never) ?protocol ?max_message ?close_timeout
          sends no second Close frame. Thus the end of [f] does not stop the
          handshake. *)
       Connection.close c
-  | exception Closed _ when Connection.is_closing c ->
+  | exception (Closed _ as e) when Connection.is_own_closed c e ->
       Connection.close c
   | exception e ->
       (* [Cancel.is_own] raises inside: take the backtrace first. *)

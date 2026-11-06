@@ -1698,6 +1698,25 @@ let server_handler req =
             Ws.Private.of_flow (Flow.of_string input (Buffer.create 16))
           in
           ignore (Ws.recv other) )
+  | "/other_late" ->
+      (* The peer closes, then the handler raises a Closed of a different
+         connection: our connection closes at that time, but the Closed is not
+         ours, also with the same code and reason. *)
+      Ws.accept req (fun c ->
+          (try ignore (Ws.recv c) with Ws.Closed _ -> ()) ;
+          let input = client Close (code_reason 1000 "bye") in
+          let other =
+            Ws.Private.of_flow (Flow.of_string input (Buffer.create 16))
+          in
+          ignore (Ws.recv other) )
+  | "/send_loop" ->
+      (* Sends until the stop: then send raises the Closed of our connection,
+         and the handler raises it again. *)
+      Ws.accept req (fun c ->
+          while true do
+            Ws.send c (Text "x") ;
+            Time.sleep Mono (Span.ms 10)
+          done )
   | "/child" ->
       (* The await of a cancelled child is not a stop of the server. *)
       Ws.accept req (fun _ ->
@@ -1880,6 +1899,45 @@ let server_tests =
             close 1011
             |} ;
           equal int 1 (List.length errors) )
+    ; test
+        "a Closed of a different connection, while our connection closes: the \
+         server reports it" (fun () ->
+          let errors = ref [] in
+          let s =
+            Sim_support.run (fun _ ->
+                with_server ~config:(config_with errors) ~handler:server_handler
+                  (fun server ->
+                    session server "/other_late" ~reply:false
+                      ~after:(client Close (code_reason 1000 "bye")) ) )
+          in
+          expect s
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 101 Switching Protocols
+            Upgrade: websocket
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+            Connection: Upgrade
+            --
+            close 1000
+            |} ;
+          equal (list string)
+            ["Caravan_websocket__Connection.Closed(1000, \"bye\")"]
+            (List.rev !errors) )
+    ; test
+        "a handler that raises the Closed of its connection at a stop: no error"
+        (fun () ->
+          let errors = ref [] in
+          let config = {(config_with errors) with shutdown_grace= Span.s 30} in
+          let s =
+            Sim_support.run (fun _ ->
+                with_server ~config ~handler:server_handler (fun server ->
+                    session server "/send_loop" ~during:(fun () ->
+                        Time.sleep Mono (Span.ms 25) ;
+                        Caravan.Server.shutdown server ) ) )
+          in
+          is_true ~msg:s
+            (String.ends_with ~suffix:"close 1001 \"server shutdown\"" s) ;
+          equal (list string) [] !errors )
     ; test "a peer that leaves without a Close frame is not an error" (fun () ->
           let errors = ref [] in
           recorded := Ivar.create () ;
@@ -2723,8 +2781,7 @@ let time_tests =
                   ~close_timeout:(Span.s 37)
                   (fun c ->
                     Ivar.fill conn c ;
-                    sync (Ivar.read go) ;
-                    raise (Ws.Closed {code= 1001; reason= "server shutdown"}) )
+                    sync (Ivar.read go) )
                   server )
           in
           let c = sync (Ivar.read conn) in

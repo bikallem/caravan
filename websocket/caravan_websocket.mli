@@ -74,12 +74,14 @@ val accept :
     The time limits are on the monotonic clock of the world ([Weft.Time] on the
     line [Mono]). In [Weft_sim], this clock is the virtual clock.
 
-    When [f] ends, [accept] closes the connection with 1000. If [f] raises
-    {!Closed} for its connection, the connection is closed already. If [f]
-    raises a different exception, [accept] closes the connection with 1011 and
-    gives the exception to the server, which reports it. A {!Closed} of a
-    different connection, for example a different client, is such an exception.
-    [accept] does not accept extensions.
+    When [f] ends, [accept] closes the connection with 1000. If [f] raises the
+    {!Closed} exception that its connection raised, the connection is closed
+    already. If [f] raises a different exception, [accept] closes the connection
+    with 1011 and gives the exception to the server, which reports it. These are
+    such exceptions: a {!Closed} of a different connection (for example a
+    different client), also with the same code and reason, and a new {!Closed}
+    value that [f] makes. The compare is of the exception value, not of its code
+    and reason. [accept] does not accept extensions.
 
     A [Weft.Promise.Cancelled] from a promise of [f] is an exception of [f]. A
     [Weft.Fiber.Cancelled] that does not come from a cancel of the handler goes
