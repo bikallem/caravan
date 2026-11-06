@@ -77,11 +77,15 @@
 
 ; The numeric parser of Resolver against inet_pton, through
 ; Unix.inet_addr_of_string. It is a suite of its own, so that the suites on the
-; simulator do not call this parser of Unix.
+; simulator do not call this parser of Unix. It runs only on Linux: the
+; inet_pton of glibc refuses a 0 before a digit in an IPv4 part, as Resolver
+; does (RFC 3986 dec-octet), but that of macOS accepts 01.2.3.4 (CI, 2026-11).
 
 (test
  (name test_numeric_unix)
  (modules test_numeric_unix)
+ (enabled_if
+  (= %{system} linux))
  (libraries caravan.client numeric_hosts windtrap unix))
 
 ; The helpers of the caravan tests on the simulator: the core helpers and the
