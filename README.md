@@ -1420,6 +1420,10 @@ The suites of test/ run in the simulator of weft, thus they use no real
 time and no real network. The suite of test/linux runs on Linux in the
 OS world of weft, with real sockets, signals and child processes.
 
+The CI (.github/workflows/ci.yml) runs `dune build`, `dune build @fmt`
+and `dune runtest` in the dev shell on Linux and macOS, and `nix build`
+on Linux, for each push to main and each pull request.
+
 The programs of the examples use `Weft_os`, but we run them only on
 Linux. Their tests run in the simulator, as the suites of test/ do. Try
 the example server, and stop it with Ctrl-C:

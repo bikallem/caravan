@@ -1,0 +1,47 @@
+# The tests on each push to main and on each pull request. The tools come from
+# the dev shell of flake.nix, as on a local machine.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A status line for each test, and a limit for each test: a test that hangs
+# fails with its name.
+env:
+  WINDTRAP_VERBOSE: "1"
+  WINDTRAP_TIMEOUT: "120"
+
+jobs:
+  # Linux also runs the suite of test/linux (real sockets, signals and child
+  # processes). The two systems run the suites of the simulator and the tests
+  # of the examples.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Build
+        run: nix develop -c dune build
+      # The result does not depend on the system.
+      - name: Format
+        if: runner.os == 'Linux'
+        run: nix develop -c dune build @fmt
+      - name: Test
+        run: nix develop -c dune runtest --force
+
+  # The package of the flake: the libraries with no tests, as a user gets them.
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Build the package
+        run: nix build -L
