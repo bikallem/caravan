@@ -1,0 +1,21 @@
+(library
+ (name example_hello)
+ (modules app)
+ (libraries caravan weft))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries example_hello example_common))
+
+(test
+ (name test)
+ (modules test)
+ (libraries
+  example_hello
+  caravan
+  caravan.client
+  caravan.testing
+  weft
+  weft.sim
+  windtrap))
