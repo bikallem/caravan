@@ -1,0 +1,21 @@
+(library
+ (name example_durable_jobs)
+ (modules store app)
+ (libraries caravan caravan.jobs caravan.middleware weft))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries example_durable_jobs example_common caravan.jobs))
+
+(test
+ (name test)
+ (modules test)
+ (libraries
+  example_durable_jobs
+  caravan
+  caravan.jobs
+  caravan.testing
+  weft
+  weft.sim
+  windtrap))
