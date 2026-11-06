@@ -1,0 +1,23 @@
+(library
+ (name example_compress)
+ (modules app)
+ (libraries caravan caravan.router caravan.middleware caravan.compress))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries example_compress example_common))
+
+; The test makes and decodes gzip bodies with decompress, as gzip and curl
+; --compressed do.
+
+(test
+ (name test)
+ (modules test)
+ (libraries
+  example_compress
+  caravan
+  caravan.testing
+  windtrap
+  decompress.de
+  decompress.gz))
