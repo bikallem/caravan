@@ -1,0 +1,20 @@
+(library
+ (name example_proxy_headers)
+ (modules app)
+ (libraries caravan caravan.middleware weft))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries example_proxy_headers caravan.middleware example_common))
+
+(test
+ (name test)
+ (modules test)
+ (libraries
+  example_proxy_headers
+  caravan
+  caravan.middleware
+  caravan.testing
+  weft
+  windtrap))
