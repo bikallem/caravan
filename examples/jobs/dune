@@ -1,0 +1,14 @@
+(library
+ (name example_jobs)
+ (modules app)
+ (libraries caravan caravan.jobs weft))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries example_jobs example_common caravan.jobs))
+
+(test
+ (name test)
+ (modules test)
+ (libraries example_jobs caravan caravan.jobs caravan.testing weft windtrap))
