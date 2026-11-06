@@ -1,0 +1,14 @@
+(library
+ (name example_middleware)
+ (modules app)
+ (libraries caravan))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries example_middleware example_common))
+
+(test
+ (name test)
+ (modules test)
+ (libraries example_middleware caravan caravan.testing windtrap))
