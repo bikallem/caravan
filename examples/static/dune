@@ -1,0 +1,25 @@
+(library
+ (name example_static)
+ (modules app)
+ (libraries caravan caravan.router caravan.static))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries example_static example_common))
+
+; The test copies the files of public/ into the file system of the simulator.
+
+(test
+ (name test)
+ (modules test)
+ (deps
+  (source_tree public))
+ (libraries
+  example_static
+  caravan
+  caravan.testing
+  unix
+  weft
+  weft.os
+  windtrap))
