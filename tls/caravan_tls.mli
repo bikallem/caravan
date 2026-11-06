@@ -27,58 +27,29 @@
 
     {1:flow The TLS flow}
 
-    {!server} and {!client} give a {!Caravan.Flow.t}. A read and a write can run
-    at the same time in two fibers, as the flow contract permits. A reader never
-    waits for a TCP write: it waits for a writer only while the writer encrypts
-    one record. Thus [Caravan.Flow.read_now] never waits for input, but it can
-    wait for the lock of the session, and a cancel can come in it. A response of
-    the session to the peer, for example a TLS 1.3 KeyUpdate, goes out before
-    the next write.
+    The TLS flow is that of the library [weft-tls]: {!server}, {!client} and
+    {!Handshake_error} are [Weft_tls.server], [Weft_tls.client] and
+    [Weft_tls.Handshake_error]. The doc of [Weft_tls] gives the rules of the
+    flow (concurrent reads and writes, the failures, [close_notify], the budget
+    of records with no plaintext) and of the handshake. *)
 
-    After the handshake:
-    - A TLS failure of the peer (for example a bad record or an alert) makes a
-      read or a write raise [Caravan.Flow.Closed], after the plaintext that came
-      before it. The flow sends no alert.
-    - The end of the TCP stream with no [close_notify] makes a read raise
-      [Caravan.Flow.Closed]: it can be a truncation. A [close_notify] of the
-      peer gives the end of the stream (a read gives 0).
-    - A session permits 64 small records with no plaintext (for example
-      KeyUpdate messages), and one more for each 16 KiB of plaintext. A record
-      with no plaintext costs one more for each KiB of its size. More fail the
-      flow: ocaml-tls 2.1.3 keeps memory for each KeyUpdate, and for a part of a
-      handshake message.
-    - After a [close_notify] of the peer, the flow ignores the records that
-      follow it.
-    - [Caravan.Flow.shutdown_send] sends [close_notify], then the end of the TCP
-      stream. [Caravan.Flow.close] sends nothing: it never waits.
-    - A write that raises, also for a cancel, can send a part of a record. Then
-      the flow is failed, and each later write raises [Caravan.Flow.Closed]. *)
-
-(** A failure of the handshake: a TLS alert, a bad message, a failed check of a
-    certificate, a handshake of more than 64 KiB, the end of the connection, or
-    too many records with no plaintext in the same read as the end of the
-    handshake (see {!flow}). The text tells the cause. *)
+(** A failure of the handshake: [Weft_tls.Handshake_error]. The text tells the
+    cause. *)
 exception Handshake_error of string
 
 val server :
   Tls.Config.server -> Caravan.Flow.t -> Caravan.Flow.t * Tls.Core.epoch_data
-(** [server config flow] does the handshake of a server on [flow], and gives the
-    TLS flow and the data of the session, for example its ALPN protocol. The
-    read deadlines and timeouts of [flow] apply to the handshake.
-
-    @raise Handshake_error
-      if the handshake fails. For a failure of TLS, the alert goes to the peer
-      if the connection is open.
-    @raise Caravan.Flow.Closed
-    @raise Caravan.Flow.Timeout as a read or a write of [flow]. *)
+(** [server config flow] is [Weft_tls.server config flow]: the handshake of a
+    server on [flow], then the TLS flow and the data of the session, for example
+    its ALPN protocol. *)
 
 val client :
   Tls.Config.client -> Caravan.Flow.t -> Caravan.Flow.t * Tls.Core.epoch_data
-(** [client config flow] does the handshake of a client on [flow], as {!server}.
-    The authenticator of [config] checks the certificate of the server, and the
-    name [peer_name] of [config] (see [Tls.Config.client] and
-    [Tls.Config.peer]). Without a peer name, the authenticator checks no name:
-    give one for each server on the Internet. *)
+(** [client config flow] is [Weft_tls.client config flow]: the handshake of a
+    client on [flow]. The authenticator of [config] checks the certificate of
+    the server, and the name [peer_name] or the address [ip] of [config].
+    Without one of them, the authenticator checks no name: give one for each
+    server on the Internet. *)
 
 val https :
      Tls.Config.client
@@ -136,7 +107,7 @@ val engine : Tls.Config.server -> Caravan.Engine.t -> Caravan.Engine.t
       fails or that ends early closes the connection, and the server reports
       nothing: a client can cause each of these failures.
     - After [inner] returns, the engine sends [close_notify] if [inner] did not,
-      with the deadline [linger_timeout].
+      then the end of the TCP stream, with the deadline [linger_timeout].
 
     @raise Invalid_argument
       if the ALPN list of [config] has a protocol other than ["http/1.1"]
@@ -160,4 +131,13 @@ module Private : sig
     -> (Caravan.Flow.t, string) result
   (* [https_with ~client config] is [https config] with the handshake [client],
      for a test. *)
+
+  val guard :
+       Caravan.Flow.t
+    -> handshake:bool ref
+    -> (bytes -> int -> int -> int)
+    -> Caravan.Flow.t
+  (* [guard tcp ~handshake read] is the base flow of the handshake of [engine]:
+     [tcp], with the reads of [read] while [!handshake]. Each other function
+     goes to [tcp]. For a test. *)
 end
