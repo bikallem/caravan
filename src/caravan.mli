@@ -21,7 +21,13 @@ module Handler = Handler
 
 (** {1:transport Transport} *)
 
-module Tcp = Tcp
+(** The TCP and Unix flows and listeners: [Weft_flow.Tcp] of the library
+    [weft.flow]. Two differences from the [Tcp] of caravan before:
+    [Listener.listen] without [~backlog] uses the default backlog of
+    [Weft.Net.listen], and [connect] has the option [?keep_alive]. The server
+    always gives the backlog of its {!Config}. *)
+module Tcp = Weft_flow.Tcp
+
 module Config = Config
 module Engine = Engine
 module Server = Server

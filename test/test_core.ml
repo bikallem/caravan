@@ -438,15 +438,6 @@ let date_tests =
 
 let read_all = Server_support.read_all
 
-(* [readable_before_20ms flow] is [true] if [readable flow] is ready before 20
-   ms of virtual time. *)
-let readable_before_20ms flow =
-  Weft.(
-    sync
-      (choose
-         [ wrap (Flow.readable flow) (fun () -> true)
-         ; wrap (Time.after Mono (Span.ms 20)) (fun () -> false) ] ) )
-
 (* A flow for the tests of [Flow]. Each function that the test does not give
    does nothing: a read gives 0 (the end of the stream), and [readable] is ready
    at once. *)
@@ -487,73 +478,7 @@ let logged_flow ?(input = ref "") ?read_error log =
 
 let flow_tests =
   group "Flow"
-    [ test "of_string reads the input, then 0 for good" (fun () ->
-          let flow = Flow.of_string "hello" (Buffer.create 0) in
-          equal string "hello" (read_all flow) ;
-          equal int 0 (Flow.read flow (Bytes.create 4) 0 4) )
-    ; test "chunk caps each read" (fun () ->
-          let flow = Flow.of_string ~chunk:2 "hello" (Buffer.create 0) in
-          let buf = Bytes.create 8 in
-          equal (list int) [2; 2; 1; 0]
-            (List.init 4 (fun _ -> Flow.read flow buf 0 8)) )
-    ; test "writes append to the output" (fun () ->
-          let out = Buffer.create 16 in
-          let flow = Flow.of_string "" out in
-          Flow.write flow (Bytes.of_string "xxabcxx") 2 3 ;
-          Flow.write_string flow "def" ;
-          Flow.write flow (Bytes.of_string "z") 0 0 ;
-          equal string "abcdef" (Buffer.contents out) )
-    ; test "invalid ranges are rejected" (fun () ->
-          let flow = Flow.of_string "abc" (Buffer.create 0) in
-          let buf = Bytes.create 4 in
-          List.iter
-            (fun (off, len) ->
-              raises_match is_invalid_arg (fun () -> Flow.read flow buf off len) )
-            [(0, 0); (-1, 2); (0, 5); (3, 2)] ;
-          raises_match is_invalid_arg (fun () -> Flow.write flow buf 2 3) ;
-          raises_match is_invalid_arg (fun () ->
-              Flow.of_string ~chunk:0 "" (Buffer.create 0) ) )
-    ; test "read_now reads what is there without blocking" (fun () ->
-          let buf = Bytes.create 4 in
-          let f = Flow.of_string ~chunk:2 "abc" (Buffer.create 0) in
-          equal
-            (list (option int))
-            [Some 2; Some 1; Some 0]
-            (List.init 3 (fun _ -> Flow.read_now f buf 0 4)) ;
-          let nothing =
-            fake_flow
-              ~read:(fun _ _ _ -> failwith "blocking read")
-              ~read_now:(fun _ _ _ -> None)
-              ~readable:Weft.never ()
-          in
-          let p = Flow.prepend "x" nothing in
-          equal
-            (list (option int))
-            [Some 1; None]
-            (List.init 2 (fun _ -> Flow.read_now p buf 0 4)) ;
-          List.iter
-            (fun (off, len) ->
-              raises_match is_invalid_arg (fun () ->
-                  Flow.read_now f buf off len ) )
-            [(0, 0); (-1, 2); (3, 2)] ;
-          Flow.close f ;
-          raises Flow.Closed (fun () -> Flow.read_now f buf 0 1) )
-    ; test "reset closes once, abortively, and close falls back to it"
-        (fun () ->
-          let log = ref [] in
-          let flow ?reset () =
-            fake_flow ~close:(fun () -> log := "close" :: !log) ?reset ()
-          in
-          let f = flow ~reset:(fun () -> log := "reset" :: !log) () in
-          Flow.reset f ;
-          Flow.reset f ;
-          Flow.close f ;
-          equal (list string) ["reset"] !log ;
-          raises Flow.Closed (fun () -> Flow.read f (Bytes.create 1) 0 1) ;
-          log := [] ;
-          Flow.reset (flow ()) ;
-          equal (list string) ~msg:"without reset, close" ["close"] !log )
-    ; test "linger sends the end of the stream, then discards at most max bytes"
+    [ test "linger sends the end of the stream, then discards at most max bytes"
         (fun () ->
           let log = ref [] and input = ref "abcdef" in
           let flow ?read_error () = logged_flow ~input ?read_error log in
@@ -588,133 +513,20 @@ let flow_tests =
           equal int 1 !closes ;
           raises Flow.Closed (fun () -> Flow.read flow (Bytes.create 1) 0 1) ;
           raises Flow.Closed (fun () -> Flow.write_string flow "x") )
-    ; test "write rejects an invalid range before the write of the flow"
-        (fun () ->
-          let writes = ref 0 in
-          let flow = fake_flow ~write:(fun _ _ _ -> incr writes) () in
-          let buf = Bytes.create 4 in
-          List.iter
-            (fun (off, len) ->
-              raises_match is_invalid_arg (fun () ->
-                  Flow.write flow buf off len ) )
-            [(-1, 2); (0, 5); (3, 2); (2, -1)] ;
-          equal int ~msg:"no write of the flow" 0 !writes )
-    ; test "make delegates to its functions" (fun () ->
-          let log = ref [] in
-          let note s = log := s :: !log in
-          let flow =
-            Flow.make
-              ~read:(fun buf off _ -> note "read" ; Bytes.set buf off 'a' ; 1)
-              ~read_now:(fun _ _ _ -> note "read_now" ; None)
-              ~write:(fun _ _ len -> note (Printf.sprintf "write %d" len))
-              ~readable:(Weft.always ())
-              ~shutdown_send:(fun () -> note "shutdown")
-              ~close:(fun () -> note "close")
-              ~set_read_deadline:(fun d ->
-                note (if d = None then "rd none" else "rd") )
-              ~set_write_deadline:(fun d ->
-                note (if d = None then "wd none" else "wd") )
-              ~set_read_timeout:(fun d -> note (timeout_text "rt" d))
-              ~set_write_timeout:(fun d -> note (timeout_text "wt" d))
-              ()
-          in
-          equal int 1 (Flow.read flow (Bytes.create 1) 0 1) ;
-          equal (option int) None (Flow.read_now flow (Bytes.create 1) 0 1) ;
-          Flow.write_string flow "abc" ;
-          Flow.write_string flow "" ;
-          Flow.shutdown_send flow ;
-          Flow.set_read_deadline flow None ;
-          Flow.set_write_deadline flow None ;
-          Flow.set_read_timeout flow (Some (Weft.Span.s 5)) ;
-          Flow.set_write_timeout flow (Some (Weft.Span.ms 7)) ;
-          Flow.set_read_timeout flow None ;
-          Flow.set_write_timeout flow None ;
-          Flow.close flow ;
-          equal (list string)
-            [ "read"
-            ; "read_now"
-            ; "write 3"
-            ; "shutdown"
-            ; "rd none"
-            ; "wd none"
-            ; "rt 5000000000ns"
-            ; "wt 7000000ns"
-            ; "rt none"
-            ; "wt none"
-            ; "close" ]
-            (List.rev !log) )
-    ; test "prepend reads its bytes first" (fun () ->
-          let out = Buffer.create 8 in
-          let flow =
-            Flow.prepend "ab" (Flow.prepend "" (Flow.of_string "cd" out))
-          in
-          equal string "abcd" (read_all ~size:3 flow) ;
-          Flow.write_string flow "w" ;
-          equal string "w" (Buffer.contents out) ;
-          equal string "xyz"
-            (read_all
-               (Flow.prepend "x" (Flow.prepend "y" (Flow.of_string "z" out))) ) )
-    ; test "prepend passes shutdown and close to the flow" (fun () ->
-          let log = ref [] in
-          let flow =
-            fake_flow
-              ~shutdown_send:(fun () -> log := "shutdown" :: !log)
-              ~close:(fun () -> log := "close" :: !log)
-              ()
-          in
-          let p = Flow.prepend "x" flow in
-          Flow.shutdown_send p ;
-          Flow.close p ;
-          equal (list string) ["shutdown"; "close"] (List.rev !log) ;
-          let f = Flow.of_string "" (Buffer.create 0) in
-          let now = Sim_support.run (fun _ -> Weft.Time.now Mono) in
-          Flow.set_read_deadline f (Some now) ;
-          Flow.set_write_deadline f None ;
-          Flow.shutdown_send f ;
-          equal int 0 (Flow.read f (Bytes.create 1) 0 1) )
-    ; test "prepend gives the timeouts to the flow" (fun () ->
-          let log = ref [] in
-          let p = Flow.prepend "x" (logged_flow log) in
-          Flow.set_read_timeout p (Some (Weft.Span.s 1)) ;
-          Flow.set_write_timeout p (Some (Weft.Span.s 2)) ;
-          equal (list string)
-            ["rt 1000000000ns"; "wt 2000000000ns"]
-            (List.rev !log) )
-    ; test "prepend is readable while its bytes remain" (fun () ->
-          let flow = Flow.prepend "a" (fake_flow ~readable:Weft.never ()) in
-          Sim_support.manual
-          @@ fun sim ->
-          Weft.Fiber.scope
-          @@ fun s ->
-          let c = Sim_support.call s (fun () -> readable_before_20ms flow) in
-          is_true ~msg:"ready at once before the prefix is read"
-            (Sim_support.ended sim c && Sim_support.await c) ;
-          equal int 1 (Flow.read flow (Bytes.create 4) 0 4) ;
-          let t0 = Weft.(Time.now Mono) in
-          let c = Sim_support.call s (fun () -> readable_before_20ms flow) in
-          equal bool ~msg:"waits for the inner flow after" false
-            (Sim_support.ends_at sim ~t0 (Weft.Span.ms 20) c) )
-    ; prop "reads return the input however it is split"
-        Gen.(
-          pair
-            (pair string (int_range 0 64))
-            (pair (int_range 1 9) (int_range 1 9)) )
-        (fun ((input, cut), (chunk, size)) ->
-          let cut = Int.min cut (String.length input) in
-          let flow =
-            Flow.prepend (String.sub input 0 cut)
-              (Flow.of_string ~chunk
-                 (String.sub input cut (String.length input - cut))
-                 (Buffer.create 0) )
-          in
-          equal string input (read_all ~size flow) ) ]
+    ; test "Caravan.Flow and Caravan.Tcp are those of weft.flow" (fun () ->
+          (* The two coercions compile only if the types are equal. *)
+          let flow : Weft_flow.Flow.t = Flow.of_string "x" (Buffer.create 0) in
+          let _ : Tcp.Listener.t -> Weft_flow.Tcp.Listener.t = Fun.id in
+          equal string "x" (read_all flow) ;
+          raises Weft_flow.Flow.Closed (fun () -> raise Flow.Closed) ;
+          raises Weft_flow.Flow.Timeout (fun () -> raise Flow.Timeout) ) ]
 
 (* Deadline *)
 
 module Deadline = Private.Deadline
 
 (* [same a b] is [true] iff the two deadlines are the same time, or are both
-   [None]. It does not use [Deadline.equal], which a test examines. *)
+   [None]. *)
 let same a b =
   match (a, b) with
   | None, None ->
@@ -758,27 +570,6 @@ let deadline_tests =
           advance sim (Span.s 1) ;
           is_true ~msg:"after the deadline" (Deadline.has_passed d) ;
           is_false ~msg:"no deadline" (Deadline.has_passed None) )
-    ; test "equal compares the times" (fun () ->
-          manual
-          @@ fun _ ->
-          let t0 = Time.now Mono in
-          let t1 = t0 +: Span.ns 1 in
-          is_true (Deadline.equal None None) ;
-          is_true (Deadline.equal (Some t1) (Some (t0 +: Span.ns 1))) ;
-          is_false (Deadline.equal (Some t0) (Some t1)) ;
-          is_false (Deadline.equal (Some t1) (Some t0)) ;
-          is_false (Deadline.equal None (Some t0)) ;
-          is_false (Deadline.equal (Some t0) None) )
-    ; test "earlier gives the earlier time, and None is the latest" (fun () ->
-          manual
-          @@ fun _ ->
-          let t0 = Time.now Mono in
-          let t1 = t0 +: Span.ns 1 in
-          equal deadline (Some t0) (Deadline.earlier (Some t0) (Some t1)) ;
-          equal deadline (Some t0) (Deadline.earlier (Some t1) (Some t0)) ;
-          equal deadline (Some t1) (Deadline.earlier None (Some t1)) ;
-          equal deadline (Some t1) (Deadline.earlier (Some t1) None) ;
-          equal deadline None (Deadline.earlier None None) )
     ; test "at is ready at its deadline, and never for None" (fun () ->
           manual
           @@ fun sim ->

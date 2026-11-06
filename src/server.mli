@@ -19,9 +19,9 @@ val http1 : Engine.t
 val start :
   ?config:Config.t -> ?engine:Engine.t -> Weft.Fiber.scope -> Handler.t -> t
 (** [start ~config ~engine sw handler] listens on [config.addr] with
-    {!Tcp.Listener} (default {!Config.default}) and serves connections with
-    [engine] (default HTTP/1.1). It calls [handler] for each request. At most
-    [config.max_connections] connections are served at the same time.
+    {!Weft_flow.Tcp.Listener} (default {!Config.default}) and serves connections
+    with [engine] (default HTTP/1.1). It calls [handler] for each request. At
+    most [config.max_connections] connections are served at the same time.
 
     The server runs in a new fiber of [sw]. Thus [Fiber.scope] of [sw] returns
     only after the server stopped: call {!shutdown} or {!abort} before its body
@@ -177,7 +177,7 @@ val run :
 
     For the tests, not part of the public API. A test gives a fake listener that
     makes [accept] errors that the simulator cannot make, for example
-    [Other "EPROTO"]. {!Tcp.Listener} has this signature. *)
+    [Other "EPROTO"]. {!Weft_flow.Tcp.Listener} has this signature. *)
 
 (** The listening socket of a server. *)
 module type LISTENER = sig
@@ -186,9 +186,9 @@ module type LISTENER = sig
   val addr : t -> Weft.Net.addr
 
   val accept : t -> Weft.Net.t * Weft.Net.addr
-  (** As {!Tcp.Listener.accept}: it waits, it is a cancellation point, and it
-      raises [Weft.Net.Error]. After [close], also for a call that waits at that
-      time, it raises [Weft.Net.Error (Bad_fd, _)]. *)
+  (** As {!Weft_flow.Tcp.Listener.accept}: it waits, it is a cancellation point,
+      and it raises [Weft.Net.Error]. After [close], also for a call that waits
+      at that time, it raises [Weft.Net.Error (Bad_fd, _)]. *)
 
   val close : t -> unit
   (** It never blocks, and a second call does nothing. *)
@@ -206,7 +206,7 @@ val start_with :
 
     [(module L : LISTENER)] is a module-dependent argument (OCaml 5.5): the type
     of [listener] is the type [L.t] of the module. Production code gives
-    [(module Tcp.Listener)]. *)
+    [(module Weft_flow.Tcp.Listener)]. *)
 
 val run_with :
      ?config:Config.t

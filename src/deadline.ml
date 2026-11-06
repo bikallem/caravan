@@ -12,21 +12,4 @@ let has_passed = function
   | Some d ->
       compare (Time.now Mono) d >= 0
 
-let equal a b =
-  match (a, b) with
-  | None, None ->
-      true
-  | Some a, Some b ->
-      compare a b = 0
-  | None, Some _ | Some _, None ->
-      false
-
-let earlier a b =
-  match (a, b) with
-  | None, d | d, None ->
-      d
-  | Some x, Some y ->
-      (* At equal times, [a] and [b] hold the same time. *)
-      if (compare x y <= 0) [@mutate off "the same time"] then a else b
-
 let at = function None -> never | Some d -> Time.at Mono d

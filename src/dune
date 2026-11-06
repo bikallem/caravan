@@ -1,7 +1,7 @@
 (library
  (name caravan)
  (public_name caravan)
- (libraries weft http-date)
+ (libraries weft weft.flow http-date)
  (instrumentation
   (backend ppx_windtrap.mutate))
  (instrumentation

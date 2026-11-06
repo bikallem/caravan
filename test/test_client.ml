@@ -1293,7 +1293,7 @@ let exchange_tests =
           let config =
             {Client_config.default with response_timeout= Span.ms 200}
           in
-          equal string "Caravan__Flow.Closed"
+          equal string "Weft_flow__Flow.Closed"
             (error_text (fun () ->
                  t.run ~config (req ~meth:Method.POST ~body:failing "/") ) ) ;
           await s )

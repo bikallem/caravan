@@ -33,11 +33,11 @@ type t =
 let pause = Span.ms 100
 
 (* The fiber of one connection. It owns the socket [c] and one slot. The flow
-   owns [c] from the start: [Tcp.flow] does not sync and does not raise.
-   [finally] does not sync, so it runs also in a cancelled fiber. *)
+   owns [c] from the start: [Weft_flow.Tcp.flow] does not sync and does not
+   raise. [finally] does not sync, so it runs also in a cancelled fiber. *)
 let connection (config : Config.t) engine handler ~stop ~slots ~count ~id c peer
     () =
-  let f = Tcp.flow c in
+  let f = Weft_flow.Tcp.flow c in
   Fun.protect
     ~finally:(fun () ->
       Flow.close f ;
@@ -223,8 +223,8 @@ let start_with ?(config = Config.default) ?(engine = http1) sw
       Printexc.raise_with_backtrace e bt
 
 let start ?(config = Config.default) ?engine sw handler =
-  let l = Tcp.Listener.listen ~backlog:config.backlog config.addr in
-  start_with ~config ?engine sw (module Tcp.Listener) l handler
+  let l = Weft_flow.Tcp.Listener.listen ~backlog:config.backlog config.addr in
+  start_with ~config ?engine sw (module Weft_flow.Tcp.Listener) l handler
 
 let local_addr t = t.addr
 
@@ -417,6 +417,6 @@ let run_with ?(config = Config.default) ?engine ?domains ?(on_start = ignore)
 let run ?(config = Config.default) ?engine ?domains ?on_start ?services os
     handler =
   run_with ~config ?engine ?domains ?on_start ?services os
-    (module Tcp.Listener)
-    (fun () -> Tcp.Listener.listen ~backlog:config.backlog config.addr)
+    (module Weft_flow.Tcp.Listener)
+    (fun () -> Weft_flow.Tcp.Listener.listen ~backlog:config.backlog config.addr)
     handler
