@@ -25,42 +25,10 @@ this example (examples/dune).
 > layer are complete but young, and their API can change. HTTP/2,
 > HTTP/3 and a reverse proxy are not there yet.
 
-## Libraries
-
-Each part is a library. Use only the libraries that you need: the
-optional dependencies are necessary only for the library that uses
-them.
-
-| Library | Content | Optional dependencies |
-|---|---|---|
-| `caravan` | The HTTP/1.1 server, requests, responses, handlers, middleware, cookies, queries, forms and file uploads | |
-| `caravan.client` | The HTTP/1.1 client | |
-| `caravan.websocket` | WebSocket for the server (RFC 6455) | |
-| `caravan.router` | Routes, path parameters, 405 with `Allow`, groups | |
-| `caravan.middleware` | Forwarded fields, request IDs, access log, CORS, error page, HTTPS redirect, HSTS, cross-origin protection, rate limit, concurrency limit, health checks, cache headers | |
-| `caravan.session` | Sessions, signed cookies, CSRF tokens | digestif, eqaf, mirage-crypto-rng |
-| `caravan.auth` | JWT, bearer and cookie schemes, users, policies, OpenID Connect, codes by email, passkeys | the dependencies of `caravan.session`, and mirage-crypto-pk, mirage-crypto-ec, x509, yojson, zarith |
-| `caravan.compress` | gzip and deflate responses, decompression of request bodies | decompress |
-| `caravan.static` | Static files with ETag, conditional requests and ranges | |
-| `caravan.html` | HTML elements and attributes, with escaping and URL checks | |
-| `caravan.jobs` | Background jobs in the process, with retries, that stop with the server | |
-| `caravan.tls` | The TLS server, with ALPN, and HTTPS for the client | tls, x509, domain-name, ipaddr, mirage-crypto-rng |
-| `caravan.testing` | A test host: it runs a handler stack and the client in the weft simulator, with no sockets | |
-
-caravan and weft are not on opam. Get them from their repositories, or
-use the package `caravan` of the Nix flake, which has all the optional
-dependencies. Then add the libraries to the dune stanza of your
-executable:
-
-```dune
-(executable
- (name main)
- (libraries caravan caravan.router caravan.middleware weft weft.os))
-```
-
 ## Contents
 
 - [Libraries](#libraries)
+- [Examples](#examples)
 - [What the server does](#what-the-server-does)
 - [Routing](#routing)
 - [Middleware](#middleware)
@@ -86,6 +54,75 @@ executable:
 - [Requirements](#requirements)
 - [Development](#development)
 - [License](#license)
+
+## Libraries
+
+Each part is a library. Use only the libraries that you need: the
+optional dependencies are necessary only for the library that uses
+them.
+
+| Library | Content | Optional dependencies |
+|---|---|---|
+| `caravan` | The HTTP/1.1 server, requests, responses, handlers, middleware, cookies, queries, forms and file uploads | |
+| `caravan.client` | The HTTP/1.1 client | |
+| `caravan.websocket` | WebSocket for the server (RFC 6455) | |
+| `caravan.router` | Routes, path parameters, 405 with `Allow`, groups | |
+| `caravan.middleware` | Forwarded fields, request IDs, access log, CORS, error page, HTTPS redirect, HSTS, cross-origin protection, rate limit, concurrency limit, health checks, cache headers | |
+| `caravan.session` | Sessions, signed cookies, CSRF tokens | digestif, eqaf, mirage-crypto-rng |
+| `caravan.auth` | JWT, bearer and cookie schemes, users, policies, OpenID Connect, codes by email, passkeys | the dependencies of `caravan.session`, and mirage-crypto-pk, mirage-crypto-ec, x509, yojson, zarith |
+| `caravan.compress` | gzip and deflate responses, decompression of request bodies | decompress |
+| `caravan.static` | Static files with ETag, conditional requests and ranges | |
+| `caravan.html` | HTML elements and attributes, with escaping and URL checks | |
+| `caravan.jobs` | Background jobs in the process, with retries, that stop with the server. Durable jobs in a store of the application, unique jobs, schedules (`every`, `cron`) and recurring jobs | |
+| `caravan.tls` | The TLS server, with ALPN, and HTTPS for the client | tls, x509, domain-name, ipaddr, mirage-crypto-rng |
+| `caravan.testing` | A test host: it runs a handler stack and the client in the weft simulator, with no sockets | |
+
+caravan and weft are not on opam. Get them from their repositories, or
+use the package `caravan` of the Nix flake, which has all the optional
+dependencies. Then add the libraries to the dune stanza of your
+executable:
+
+```dune
+(executable
+ (name main)
+ (libraries caravan caravan.router caravan.middleware weft weft.os))
+```
+
+## Examples
+
+Each directory in the table is a small program for one area, with
+tests. `app.ml` is the example, and `main.ml` starts the server.
+`test.ml` tests each request of the comment at the top of `app.ml`,
+with `caravan.testing`. Run an example with `dune exec
+examples/<name>/main.exe`, and its tests with `dune test
+examples/<name>`. [examples/](examples) also has the build rules that
+compile the examples of this README.
+
+| Example | It shows |
+|---|---|
+| [hello](examples/hello/app.ml) | Plain and streamed responses, the configuration of the server, a graceful stop, a service |
+| [middleware](examples/middleware/app.ml) | Middleware, typed attributes on requests and responses |
+| [router](examples/router/app.ml) | Routes, parameters, groups with middleware, 405 and `OPTIONS` |
+| [forms](examples/forms/app.ml) | Queries, urlencoded forms and their errors, a refusal of cross-origin `POST`s |
+| [cookies](examples/cookies/app.ml) | Cookies: set, read, list and remove, a refusal of cross-origin `POST`s |
+| [uploads](examples/uploads/app.ml) | File uploads, streamed or in memory, a refusal of cross-origin `POST`s |
+| [html](examples/html/app.ml) | HTML with `caravan.html`, escaping, JSON for scripts, htmx from a local file |
+| [proxy_headers](examples/proxy_headers/app.ml) | An application behind a proxy: forwarded fields, request IDs, access log, health checks, HSTS, HTTPS redirect, error page |
+| [limits](examples/limits/app.ml) | CORS, rate limit, concurrency limit, cross-origin protection, cache headers |
+| [static](examples/static/app.ml) | Static files: ETag, 304, ranges, directories, a hidden dot file |
+| [compress](examples/compress/app.ml) | gzip and deflate responses, a page with a secret not compressed (BREACH), compressed request bodies with a size limit |
+| [tls](examples/tls/app.ml) | HTTPS with a certificate for development, ALPN, HSTS |
+| [client](examples/client/app.ml) | The HTTP client: a gateway sketch that streams to one upstream, timeouts, 502 and 504, and a program that fetches a URL |
+| [websocket](examples/websocket/app.ml) | A chat room: origins, a subprotocol, a broadcast that a peer that reads nothing delays for at most 5 s, ping, the close at a stop |
+| [jobs](examples/jobs/app.ml) | Background jobs in the process: retries, delays, a full queue, counts |
+| [durable_jobs](examples/durable_jobs/app.ml) | Durable jobs: a store of the application, unique and delayed jobs, recurring jobs on a schedule, a rate limit |
+| [sessions](examples/sessions/app.ml) | Sessions with a store, CSRF tokens, signed links |
+| [auth](examples/auth/app.ml) | Login with a session, policies on roles, the return path, logout |
+| [api](examples/api/app.ml) | A JSON API: API keys with an expiry and a revocation by the key text, bearer tokens (JWT), a custom scheme, scopes, a rate limit for each user |
+| [email_codes](examples/email_codes/app.ml) | Sign-in with a one-time code by mail, a job that sends it, limits |
+| [passkeys](examples/passkeys/app.ml) | Passkeys (WebAuthn): registration and sign-in with a browser page |
+| [oidc](examples/oidc/app.ml) | Sign-in with an OpenID provider (for example Google): login, callback, users |
+| [testing](examples/testing/test.ml) | The test host: races over seeds, manual time, signals, errors, latency |
 
 ## What the server does
 
@@ -134,14 +171,18 @@ let hello req =
 let handler = Handler.compose [auth] hello
 ```
 
-`examples/middleware.ml` has a full example.
+[examples/middleware](examples/middleware/app.ml) has a full example.
 
-The libraries `caravan`, `caravan.client`, `caravan.websocket`,
-`caravan.router`, `caravan.middleware`, `caravan.static`,
-`caravan.tls` and `caravan.session` depend on no world of weft.
-They run in each world, for example the OS world
+All libraries except `caravan.testing` depend on no world of weft:
+`caravan`, `caravan.client`, `caravan.websocket`, `caravan.router`,
+`caravan.middleware`, `caravan.session`, `caravan.auth`,
+`caravan.compress`, `caravan.static`, `caravan.html`, `caravan.jobs`
+and `caravan.tls`. They run in each world, for example the OS world
 (`Weft.run (module Weft_os)`) and the simulator of weft
 (`Weft_sim.run`). `caravan.testing` runs only in the simulator.
+
+[examples/hello](examples/hello/app.ml) has streamed responses, the
+configuration of the server, the graceful stop and a service.
 
 ## Routing
 
@@ -173,7 +214,7 @@ let app =
   (`Caravan_router.template`) is on the request and on the response,
   for an access log.
 
-`examples/router.ml` has a full example.
+[examples/router](examples/router/app.ml) has a full example.
 
 ## Middleware
 
@@ -268,6 +309,11 @@ let app handler =
   that changes the path goes after `Https_redirect`, so that the
   redirect keeps the path of the client.
 
+[examples/proxy_headers](examples/proxy_headers/app.ml) has the
+middleware for an application behind a proxy, and
+[examples/limits](examples/limits/app.ml) has CORS, the limits, the
+protection against CSRF and the cache headers.
+
 ## HTML
 
 The `caravan.html` library builds HTML in OCaml code. `El` has the
@@ -321,6 +367,8 @@ let csrf_input req =
   `Invalid_argument` when the code builds the element.
 - The library does not check the content model of HTML5.
 
+[examples/html](examples/html/app.ml) has a full example.
+
 ## Queries and forms
 
 `Request.query_params` gives the pairs of the query, and
@@ -358,6 +406,8 @@ let login req =
   read, thus the client gets no `100 Continue`.
 - `Request.with_form` gives a request a form body, for the client or for
   a test.
+
+[examples/forms](examples/forms/app.ml) has a full example.
 
 ## Cookies
 
@@ -401,6 +451,8 @@ let clear _ =
   gives the order, and a sibling subdomain can set a cookie with the
   same name: use a `__Host-` name for a security cookie.
 - `Cookie.pp` shows the length of the value, not the value.
+
+[examples/cookies](examples/cookies/app.ml) has a full example.
 
 ## Sessions
 
@@ -448,6 +500,9 @@ let app =
 - Make no session for an anonymous user: a session starts at the first
   `set` (or `id`).
 
+[examples/sessions](examples/sessions/app.ml) has a full example, with
+CSRF tokens and signed links.
+
 ## CSRF
 
 `Caravan_middleware.Cross_origin` stops the cross-origin requests of
@@ -491,6 +546,9 @@ let app =
 - Use `Csrf` only for the routes of the cookie sessions. A JSON API
   with a bearer token needs no token against CSRF.
 
+[examples/sessions](examples/sessions/app.ml) has CSRF tokens in forms,
+and a multipart upload that calls `Csrf.check`.
+
 ## Authentication
 
 The optional `caravan.auth` library verifies JSON Web Tokens, for
@@ -533,6 +591,9 @@ let user req =
   skips a check.
 - The JSON must be strict RFC 8259: no comments, no `NaN`, no
   duplicate member names.
+
+[examples/api](examples/api/app.ml) verifies bearer tokens with a JWK
+Set.
 
 ## Users and policies
 
@@ -619,6 +680,8 @@ let app =
   2020 can send it from another site (a login CSRF).
 - After a login, redirect only to `Caravan_auth.return_path`.
 
+[examples/auth](examples/auth/app.ml) has a full example.
+
 ## OpenID Connect
 
 `Caravan_auth.Oidc` is for the sign-in with an OpenID provider, for
@@ -693,6 +756,9 @@ let routes client =
 - Give each client its own redirect URI. The session cookie must be
   `SameSite=Lax` (the default) or `None`.
 
+[examples/oidc](examples/oidc/app.ml) has a full example, with a fake
+provider in its tests.
+
 ## Codes by email
 
 `Caravan_auth.Code` signs a user in with a one-time code that your
@@ -730,6 +796,8 @@ let code req text =
 - Give the same response for known and unknown addresses, put a rate
   limit on the two routes, and give a second way to sign in: an
   attacker can keep the code sign-in of an address closed.
+
+[examples/email_codes](examples/email_codes/app.ml) has a full example.
 
 ## Passkeys
 
@@ -780,6 +848,9 @@ In the browser, `PublicKeyCredential.parseCreationOptionsFromJSON` and
 - Read the body of a response with a limit of 64 KiB, and put a rate
   limit on the routes of the options: each one can make a session. Two
   copies of one response sent at the same time can both pass.
+
+[examples/passkeys](examples/passkeys/app.ml) has a full example, with a
+software authenticator in its tests.
 
 ## API keys
 
@@ -835,6 +906,9 @@ let api =
 - A browser never sends a key by itself: with a session scheme too,
   exempt `"ApiKey"` from the CSRF tokens by its name.
 
+[examples/api](examples/api/app.ml) has a full example, with API keys,
+bearer tokens and a scheme of its own.
+
 ## Compression
 
 The optional `caravan.compress` library compresses the responses with
@@ -872,6 +946,8 @@ let app handler =
   415 for another coding. Put it after `Error_page`.
 - For pure OCaml, add `checkseum.ocaml` to the libraries of your
   executable: the default checksums of decompress have C code.
+
+[examples/compress](examples/compress/app.ml) has a full example.
 
 ## File uploads
 
@@ -918,6 +994,8 @@ let upload req =
 - `Request.with_multipart` gives a request a multipart body, for the
   client or for a test.
 
+[examples/uploads](examples/uploads/app.ml) has a full example.
+
 ## Static files
 
 The `caravan.static` library serves the files of a directory. It reads
@@ -958,6 +1036,8 @@ let app handler =
 - With `caravan.router`, `Caravan_static.dir ~root (Caravan_router.rest req)
   req` serves a route `/static/**`. `Caravan_static.file` serves one
   file.
+
+[examples/static](examples/static/app.ml) has a full example.
 
 ## TLS
 
@@ -1001,6 +1081,9 @@ let () =
 - A client that ends the TCP connection with no `close_notify` gives
   `Flow.Closed` to a read: it can be a truncation.
 
+[examples/tls](examples/tls/app.ml) has a full example, with a
+certificate for development.
+
 ## WebSocket
 
 The `caravan.websocket` library adds WebSocket
@@ -1035,6 +1118,8 @@ let handler req =
 - All the cases of the [Autobahn](https://github.com/crossbario/autobahn-testsuite)
   test suite give OK, or INFORMATIONAL for three cases, except the
   compression cases: caravan does not accept `permessage-deflate`.
+
+[examples/websocket](examples/websocket/app.ml) has a full example.
 
 ## Client
 
@@ -1099,6 +1184,10 @@ let () =
   not chunked) needs a `close_notify` of the server. Else the client
   gives `Error Truncated`.
 
+[examples/client](examples/client/app.ml) has a gateway that forwards
+requests with the client, and a program that fetches a URL
+([fetch.ml](examples/client/fetch.ml)).
+
 ## Background jobs
 
 `Caravan_jobs` runs work after the response, in fibers of the process,
@@ -1146,6 +1235,8 @@ let () =
 - `Caravan_jobs.stats` gives the counts, for example for a health check.
   In a test, `Caravan_jobs.drain` waits for all jobs, also the delayed
   ones, in virtual time.
+
+[examples/jobs](examples/jobs/app.ml) has a full example.
 
 ### Durable jobs
 
@@ -1221,6 +1312,9 @@ let () =
 - Put `Recurring` after its queues in `~services`, and give a new name
   to an entry whose schedule changes.
 
+[examples/durable_jobs](examples/durable_jobs/app.ml) has a store, unique
+jobs and recurring jobs.
+
 ## Testing
 
 The `caravan.testing` library runs a handler through the real server
@@ -1273,6 +1367,9 @@ let () =
 - `Caravan_testing.sim` gives the simulator, for latency, network faults
   and names (`Weft_sim.set_dns`).
 
+[examples/testing](examples/testing/test.ml) shows each function of
+`caravan.testing`, and each example has a `test.ml`.
+
 ## Requirements
 
 - OCaml >= 5.5.0
@@ -1315,7 +1412,7 @@ make test       # all test suites (dune test --force)
 make fmt        # format with ocamlformat (dune fmt)
 make mutate     # mutation testing of the suites of test/, in parallel
 make mutate MUTATE=websocket/   # only the mutants of the files under a prefix
-make coverage   # test coverage report of all suites
+make coverage   # test coverage report of the suites of test/
 make autobahn   # the Autobahn WebSocket test suite, with podman or docker
 ```
 
@@ -1323,18 +1420,19 @@ The suites of test/ run in the simulator of weft, thus they use no real
 time and no real network. The suite of test/linux runs on Linux in the
 OS world of weft, with real sockets, signals and child processes.
 
-The examples use `Weft_os`, but we test them only on Linux. Try the
-example server, and stop it with Ctrl-C:
+The programs of the examples use `Weft_os`, but we run them only on
+Linux. Their tests run in the simulator, as the suites of test/ do. Try
+the example server, and stop it with Ctrl-C:
 
 ```sh
-dune exec examples/hello.exe
-curl -i localhost:8080/hello
+dune exec examples/hello/main.exe
+curl -i 127.0.0.1:8080/hello
 ```
 
-For WebSocket, run `dune exec examples/ws_echo.exe` and open
-<http://localhost:8080/> in a browser. While the example server runs,
-`dune exec examples/fetch.exe -- http://localhost:8080/hello` fetches a
-page with the client.
+For WebSocket, run `dune exec examples/websocket/main.exe` and open
+<http://127.0.0.1:8080/> in two tabs of a browser. While the hello example runs,
+`dune exec examples/client/fetch.exe -- http://127.0.0.1:8080/hello`
+fetches a page with the client.
 
 ## License
 
