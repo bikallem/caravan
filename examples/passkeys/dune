@@ -1,0 +1,38 @@
+(library
+ (name example_passkeys)
+ (modules app)
+ (libraries
+  caravan
+  caravan.auth
+  caravan.html
+  caravan.middleware
+  caravan.session
+  mirage-crypto-rng
+  weft))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries
+  example_passkeys
+  example_dev
+  example_common
+  mirage-crypto-rng.unix))
+
+(test
+ (name test)
+ (modules test)
+ (libraries
+  example_passkeys
+  example_support
+  caravan
+  caravan.auth
+  caravan.session
+  caravan.testing
+  base64
+  digestif
+  mirage-crypto-ec
+  mirage-crypto-rng
+  weft
+  windtrap
+  yojson))
