@@ -12,3 +12,6 @@ _build/
 
 # Autobahn test suite reports
 autobahn/reports/
+
+# The htmx file of examples/html (the user downloads it)
+examples/html/htmx.min.js

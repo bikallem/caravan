@@ -1,0 +1,14 @@
+(library
+ (name example_html)
+ (modules app)
+ (libraries caravan caravan.html yojson))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries example_html example_common))
+
+(test
+ (name test)
+ (modules test)
+ (libraries example_html caravan caravan.html caravan.testing windtrap))
