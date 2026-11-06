@@ -1,0 +1,59 @@
+(library
+ (name example_client)
+ (modules app)
+ (libraries caravan caravan.client caravan.router weft))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries example_client caravan caravan.client weft weft.os))
+
+; A fetch program: it prints the status and the body of a URL.
+
+(executable
+ (name fetch)
+ (modules fetch)
+ (libraries
+  example_dev
+  caravan
+  caravan.client
+  caravan.tls
+  tls
+  mirage-crypto-rng.unix
+  weft
+  weft.os))
+
+(test
+ (name test)
+ (modules test)
+ (libraries
+  example_client
+  caravan
+  caravan.client
+  caravan.testing
+  weft
+  windtrap))
+
+; fetch.exe with a bad URL: one line on stderr, and the exit code 2. The
+; client refuses the port of the second URL.
+
+(rule
+ (write-file
+  fetch_bad_url.expected
+  "not a URL: ftp://x/\nnot a URL: http://x:99999/\n"))
+
+(rule
+ (with-stderr-to
+  fetch_bad_url.output
+  (progn
+   (with-accepted-exit-codes
+    2
+    (run %{exe:fetch.exe} ftp://x/))
+   (with-accepted-exit-codes
+    2
+    (run %{exe:fetch.exe} http://x:99999/)))))
+
+(rule
+ (alias runtest)
+ (action
+  (diff fetch_bad_url.expected fetch_bad_url.output)))

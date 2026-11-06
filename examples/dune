@@ -1,8 +1,8 @@
 ; The examples run in Weft_os, the world of weft for the OS of the build.
 
 (executables
- (names ws_echo fetch readme)
- (modules ws_echo fetch readme)
+ (names ws_echo readme)
+ (modules ws_echo readme)
  (libraries
   caravan
   caravan.websocket
