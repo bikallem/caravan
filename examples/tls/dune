@@ -1,0 +1,37 @@
+(library
+ (name example_tls)
+ (modules app)
+ (libraries caravan caravan.middleware))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries
+  example_tls
+  example_dev
+  example_common
+  caravan
+  caravan.tls
+  tls
+  x509
+  ptime
+  mirage-crypto-rng.unix
+  unix))
+
+; The test serves the application over TLS with a development certificate.
+
+(test
+ (name test)
+ (modules test)
+ (libraries
+  example_tls
+  example_dev
+  caravan
+  caravan.client
+  caravan.tls
+  caravan.testing
+  tls
+  ptime
+  mirage-crypto-rng
+  weft
+  windtrap))
