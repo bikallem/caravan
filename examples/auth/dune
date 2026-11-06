@@ -1,0 +1,28 @@
+(library
+ (name example_auth)
+ (modules app)
+ (libraries
+  caravan
+  caravan.auth
+  caravan.html
+  caravan.middleware
+  caravan.router
+  caravan.session))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries example_auth example_dev example_common mirage-crypto-rng.unix))
+
+(test
+ (name test)
+ (modules test)
+ (libraries
+  example_auth
+  example_support
+  caravan
+  caravan.auth
+  caravan.session
+  caravan.testing
+  mirage-crypto-rng
+  windtrap))
