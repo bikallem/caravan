@@ -11,7 +11,7 @@ _build/
 .vscode/settings.json
 
 # Autobahn test suite reports
-autobahn/reports/
+test/linux/autobahn/reports/
 
 # The htmx file of examples/html (the user downloads it)
 examples/html/htmx.min.js

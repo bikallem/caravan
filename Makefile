@@ -46,23 +46,25 @@ coverage:
 
 # The Autobahn WebSocket test suite, in a container: podman by default,
 # CONTAINER=docker for docker. All cases except compression (12.x, 13.x).
-# The reports go to autobahn/reports. The target fails if a case fails.
+# The configuration is in $(AUTOBAHN), and the reports go to
+# $(AUTOBAHN)/reports. The target fails if a case fails.
 CONTAINER ?= podman
+AUTOBAHN := test/linux/autobahn
 
 autobahn:
 	dune build test/linux/autobahn_server.exe
-	mkdir -p autobahn/reports
-	: > autobahn/reports/server.log
-	./_build/default/test/linux/autobahn_server.exe > autobahn/reports/server.log 2>&1 & server=$$!; \
+	mkdir -p $(AUTOBAHN)/reports
+	: > $(AUTOBAHN)/reports/server.log
+	./_build/default/test/linux/autobahn_server.exe > $(AUTOBAHN)/reports/server.log 2>&1 & server=$$!; \
 	trap 'kill $$server 2>/dev/null' EXIT INT TERM; \
-	for i in $$(seq 50); do grep -q '^listening' autobahn/reports/server.log && break; sleep 0.1; done; \
-	grep -q '^listening' autobahn/reports/server.log || { echo "The server did not start."; exit 1; }; \
+	for i in $$(seq 50); do grep -q '^listening' $(AUTOBAHN)/reports/server.log && break; sleep 0.1; done; \
+	grep -q '^listening' $(AUTOBAHN)/reports/server.log || { echo "The server did not start."; exit 1; }; \
 	$(CONTAINER) run --rm --network host \
-	  -v "$(CURDIR)/autobahn:/config:Z" -v "$(CURDIR)/autobahn/reports:/reports:Z" \
+	  -v "$(CURDIR)/$(AUTOBAHN):/config:Z" -v "$(CURDIR)/$(AUTOBAHN)/reports:/reports:Z" \
 	  docker.io/crossbario/autobahn-testsuite \
-	  wstest -m fuzzingclient -s /config/fuzzingclient.json > autobahn/reports/wstest.log 2>&1; \
+	  wstest -m fuzzingclient -s /config/fuzzingclient.json > $(AUTOBAHN)/reports/wstest.log 2>&1; \
 	status=$$?; test $$status -eq 0
 	jq -r '.caravan | to_entries | group_by(.value.behavior) | .[] | "\(.[0].value.behavior): \(length)"' \
-	  autobahn/reports/servers/index.json
+	  $(AUTOBAHN)/reports/servers/index.json
 	jq -e '[.caravan[] | select(.behavior == "FAILED" or .behaviorClose == "FAILED")] | length == 0' \
-	  autobahn/reports/servers/index.json > /dev/null
+	  $(AUTOBAHN)/reports/servers/index.json > /dev/null

@@ -50,6 +50,11 @@
  (modules serve_until_signal)
  (libraries caravan weft weft.linux))
 
+; The directory autobahn has the configuration of the Autobahn client of make
+; autobahn, and the reports of a run. dune does not scan it.
+
+(data_only_dirs autobahn)
+
 ; The server of make autobahn.
 
 (executable
