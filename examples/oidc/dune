@@ -1,0 +1,52 @@
+(library
+ (name example_oidc)
+ (modules app)
+ (libraries
+  caravan
+  caravan.auth
+  caravan.html
+  caravan.middleware
+  caravan.router
+  caravan.session
+  weft))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries
+  example_oidc
+  example_dev
+  caravan
+  caravan.auth
+  caravan.client
+  caravan.tls
+  tls
+  mirage-crypto-rng.unix
+  weft
+  weft.os))
+
+; The test runs a fake provider as a second server in the simulator, over TLS
+; with a development certificate.
+
+(test
+ (name test)
+ (modules test)
+ (libraries
+  example_oidc
+  example_dev
+  example_support
+  caravan
+  caravan.auth
+  caravan.client
+  caravan.session
+  caravan.testing
+  caravan.tls
+  tls
+  ptime
+  base64
+  digestif
+  yojson
+  mirage-crypto-rng
+  weft
+  weft.sim
+  windtrap))
