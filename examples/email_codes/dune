@@ -1,0 +1,34 @@
+(library
+ (name example_email_codes)
+ (modules app)
+ (libraries
+  caravan
+  caravan.auth
+  caravan.html
+  caravan.jobs
+  caravan.middleware
+  caravan.session
+  weft))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries
+  example_email_codes
+  example_dev
+  example_common
+  caravan.jobs
+  mirage-crypto-rng.unix))
+
+(test
+ (name test)
+ (modules test)
+ (libraries
+  example_email_codes
+  example_support
+  caravan
+  caravan.jobs
+  caravan.testing
+  mirage-crypto-rng
+  weft
+  windtrap))
