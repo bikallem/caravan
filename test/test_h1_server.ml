@@ -88,6 +88,13 @@ let kept_writer = ref None
    that stops while the handler runs). *)
 let stopping = ref false
 
+(* The calls of [on_refused] of the upgrades of the tests: {!show} prints their
+   number if it is not 0. *)
+let refused = ref 0
+
+let upgrade ?status ?headers f =
+  Response.upgrade ?status ?headers ~on_refused:(fun () -> incr refused) f
+
 let handler req =
   if Method.equal (Request.meth req) Method.CONNECT then
     match Request.authority req with
@@ -97,9 +104,9 @@ let handler req =
         Response.string ~status:Status.forbidden "denied"
     | Some "stopping.example:443" ->
         stopping := true ;
-        Response.upgrade ~status:Status.ok echo_upgraded
+        upgrade ~status:Status.ok echo_upgraded
     | _ ->
-        Response.upgrade ~status:Status.ok echo_upgraded
+        upgrade ~status:Status.ok echo_upgraded
   else
     match Request.path_only req with
     | "/swallow" -> (
@@ -162,29 +169,29 @@ let handler req =
       try slowly ~read:false ~span:hold req
       with Fiber.Cancelled _ -> failwith "cleanup failed" )
     | "/ws" ->
-        Response.upgrade ~headers:upgrade_echo echo_upgraded
+        upgrade ~headers:upgrade_echo echo_upgraded
     | "/ws-bare" ->
-        Response.upgrade echo_upgraded
+        upgrade echo_upgraded
     | "/ws-as" ->
         (* A 101 to the protocols of the query. *)
         let protocols = Option.value (Request.query req) ~default:"" in
-        Response.upgrade
+        upgrade
           ~headers:(Headers.of_list [("Upgrade", protocols)])
           echo_upgraded
     | "/ws-stopping" ->
         (* The server starts to stop while the handler runs. *)
         stopping := true ;
-        Response.upgrade ~headers:upgrade_echo echo_upgraded
+        upgrade ~headers:upgrade_echo echo_upgraded
     | "/ws-bare-stopping" ->
         stopping := true ;
-        Response.upgrade echo_upgraded
+        upgrade echo_upgraded
     | "/ws-read" ->
         ignore (Body.to_string (Request.body req)) ;
-        Response.upgrade ~headers:upgrade_echo echo_upgraded
+        upgrade ~headers:upgrade_echo echo_upgraded
     | "/ws-fail" ->
-        Response.upgrade ~headers:upgrade_echo (fun _ -> failwith "ws")
+        upgrade ~headers:upgrade_echo (fun _ -> failwith "ws")
     | "/tunnel" ->
-        Response.upgrade ~status:Status.ok echo_upgraded
+        upgrade ~status:Status.ok echo_upgraded
     | "/stop" ->
         Response.stream (fun w ->
             Body.Writer.write_string w "bye" ;
@@ -227,7 +234,7 @@ let handler req =
                 Fiber.cancel s (Failure "inner") ;
                 Fiber.yield () ) )
     | "/ws-cancelled-scope" ->
-        Response.upgrade ~headers:upgrade_echo (fun _ ->
+        upgrade ~headers:upgrade_echo (fun _ ->
             Fiber.scope (fun s ->
                 Fiber.cancel s (Failure "inner") ;
                 Fiber.yield () ) )
@@ -435,6 +442,7 @@ let serve ?(config = {Config.default with date_header= false})
      for it only if the test asks. *)
   let config = config_for config errors ~watch in
   slow_outcome := "" ;
+  refused := 0 ;
   let m = memory ?chunk ?stall ?reset ?unwritable ?false_wakes input in
   stopping := false ;
   let ctx = ctx ~is_stopping:(fun () -> !stopping) config in
@@ -467,7 +475,8 @@ let show ?config ?handler ?chunk ?ends_after ?cancel_on ?stall ?reset
   in
   show_crlf out
   ^ String.concat "" (List.map (fun e -> "\n! " ^ e) errors)
-  ^ if !slow_outcome = "" then "" else "\n" ^ !slow_outcome
+  ^ (if !slow_outcome = "" then "" else "\n" ^ !slow_outcome)
+  ^ if !refused = 0 then "" else Printf.sprintf "\n[on_refused %d]" !refused
 
 let get ?(v = "HTTP/1.1") ?(headers = []) path =
   Printf.sprintf "GET %s %s\r\nHost: a.example\r\n%s\r\n" path v
@@ -1607,6 +1616,7 @@ let upgrade_tests =
             \r\n
             Internal Server Error
             [FIN]
+            [on_refused 1]
             |} )
     ; test "Expect 100-continue and a chunked body above max_drain: 100, 500"
         (fun () ->
@@ -1631,6 +1641,7 @@ let upgrade_tests =
             \r\n
             Internal Server Error
             [FIN]
+            [on_refused 1]
             |} )
     ; test "Expect 100-continue and a body that the handler read: one 100"
         (fun () ->
@@ -1722,6 +1733,7 @@ let upgrade_tests =
             Internal Server Error
             [FIN]
             ! Failure("Response.upgrade: 101 without an Upgrade field")
+            [on_refused 1]
             |} )
     ; test "Expect 100-continue and a client that left: nothing, no error"
         (fun () ->
@@ -1731,7 +1743,7 @@ let upgrade_tests =
                   ~headers:
                     [("Upgrade", "echo"); ("Connection", "Upgrade"); expect_100]
                   "/ws" ) )
-          @@ __POS_OF__ {||} )
+          @@ __POS_OF__ {| [on_refused 1] |} )
     ; test "Expect 100-continue in HTTP/1.0 CONNECT with a body: no 100"
         (fun () ->
           (* RFC 9110 10.1.1: a server ignores the expectation of HTTP/1.0. The
@@ -1819,6 +1831,7 @@ let upgrade_tests =
             Internal Server Error
             [FIN]
             ! Failure("Response.upgrade: 101 to a protocol that the request did not offer: other")
+            [on_refused 1]
             |} )
     ; test "a server that stops opens no new upgrade: 503 (#26)" (fun () ->
           let ws_stopping ?(headers = []) () =
@@ -1856,6 +1869,7 @@ let upgrade_tests =
             \r\n
             Service Unavailable
             [FIN]
+            [on_refused 1]
             ---
             HTTP/1.1 503 Service Unavailable\r\n
             Content-Type: text/plain; charset=utf-8\r\n
@@ -1864,6 +1878,7 @@ let upgrade_tests =
             \r\n
             Service Unavailable
             [FIN]
+            [on_refused 1]
             ---
             HTTP/1.1 503 Service Unavailable\r\n
             Content-Type: text/plain; charset=utf-8\r\n
@@ -1872,6 +1887,7 @@ let upgrade_tests =
             \r\n
             Service Unavailable
             [FIN]
+            [on_refused 1]
             ---
             HTTP/1.1 503 Service Unavailable\r\n
             Content-Type: text/plain; charset=utf-8\r\n
@@ -1880,6 +1896,7 @@ let upgrade_tests =
             \r\n
             Service Unavailable
             [FIN]
+            [on_refused 1]
             ---
             HTTP/1.1 503 Service Unavailable\r\n
             Content-Type: text/plain; charset=utf-8\r\n
@@ -1888,6 +1905,7 @@ let upgrade_tests =
             \r\n
             Service Unavailable
             [FIN]
+            [on_refused 1]
             ---
             HTTP/1.1 500 Internal Server Error\r\n
             Content-Type: text/plain; charset=utf-8\r\n
@@ -1897,6 +1915,7 @@ let upgrade_tests =
             Internal Server Error
             [FIN]
             ! Failure("Response.upgrade: 101 without an Upgrade field")
+            [on_refused 1]
             |} )
     ; test "a stop at the 100: 503 after the 100 (#26)" (fun () ->
           (* The stop starts when the engine writes the 100: the second check,
@@ -2060,28 +2079,32 @@ let upgrade_tests =
             \r\n
             Internal Server Error
             [FIN]
-            ! Failure("Response.upgrade: 101 to a request that did not ask for an upgrade")--HTTP/1.1 500 Internal Server Error\r\n
+            ! Failure("Response.upgrade: 101 to a request that did not ask for an upgrade")
+            [on_refused 1]--HTTP/1.1 500 Internal Server Error\r\n
             Content-Type: text/plain; charset=utf-8\r\n
             Content-Length: 22\r\n
             Connection: close\r\n
             \r\n
             Internal Server Error
             [FIN]
-            ! Failure("Response.upgrade: 101 to an HTTP/1.0 request")--HTTP/1.1 500 Internal Server Error\r\n
+            ! Failure("Response.upgrade: 101 to an HTTP/1.0 request")
+            [on_refused 1]--HTTP/1.1 500 Internal Server Error\r\n
             Content-Type: text/plain; charset=utf-8\r\n
             Content-Length: 22\r\n
             Connection: close\r\n
             \r\n
             Internal Server Error
             [FIN]
-            ! Failure("Response.upgrade: 101 to a request that did not ask for an upgrade")--HTTP/1.1 500 Internal Server Error\r\n
+            ! Failure("Response.upgrade: 101 to a request that did not ask for an upgrade")
+            [on_refused 1]--HTTP/1.1 500 Internal Server Error\r\n
             Content-Type: text/plain; charset=utf-8\r\n
             Content-Length: 22\r\n
             Connection: close\r\n
             \r\n
             Internal Server Error
             [FIN]
-            ! Failure("Response.upgrade: 101 without an Upgrade field")--HTTP/1.1 500 Internal Server Error\r\n
+            ! Failure("Response.upgrade: 101 without an Upgrade field")
+            [on_refused 1]--HTTP/1.1 500 Internal Server Error\r\n
             Content-Type: text/plain; charset=utf-8\r\n
             Content-Length: 22\r\n
             Connection: close\r\n
@@ -2089,6 +2112,7 @@ let upgrade_tests =
             Internal Server Error
             [FIN]
             ! Failure("Response.upgrade: 2xx upgrade to a GET request")
+            [on_refused 1]
             |} )
     ; test "a 2xx to CONNECT that is not an upgrade gets 500, and no tunnel"
         (fun () ->
@@ -2162,6 +2186,7 @@ let upgrade_tests =
             \r\n
             Internal Server Error
             [FIN]
+            [on_refused 1]
             |} )
     ; test "an upgrade callback that raises is reported" (fun () ->
           expect (show (ws "/ws-fail"))
@@ -2173,6 +2198,34 @@ let upgrade_tests =
             \r\n
 
             ! Failure("ws")
+            |} )
+    ; test "a 101 that the engine cannot write runs on_refused, not f"
+        (fun () ->
+          let ran = ref false in
+          let handler _ =
+            upgrade ~headers:upgrade_echo (fun _ -> ran := true)
+          in
+          expect (show ~handler ~unwritable:true (ws "/ws"))
+          @@ __POS_OF__ {| [on_refused 1] |} ;
+          is_false ~msg:"f" !ran )
+    ; test "an on_refused that raises is reported, and the 500 goes" (fun () ->
+          let handler _ =
+            Response.upgrade
+              ~on_refused:(fun () -> failwith "release")
+              echo_upgraded
+          in
+          expect (show ~handler (get "/"))
+          @@ __POS_OF__
+               {|
+            HTTP/1.1 500 Internal Server Error\r\n
+            Content-Type: text/plain; charset=utf-8\r\n
+            Content-Length: 22\r\n
+            Connection: close\r\n
+            \r\n
+            Internal Server Error
+            [FIN]
+            ! Failure("Response.upgrade: 101 to a request that did not ask for an upgrade")
+            ! Failure("release")
             |} )
     ; test "an upgrade gets a flow with no deadline and no timeout" (fun () ->
           (* The flow records if each of its four limits has a value. Each one
@@ -2195,7 +2248,7 @@ let upgrade_tests =
             let seen = ref [] in
             let handler req =
               if read then ignore (Body.to_string (Request.body req)) ;
-              Response.upgrade ~headers:upgrade_echo (fun _ ->
+              upgrade ~headers:upgrade_echo (fun _ ->
                   seen := Array.to_list limits )
             in
             Sim_support.run (fun _ ->
@@ -2762,7 +2815,7 @@ let handler_error_tests =
     ; test "a cancel of an upgraded connection reports no error" (fun () ->
           let started = Ivar.create () in
           let handler _ =
-            Response.upgrade ~headers:upgrade_echo (fun _ ->
+            upgrade ~headers:upgrade_echo (fun _ ->
                 Ivar.fill started () ;
                 Time.sleep Mono (Span.s 10) )
           in
@@ -2874,12 +2927,13 @@ let on_end_tests =
             try
               Time.sleep Mono (Span.s 3600) ;
               Response.empty ()
-            with Fiber.Cancelled _ -> Response.upgrade ignore
+            with Fiber.Cancelled _ -> upgrade ignore
           in
           let _, errors =
             serve ~handler ~cancel_on:(fun () -> Ivar.read holding) (get "/")
           in
-          equal (list string) [] errors )
+          equal (list string) [] errors ;
+          equal int ~msg:"on_refused" 1 !refused )
     ; test "the body of a handler that catches its cancel is closed" (fun () ->
           let log = ref [] and closes = ref 0 in
           let holding = Ivar.create () in
@@ -3128,6 +3182,7 @@ let tcp_tests =
           Flow.write_string client "GET / HTTP/1.1\r\n\r\n" ;
           Sim_support.ends_at sim ~t0 linger_l c )
     ; test "an upgrade after a cancelled read of the body gets 500" (fun () ->
+          let client_flow = ref None and before_500 = ref false in
           (* A child of the handler reads the body and waits for the rest. The
              handler cancels the child, so the body failed with the cancel of a
              different fiber. The engine must not read the body again for the
@@ -3145,12 +3200,20 @@ let tcp_tests =
                     ()
                 | exception Promise.Cancelled ->
                     () ) ;
-            Response.upgrade ~headers:upgrade_echo echo_upgraded
+            Response.upgrade ~headers:upgrade_echo
+              ~on_refused:(fun () ->
+                (* The release comes before the 500. *)
+                let client = Option.get !client_flow in
+                before_500 :=
+                  Option.is_none (Flow.read_now client (Bytes.create 1) 0 1) )
+              echo_upgraded
           in
           Sim_support.manual
           @@ fun sim ->
           on_tcp ~handler sim
-          @@ fun _ client _ ->
+          @@ fun _ c _ ->
+          client_flow := Some c ;
+          let client = c in
           Flow.write_string client
             "GET /ws HTTP/1.1\r\n\
              Host: a.example\r\n\
@@ -3165,7 +3228,44 @@ let tcp_tests =
              Content-Length: 22\r\n\
              Connection: close\r\n\
              \r\n\
-             Internal Server Error\n" ) ]
+             Internal Server Error\n" ;
+          is_true ~msg:"on_refused before the 500" !before_500 )
+    ; test "a cancel in the drain of an upgrade runs on_refused in a shield"
+        (fun () ->
+          let calls = ref 0 in
+          let handler _ =
+            Response.upgrade ~headers:upgrade_echo
+              ~on_refused:(fun () ->
+                (* Outside a shield, this sleep raises the cancel. *)
+                Time.sleep Mono (Span.ms 1) ;
+                incr calls )
+              echo_upgraded
+          in
+          let errors = ref [] in
+          Sim_support.run (fun sim ->
+              Server_support.with_flows sim
+              @@ fun ~server ~client ->
+              let ctx = ctx (config_for config errors ~watch:true) in
+              Fiber.scope (fun s ->
+                  let c = engine ~handler s ctx server in
+                  (* 2 of the 5 bytes of the body: the drain waits. *)
+                  Flow.write_string client
+                    "GET /ws HTTP/1.1\r\n\
+                     Host: a.example\r\n\
+                     Upgrade: echo\r\n\
+                     Connection: Upgrade\r\n\
+                     Content-Length: 5\r\n\
+                     \r\n\
+                     ab" ;
+                  Time.sleep Mono (Span.ms 10) ;
+                  Sim_support.cancel c ;
+                  match Sim_support.await c with
+                  | () ->
+                      ()
+                  | exception Promise.Cancelled ->
+                      () ) ) ;
+          equal (list string) ~msg:"errors" [] !errors ;
+          equal int ~msg:"on_refused" 1 !calls ) ]
 
 let () =
   exit

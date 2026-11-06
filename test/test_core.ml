@@ -2762,6 +2762,51 @@ let response_tests =
               raises_match is_invalid_arg (fun () ->
                   Response.upgrade ~status:s ignore ) )
             Status.[continue; not_found; moved_permanently] )
+    ; test "abandon closes a body, or runs on_refused one time" (fun () ->
+          Sim_support.run
+          @@ fun _ ->
+          let calls = ref 0 in
+          let r = Response.upgrade ~on_refused:(fun () -> incr calls) ignore in
+          let copies =
+            [ r
+            ; Response.with_status Status.ok r
+            ; Response.with_headers (Headers.of_list [("X", "1")]) r
+            ; Response.with_attrs Attrs.empty r ]
+          in
+          List.iter Response.abandon copies ;
+          List.iter Response.abandon copies ;
+          equal int ~msg:"one time, also through the copies" 1 !calls ;
+          (* An upgrade with no on_refused: nothing. *)
+          Response.abandon (Response.upgrade ignore) ;
+          (* A body: it closes, one time. *)
+          let closes = ref 0 in
+          let b =
+            Body.of_source ~close:(fun () -> incr closes) (fun _ _ _ -> 0)
+          in
+          let r = Response.make b in
+          Response.abandon r ;
+          Response.abandon r ;
+          equal int ~msg:"the body closes one time" 1 !closes ;
+          (* In a shield: a wait in on_refused does not see the cancel. *)
+          let waited = ref false in
+          let r =
+            Response.upgrade
+              ~on_refused:(fun () ->
+                Weft.Time.sleep Mono (Weft.Span.ms 1) ;
+                waited := true )
+              ignore
+          in
+          ( try
+              Weft.Fiber.scope (fun s ->
+                  Weft.Fiber.cancel s Exit ; Response.abandon r )
+            with Weft.Fiber.Cancelled _ -> () ) ;
+          is_true ~msg:"the shield" !waited ;
+          (* The exception of on_refused goes out of abandon, one time. *)
+          let r =
+            Response.upgrade ~on_refused:(fun () -> failwith "release") ignore
+          in
+          raises (Failure "release") (fun () -> Response.abandon r) ;
+          Response.abandon r )
     ; test "statuses must suit the response" (fun () ->
           let early = Status.v 103 in
           List.iter

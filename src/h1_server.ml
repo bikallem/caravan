@@ -151,6 +151,10 @@ let serve : Engine.t =
     match Conn_info.scheme ctx.conn with `Http -> "http" | `Https -> "https"
   in
   let report e = config.on_error e (Printexc.get_raw_backtrace ()) in
+  (* A response that the engine does not send: its body closes, or an upgrade
+     runs its [on_refused]. Response.abandon runs in a shield, also in a
+     cancelled fiber. The engine reports its exception. *)
+  let abandon response = try Response.abandon response with e -> report e in
   let date () =
     if config.date_header then Some (Date.of_posix (Time.now Posix)) else None
   in
@@ -285,19 +289,12 @@ let serve : Engine.t =
              handler. A Fiber.Cancelled is a failure: weft gives it only for a
              scope that the handler cancelled. *)
           let bt = Printexc.get_raw_backtrace () in
-          (* A handler that catches its cancel can give a response: close its
-             body, in the shield. There, a cancel can come only from another
-             scope, thus it is a failure to report. *)
-          let close_body response =
-            match Response.kind response with
-            | Response.Body b -> (
-              try Body.close b with e -> report e )
-            | Response.Upgrade _ ->
-                ()
-          in
+          (* A handler that catches its cancel can give a response: abandon it,
+             in a shield. There, a cancel can come only from another scope, thus
+             it is a failure to report. *)
           ( match Fiber.shield (fun () -> Promise.await p) with
           | response ->
-              Fiber.shield (fun () -> close_body response)
+              abandon response
           | exception (Promise.Cancelled | Fiber.Scope_closed) ->
               ()
           (* The client left during the request body, as on the path with no
@@ -314,41 +311,60 @@ let serve : Engine.t =
       | `Response response -> (
         match Response.kind response with
         | Response.Upgrade f -> (
-          match upgrade_error head response with
-          | Some e ->
-              report (Failure ("Response.upgrade: " ^ e)) ;
-              fail_500 head
-          (* A server that stops opens no new upgrade or tunnel (#26), and sends
-             no 100 for it. *)
-          | None when ctx.is_stopping () ->
-              fail_503 head
-          (* A body too large to drain gets the 500 with no 100: after a 100 the
-             client sends it (RFC 9110 §10.1.1). *)
-          | None
-            when Option.fold ~none:false
-                   ~some:(fun n -> n > config.max_drain)
-                   (H1_body.unread body) ->
-              fail_500 head
-          | None -> (
-            match continue_before_switch response body with
-            | exception Body.Truncated ->
-                `Close (* the client left *)
-            (* What follows the request body is for the new protocol. *)
-            | () when not (drain body) ->
-                fail_500 head
-            (* The stop can start during the 100 or the drain. *)
-            | () when ctx.is_stopping () ->
-                fail_503 head
-            | () ->
-                (* The writer ignores keep_alive for an upgrade. *)
-                ignore
-                  (write ~committed ~body
-                     ~keep_alive:(fun () ->
-                       (true
-                       [@mutate off "the head of an upgrade has no keep-alive"]
-                       ) )
-                     head response ) ;
-                switch f ) )
+          (* The decision, and the head of the switch. The handler of an
+             exception covers only these steps, never [switch f]: thus
+             [on_refused] never runs after [f] started. *)
+          match
+            match upgrade_error head response with
+            | Some e ->
+                report (Failure ("Response.upgrade: " ^ e)) ;
+                `Fail_500
+            (* A server that stops opens no new upgrade or tunnel (#26), and
+               sends no 100 for it. *)
+            | None when ctx.is_stopping () ->
+                `Fail_503
+            (* A body too large to drain gets the 500 with no 100: after a 100
+               the client sends it (RFC 9110 §10.1.1). *)
+            | None
+              when Option.fold ~none:false
+                     ~some:(fun n -> n > config.max_drain)
+                     (H1_body.unread body) ->
+                `Fail_500
+            | None -> (
+              match continue_before_switch response body with
+              | exception Body.Truncated ->
+                  `Left
+              (* What follows the request body is for the new protocol. *)
+              | () when not (drain body) ->
+                  `Fail_500
+              (* The stop can start during the 100 or the drain. *)
+              | () when ctx.is_stopping () ->
+                  `Fail_503
+              | () ->
+                  (* The writer ignores keep_alive for an upgrade. *)
+                  ignore
+                    (write ~committed ~body
+                       ~keep_alive:(fun () ->
+                         (true
+                         [@mutate
+                           off "the head of an upgrade has no keep-alive"] ) )
+                       head response ) ;
+                  `Switch )
+          with
+          | `Switch ->
+              switch f
+          (* The release comes before the error response: its write can wait for
+             a client that does not read. *)
+          | `Fail_500 ->
+              abandon response ; fail_500 head
+          | `Fail_503 ->
+              abandon response ; fail_503 head
+          | `Left ->
+              abandon response ; `Close (* the client left *)
+          | exception e ->
+              let bt = Printexc.get_raw_backtrace () in
+              abandon response ;
+              Printexc.raise_with_backtrace e bt )
         (* RFC 9110 §9.3.6: a 2xx to CONNECT opens a tunnel. *)
         | Response.Body b
           when Method.equal head.meth Method.CONNECT

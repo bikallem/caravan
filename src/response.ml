@@ -1,6 +1,13 @@
 type kind = Body of Body.t | Upgrade of (Flow.t -> unit)
 
-type t = {status: Status.t; headers: Headers.t; kind: kind; attrs: Attrs.t}
+(* [refused] runs the [on_refused] function of an upgrade, at most one time: the
+   copies of a response share its flag. *)
+type t =
+  { status: Status.t
+  ; headers: Headers.t
+  ; kind: kind
+  ; attrs: Attrs.t
+  ; refused: unit -> unit }
 
 (* A body response's status is final: 1xx are interim and the engine's to send.
    An upgrade switches protocols (101) or opens a tunnel (2xx). *)
@@ -16,12 +23,12 @@ let check_status fn status kind =
   | Body _ | Upgrade _ ->
       ()
 
-let v fn status headers kind =
+let v ~refused fn status headers kind =
   check_status fn status kind ;
-  {status; headers; kind; attrs= Attrs.empty}
+  {status; headers; kind; attrs= Attrs.empty; refused}
 
 let make ?(status = Status.ok) ?(headers = Headers.empty) body =
-  v "make" status headers (Body body)
+  v ~refused:ignore "make" status headers (Body body)
 
 let string ?status ?(headers = Headers.empty) ?content_type s =
   let headers =
@@ -41,9 +48,21 @@ let empty ?(status = Status.no_content) ?headers () =
 let stream ?status ?headers ?length produce =
   make ?status ?headers (Body.of_writer ?length produce)
 
-let upgrade ?(status = Status.switching_protocols) ?(headers = Headers.empty) f
-    =
-  v "upgrade" status headers (Upgrade f)
+let upgrade ?(status = Status.switching_protocols) ?(headers = Headers.empty)
+    ?on_refused f =
+  let refused =
+    match on_refused with
+    | None ->
+        ignore
+    | Some g ->
+        let ran = Atomic.make false in
+        fun () -> if not (Atomic.exchange ran true) then g ()
+  in
+  v ~refused "upgrade" status headers (Upgrade f)
+
+let abandon r =
+  Weft.Fiber.shield (fun () ->
+      match r.kind with Body b -> Body.close b | Upgrade _ -> r.refused () )
 
 let status r = r.status
 
