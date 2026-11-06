@@ -1,0 +1,27 @@
+(library
+ (name example_sessions)
+ (modules app)
+ (libraries caravan caravan.html caravan.middleware caravan.session weft))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries
+  example_sessions
+  example_dev
+  example_common
+  mirage-crypto-rng.unix))
+
+(test
+ (name test)
+ (modules test)
+ (libraries
+  example_sessions
+  example_support
+  caravan
+  caravan.session
+  caravan.testing
+  mirage-crypto-rng
+  weft
+  weft.sim
+  windtrap))
