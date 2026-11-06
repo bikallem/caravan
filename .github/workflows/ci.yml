@@ -45,3 +45,32 @@ jobs:
       - uses: cachix/install-nix-action@v31
       - name: Build the package
         run: nix build -L
+
+  # Windows, with OCaml 5.5 (MinGW-w64) from opam: Nix does not run on
+  # Windows. The pins are the commits of flake.lock (weft, windtrap) and of
+  # flake.nix (http-date). The test dependencies of caravan.opam include the
+  # optional libraries, thus each library and its suite build here too.
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      # The expected values of the tests have CRLF in their text: the checkout
+      # must keep LF.
+      - name: Keep LF in the checkout
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v5
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.5.0"
+      - name: Install the dependencies
+        run: |
+          opam pin add -n weft git+https://github.com/ocaml-caravanserai/weft.git#6f05d1773e5d29e1882cfde378ee8349b896ce1a
+          opam pin add -n weft-tls git+https://github.com/ocaml-caravanserai/weft.git#6f05d1773e5d29e1882cfde378ee8349b896ce1a
+          opam pin add -n windtrap git+https://github.com/bikallem/windtrap.git#a851bdaad59fedbf86b3117aab502865ccc2b18c
+          opam pin add -n ppx_windtrap git+https://github.com/bikallem/windtrap.git#a851bdaad59fedbf86b3117aab502865ccc2b18c
+          opam pin add -n http-date git+https://github.com/bikallem/http-date.git#8924a84d249a2773f12d79c442bf133eff5d549f
+          opam install . --deps-only --with-test
+      - name: Build
+        run: opam exec -- dune build
+      - name: Test
+        run: opam exec -- dune runtest --force
