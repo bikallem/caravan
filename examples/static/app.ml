@@ -81,7 +81,9 @@ let make ~root =
          R.get "/files/**" (fun req ->
              Caravan_static.dir ~cache_control ~content_type ~root (R.rest req)
                req )
-       ; (* One file. Its type comes from its extension: image/x-icon. *)
+       ; (* One file. Its type comes from its extension: image/x-icon. The path
+            joins with '/', as caravan.static does: Windows accepts it, and the
+            simulator of the tests has only '/'. *)
          R.get "/favicon.ico"
            (Caravan_static.file ~cache_control:"max-age=86400"
-              (Filename.concat root "favicon.ico") ) ] )
+              (root ^ "/favicon.ico") ) ] )
