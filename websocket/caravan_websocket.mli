@@ -142,11 +142,13 @@ val recv : t -> message
     Many fibers can call [recv] on a connection at the same time. They get the
     messages one at a time: each message goes to one fiber.
 
-    If a cancel stops [recv] between two messages, the connection stays open. If
-    the cancel stops it in the middle of a frame or a fragmented message, the
-    connection closes with the code 1006. If the cancel comes after a Ping and
-    before its Pong goes, the peer gets no Pong. If the cancel comes after the
-    Pong got the writer (see {!send}), the connection closes with the code 1006.
+    If a cancel stops [recv] between two messages, also when a part of the
+    header of the next frame came, the connection stays open: the next [recv]
+    reads that frame. If the cancel stops it after the header of a frame, or in
+    a fragmented message, the connection closes with the code 1006. If the
+    cancel comes after a Ping and before its Pong goes, the peer gets no Pong.
+    If the cancel comes after the Pong got the writer (see {!send}), the
+    connection closes with the code 1006.
 
     @raise Closed
       when the peer closes the connection, or when it does not obey the

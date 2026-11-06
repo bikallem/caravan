@@ -1,6 +1,8 @@
 open Weft
 open Caravan
 open Caravan.Private
+module Reader = Weft_flow.Reader
+module Writer = Weft_flow.Writer
 
 type message = Text of string | Binary of string
 
@@ -8,8 +10,8 @@ exception Closed of {code: int; reason: string}
 
 type t =
   { flow: Flow.t
-  ; r: Buf_reader.t
-  ; w: Buf_writer.t
+  ; r: Reader.t
+  ; w: Writer.t
   ; writer: Fiber.Semaphore.t (* one frame at a time on [w] *)
   ; reader: Fiber.Semaphore.t (* one fiber at a time reads frames *)
   ; protocol: string option
@@ -17,7 +19,6 @@ type t =
   ; close_timeout: Span.t
   ; read_timeout: Span.t option (* [Some] of the read timeout, made once *)
   ; idle_timeout: Span.t option
-  ; mutable in_frame: bool (* a byte of the frame came: with [reader] *)
   ; close_at: Clock.mono option Atomic.t (* the deadline of [close], set once *)
   ; closing: exn option Atomic.t (* we sent a Close frame: what [send] raises *)
   ; closed: exn Ivar.t (* the first [Closed] exception *) }
@@ -51,20 +52,6 @@ let set_close_deadline t =
     Flow.set_write_deadline t.flow d
   end
 
-(* The reads of [t.r]. Each read of the flow sets the timeout of its wait. Until
-   the first byte of a frame, the timeout is [idle_timeout]. Inside a frame,
-   each read that waits gets the timeout [read_timeout] from the start of its
-   wait. Thus a slow frame with no long pause can take more time than
-   [read_timeout]. *)
-let read_bytes t buf off len =
-  Flow.set_read_timeout t.flow
-    (if t.in_frame then t.read_timeout else t.idle_timeout) ;
-  let n = Flow.read t.flow buf off len in
-  (* A byte of the frame came, or the input ended: then [Frame.read] stops with
-     End_of_file. *)
-  t.in_frame <- true ;
-  n
-
 let make ?protocol ?(max_message = 8 * 1024 * 1024) ?(close_timeout = Span.s 5)
     ?(write_timeout = Span.s 30) ?(read_timeout = Span.s 30) ?idle_timeout flow
     =
@@ -73,29 +60,21 @@ let make ?protocol ?(max_message = 8 * 1024 * 1024) ?(close_timeout = Span.s 5)
   (* Each write that waits gets the write timeout. A frame takes one or two
      writes of the flow. *)
   Flow.set_write_timeout flow (Some write_timeout) ;
-  (* [read_bytes] is necessary to make [r], and it needs the connection. *)
-  let self = ref None in
-  let read buf off len = read_bytes (Option.get !self) buf off len in
-  (* The first [recv] allocates the 4 KiB buffer of [r]. Small frames then need
-     one read of the flow, not one for each part of the frame. *)
-  let t =
-    { flow
-    ; r= Buf_reader.make read
-    ; w= Buf_writer.make (Flow.write flow)
-    ; writer= Fiber.Semaphore.create 1
-    ; reader= Fiber.Semaphore.create 1
-    ; protocol
-    ; max_message
-    ; close_timeout
-    ; read_timeout= Some read_timeout
-    ; idle_timeout
-    ; in_frame= false [@mutate off "next sets in_frame before each read of r"]
-    ; close_at= Atomic.make None
-    ; closing= Atomic.make None
-    ; closed= Ivar.create () }
-  in
-  self := Some t ;
-  t
+  (* [r] and [w] have a buffer of 4 KiB each. Small frames then need one read of
+     the flow, not one for each part of the frame. *)
+  { flow
+  ; r= Reader.create flow
+  ; w= Writer.create flow
+  ; writer= Fiber.Semaphore.create 1
+  ; reader= Fiber.Semaphore.create 1
+  ; protocol
+  ; max_message
+  ; close_timeout
+  ; read_timeout= Some read_timeout
+  ; idle_timeout
+  ; close_at= Atomic.make None
+  ; closing= Atomic.make None
+  ; closed= Ivar.create () }
 
 (* [Sys.opaque_identity] stops a compiler that inlines a constant code and
    reason from making one static [Closed] value for all connections: then the
@@ -143,7 +122,9 @@ let write_frame t (frame : Frame.t) =
       | (Text | Binary | Continuation | Ping), Some e ->
           raise e
       | _ -> (
-        try Frame.write t.w frame ; Buf_writer.flush t.w with
+        (* After an exception of a write, [t.w] is broken. Both handlers shut
+           the connection, thus [check_closed] stops each later write. *)
+        try Frame.write t.w frame ; Writer.flush t.w with
         | Flow.Closed | Flow.Timeout ->
             raise (shut t 1006 "")
         | e ->
@@ -263,8 +244,8 @@ let rec next t part =
   let size = match part with None -> 0 | Some (_, (_, len), _) -> len in
   (* The idle timeout applies until the first byte of the frame. The bytes of
      the frame can be in [t.r] at this time. *)
-  t.in_frame <- Buf_reader.buffered t.r > 0 ;
-  let start = Buf_reader.consumed t.r in
+  let idle = ref (Reader.buffered t.r = 0) in
+  let start = Reader.consumed t.r in
   (* The UTF-8 of a text message, checked for each part of a frame as it
      arrives, after the [pending] bytes of an incomplete sequence (RFC 6455
      §8.1: we fail at the first incorrect byte, not at the end of the frame). A
@@ -285,7 +266,19 @@ let rec next t part =
       | _ ->
           ()
   in
-  match Frame.read ~on_data t.r ~masked:true ~max:(t.max_message - size) with
+  (* Until the first byte, a read of the flow waits at most [idle_timeout].
+     After it, each read that waits gets the timeout [read_timeout] from the
+     start of its wait. Thus a slow frame with no long pause can take more time
+     than [read_timeout]. *)
+  match
+    if !idle then begin
+      Flow.set_read_timeout t.flow t.idle_timeout ;
+      Reader.ensure t.r 1 ;
+      idle := false
+    end ;
+    Flow.set_read_timeout t.flow t.read_timeout ;
+    Frame.read ~on_data t.r ~masked:true ~max:(t.max_message - size)
+  with
   | exception Bad_text ->
       fail t 1007 "text is not UTF-8"
   | exception Frame.Error (Protocol_error reason) ->
@@ -293,13 +286,14 @@ let rec next t part =
   | exception Frame.Error Too_big ->
       fail t 1009 "message is too large"
   | exception Flow.Timeout when Atomic.get t.closing = None ->
-      if t.in_frame then fail t 1001 "read timeout"
-      else fail ~discard:false t 1001 "idle timeout"
+      if !idle then fail ~discard:false t 1001 "idle timeout"
+      else fail t 1001 "read timeout"
   | exception (End_of_file | Flow.Closed | Flow.Timeout) ->
       raise (shut t 1006 "")
-  (* Between two messages, an exception before the first byte of a frame, for
-     example a cancel, leaves the stream in step. *)
-  | exception e when part = None && Buf_reader.consumed t.r = start ->
+  (* Between two messages, an exception before the end of the header of a frame,
+     for example a cancel, leaves the stream in step: [Frame.read] consumed
+     nothing, and the reader keeps the bytes of the header. *)
+  | exception e when part = None && Reader.consumed t.r = start ->
       raise e
   | exception e ->
       abort t e

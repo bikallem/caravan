@@ -7,6 +7,9 @@ open Windtrap
 open Weft
 open Caravan.Private
 open Caravan_websocket.Private
+module Reader = Weft_flow.Reader
+module Writer = Weft_flow.Writer
+module Flow = Caravan.Flow
 
 let is_invalid_arg = function Invalid_argument _ -> true | _ -> false
 
@@ -139,14 +142,23 @@ let frame = Testable.structural ~pp:pp_frame
 
 let encode ?mask f =
   let out = Buffer.create 64 in
-  let w =
-    Buf_writer.make (fun b off len -> Buffer.add_subbytes out b off len)
-  in
-  Frame.write ?mask w f ; Buf_writer.flush w ; Buffer.contents out
+  let w = Writer.create (Flow.of_string "" out) in
+  Frame.write ?mask w f ; Writer.flush w ; Buffer.contents out
+
+(* [reader ~size ~chunk s] is a reader of [s] with a buffer of [size] bytes. A
+   read of the flow gives at most [chunk] bytes. *)
+let reader ?size ?chunk s =
+  Reader.create ?size (Flow.of_string ?chunk s (Buffer.create 0))
+
+(* [at_end r] is [true] iff [r] holds no byte and its stream ended. It waits for
+   a byte or the end. *)
+let at_end r =
+  Reader.buffered r = 0
+  && match Reader.ensure r 1 with () -> false | exception End_of_file -> true
 
 (* What [Frame.read] makes of [input]: a frame, or the error. *)
 let outcome ?(masked = true) ?(max = 1000) input =
-  match Frame.read (Buf_reader.of_string input) ~masked ~max with
+  match Frame.read (reader input) ~masked ~max with
   | f ->
       Format.asprintf "%a" pp_frame f
   | exception Frame.Error (Protocol_error m) ->
@@ -180,18 +192,17 @@ let frame_tests =
     ; test "RFC 6455 examples decode, one after another" (fun () ->
           let unmasked = List.filter (fun (_, m, _) -> m = None) examples in
           let r =
-            Buf_reader.of_string ~size:16 ~chunk:5
+            reader ~size:16 ~chunk:5
               (String.concat "" (List.map (fun (_, _, e) -> e) unmasked))
           in
           equal (list frame)
             (List.map (fun (fr, _, _) -> fr) unmasked)
             (List.map (fun _ -> Frame.read r ~masked:false ~max:65536) unmasked) ;
-          is_true (Buf_reader.peek_eof r) ;
+          is_true (at_end r) ;
           List.iter
             (fun (fr, m, e) ->
               if m <> None then
-                equal frame fr
-                  (Frame.read (Buf_reader.of_string e) ~masked:true ~max:5) )
+                equal frame fr (Frame.read (reader e) ~masked:true ~max:5) )
             examples )
     ; test "lengths take the shortest encoding" (fun () ->
           equal
@@ -276,7 +287,7 @@ top bit: protocol error: length with its top bit set
     ; test "a declared length does not allocate before the payload arrives"
         (fun () ->
           let header = of_hex "827f" ^ "\x00\x00\x00\x00\x00\x80\x00\x00" in
-          let r = Buf_reader.of_string (header ^ "short") in
+          let r = reader (header ^ "short") in
           let before = Gc.allocated_bytes () in
           raises End_of_file (fun () -> Frame.read r ~masked:false ~max:max_int) ;
           let used = Gc.allocated_bytes () -. before in
@@ -332,7 +343,7 @@ top bit: protocol error: length with its top bit set
                 (String.sub payload 0 (Int.min 125 (String.length payload)))
             else f ~fin opcode payload
           in
-          let r = Buf_reader.of_string ~size ~chunk (encode ?mask fr) in
+          let r = reader ~size ~chunk (encode ?mask fr) in
           (* The parts that on_data gets: not empty, in order, and the payload,
              unmasked. None for a control frame. *)
           let parts = Buffer.create 64 and empty = ref false in
@@ -342,7 +353,7 @@ top bit: protocol error: length with its top bit set
             Buffer.add_subbytes parts buf off len
           in
           equal frame fr (Frame.read ~on_data r ~masked:(mask <> None) ~max:300) ;
-          is_true (Buf_reader.peek_eof r) ;
+          is_true (at_end r) ;
           is_true ~msg:"no empty part" (not !empty) ;
           equal string
             (if Frame.is_control opcode then "" else fr.payload)
@@ -375,7 +386,7 @@ let show_frame (f : Frame.t) =
 
 (* The frames in [out], one for each line. *)
 let frames out =
-  let r = Buf_reader.of_string out in
+  let r = reader out in
   let rec loop acc =
     match Frame.read r ~masked:false ~max:max_int with
     | f ->
@@ -1318,8 +1329,6 @@ let close_tests =
                    ; (1000, "\xff") ] ;
                  Ws.close ~code:4999 ~reason c ) ) ) ]
 
-module Flow = Caravan.Flow
-
 (* [with_socket sim f] runs [f c peer] with a server connection [c] on a TCP
    connection of the simulator, and the flow [peer] of the other side. *)
 let with_socket ?close_timeout ?write_timeout ?read_timeout ?idle_timeout sim f
@@ -1389,7 +1398,7 @@ let socket_tests =
             ^ "\x01\x02\x03\x04"
           in
           Flow.write_string peer (header ^ String.make 1_000_000 'x') ;
-          let r = Buf_reader.of_flow peer in
+          let r = Reader.create peer in
           equal string "close 1009"
             (show_frame (Frame.read r ~masked:false ~max:125)) ;
           raises End_of_file (fun () -> Frame.read r ~masked:false ~max:125) ;
@@ -1408,7 +1417,7 @@ let socket_tests =
           let sender =
             call s (fun () -> closed_code (fun () -> Ws.send c (Binary large)))
           in
-          is_false (Buf_reader.peek_eof (Buf_reader.of_flow peer)) ;
+          is_false (at_end (Reader.create peer)) ;
           let reader = call s (fun () -> Ws.recv c) in
           Flow.write_string peer (client Close (code_reason 1000 "")) ;
           (* The reply to the Close frame waits for the writer. *)
@@ -1430,8 +1439,8 @@ let socket_tests =
           @@ fun s ->
           let sender = call s (fun () -> Ws.send c (Binary large)) in
           (* When the first bytes come, the send is in its frame. *)
-          let r = Buf_reader.of_flow peer in
-          is_false (Buf_reader.peek_eof r) ;
+          let r = Reader.create peer in
+          is_false (at_end r) ;
           Sim_support.cancel sender ;
           was_cancelled sender ;
           equal int 1006 (closed_code (fun () -> Ws.send c (Text "hello"))) ;
@@ -1767,6 +1776,8 @@ let session ?first ?(after = "") ?(during = ignore) ?(reply = true) server path
   Flow.write_string flow (upgrade_request ?first path) ;
   let r = Buf_reader.of_flow flow in
   let head = response_head r in
+  (* The frames that came with the head are in [r]. *)
+  let r = Reader.create (Flow.prepend (Buf_reader.take_buffered r) flow) in
   Flow.write_string flow after ;
   during () ;
   let rec frames acc =
@@ -2190,7 +2201,7 @@ let all_end_at sim ~t0 d calls =
 
 (* The next frame that the peer reads. *)
 let peer_frame peer =
-  show_frame (Frame.read (Buf_reader.of_flow peer) ~masked:false ~max:125)
+  show_frame (Frame.read (Reader.create peer) ~masked:false ~max:125)
 
 let time_tests =
   group "Connection and exact time"
@@ -2560,7 +2571,7 @@ let time_tests =
           Weft_sim.settle sim ;
           let closer = call s (fun () -> outcome (fun () -> Ws.close c)) in
           is_closing_now sim c ;
-          let r = Buf_reader.of_flow peer in
+          let r = Reader.create peer in
           let next () = Frame.read r ~masked:false ~max:max_int in
           equal int (String.length large) (String.length (next ()).payload) ;
           equal string "close 1000" (show_frame (next ())) ;
@@ -2577,7 +2588,7 @@ let time_tests =
           let first =
             call s (fun () -> outcome (fun () -> Ws.close ~code:1001 c))
           in
-          let r = Buf_reader.of_flow peer in
+          let r = Reader.create peer in
           equal string "close 1001"
             (show_frame (Frame.read r ~masked:false ~max:125)) ;
           let second = call s (fun () -> outcome (fun () -> Ws.close c)) in
@@ -2596,11 +2607,11 @@ let time_tests =
              cancel ends the linger. *)
           let reader = call s (fun () -> Ws.recv c) in
           Flow.write_string peer (client Continuation "x") ;
-          let r = Buf_reader.of_flow peer in
+          let r = Reader.create peer in
           equal string "close 1002"
             (show_frame (Frame.read r ~masked:false ~max:125)) ;
           (* The end of the stream shows that the server is in the linger. *)
-          is_true (Buf_reader.peek_eof r) ;
+          is_true (at_end r) ;
           is_false ~msg:"the reader lingers" (ended sim reader) ;
           Sim_support.cancel reader ;
           was_cancelled reader ;
@@ -2653,18 +2664,37 @@ let time_tests =
           @@ fun s c peer ->
           let reader = call s (fun () -> Ws.recv c) in
           let frame = client Text "hello" in
-          Flow.write_string peer (String.sub frame 0 3) ;
-          (* The reader took the bytes and waits inside the frame. *)
+          (* The header of a masked frame of 5 bytes has 6 bytes. *)
+          Flow.write_string peer (String.sub frame 0 7) ;
+          (* The reader took the header and waits inside the payload. *)
           Weft_sim.settle sim ;
           Sim_support.cancel reader ;
           was_cancelled reader ;
           (* The connection is closed: the write can get a reset. *)
           ( try
               Flow.write_string peer
-                ( String.sub frame 3 (String.length frame - 3)
+                ( String.sub frame 7 (String.length frame - 7)
                 ^ client Text "next" )
             with Flow.Closed -> () ) ;
           equal int 1006 (closed_code (fun () -> Ws.recv c)) )
+    ; test "a cancel in the header of a received frame keeps the connection"
+        (fun () ->
+          Sim_support.manual
+          @@ fun sim ->
+          with_timed_socket sim
+          @@ fun s c peer ->
+          let reader = call s (fun () -> Ws.recv c) in
+          let frame = client Text "hello" in
+          Flow.write_string peer (String.sub frame 0 3) ;
+          (* The reader holds 3 bytes of the header and waits for the rest. *)
+          Weft_sim.settle sim ;
+          Sim_support.cancel reader ;
+          was_cancelled reader ;
+          (* The header is not consumed: the next recv reads the same frame. *)
+          Flow.write_string peer (String.sub frame 3 (String.length frame - 3)) ;
+          is_true (Ws.recv c = Text "hello") ;
+          Flow.write_string peer (client Text "next") ;
+          is_true (Ws.recv c = Text "next") )
     ; test
         "a cancel in the wait to send a Pong inside a fragmented message \
          closes with 1006" (fun () ->
@@ -2739,7 +2769,7 @@ let time_tests =
           Weft_sim.settle sim ;
           let closer = call s (fun () -> outcome (fun () -> Ws.close c)) in
           is_closing_now sim c ;
-          let r = Buf_reader.of_flow peer in
+          let r = Reader.create peer in
           let next () = Frame.read r ~masked:false ~max:max_int in
           equal int (String.length large) (String.length (next ()).payload) ;
           equal string "ended" (await big) ;
@@ -2798,7 +2828,7 @@ let time_tests =
           (* After the end of the handler, the connection waits for the end of
              the closing handshake. *)
           is_false ~msg:"the handshake waits" (ended sim handler) ;
-          let r = Buf_reader.of_flow peer in
+          let r = Reader.create peer in
           let first = Frame.read r ~masked:false ~max:max_int in
           let second =
             match Frame.read r ~masked:false ~max:125 with
@@ -2840,6 +2870,9 @@ let time_tests =
           let r = Buf_reader.of_flow flow in
           equal string "HTTP/1.1 101 Switching Protocols"
             (List.hd (response_head r)) ;
+          let r =
+            Reader.create (Flow.prepend (Buf_reader.take_buffered r) flow)
+          in
           in_scope
           @@ fun s ->
           let close_frame =
@@ -2978,7 +3011,7 @@ let race_tests =
                 done )
           in
           let a = sender 'a' and b = sender 'b' in
-          let r = Buf_reader.of_flow peer and last = Hashtbl.create 2 in
+          let r = Reader.create peer and last = Hashtbl.create 2 in
           for _ = 1 to 2 * count do
             let f = Frame.read r ~masked:false ~max:max_int in
             match String.split_on_char ' ' f.payload with

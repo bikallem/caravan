@@ -1,4 +1,5 @@
-open Caravan.Private
+module Reader = Weft_flow.Reader
+module Writer = Weft_flow.Writer
 
 type opcode = Continuation | Text | Binary | Close | Ping | Pong
 
@@ -84,13 +85,6 @@ let apply_mask ?(phase = 0) key buf off len =
     Bytes.set buf (off + i) (Char.chr b)
   done
 
-let rec really_read r buf off len =
-  if len > 0 then begin
-    let n = Buf_reader.read_into r buf off len in
-    if n = 0 then raise End_of_file ;
-    really_read r buf (off + n) (len - n)
-  end
-
 (* Reads [len] bytes, unmasked with [key] if it is not [""]. The buffer grows as
    the bytes arrive, thus a peer that declares a large length and sends no
    payload does not take that memory. Each part that a read gives goes to
@@ -103,7 +97,7 @@ let read_payload r ~key ~on_data len =
         if pos < Bytes.length buf then buf
         else Bytes.extend buf 0 (Int.min pos (len - pos))
       in
-      let n = Buf_reader.read_into r buf pos (Bytes.length buf - pos) in
+      let n = Reader.read_into r buf pos (Bytes.length buf - pos) in
       if n = 0 then raise End_of_file ;
       if key <> "" then apply_mask ~phase:(pos land 3) key buf pos n ;
       on_data buf pos n ;
@@ -115,10 +109,13 @@ let read_payload r ~key ~on_data len =
        (Int.min len (65536 [@mutate off "a capacity: the buffer grows to len"])) )
     0
 
+(* The header: 2 bytes, the extended length (0, 2 or 8 bytes), then the key of
+   the mask (4 bytes) if [masked]. [read] checks the length before it waits for
+   the key, and consumes the header only when it is complete. Thus a cancel in
+   the header consumes nothing. *)
 let read ?on_data r ~masked ~max =
-  let hdr = Bytes.create 8 in
-  really_read r hdr 0 2 ;
-  let b0 = Bytes.get_uint8 hdr 0 and b1 = Bytes.get_uint8 hdr 1 in
+  Reader.ensure r 2 ;
+  let b0 = Reader.get_uint8 r 0 and b1 = Reader.get_uint8 r 1 in
   if b0 land 0x70 <> 0 then protocol_error "reserved bits set" ;
   let fin = b0 land 0x80 <> 0 and opcode = opcode_of_int (b0 land 0x0f) in
   if is_control opcode && not fin then protocol_error "fragmented control frame" ;
@@ -126,30 +123,32 @@ let read ?on_data r ~masked ~max =
     protocol_error "control frame longer than 125 bytes" ;
   if b1 land 0x80 <> 0 <> masked then
     protocol_error (if masked then "unmasked frame" else "masked frame") ;
-  let len =
+  let ext, len =
     match b1 land 0x7f with
     | 126 ->
-        really_read r hdr 0 2 ; Bytes.get_uint16_be hdr 0
+        Reader.ensure r 4 ;
+        (2, Reader.get_uint16_be r 2)
     | 127 ->
-        really_read r hdr 0 8 ;
-        let n = Bytes.get_int64_be hdr 0 in
+        Reader.ensure r 10 ;
+        let n = Reader.get_int64_be r 2 in
         if Int64.compare n 0L < 0 then
           protocol_error "length with its top bit set" ;
         (* We compare before the conversion, because [n] can be too large for an
            [int]. *)
         if Int64.compare n (Int64.of_int max) > 0 then raise (Error Too_big) ;
-        Int64.to_int n
+        (8, Int64.to_int n)
     | n ->
-        n
+        (0, n)
   in
   if len > max && not (is_control opcode) then raise (Error Too_big) ;
   let key =
     if masked then (
-      really_read r hdr 0 4 ;
-      Bytes.sub_string hdr 0
+      Reader.ensure r (2 + ext + 4) ;
+      Reader.sub_string r (2 + ext)
         (4 [@mutate off "apply_mask uses only the first 4 bytes of the key"]) )
     else ""
   in
+  Reader.consume r (2 + ext + String.length key) ;
   let on_data =
     match on_data with
     | Some f when not (is_control opcode) ->
@@ -165,31 +164,25 @@ let write ?mask w {fin; opcode; payload} =
   if is_control opcode && ((not fin) || len > 125) then
     invalid_arg
       "Frame.write: a control frame must be final and at most 125 bytes" ;
-  let hdr = Bytes.create 14 in
-  Bytes.set_uint8 hdr 0 ((if fin then 0x80 else 0) lor int_of_opcode opcode) ;
+  ( match mask with
+  | Some key when String.length key <> 4 ->
+      invalid_arg "Frame.write: the mask must be 4 bytes"
+  | _ ->
+      () ) ;
+  Writer.write_uint8 w ((if fin then 0x80 else 0) lor int_of_opcode opcode) ;
   let m = if Option.is_some mask then 0x80 else 0 in
-  let n =
-    if len < 126 then (
-      Bytes.set_uint8 hdr 1 (m lor len) ;
-      2 )
-    else if len < 0x10000 then (
-      Bytes.set_uint8 hdr 1 (m lor 126) ;
-      Bytes.set_uint16_be hdr 2 len ;
-      4 )
-    else (
-      Bytes.set_uint8 hdr 1 (m lor 127) ;
-      Bytes.set_int64_be hdr 2 (Int64.of_int len) ;
-      10 )
-  in
+  if len < 126 then Writer.write_uint8 w (m lor len)
+  else if len < 0x10000 then (
+    Writer.write_uint8 w (m lor 126) ;
+    Writer.write_uint16_be w len )
+  else (
+    Writer.write_uint8 w (m lor 127) ;
+    Writer.write_int64_be w (Int64.of_int len) ) ;
   match mask with
   | None ->
-      Buf_writer.write_bytes w hdr 0 n ;
-      Buf_writer.write_string w payload
+      Writer.write_string w payload
   | Some key ->
-      if String.length key <> 4 then
-        invalid_arg "Frame.write: the mask must be 4 bytes" ;
-      Bytes.blit_string key 0 hdr n 4 ;
-      Buf_writer.write_bytes w hdr 0 (n + 4) ;
+      Writer.write_string w key ;
       let p = Bytes.of_string payload in
       apply_mask key p 0 len ;
-      Buf_writer.write_bytes w p 0 len
+      Writer.write_bytes w p 0 len

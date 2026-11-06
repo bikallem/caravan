@@ -675,12 +675,16 @@ let websocket server =
     "HTTP/1.1 101 Switching Protocols" status ;
   equal (option string) ~msg:"Sec-WebSocket-Accept" (Some ws_accept)
     (List.assoc_opt "sec-websocket-accept" fields) ;
-  let w = Buf_writer.make (Flow.write flow) in
+  let w = Weft_flow.Writer.create flow in
   let send (frame : Frame.t) =
     Frame.write ~mask:"\x12\x34\x56\x78" w frame ;
-    Buf_writer.flush w
+    Weft_flow.Writer.flush w
   in
-  let recv () = Frame.read r ~masked:false ~max:1000 in
+  (* The frames that came with the head are in [r]. *)
+  let fr =
+    Weft_flow.Reader.create (Flow.prepend (Buf_reader.take_buffered r) flow)
+  in
+  let recv () = Frame.read fr ~masked:false ~max:1000 in
   send {fin= true; opcode= Text; payload= "hello"} ;
   let echo = recv () in
   is_true ~msg:"the echo is the Text frame" (echo.opcode = Text) ;
@@ -689,7 +693,8 @@ let websocket server =
   let close = recv () in
   is_true ~msg:"the reply is a Close frame" (close.opcode = Close) ;
   equal string ~msg:"the code of the reply" "\x03\xe8" close.payload ;
-  is_true ~msg:"the end of the stream, not a reset" (Server_support.is_eof r)
+  is_true ~msg:"the end of the stream, not a reset"
+    (Weft_flow.Reader.read_into fr (Bytes.create 1) 0 1 = 0)
 
 (* "localhost" can give ::1 first, and the server listens only on 127.0.0.1: the
    client tries the next address. *)

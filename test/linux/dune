@@ -23,6 +23,7 @@
   ptime
   server_support
   weft
+  weft.flow
   weft.linux
   weft.posix
   windtrap

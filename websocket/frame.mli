@@ -2,8 +2,6 @@
    ({{:https://www.rfc-editor.org/rfc/rfc6455#section-5.2}RFC 6455 §5.2}),
    without extensions. *)
 
-open Caravan.Private
-
 type opcode = Continuation | Text | Binary | Close | Ping | Pong
 
 (** The type for frames. [payload] is unmasked. *)
@@ -21,7 +19,7 @@ val is_control : opcode -> bool
 
 val read :
      ?on_data:(opcode -> bytes -> int -> int -> unit)
-  -> Buf_reader.t
+  -> Weft_flow.Reader.t
   -> masked:bool
   -> max:int
   -> t
@@ -36,16 +34,21 @@ val read :
     not empty and make the whole payload. An exception from [on_data] goes out
     of [read]: the frame is then not read to its end.
 
+    [read] consumes the header from [r] only when all of it came. Thus if [read]
+    raises in the header, for example for a cancel or a timeout, it consumed
+    nothing of [r], and a later [read] reads the same frame.
+
     @raise Error
       if the frame has a reserved bit or opcode, is a control frame that is
       fragmented or longer than 125 bytes, is masked otherwise than [masked]
       says, or has a 64-bit length with its top bit set ([Protocol_error]), or
-      if it is a data frame with a length over [max] ([Too_big]). [read] reads
-      nothing after the length then. The payload buffer grows as the bytes
-      arrive: before its payload, a declared length allocates at most 64 KiB.
+      if it is a data frame with a length over [max] ([Too_big]). [read] does
+      not wait for the bytes after the length then. The payload buffer grows as
+      the bytes arrive: before its payload, a declared length allocates at most
+      64 KiB.
     @raise End_of_file if the input ends before the frame does. *)
 
-val write : ?mask:string -> Buf_writer.t -> t -> unit
+val write : ?mask:string -> Weft_flow.Writer.t -> t -> unit
 (** [write ~mask w f] writes [f] with the shortest length encoding, masked with
     the 4-byte key [mask] if given, as a client must.
 
