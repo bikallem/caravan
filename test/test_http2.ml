@@ -1,4 +1,5 @@
-(* The tests of caravan.http2: the error codes and the frames. *)
+(* The tests of caravan.http2: the error codes, the frames and the connection
+   state. *)
 
 open Windtrap
 open Weft
@@ -830,4 +831,1675 @@ let frame_tests =
           equal string (of_hex "ffffff 00 00 7fffffff") (String.sub bytes 0 9) ;
           equal int (9 + 0xff_ffff) (String.length bytes) ) ]
 
-let () = exit (Windtrap.run "http2" [error_tests; frame_tests])
+(* {1 Connection state} *)
+
+module Conn_state = Caravan_http2.Private.Conn_state
+
+let max_window = 0x7fff_ffff
+
+(* Two streams at most: the connection receive window is 131070 bytes. *)
+let local =
+  { Conn_state.max_concurrent_streams= 2
+  ; initial_window= 65535
+  ; header_table_size= 4096
+  ; max_header_list_size= 16384 }
+
+(* One stream at most: the connection receive window is 65535 bytes, as the
+   window of a stream. Thus a credit of 32768 bytes or more sends a
+   WINDOW_UPDATE frame on the connection too. *)
+let one = {local with max_concurrent_streams= 1}
+
+let show_use : Conn_state.use -> string = function
+  | Open ->
+      "open"
+  | Trailers ->
+      "trailers"
+  | Refused ->
+      "refused"
+  | Reset c ->
+      "reset " ^ show_code c
+  | Ignored ->
+      "ignored"
+
+(* A string of more than 16 bytes prints as its length. *)
+let show_bytes s =
+  if String.length s > 16 then sprintf "len:%d" (String.length s)
+  else sprintf "%S" s
+
+let show_event : Conn_state.event -> string = function
+  | Send f ->
+      "send " ^ show f
+  | Header_block {stream; block; end_stream; use} ->
+      sprintf "block %d%s %s %s" stream
+        (flags [(end_stream, "END_STREAM")])
+        (show_bytes block) (show_use use)
+  | Data {stream; data; end_stream} ->
+      sprintf "data %d%s %s" stream
+        (flags [(end_stream, "END_STREAM")])
+        (show_bytes data)
+  | Body_error {stream} ->
+      sprintf "body error %d" stream
+  | Peer_reset {stream} ->
+      sprintf "peer reset %d" stream
+  | Credit ->
+      "credit"
+  | Peer_goaway {last_stream; code} ->
+      sprintf "peer goaway %d %s" last_stream (show_code code)
+  | Stream_error {stream; code} ->
+      sprintf "stream error %d %s" stream (show_code code)
+
+let show_result = function
+  | Ok events ->
+      List.map show_event events
+  | Error (c, _) ->
+      ["error " ^ show_code c]
+
+let texts = Testable.(list string)
+
+(* A state after the client preface and its SETTINGS frame. *)
+let started ?(local = local) () =
+  let t = Conn_state.create local in
+  ( match
+      Conn_state.on_frame t ~live:0 (Frame.Settings {ack= false; settings= []})
+    with
+  | Ok _ ->
+      ()
+  | Error _ ->
+      fail "the first SETTINGS frame gave an error" ) ;
+  t
+
+(* [gives t f expected]: the frame [f] of the client gives the events
+   [expected], as text. *)
+let gives ?__POS__ ?(live = 0) t f expected =
+  equal ?__POS__ texts expected (show_result (Conn_state.on_frame t ~live f))
+
+let error_text c = ["error " ^ show_code c]
+
+let headers ?(end_stream = false) ?(end_headers = true) ?priority ?(block = "")
+    stream =
+  Frame.Headers {stream; end_stream; end_headers; priority; block}
+
+let data ?(end_stream = false) ?(pad = 0) stream s =
+  Frame.Data {stream; end_stream; data= s; flow_length= String.length s + pad}
+
+let continuation ?(end_headers = true) stream block =
+  Frame.Continuation {stream; end_headers; block}
+
+let rst stream = Frame.Rst_stream {stream; code= Error.Cancel}
+
+let window_update stream increment = Frame.Window_update {stream; increment}
+
+let settings l = Frame.Settings {ack= false; settings= l}
+
+let on stream = {Frame.exclusive= false; dependency= stream; weight= 15}
+
+let priority stream dependency = Frame.Priority {stream; priority= on dependency}
+
+let malformed stream =
+  Frame.Malformed {stream; code= Error.Frame_size_error; reason= "a test"}
+
+(* The texts of the expected events. *)
+let block_text ?(end_stream = false) ?(block = "") stream use =
+  show_event (Header_block {stream; block; end_stream; use})
+
+let opened ?end_stream ?block stream = block_text ?end_stream ?block stream Open
+
+let data_text ?(end_stream = false) stream s =
+  show_event (Data {stream; data= s; end_stream})
+
+let update stream increment =
+  show_event (Send (Frame.Window_update {stream; increment}))
+
+let ack = show_event (Send (Frame.Settings {ack= true; settings= []}))
+
+let frames_text l = List.map show l
+
+(* A WINDOW_UPDATE frame as [frames_text] shows it. *)
+let sent_update stream increment = show (Frame.Window_update {stream; increment})
+
+let open_stream ?end_stream t stream =
+  gives t (headers ?end_stream stream) [opened ?end_stream stream]
+
+(* A stream that ended in the two directions. *)
+let ended t stream =
+  open_stream ~end_stream:true t stream ;
+  Conn_state.end_local t ~stream
+
+(* A stream that we reset, and whose fiber ended. *)
+let reset_and_discarded t stream =
+  open_stream t stream ;
+  ignore (Conn_state.reset_local t ~stream Error.Cancel) ;
+  ignore (Conn_state.discard t ~stream)
+
+(* A state for each closed kind, and one with a stream that is implicitly
+   closed. Each item: the name, the state, the closed stream. *)
+let closed_kinds ?(local = local) () =
+  let reset_by_us () =
+    let t = started ~local () in
+    open_stream t 1 ;
+    ignore (Conn_state.reset_local t ~stream:1 Error.Cancel) ;
+    (t, 1)
+  in
+  let refused () =
+    let t = started ~local () in
+    gives ~live:local.max_concurrent_streams t (headers 1) [block_text 1 Refused] ;
+    (t, 1)
+  in
+  let ignored () =
+    let t = started ~local () in
+    ignore (Conn_state.goaway t Error.No_error "") ;
+    gives t (headers 1) [block_text 1 Ignored] ;
+    (t, 1)
+  in
+  let ended_both () =
+    let t = started ~local () in
+    ended t 1 ; (t, 1)
+  in
+  let client_reset () =
+    let t = started ~local () in
+    open_stream t 1 ;
+    gives t (rst 1) ["peer reset 1"] ;
+    (t, 1)
+  in
+  let implicitly_closed () =
+    let t = started ~local () in
+    open_stream t 5 ; (t, 3)
+  in
+  List.map
+    (fun (name, f) ->
+      let t, stream = f () in
+      (name, t, stream) )
+    [ ("reset by us", reset_by_us)
+    ; ("refused", refused)
+    ; ("ignored", ignored)
+    ; ("ended", ended_both)
+    ; ("reset by the client", client_reset)
+    ; ("implicitly closed", implicitly_closed) ]
+
+let conn_state_rows =
+  [ (* The HEADERS order of plan section 6. *)
+    test "HEADERS order 1: an id in the table or in the closed set" (fun () ->
+        (* Step 1 comes before step 2: these ids are not new. *)
+        let t = started () in
+        open_stream t 1 ;
+        gives t
+          (headers ~end_stream:true 1)
+          [block_text ~end_stream:true 1 Trailers] ;
+        open_stream t 3 ;
+        ignore (Conn_state.reset_local t ~stream:3 Error.Cancel) ;
+        gives t (headers 3) [block_text 3 Ignored] )
+  ; test "HEADERS order 2: an even id (h2spec http2/5.1.1/1)" (fun () ->
+        let t = started () in
+        gives t (headers 2) (error_text Protocol_error) )
+  ; test
+      "HEADERS order 2: an id not more than the last id (h2spec http2/5.1.1/2)"
+      (fun () ->
+        let t = started () in
+        open_stream t 5 ;
+        gives t (headers 3) (error_text Protocol_error) ;
+        let t = started () in
+        open_stream t 5 ;
+        gives t
+          (headers ~end_stream:true 5)
+          [block_text ~end_stream:true 5 Trailers] ;
+        Conn_state.end_local t ~stream:5 ;
+        ignore (Conn_state.discard t ~stream:5) ;
+        gives t (headers 1) (error_text Protocol_error) )
+  ; test "HEADERS order 3: a new id after our GOAWAY" (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        open_stream t 3 ;
+        let goaway = Conn_state.goaway t Error.No_error "" in
+        equal frame
+          (Frame.Goaway {last_stream= 3; code= Error.No_error; debug= ""})
+          goaway ;
+        (* Step 3 comes before step 4: two streams are active. *)
+        gives t (headers 5) [block_text 5 Ignored] ;
+        (* The id is in the closed set as "ignored". *)
+        gives t (headers 5) [block_text 5 Ignored] ;
+        gives t (data 5 "abc") [] ;
+        (* Step 2 comes before step 3. *)
+        gives t (headers 6) (error_text Protocol_error) ;
+        equal int 2 (Conn_state.active_streams t) )
+  ; test "HEADERS order 4: too many active streams (h2spec http2/5.1.2/1)"
+      (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        open_stream t 3 ;
+        (* Step 4 comes before step 5. *)
+        gives t (headers ~priority:(on 5) 5) [block_text 5 Refused] ;
+        equal int 2 (Conn_state.active_streams t) ;
+        (* The id is in the closed set as "reset by us". *)
+        gives t (data 5 "abc") [] ;
+        gives t (headers 5) [block_text 5 Ignored] ;
+        equal (option frame) None
+          (Conn_state.reset_local t ~stream:5 Error.Cancel) )
+  ; test "HEADERS order 4: too many live fibers" (fun () ->
+        let t = started () in
+        gives ~live:2 t (headers 1) [block_text 1 Refused] ;
+        equal int 0 (Conn_state.active_streams t) ;
+        gives ~live:1 t (headers 3) [opened 3] )
+  ; test
+      "HEADERS order 5: a stream that depends on itself (h2spec http2/5.3.1/1)"
+      (fun () ->
+        let t = started () in
+        gives t
+          (headers ~priority:(on 1) 1)
+          [block_text 1 (Reset Protocol_error)] ;
+        equal int 0 (Conn_state.active_streams t) ;
+        (* The id is in the closed set as "reset by us". *)
+        gives t (data 1 "abc") [] ;
+        gives t
+          (headers ~end_stream:true 1)
+          [block_text ~end_stream:true 1 Ignored] ;
+        (* A dependency on another stream is not an error. *)
+        gives t (headers ~priority:(on 1) 3) [opened 3] )
+  ; test "HEADERS order 6: a new stream" (fun () ->
+        let t = started () in
+        gives t (headers ~block:"abc" 1) [opened ~block:"abc" 1] ;
+        gives t (headers ~end_stream:true 3) [opened ~end_stream:true 3] ;
+        equal int 2 (Conn_state.active_streams t) )
+  ; (* The rules table of plan section 6, one test for each row. *)
+    test "the first frame is not SETTINGS (h2spec http2/3.5/2)" (fun () ->
+        List.iter
+          (fun f ->
+            let t = Conn_state.create local in
+            gives t f (error_text Protocol_error) )
+          [ Frame.Ping {ack= false; data= "12345678"}
+          ; Frame.Settings {ack= true; settings= []}
+          ; headers 1 ] ;
+        let t = Conn_state.create local in
+        gives t (settings []) [ack] )
+  ; test "another frame in an open header block" (fun () ->
+        (* h2spec http2/4.3/2, http2/4.3/3, http2/5.5/2, http2/6.2/1,
+           http2/6.2/2, http2/6.10/2 *)
+        List.iter
+          (fun (cont, f) ->
+            let t = started () in
+            gives t (headers ~end_headers:false 1) [] ;
+            if cont then gives t (continuation ~end_headers:false 1 "x") [] ;
+            gives t f (error_text Protocol_error) )
+          [ (false, priority 1 0)
+          ; (false, headers 3)
+          ; (false, Frame.Unknown {kind= 0xff; stream= 1})
+          ; (true, data 1 "x")
+          ; (false, continuation 3 "x")
+          ; (false, Frame.Ping {ack= false; data= "12345678"}) ] )
+  ; test "CONTINUATION with no open header block" (fun () ->
+        (* h2spec http2/5.1/4, http2/6.10/4, http2/6.10/5, http2/6.10/6 *)
+        let t = started () in
+        gives t (continuation 1 "x") (error_text Protocol_error) ;
+        let t = started () in
+        open_stream t 1 ;
+        gives t (continuation 1 "x") (error_text Protocol_error) ;
+        let t = started () in
+        gives t (headers ~end_headers:false 1) [] ;
+        gives t (continuation 1 "x") [opened ~block:"x" 1] ;
+        gives t (continuation 1 "y") (error_text Protocol_error) ;
+        let t = started () in
+        open_stream t 1 ;
+        gives t (data 1 "x") [data_text 1 "x"] ;
+        gives t (continuation 1 "y") (error_text Protocol_error) )
+  ; test "HEADERS on an open stream with no END_STREAM (h2spec http2/8.1/1)"
+      (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        gives t (headers 1) [block_text 1 (Reset Protocol_error)] ;
+        equal int 0 (Conn_state.active_streams t) ;
+        (* Trailers that depend on their own stream. *)
+        open_stream t 3 ;
+        gives t
+          (headers ~end_stream:true ~priority:(on 3) 3)
+          [block_text ~end_stream:true 3 (Reset Protocol_error)] ;
+        (* The stream is reset by us: no second RST_STREAM. *)
+        equal (option frame) None
+          (Conn_state.reset_local t ~stream:3 Error.Cancel) )
+  ; test "HEADERS on a half-closed (remote) stream (h2spec http2/5.1/6)"
+      (fun () ->
+        let t = started () in
+        open_stream ~end_stream:true t 1 ;
+        gives t
+          (headers ~end_stream:true 1)
+          [block_text ~end_stream:true 1 (Reset Stream_closed)] ;
+        equal int 0 (Conn_state.active_streams t) )
+  ; test "WINDOW_UPDATE, RST_STREAM or PRIORITY on a closed id is ignored"
+      (fun () ->
+        List.iter
+          (fun (_, t, stream) ->
+            List.iter
+              (fun f -> gives t f [])
+              [ window_update stream 10
+              ; window_update stream 0
+              ; rst stream
+              ; priority stream 0 ] )
+          (closed_kinds ()) )
+  ; test "a frame on an id that we reset, refused or ignored" (fun () ->
+        List.iter
+          (fun (name, t, stream) ->
+            if List.mem name ["reset by us"; "refused"; "ignored"] then begin
+              (* DATA gives connection credit at once. *)
+              gives t (data stream (String.make 20000 'x')) [] ;
+              gives t (data stream "" ~pad:12768) [update 0 32768] ;
+              gives t
+                (headers ~end_stream:true stream)
+                [block_text ~end_stream:true stream Ignored] ;
+              gives t (malformed stream) [] ;
+              gives t (data ~end_stream:true stream "x") []
+            end )
+          (closed_kinds ~local:one ()) )
+  ; test "HEADERS on an id that ended in two directions" (fun () ->
+        (* h2spec http2/5.1/12; http2/5.1/9 after a RST_STREAM of the client *)
+        let t = started () in
+        ended t 1 ;
+        gives t (headers ~end_stream:true 1) (error_text Stream_closed) ;
+        let t = started () in
+        open_stream t 1 ;
+        gives t (rst 1) ["peer reset 1"] ;
+        gives t (headers ~end_stream:true 1) (error_text Stream_closed) )
+  ; test "DATA on an id that ended in two directions" (fun () ->
+        (* h2spec http2/5.1/11; http2/5.1/8 after a RST_STREAM of the client *)
+        let t = started () in
+        ended t 1 ;
+        gives t (data 1 "x") (error_text Stream_closed) ;
+        let t = started () in
+        open_stream t 1 ;
+        gives t (rst 1) ["peer reset 1"] ;
+        gives t (data 1 "x") (error_text Stream_closed) )
+  ; test "a closed id that left the closed set" (fun () ->
+        (* One stream at most: the closed set holds 4 ids. *)
+        let t = started ~local:one () in
+        List.iter (reset_and_discarded t) [1; 3; 5; 7; 9] ;
+        (* 3 is in the set: its trailers are ignored. 1 left the set. *)
+        gives t
+          (headers ~end_stream:true 3)
+          [block_text ~end_stream:true 3 Ignored] ;
+        (* Step 2 of the HEADERS order: the id is not new. *)
+        gives t (headers ~end_stream:true 1) (error_text Protocol_error) ;
+        let t = started ~local:one () in
+        List.iter (reset_and_discarded t) [1; 3; 5; 7; 9] ;
+        (* h2spec http2/5.1/13: a CONTINUATION frame has no stream state. *)
+        gives t (continuation 1 "x") (error_text Protocol_error) ;
+        let t = started ~local:one () in
+        List.iter (reset_and_discarded t) [1; 3; 5; 7; 9] ;
+        (* DATA gives connection credit, and is ignored. *)
+        gives t (data 1 (String.make 20000 'x')) [] ;
+        gives t (data 1 "" ~pad:12768) [update 0 32768] ;
+        List.iter
+          (fun f -> gives t f [])
+          [window_update 1 10; rst 1; priority 1 0; malformed 1] )
+  ; test "refused ids push a reset id out of the closed set" (fun () ->
+        (* The sequence of the correctness review of PR 4 (probe P1). The client
+           sent DATA and trailers on stream 1 before it got our RST_STREAM. *)
+        let t = started ~local:one () in
+        reset_and_discarded t 1 ;
+        open_stream t 3 ;
+        List.iter
+          (fun stream -> gives t (headers stream) [block_text stream Refused])
+          [5; 7; 9; 11] ;
+        gives t (data 1 "abc") [] ;
+        gives t (data ~end_stream:true 1 "") [] ;
+        gives t
+          (headers ~end_stream:true 3)
+          [block_text ~end_stream:true 3 Trailers] )
+  ; test "the closed set holds at most 4096 ids" (fun () ->
+        let t = started ~local:{local with max_concurrent_streams= 5000} () in
+        let ids = List.init 4098 (fun i -> (2 * i) + 1) in
+        List.iter (open_stream t) ids ;
+        (* The last id closes first, then 4096 other ids. *)
+        let last = 8195 in
+        let close stream =
+          ignore (Conn_state.reset_local t ~stream Error.Cancel) ;
+          ignore (Conn_state.discard t ~stream)
+        in
+        close last ;
+        List.iter close (List.filteri (fun i _ -> i < 4096) ids) ;
+        equal int 1 (Conn_state.active_streams t) ;
+        (* The last id left the set: it is closed, not idle. *)
+        gives t (data last "x") [] ;
+        gives t (headers ~end_stream:true last) (error_text Protocol_error) )
+  ; test "DATA on an idle stream (h2spec http2/5.1/1, http2/6.1/1)" (fun () ->
+        List.iter
+          (fun stream ->
+            let t = started () in
+            open_stream t 1 ;
+            gives t (data stream "x") (error_text Protocol_error) )
+          [3; 2; 0] )
+  ; test "DATA on a half-closed (remote) stream (h2spec http2/5.1/5)" (fun () ->
+        let t = started ~local:one () in
+        open_stream ~end_stream:true t 1 ;
+        gives t
+          (data 1 (String.make 40000 'x'))
+          [update 0 40000; "stream error 1 STREAM_CLOSED"] ;
+        equal int 0 (Conn_state.active_streams t) ;
+        gives t (data 1 "x") [] )
+  ; test "DATA over the stream window" (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        gives t (data 1 (String.make 65536 'x')) (error_text Flow_control_error) ;
+        let t = started () in
+        open_stream t 1 ;
+        gives t (data 1 "" ~pad:65535)
+          [update 1 65535; update 0 65535; data_text 1 ""] ;
+        gives t
+          (data 1 (String.make 65535 'x'))
+          [data_text 1 (String.make 65535 'x')] ;
+        gives t (data 1 "x") (error_text Flow_control_error) )
+  ; test "DATA over the connection window" (fun () ->
+        (* The connection window is 131070 bytes, and half of it is 65535. *)
+        let t = started () in
+        open_stream t 1 ;
+        open_stream t 3 ;
+        let full = String.make 65535 'x' in
+        gives t (data 1 full) [data_text 1 full] ;
+        gives t
+          (data 3 (String.make 40000 'x'))
+          [data_text 3 (String.make 40000 'x')] ;
+        equal texts
+          [sent_update 3 40000]
+          (frames_text (Conn_state.consumed t ~stream:3 40000)) ;
+        (* Stream 3 has 65535 bytes of window, the connection 25535. *)
+        gives t (data 3 (String.make 25536 'x')) (error_text Flow_control_error) ;
+        let t = started () in
+        open_stream t 1 ;
+        open_stream t 3 ;
+        gives t (data 1 full) [data_text 1 full] ;
+        gives t (data 3 full) [data_text 3 full] ;
+        ignore (Conn_state.reset_local t ~stream:1 Error.Cancel) ;
+        gives t (data 1 "x") (error_text Flow_control_error) ;
+        (* DATA on a stream that we reset, or that the client ended, counts in
+           the connection window before its credit. *)
+        let reset t =
+          ignore (Conn_state.reset_local t ~stream:3 Error.Cancel)
+        in
+        let half_closed t =
+          gives t
+            (headers ~end_stream:true 3)
+            [block_text ~end_stream:true 3 Trailers]
+        in
+        List.iter
+          (fun close_3 ->
+            let t = started () in
+            open_stream t 1 ;
+            open_stream t 3 ;
+            gives t (data 1 full) [data_text 1 full] ;
+            close_3 t ;
+            ignore
+              (Conn_state.on_frame t ~live:0 (data 3 (String.make 30000 'x'))) ;
+            (* 131070 - 65535 - 30000 = 35535 bytes remain. *)
+            open_stream t 5 ;
+            gives t
+              (data 5 (String.make 35536 'x'))
+              (error_text Flow_control_error) )
+          [reset; half_closed] )
+  ; test "RST_STREAM or WINDOW_UPDATE on an idle stream" (fun () ->
+        (* h2spec http2/5.1/2, http2/6.4/2, http2/5.1/3 *)
+        List.iter
+          (fun f ->
+            let t = started () in
+            open_stream t 1 ;
+            gives t f (error_text Protocol_error) )
+          [rst 3; window_update 3 10; rst 2; window_update 2 10] )
+  ; test "WINDOW_UPDATE of 0 (h2spec http2/6.9/1, http2/6.9/2)" (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        gives t (window_update 1 0) ["stream error 1 PROTOCOL_ERROR"] ;
+        equal int 0 (Conn_state.active_streams t) ;
+        gives t (window_update 0 0) (error_text Protocol_error) )
+  ; test "WINDOW_UPDATE over 2^31-1 (h2spec http2/6.9.1/2, http2/6.9.1/3)"
+      (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        open_stream t 3 ;
+        gives t (window_update 1 (max_window - 65535)) ["credit"] ;
+        gives t (window_update 1 1) ["stream error 1 FLOW_CONTROL_ERROR"] ;
+        equal int 1 (Conn_state.active_streams t) ;
+        gives t (window_update 0 (max_window - 65535)) ["credit"] ;
+        equal int 65535 (Conn_state.send_window t ~stream:3) ;
+        gives t (window_update 0 1) (error_text Flow_control_error) )
+  ; test "SETTINGS values (h2spec http2/6.5.2/1, /3, /4)" (fun () ->
+        List.iter
+          (fun (pairs, expected) ->
+            let t = started () in
+            gives t (settings pairs) expected )
+          [ ([(0x2, 2)], error_text Protocol_error)
+          ; ([(0x2, 0); (0x2, 1)], [ack])
+          ; ([(0x5, 16383)], error_text Protocol_error)
+          ; ([(0x5, 0x100_0000)], error_text Protocol_error) ] ;
+        let t = started () in
+        equal int 16384 (Conn_state.peer_max_frame_size t) ;
+        gives t (settings [(0x5, 0xff_ffff)]) [ack] ;
+        equal int 0xff_ffff (Conn_state.peer_max_frame_size t) ;
+        gives t (settings [(0x5, 20000); (0x5, 16384)]) [ack] ;
+        equal int 16384 (Conn_state.peer_max_frame_size t) ;
+        (* A frame with an error changes nothing. *)
+        gives t (settings [(0x5, 20000); (0x2, 2)]) (error_text Protocol_error) ;
+        equal int 16384 (Conn_state.peer_max_frame_size t) )
+  ; test "SETTINGS_ENABLE_CONNECT_PROTOCOL is ignored (plan section 15)"
+      (fun () ->
+        let t = started () in
+        List.iter
+          (fun v -> gives t (settings [(0x8, v)]) [ack])
+          [0; 1; 2; 0xffff_ffff] )
+  ; test
+      "SETTINGS_INITIAL_WINDOW_SIZE over 2^31-1 (h2spec http2/6.5.2/2, \
+       http2/6.9.2/3)" (fun () ->
+        let t = started () in
+        gives t
+          (settings [(0x4, max_window + 1)])
+          (error_text Flow_control_error) ;
+        gives t (settings [(0x4, max_window)]) [ack; "credit"] ;
+        (* A change that makes the window of a stream more than 2^31-1. *)
+        let t = started () in
+        open_stream t 1 ;
+        gives t (window_update 1 (max_window - 65536)) ["credit"] ;
+        gives t (settings [(0x4, 65536)]) [ack; "credit"] ;
+        gives t (settings [(0x4, 65537)]) (error_text Flow_control_error) ;
+        (* A stream that is closed does not count. *)
+        ignore (Conn_state.reset_local t ~stream:1 Error.Cancel) ;
+        gives t (settings [(0x4, 65537)]) [ack; "credit"] )
+  ; test
+      "SETTINGS_INITIAL_WINDOW_SIZE change (h2spec http2/6.9.2/1, /2, \
+       http2/6.5.3/1)" (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        gives t (settings [(0x4, 100); (0x4, 1000)]) [ack; "credit"] ;
+        equal int 1000 (Conn_state.send_window t ~stream:1) ;
+        Conn_state.sent t ~stream:1 600 ;
+        gives t (settings [(0x4, 0)]) [ack; "credit"] ;
+        equal int (-600) (Conn_state.send_window t ~stream:1) ;
+        gives t (settings [(0x4, 0)]) [ack] ;
+        gives t (settings [(0x4, 1600)]) [ack; "credit"] ;
+        equal int 1000 (Conn_state.send_window t ~stream:1) ;
+        (* A new stream starts with the last value. *)
+        open_stream t 3 ;
+        equal int 1600 (Conn_state.send_window t ~stream:3) )
+  ; test "one delta for each SETTINGS frame (plan section 15)" (fun () ->
+        (* With a delta for each pair, the first pair would make the window of
+           stream 1 more than 2^31-1. *)
+        let t = started () in
+        open_stream t 1 ;
+        gives t (window_update 0 (max_window - 65535)) ["credit"] ;
+        gives t (window_update 1 (max_window - 65535 - 10)) ["credit"] ;
+        gives t (settings [(0x4, 65535 + 100); (0x4, 65535)]) [ack] ;
+        equal int (max_window - 10) (Conn_state.send_window t ~stream:1) )
+  ; test "a SETTINGS frame gets an ACK (h2spec http2/6.5.3/2, http2/6.5.2/5)"
+      (fun () ->
+        let t = started () in
+        gives t (settings [(0x1, 100); (0x3, 7); (0x6, 10)]) [ack] ;
+        (* Frame.read keeps only the known ids: a frame with only unknown ids
+           has no settings (plan section 15). *)
+        gives t (settings []) [ack] ;
+        gives t (Frame.Settings {ack= true; settings= []}) [] )
+  ; test "PING (h2spec http2/6.7/1, http2/6.7/2)" (fun () ->
+        let t = started () in
+        gives t
+          (Frame.Ping {ack= false; data= "abcdefgh"})
+          [show_event (Send (Frame.Ping {ack= true; data= "abcdefgh"}))] ;
+        gives t (Frame.Ping {ack= true; data= "abcdefgh"}) [] )
+  ; test "PUSH_PROMISE from a client (h2spec http2/8.2/1)" (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        gives t (Frame.Push_promise {stream= 1}) (error_text Protocol_error) )
+  ; test "GOAWAY from the client" (fun () ->
+        let t = started () in
+        gives t
+          (Frame.Goaway
+             {last_stream= 7; code= Error.Enhance_your_calm; debug= "x"} )
+          ["peer goaway 7 ENHANCE_YOUR_CALM"] )
+  ; test "PRIORITY and unknown frames do nothing (h2spec http2/5.5/1)"
+      (fun () ->
+        let t = started () in
+        gives t (priority 3 1) [] ;
+        gives t (Frame.Unknown {kind= 0xff; stream= 3}) [] ;
+        gives t (Frame.Unknown {kind= 0xff; stream= 0}) [] ;
+        (* Stream 3 stays idle. *)
+        open_stream t 3 ;
+        gives t (priority 3 0) [] ;
+        gives t (Frame.Unknown {kind= 0xff; stream= 3}) [] ;
+        equal int 1 (Conn_state.active_streams t) )
+  ; test "Malformed on an open or half-closed stream" (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        gives t (malformed 1) ["stream error 1 FRAME_SIZE_ERROR"] ;
+        open_stream ~end_stream:true t 3 ;
+        gives t (malformed 3) ["stream error 3 FRAME_SIZE_ERROR"] ;
+        open_stream t 5 ;
+        Conn_state.end_local t ~stream:5 ;
+        gives t (malformed 5) ["stream error 5 FRAME_SIZE_ERROR"] ;
+        equal int 0 (Conn_state.active_streams t) )
+  ; test "Malformed on an idle id (h2spec http2/5.3.1/2)" (fun () ->
+        let t = started () in
+        gives t
+          (Frame.Malformed
+             {stream= 1; code= Error.Protocol_error; reason= "self"} )
+          (error_text Protocol_error) ;
+        let t = started () in
+        gives t (malformed 2) (error_text Frame_size_error) )
+  ; test "Malformed on a closed id is ignored" (fun () ->
+        List.iter
+          (fun (_, t, stream) -> gives t (malformed stream) [])
+          (closed_kinds ()) )
+  ; test "a bad local value" (fun () ->
+        Conn_state.validate local ;
+        Conn_state.validate
+          { Conn_state.max_concurrent_streams= 0xffff_ffff
+          ; initial_window= max_window
+          ; header_table_size= 0xffff_ffff
+          ; max_header_list_size= 0xffff_ffff } ;
+        Conn_state.validate
+          {one with header_table_size= 0; max_header_list_size= 0} ;
+        List.iter
+          (fun (l, text) ->
+            raises
+              (Invalid_argument ("Conn_state.validate: " ^ text))
+              (fun () -> Conn_state.validate l) )
+          [ ({local with max_concurrent_streams= 0}, "max_concurrent_streams 0")
+          ; ( {local with max_concurrent_streams= 0x1_0000_0000}
+            , "max_concurrent_streams 4294967296" )
+          ; ({local with initial_window= 65534}, "initial_window 65534")
+          ; ( {local with initial_window= max_window + 1}
+            , "initial_window 2147483648" )
+          ; ({local with header_table_size= -1}, "header_table_size -1")
+          ; ( {local with header_table_size= 0x1_0000_0000}
+            , "header_table_size 4294967296" )
+          ; ({local with max_header_list_size= -1}, "max_header_list_size -1")
+          ; ( {local with max_header_list_size= 0x1_0000_0000}
+            , "max_header_list_size 4294967296" ) ] )
+  ; test "start_frames" (fun () ->
+        let settings_of l =
+          Frame.Settings
+            { ack= false
+            ; settings=
+                [ (0x1, l.Conn_state.header_table_size)
+                ; (0x3, l.max_concurrent_streams)
+                ; (0x4, l.initial_window)
+                ; (0x6, l.max_header_list_size) ] }
+        in
+        let start l = Conn_state.start_frames (Conn_state.create l) in
+        equal (list frame)
+          [settings_of local; window_update 0 65535]
+          (start local) ;
+        (* 65535 needs no WINDOW_UPDATE frame. *)
+        equal (list frame) [settings_of one] (start one) ;
+        let large = {local with max_concurrent_streams= 0xffff_ffff} in
+        equal (list frame)
+          [settings_of large; window_update 0 (max_window - 65535)]
+          (start large) ;
+        (* 32768 * 65535 is less than 2^31-1, 32769 * 65535 is more. *)
+        let edge n = {local with max_concurrent_streams= n} in
+        equal (list frame)
+          [settings_of (edge 32768); window_update 0 ((32768 * 65535) - 65535)]
+          (start (edge 32768)) ;
+        equal (list frame)
+          [settings_of (edge 32769); window_update 0 (max_window - 65535)]
+          (start (edge 32769)) )
+  ; test "our GOAWAY" (fun () ->
+        let t = started () in
+        let last t =
+          match Conn_state.goaway t Error.No_error "" with
+          | Frame.Goaway {last_stream; _} ->
+              last_stream
+          | _ ->
+              fail "not a GOAWAY frame"
+        in
+        let t2 = started () in
+        equal int 0 (last t2) ;
+        open_stream t 1 ;
+        open_stream t 3 ;
+        gives t (headers 5) [block_text 5 Refused] ;
+        equal frame
+          (Frame.Goaway {last_stream= 5; code= Error.Protocol_error; debug= "d"})
+          (Conn_state.goaway t Error.Protocol_error "d") ;
+        gives t (headers 7) [block_text 7 Ignored] ;
+        equal int 5 (last t) )
+  ; test "reset_local and end_local keep the RST rule" (fun () ->
+        let t = started () in
+        let rst_frame stream =
+          Some (Frame.Rst_stream {stream; code= Error.Cancel})
+        in
+        equal (option frame) None
+          (Conn_state.reset_local t ~stream:1 Error.Cancel) ;
+        open_stream t 1 ;
+        equal (option frame) (rst_frame 1)
+          (Conn_state.reset_local t ~stream:1 Error.Cancel) ;
+        equal (option frame) None
+          (Conn_state.reset_local t ~stream:1 Error.Cancel) ;
+        equal int 0 (Conn_state.active_streams t) ;
+        (* Ended in the two directions: no RST_STREAM. *)
+        open_stream t 3 ;
+        Conn_state.end_local t ~stream:3 ;
+        equal int 1 (Conn_state.active_streams t) ;
+        gives t (data ~end_stream:true 3 "x") [data_text ~end_stream:true 3 "x"] ;
+        equal int 0 (Conn_state.active_streams t) ;
+        equal (option frame) None
+          (Conn_state.reset_local t ~stream:3 Error.Cancel) ;
+        (* A stream that the client reset. *)
+        open_stream t 5 ;
+        gives t (rst 5) ["peer reset 5"] ;
+        equal (option frame) None
+          (Conn_state.reset_local t ~stream:5 Error.Cancel) ;
+        (* end_local on a stream that is not active does nothing. *)
+        Conn_state.end_local t ~stream:9 ;
+        Conn_state.end_local t ~stream:5 ;
+        equal int 0 (Conn_state.active_streams t) ) ]
+
+(* [length t stream n] sets the content-length [n] of [stream], and makes sure
+   that the result is [gives]. *)
+let length ?(gives = []) t stream n =
+  equal texts gives
+    (List.map show_event (Conn_state.set_content_length t ~stream n))
+
+let conn_state_flows =
+  [ test "send_window after sent, WINDOW_UPDATE and SETTINGS" (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        open_stream t 3 ;
+        let window stream = Conn_state.send_window t ~stream in
+        equal int 65535 (window 1) ;
+        Conn_state.sent t ~stream:1 1000 ;
+        (* The connection window limits stream 3. *)
+        equal int 64535 (window 1) ;
+        equal int 64535 (window 3) ;
+        gives t (window_update 0 10000) ["credit"] ;
+        equal int 64535 (window 1) ;
+        equal int 65535 (window 3) ;
+        gives t (window_update 1 5) ["credit"] ;
+        equal int 64540 (window 1) ;
+        (* A delta of -64535 on each stream. *)
+        gives t (settings [(0x4, 1000)]) [ack; "credit"] ;
+        equal int 5 (window 1) ;
+        equal int 1000 (window 3) ;
+        (* A negative stream window. *)
+        Conn_state.sent t ~stream:3 3000 ;
+        equal int (-2000) (window 3) ;
+        (* A delta of +69000. The connection window is 71535. *)
+        gives t (settings [(0x4, 70000)]) [ack; "credit"] ;
+        equal int 67000 (window 3) ;
+        equal int 69005 (window 1) ;
+        Conn_state.sent t ~stream:1 69005 ;
+        equal int 0 (window 1) ;
+        equal int 2530 (window 3) ;
+        (* A stream that the state does not know. *)
+        equal int 0 (window 99) ;
+        Conn_state.sent t ~stream:99 30 ;
+        equal int 2500 (window 3) )
+  ; test "receive windows: consumed, padding and discard" (fun () ->
+        (* One stream at most: the two windows have 65535 bytes, and a credit of
+           32768 bytes or more sends a WINDOW_UPDATE frame. *)
+        let t = started ~local:one () in
+        open_stream t 1 ;
+        let big = String.make 32768 'x' in
+        gives t (data 1 big) [data_text 1 big] ;
+        let consumed n = frames_text (Conn_state.consumed t ~stream:1 n) in
+        equal texts [] (consumed 32767) ;
+        equal texts [sent_update 1 32768; sent_update 0 32768] (consumed 1) ;
+        (* No byte is held: [consumed] gives back nothing. *)
+        equal texts [] (consumed 40000) ;
+        equal texts [] (consumed (-5)) ;
+        (* The padding goes back at once. *)
+        gives t (data 1 "abc" ~pad:32765) [data_text 1 "abc"] ;
+        gives t (data 1 "" ~pad:3)
+          [update 1 32768; update 0 32768; data_text 1 ""] ;
+        equal texts [] (consumed 3) ;
+        (* discard gives back the held bytes as consumed does. *)
+        let t = started ~local:one () in
+        open_stream t 1 ;
+        let n20 = String.make 20000 'x' in
+        gives t (data 1 n20) [data_text 1 n20] ;
+        equal texts [] (frames_text (Conn_state.consumed t ~stream:1 20000)) ;
+        gives t (data 1 n20) [data_text 1 n20] ;
+        equal texts
+          [sent_update 1 40000; sent_update 0 40000]
+          (frames_text (Conn_state.discard t ~stream:1)) ;
+        equal texts [] (frames_text (Conn_state.discard t ~stream:1)) ;
+        (* After discard, the bytes of DATA go back at once. The stream window
+           is full again: 65535 bytes. *)
+        let n32 = String.make 32768 'x' in
+        gives t (data 1 n32) [update 1 32768; update 0 32768; data_text 1 n32] ;
+        gives t
+          (data 1 (String.make 65535 'x'))
+          [update 1 65535; update 0 65535; data_text 1 (String.make 65535 'x')] ;
+        equal int 1 (Conn_state.active_streams t) ;
+        equal (option frame)
+          (Some (Frame.Rst_stream {stream= 1; code= Error.Cancel}))
+          (Conn_state.reset_local t ~stream:1 Error.Cancel) ;
+        (* The stream was discarded and is closed: the state forgot it. *)
+        equal int 0 (Conn_state.send_window t ~stream:1) ;
+        gives t (data 1 "x") [] )
+  ; test "a stream that the client ended gets no WINDOW_UPDATE frame" (fun () ->
+        let t = started ~local:one () in
+        open_stream t 1 ;
+        let big = String.make 40000 'x' in
+        gives t (data ~end_stream:true 1 big) [data_text ~end_stream:true 1 big] ;
+        equal texts
+          [sent_update 0 40000]
+          (frames_text (Conn_state.consumed t ~stream:1 40000)) )
+  ; test "a closed stream keeps its held bytes until discard" (fun () ->
+        let t = started ~local:one () in
+        open_stream t 1 ;
+        let big = String.make 40000 'x' in
+        gives t (data 1 big) [data_text 1 big] ;
+        gives t (rst 1) ["peer reset 1"] ;
+        equal texts
+          [sent_update 0 40000]
+          (frames_text (Conn_state.consumed t ~stream:1 40000)) ;
+        open_stream t 3 ;
+        gives t (data ~end_stream:true 3 big) [data_text ~end_stream:true 3 big] ;
+        Conn_state.end_local t ~stream:3 ;
+        equal int 0 (Conn_state.active_streams t) ;
+        equal texts
+          [sent_update 0 40000]
+          (frames_text (Conn_state.discard t ~stream:3)) ;
+        (* The stream was closed and discarded: the state forgot it. *)
+        equal int 0 (Conn_state.send_window t ~stream:3) )
+  ; test "a WINDOW_UPDATE frame at exactly half of the window" (fun () ->
+        (* An even window: 65536 bytes for the stream and the connection. *)
+        let t = started ~local:{one with initial_window= 65536} () in
+        open_stream t 1 ;
+        gives t (data 1 "" ~pad:32767) [data_text 1 ""] ;
+        gives t (data 1 "" ~pad:1)
+          [update 1 32768; update 0 32768; data_text 1 ""] )
+  ; (* Plan section 6, test 4. *)
+    test "CONTINUATION after a Refused, a Reset and an Ignored block" (fun () ->
+        let split t stream expected =
+          gives t (headers ~end_headers:false ~block:"ab" stream) [] ;
+          gives t (continuation ~end_headers:false stream "cd") [] ;
+          gives t (continuation ~end_headers:false stream "") [] ;
+          gives t (continuation stream "ef") [expected] ;
+          (* The block is closed: a PING frame is legal. *)
+          gives t
+            (Frame.Ping {ack= false; data= "12345678"})
+            [show_event (Send (Frame.Ping {ack= true; data= "12345678"}))]
+        in
+        let t = started ~local:one () in
+        open_stream t 1 ;
+        split t 3 (block_text ~block:"abcdef" 3 Refused) ;
+        let t = started () in
+        open_stream t 1 ;
+        split t 1 (block_text ~block:"abcdef" 1 (Reset Protocol_error)) ;
+        let t = started () in
+        gives t (headers ~end_headers:false ~block:"ab" ~priority:(on 3) 3) [] ;
+        gives t (continuation 3 "cd")
+          [block_text ~block:"abcd" 3 (Reset Protocol_error)] ;
+        let t = started () in
+        ignore (Conn_state.goaway t Error.No_error "") ;
+        split t 1 (block_text ~block:"abcdef" 1 Ignored) ;
+        let t = started () in
+        gives t (headers ~end_stream:true ~end_headers:false ~block:"ab" 1) [] ;
+        gives t (continuation 1 "cd") [opened ~end_stream:true ~block:"abcd" 1] ;
+        (* The next frame is a new frame. *)
+        gives t
+          (Frame.Ping {ack= false; data= "12345678"})
+          [show_event (Send (Frame.Ping {ack= true; data= "12345678"}))] )
+  ; (* Plan section 6, test 5: the content-length rule (h2spec http2/8.1.2.6/1,
+       http2/8.1.2.6/2). *)
+    test "content-length: more bytes than declared" (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        length t 1 5 ;
+        gives t (data 1 "abc") [data_text 1 "abc"] ;
+        gives t (data 1 "def") ["body error 1"] ;
+        equal int 0 (Conn_state.active_streams t) ;
+        gives t (data 1 "x") [] )
+  ; test "content-length: fewer bytes than declared" (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        length t 1 5 ;
+        gives t (data 1 "ab") [data_text 1 "ab"] ;
+        gives t (data ~end_stream:true 1 "c") ["body error 1"] ;
+        equal int 0 (Conn_state.active_streams t) )
+  ; test "content-length: the declared length, with padding" (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        length t 1 5 ;
+        gives t (data 1 "abc" ~pad:10) [data_text 1 "abc"] ;
+        gives t
+          (data ~end_stream:true 1 "de")
+          [data_text ~end_stream:true 1 "de"] )
+  ; test "content-length: END_STREAM on the HEADERS frame" (fun () ->
+        let t = started () in
+        open_stream ~end_stream:true t 1 ;
+        length ~gives:["body error 1"] t 1 5 ;
+        equal int 0 (Conn_state.active_streams t) ;
+        let t = started () in
+        open_stream ~end_stream:true t 1 ;
+        length t 1 0 )
+  ; test "content-length: the bytes before set_content_length count" (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        gives t (data 1 "abcdef") [data_text 1 "abcdef"] ;
+        length ~gives:["body error 1"] t 1 5 )
+  ; test "content-length: trailers that end a short body" (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        length t 1 5 ;
+        gives t (data 1 "abc") [data_text 1 "abc"] ;
+        gives t
+          (headers ~end_stream:true 1)
+          [block_text ~end_stream:true 1 (Reset Protocol_error)] ;
+        equal int 0 (Conn_state.active_streams t) )
+  ; test "content-length: a stream that is not active" (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        gives t
+          (data ~end_stream:true 1 "abcdef")
+          [data_text ~end_stream:true 1 "abcdef"] ;
+        Conn_state.end_local t ~stream:1 ;
+        length t 1 2 ;
+        length t 7 2 )
+  ; (* A Body_error after our END_STREAM gives a RST_STREAM (plan section
+       18). *)
+    test "content-length: a Body_error after end_local" (fun () ->
+        let t = started () in
+        open_stream t 1 ;
+        length t 1 5 ;
+        Conn_state.end_local t ~stream:1 ;
+        gives t (data ~end_stream:true 1 "abc") ["body error 1"] ;
+        equal int 0 (Conn_state.active_streams t) )
+  ; test "a header block over 4 * max_header_list_size" (fun () ->
+        (* The limit is 4 * 20000 = 80000 bytes. *)
+        let large = {local with max_header_list_size= 20000} in
+        let block n = String.make n 'a' in
+        let t = started ~local:large () in
+        gives t (headers ~block:(block 80000) 1) [opened ~block:(block 80000) 1] ;
+        gives t (headers ~block:(block 80001) 3) (error_text Enhance_your_calm) ;
+        let t = started ~local:large () in
+        gives t (headers ~end_headers:false ~block:(block 40000) 1) [] ;
+        gives t (continuation ~end_headers:false 1 (block 40000)) [] ;
+        gives t (continuation 1 "c") (error_text Enhance_your_calm) ;
+        let t = started ~local:large () in
+        gives t (headers ~end_headers:false ~block:(block 40000) 1) [] ;
+        gives t (continuation 1 (block 40000)) [opened ~block:(block 80000) 1] )
+  ; test "a header block limit of 65536 bytes at least" (fun () ->
+        (* A small max_header_list_size: the engine gives 431, not GOAWAY. *)
+        let block n = String.make n 'a' in
+        List.iter
+          (fun max_header_list_size ->
+            let small = {local with max_header_list_size} in
+            let t = started ~local:small () in
+            gives t (headers ~block:(block 100) 1) [opened ~block:(block 100) 1] ;
+            gives t
+              (headers ~block:(block 65536) 3)
+              [opened ~block:(block 65536) 3] ;
+            let t = started ~local:small () in
+            gives t
+              (headers ~block:(block 65537) 1)
+              (error_text Enhance_your_calm) )
+          [0; 10; 16384] )
+  ; test "known_streams goes back to 0" (fun () ->
+        let t = started () in
+        equal int 0 (Conn_state.known_streams t) ;
+        open_stream t 1 ;
+        open_stream ~end_stream:true t 3 ;
+        equal int 2 (Conn_state.known_streams t) ;
+        (* Stream 1: reset, then discarded. *)
+        ignore (Conn_state.reset_local t ~stream:1 Error.Cancel) ;
+        equal int 2 (Conn_state.known_streams t) ;
+        ignore (Conn_state.discard t ~stream:1) ;
+        equal int 1 (Conn_state.known_streams t) ;
+        (* Stream 3: discarded, then ended. *)
+        ignore (Conn_state.discard t ~stream:3) ;
+        equal int 1 (Conn_state.known_streams t) ;
+        Conn_state.end_local t ~stream:3 ;
+        equal int 0 (Conn_state.known_streams t) ;
+        (* Refused and ignored ids have no record. *)
+        gives ~live:2 t (headers 5) [block_text 5 Refused] ;
+        ignore (Conn_state.goaway t Error.No_error "") ;
+        gives t (headers 7) [block_text 7 Ignored] ;
+        equal int 0 (Conn_state.known_streams t) ) ]
+
+(* {2 The stateful test of plan section 6, test 2}
+
+   Programs of client frames and engine calls on a connection, against a model
+   of the client view of the windows and of the stream states. The model judges
+   each outcome, and the invariant of the connection runs after each call. *)
+
+module Model = struct
+  let mcs = 3
+
+  let iw = 65535
+
+  let conn_start = mcs * iw
+
+  type phase = Active | Reset_by_us | Ended
+
+  type stream =
+    { id: int
+    ; mutable phase: phase
+    ; opened: bool (* [Open] made a record for it *)
+    ; mutable remote_ended: bool
+    ; mutable local_ended: bool
+    ; mutable live: bool (* the fake engine has a fiber for it *)
+    ; mutable discarded: bool
+    ; mutable rst_pending: bool (* a RST_STREAM NO_ERROR after our END *)
+    ; mutable window: int (* the receive window of the client view *)
+    ; mutable held: int
+    ; mutable send: int
+    ; mutable client_reset: bool
+    ; mutable input_ended: bool
+    ; mutable reset_seen: bool }
+
+  type t =
+    { mutable streams: stream list (* the newest first *)
+    ; mutable skipped: int list (* the ids that the client did not use *)
+    ; mutable closed_set:
+        int list (* the closed set of the state, newest first *)
+    ; mutable next: int
+    ; mutable dead: bool (* after a connection error *)
+    ; mutable conn_window: int
+    ; mutable conn_send: int
+    ; mutable peer_initial: int }
+
+  let create () =
+    { streams= []
+    ; skipped= []
+    ; closed_set= []
+    ; next= 1
+    ; dead= false
+    ; conn_window= conn_start
+    ; conn_send= 65535
+    ; peer_initial= 65535 }
+
+  let find m id = List.find (fun s -> s.id = id) m.streams
+
+  let count f m = List.length (List.filter f m.streams)
+
+  let active = count (fun s -> s.phase = Active)
+
+  let live = count (fun s -> s.live)
+
+  (* A record stays until the stream is closed and discarded. *)
+  let known =
+    count (fun s -> s.opened && not (s.phase <> Active && s.discarded))
+
+  (* The ids of the streams that pass [f]. A dead connection has none: each call
+     on it is skipped. *)
+  let ids f m =
+    if m.dead then []
+    else
+      List.rev
+        (List.filter_map (fun s -> if f s then Some s.id else None) m.streams)
+
+  let alive m = not m.dead
+
+  (* The closed set of the state: [min (4 * mcs) 4096] ids. *)
+  let capacity = 4 * mcs
+
+  (* [close m s phase] closes the stream [s], in the same order as the state. *)
+  let close m s phase =
+    s.phase <- phase ;
+    m.closed_set <- List.filteri (fun i _ -> i < capacity) (s.id :: m.closed_set)
+end
+
+(* The system: the state, with the client ids and the live count of a fake
+   engine. *)
+type client = {cs: Conn_state.t; mutable next_id: int; mutable live: int}
+
+type outcome =
+  | Events of (Conn_state.event list, Error.code * string) result
+  | Frames of Frame.t list
+  | Exit of Frame.t option * Frame.t list
+  | Done
+
+let pp_outcome ppf o =
+  Format.pp_print_string ppf
+    ( match o with
+    | Events r ->
+        "[" ^ String.concat "; " (show_result r) ^ "]"
+    | Frames l ->
+        "[" ^ String.concat "; " (List.map show l) ^ "]"
+    | Exit (r, l) ->
+        sprintf "%s, [%s]"
+          (match r with Some f -> show f | None -> "no RST_STREAM")
+          (String.concat "; " (List.map show l))
+    | Done ->
+        "()" )
+
+let outcome = Testable.structural ~pp:pp_outcome
+
+(* No function raises. *)
+let got = function
+  | Ok o ->
+      o
+  | Error e ->
+      failf "the system raised %s" (Printexc.to_string e)
+
+let events r =
+  match got r with
+  | Events (Ok l) ->
+      l
+  | Events (Error (c, reason)) ->
+      failf "a connection error %s: %s" (show_code c) reason
+  | o ->
+      failf "not events: %a" pp_outcome o
+
+let frames r =
+  match got r with Frames fs -> fs | o -> failf "not frames: %a" pp_outcome o
+
+(* [apply_update m f] applies the WINDOW_UPDATE frame [f] of the server to the
+   client view. *)
+let apply_update (m : Model.t) = function
+  | Frame.Window_update {stream= 0; increment} ->
+      cover "a WINDOW_UPDATE frame on the connection" true ;
+      is_true ~msg:"an increment more than 0" (increment > 0) ;
+      m.conn_window <- m.conn_window + increment
+  | Frame.Window_update {stream; increment} ->
+      let s = Model.find m stream in
+      cover "a WINDOW_UPDATE frame on a stream" true ;
+      is_true ~msg:"a WINDOW_UPDATE frame on a stream that can get DATA"
+        (s.phase = Active && not s.remote_ended) ;
+      is_true ~msg:"an increment more than 0" (increment > 0) ;
+      s.window <- s.window + increment
+  | f ->
+      failf "not a WINDOW_UPDATE frame: %s" (show f)
+
+(* The events that are not WINDOW_UPDATE frames, as text. The WINDOW_UPDATE
+   frames go to the client view. *)
+let others m evs =
+  List.map show_event
+    (List.filter
+       (function
+         | Conn_state.Send (Frame.Window_update _ as f) ->
+             apply_update m f ; false
+         | _ ->
+             true )
+       evs )
+
+(* A stream gets at most one end of its request body. *)
+let end_input (s : Model.stream) =
+  is_true ~msg:"one end of the request body" (not s.input_ended) ;
+  s.input_ended <- true
+
+(* A stream gets at most one reset, and no event after it: the judges expect no
+   event on a stream that is not active. *)
+let reset_event (s : Model.stream) =
+  is_true ~msg:"one reset event" (not s.reset_seen) ;
+  s.reset_seen <- true
+
+let invariant (m : Model.t) c =
+  let cs = c.cs in
+  (* active_streams is at most max_concurrent_streams. *)
+  is_true ~msg:"active_streams <= max_concurrent_streams"
+    (Conn_state.active_streams cs <= Model.mcs) ;
+  equal ~msg:"active streams" int (Model.active m)
+    (Conn_state.active_streams cs) ;
+  equal ~msg:"live fibers" int (Model.live m) c.live ;
+  (* The state forgets each stream that is closed and discarded. *)
+  equal ~msg:"known streams" int (Model.known m) (Conn_state.known_streams cs) ;
+  (* The connection receive window: window + unsent credit = start - held bytes,
+     with an unsent credit from 0 to less than half of the window. A credit that
+     is too large gives a negative unsent credit. *)
+  let held =
+    List.fold_left (fun n (s : Model.stream) -> n + s.held) 0 m.streams
+  in
+  let unsent = Model.conn_start - held - m.conn_window in
+  is_true ~msg:"connection: no credit more than the held bytes" (unsent >= 0) ;
+  is_true ~msg:"connection: an unsent credit less than half"
+    (2 * unsent < Model.conn_start) ;
+  List.iter
+    (fun (s : Model.stream) ->
+      if s.phase = Active then begin
+        (* The send window of each active stream is the one of the model. *)
+        equal ~msg:"send_window" int (min m.conn_send s.send)
+          (Conn_state.send_window cs ~stream:s.id) ;
+        (* The same rule for the receive window of each stream that can get
+           DATA, also after discard. *)
+        if not s.remote_ended then begin
+          let unsent = Model.iw - s.held - s.window in
+          is_true ~msg:"stream: no credit more than the held bytes" (unsent >= 0) ;
+          is_true ~msg:"stream: an unsent credit less than half"
+            (2 * unsent < Model.iw)
+        end
+      end )
+    m.streams
+
+let stateful_local =
+  {local with max_concurrent_streams= Model.mcs; initial_window= Model.iw}
+
+let conn =
+  abstract "conn" ~invariant ~pp:(fun ppf (m : Model.t) ->
+      Format.fprintf ppf "%d streams, %d active, %d live%s"
+        (List.length m.streams) (Model.active m) (Model.live m)
+        (if m.dead then ", dead" else "") )
+
+(* The client can send DATA and trailers. A stream that we reset is in the list:
+   the client did not get the RST_STREAM frame yet. *)
+let sendable =
+  among int conn
+    (Model.ids (fun s -> (not s.remote_ended) && not s.client_reset))
+
+let resettable =
+  among int conn (Model.ids (fun s -> (not s.client_reset) && s.phase <> Ended))
+
+let any_stream = among int conn (Model.ids (fun _ -> true))
+
+let skipped =
+  among int conn (fun (m : Model.t) -> if m.dead then [] else m.skipped)
+
+let holding = among int conn (Model.ids (fun s -> s.live && s.held > 0))
+
+let responding =
+  among int conn
+    (Model.ids (fun s -> s.phase = Active && s.live && not s.local_ended))
+
+let living = among int conn (Model.ids (fun s -> s.live))
+
+let pending = among int conn (Model.ids (fun s -> s.rst_pending))
+
+let pp_int = Format.pp_print_int
+
+let int_gen l = Gen.with_pp pp_int (Gen.frequency l)
+
+let zero = Gen.constant ~pp:pp_int 0
+
+(* Most DATA frames are large, so that the windows fill to half. *)
+let size_gen = int_gen [(1, Gen.int_range 0 100); (2, Gen.int_range 10000 40000)]
+
+let pad_gen = int_gen [(3, zero); (1, Gen.int_range 1 300)]
+
+(* END_STREAM on one DATA frame in five, so that most streams can get a
+   WINDOW_UPDATE frame. *)
+let end_gen =
+  Gen.with_pp Format.pp_print_bool
+    (Gen.frequency
+       [ (1, Gen.constant ~pp:Format.pp_print_bool true)
+       ; (4, Gen.constant ~pp:Format.pp_print_bool false) ] )
+
+(* The client skips an id in one HEADERS frame in ten. A HEADERS frame on a
+   skipped id ends the connection, so the gaps must be rare. *)
+let gap_gen = int_gen [(9, zero); (1, Gen.int_range 1 2)]
+
+let increment_gen = Gen.int_range 1 100_000
+
+(* Small windows and large sends, so that some send windows go negative. *)
+let window_gen =
+  int_gen [(1, Gen.int_range 0 1000); (1, Gen.int_range 0 200_000)]
+
+let send_gen = int_gen [(1, Gen.int_range 0 2000); (1, Gen.int_range 0 70_000)]
+
+(* Large reads, so that the credit reaches half of a window. *)
+let consume_gen =
+  int_gen [(1, Gen.int_range 1 100); (3, Gen.int_range 30000 70_000)]
+
+let on_frame c f = Events (Conn_state.on_frame c.cs ~live:c.live f)
+
+(* A command [n] times: windtrap draws it [n] times as often. *)
+let weighted n c = List.init n (fun _ -> c)
+
+let new_stream (m : Model.t) id ~end_stream ~opened =
+  let s =
+    { Model.id
+    ; phase= Active
+    ; opened
+    ; remote_ended= end_stream
+    ; local_ended= false
+    ; live= opened
+    ; discarded= false
+    ; rst_pending= false
+    ; window= Model.iw
+    ; held= 0
+    ; send= m.peer_initial
+    ; client_reset= false
+    ; input_ended= false
+    ; reset_seen= false }
+  in
+  m.streams <- s :: m.streams ;
+  s
+
+let stateful_commands =
+  List.concat
+    [ weighted 1
+      @@ command "connect"
+           (Gen.unit @-> makes conn)
+           (fun () -> Model.create ())
+           (fun () ->
+             {cs= started ~local:stateful_local (); next_id= 1; live= 0} )
+    ; (* 3: the streams open fast, so that the limit refuses some. *)
+      weighted 3
+      @@ command "open"
+           ~pre:(fun m _ _ -> Model.alive m)
+           (conn ^-> gap_gen @-> Gen.bool @-> judges outcome)
+           (fun (m : Model.t) gap end_stream r ->
+             let evs = events r in
+             m.skipped <- List.init gap (fun i -> m.next + (2 * i)) @ m.skipped ;
+             let id = m.next + (2 * gap) in
+             m.next <- id + 2 ;
+             let refused =
+               Model.active m >= Model.mcs || Model.live m >= Model.mcs
+             in
+             match evs with
+             | [Header_block {stream; block= ""; end_stream= e; use= Refused}]
+               when refused && stream = id && e = end_stream ->
+                 cover "a refused stream" true ;
+                 let s = new_stream m id ~end_stream ~opened:false in
+                 Model.close m s Reset_by_us ;
+                 reset_event s
+             | [Header_block {stream; block= ""; end_stream= e; use= Open}]
+               when (not refused) && e = end_stream ->
+                 (* The harness makes the ids, so a check that they grow cannot
+                    fail here. The command "stale headers" covers the rule:
+                    HEADERS on an id that is not new is an error. *)
+                 equal ~msg:"the id" int id stream ;
+                 let s = new_stream m id ~end_stream ~opened:true in
+                 if end_stream then end_input s
+             | _ ->
+                 failf "refused %b, but the events %a" refused pp_outcome
+                   (Events (Ok evs)) )
+           (fun c gap end_stream ->
+             let id = c.next_id + (2 * gap) in
+             c.next_id <- id + 2 ;
+             let r =
+               Conn_state.on_frame c.cs ~live:c.live (headers ~end_stream id)
+             in
+             ( match r with
+             | Ok [Header_block {use= Open; _}] ->
+                 c.live <- c.live + 1
+             | _ ->
+                 () ) ;
+             Events r )
+    ; (* Six HEADERS frames at the limit: they are refused and push older ids
+         out of the closed set (the path of the H1 fix of PR 4). 3: so that each
+         run has DATA and trailers on such ids. *)
+      weighted 3
+      @@ command "refused burst"
+           ~pre:(fun m _ ->
+             Model.alive m
+             && (Model.active m >= Model.mcs || Model.live m >= Model.mcs) )
+           (conn ^-> Gen.unit @-> judges outcome)
+           (fun (m : Model.t) () r ->
+             let expected =
+               List.init 6 (fun _ ->
+                   let id = m.next in
+                   m.next <- id + 2 ;
+                   let s = new_stream m id ~end_stream:false ~opened:false in
+                   Model.close m s Reset_by_us ;
+                   reset_event s ;
+                   block_text id Refused )
+             in
+             equal texts expected
+               ( match got r with
+               | Events r ->
+                   show_result r
+               | o ->
+                   failf "not events: %a" pp_outcome o ) )
+           (fun c () ->
+             let rec burst acc n =
+               if n = 0 then Events (Ok (List.rev acc))
+               else begin
+                 let id = c.next_id in
+                 c.next_id <- id + 2 ;
+                 match Conn_state.on_frame c.cs ~live:c.live (headers id) with
+                 | Ok evs ->
+                     burst (List.rev_append evs acc) (n - 1)
+                 | Error _ as e ->
+                     Events e
+               end
+             in
+             burst [] 6 )
+    ; (* A HEADERS frame on an id that the client skipped: the id is not new. *)
+      weighted 1
+      @@ command "stale headers"
+           (conn ^-> skipped ^-> judges outcome)
+           (fun (m : Model.t) _ r ->
+             cover "a stale id" true ;
+             equal texts
+               (error_text Protocol_error)
+               ( match got r with
+               | Events r ->
+                   show_result r
+               | o ->
+                   failf "not events: %a" pp_outcome o ) ;
+             m.dead <- true )
+           (fun c id -> on_frame c (headers ~end_stream:true id))
+    ; (* 4: DATA fills the windows. *)
+      weighted 4
+      @@ command "data"
+           ~pre:(fun (m : Model.t) id size pad _ ->
+             let s = Model.find m id in
+             size + pad <= s.window && size + pad <= m.conn_window )
+           ( conn ^-> sendable ^-> size_gen @-> pad_gen @-> end_gen
+           @-> judges outcome )
+           (fun (m : Model.t) id size pad end_stream r ->
+             let evs = events r in
+             let s = Model.find m id in
+             m.conn_window <- m.conn_window - (size + pad) ;
+             s.window <- s.window - (size + pad) ;
+             if end_stream then s.remote_ended <- true ;
+             let rest = others m evs in
+             match s.phase with
+             | Active ->
+                 equal texts
+                   [data_text ~end_stream id (String.make size 'x')]
+                   rest ;
+                 if not s.discarded then s.held <- s.held + size ;
+                 if end_stream then begin
+                   end_input s ;
+                   if s.local_ended then Model.close m s Ended
+                 end
+             | Reset_by_us | Ended ->
+                 cover "DATA on a stream that we reset" true ;
+                 (* The path of the H1 fix of PR 4: DATA in flight on an id that
+                    refused ids pushed out of the closed set. *)
+                 cover "DATA on an id that left the closed set"
+                   (not (List.mem id m.closed_set)) ;
+                 equal texts [] rest )
+           (fun c id size pad end_stream ->
+             on_frame c (data ~end_stream ~pad id (String.make size 'x')) )
+    ; (* 2: trailers on old reset ids. *)
+      weighted 2
+      @@ command "trailers"
+           (conn ^-> sendable ^-> judges outcome)
+           (fun (m : Model.t) id r ->
+             let rest =
+               match got r with
+               | Events (Error _ as e) ->
+                   show_result e
+               | _ ->
+                   others m (events r)
+             in
+             let s = Model.find m id in
+             s.remote_ended <- true ;
+             match s.phase with
+             | Active ->
+                 equal texts [block_text ~end_stream:true id Trailers] rest ;
+                 end_input s ;
+                 if s.local_ended then Model.close m s Ended
+             | (Reset_by_us | Ended) when List.mem id m.closed_set ->
+                 equal texts [block_text ~end_stream:true id Ignored] rest
+             | Reset_by_us | Ended ->
+                 (* The id left the closed set: HEADERS on it is a connection
+                    error (step 2 of the HEADERS order). *)
+                 cover "trailers on an id that left the closed set" true ;
+                 equal texts (error_text Protocol_error) rest ;
+                 m.dead <- true )
+           (fun c id -> on_frame c (headers ~end_stream:true id))
+    ; weighted 1
+      @@ command "reset"
+           (conn ^-> resettable ^-> judges outcome)
+           (fun (m : Model.t) id r ->
+             let rest = others m (events r) in
+             let s = Model.find m id in
+             s.client_reset <- true ;
+             match s.phase with
+             | Active ->
+                 equal texts [sprintf "peer reset %d" id] rest ;
+                 reset_event s ;
+                 Model.close m s Ended
+             | Reset_by_us | Ended ->
+                 equal texts [] rest )
+           (fun c id -> on_frame c (rst id))
+    ; weighted 1
+      @@ command "window update"
+           ~pre:(fun (m : Model.t) id increment ->
+             let s = Model.find m id in
+             s.phase <> Active || s.send + increment <= max_window )
+           (conn ^-> any_stream ^-> increment_gen @-> judges outcome)
+           (fun (m : Model.t) id increment r ->
+             let rest = others m (events r) in
+             let s = Model.find m id in
+             match s.phase with
+             | Active ->
+                 equal texts ["credit"] rest ;
+                 s.send <- s.send + increment
+             | Reset_by_us | Ended ->
+                 equal texts [] rest )
+           (fun c id increment -> on_frame c (window_update id increment))
+    ; weighted 1
+      @@ command "connection window update"
+           ~pre:(fun (m : Model.t) increment ->
+             Model.alive m && m.conn_send + increment <= max_window )
+           (conn ^-> increment_gen @-> judges outcome)
+           (fun (m : Model.t) increment r ->
+             equal texts ["credit"] (others m (events r)) ;
+             m.conn_send <- m.conn_send + increment )
+           (fun c increment -> on_frame c (window_update 0 increment))
+    ; (* 2: some send windows go negative. *)
+      weighted 2
+      @@ command "settings"
+           ~pre:(fun (m : Model.t) v ->
+             Model.alive m
+             && List.for_all
+                  (fun (s : Model.stream) ->
+                    s.phase <> Active
+                    || s.send + v - m.peer_initial <= max_window )
+                  m.streams )
+           (conn ^-> window_gen @-> judges outcome)
+           (fun (m : Model.t) v r ->
+             let delta = v - m.peer_initial in
+             equal texts
+               (if delta = 0 then [ack] else [ack; "credit"])
+               (others m (events r)) ;
+             m.peer_initial <- v ;
+             List.iter
+               (fun (s : Model.stream) -> s.send <- s.send + delta)
+               m.streams ;
+             cover "a negative send window"
+               (List.exists
+                  (fun (s : Model.stream) -> s.phase = Active && s.send < 0)
+                  m.streams ) )
+           (fun c v -> on_frame c (settings [(0x4, v)]))
+    ; weighted 1
+      @@ command "ping"
+           ~pre:(fun m _ -> Model.alive m)
+           (conn ^-> Gen.int_range 0 99_999_999 @-> judges outcome)
+           (fun (m : Model.t) n r ->
+             let data = sprintf "%08d" n in
+             equal texts
+               [show_event (Send (Frame.Ping {ack= true; data}))]
+               (others m (events r)) )
+           (fun c n ->
+             on_frame c (Frame.Ping {ack= false; data= sprintf "%08d" n}) )
+    ; (* 3: the handlers read, so that the credit reaches half. *)
+      weighted 3
+      @@ command "consume"
+           (conn ^-> holding ^-> consume_gen @-> judges outcome)
+           (fun (m : Model.t) id n r ->
+             let fs = frames r in
+             let s = Model.find m id in
+             s.held <- s.held - min n s.held ;
+             List.iter (apply_update m) fs )
+           (fun c id n -> Frames (Conn_state.consumed c.cs ~stream:id n))
+    ; (* 2: the server sends, so that the send windows go down. *)
+      weighted 2
+      @@ command "send"
+           ~pre:(fun (m : Model.t) id n ->
+             let s = Model.find m id in
+             n <= min m.conn_send s.send )
+           (conn ^-> responding ^-> send_gen @-> judges outcome)
+           (fun (m : Model.t) id n r ->
+             equal outcome Done (got r) ;
+             let s = Model.find m id in
+             m.conn_send <- m.conn_send - n ;
+             s.send <- s.send - n )
+           (fun c id n ->
+             Conn_state.sent c.cs ~stream:id n ;
+             Done )
+    ; weighted 1
+      @@ command "respond"
+           (conn ^-> responding ^-> judges outcome)
+           (fun (m : Model.t) id r ->
+             equal outcome Done (got r) ;
+             let s = Model.find m id in
+             s.local_ended <- true ;
+             if s.remote_ended then Model.close m s Ended )
+           (fun c id ->
+             Conn_state.end_local c.cs ~stream:id ;
+             Done )
+    ; (* 2: the fibers end, so that new streams can open. *)
+      weighted 2
+      @@ command "exit"
+           (conn ^-> living ^-> judges outcome)
+           (fun (m : Model.t) id r ->
+             match got r with
+             | Exit (reset, fs) ->
+                 let s = Model.find m id in
+                 equal (option frame)
+                   ( if s.phase = Active then
+                       Some (Frame.Rst_stream {stream= id; code= Error.No_error})
+                     else None )
+                   reset ;
+                 if s.phase = Active then Model.close m s Reset_by_us ;
+                 s.held <- 0 ;
+                 s.live <- false ;
+                 s.discarded <- true ;
+                 List.iter (apply_update m) fs
+             | o ->
+                 failf "not an exit: %a" pp_outcome o )
+           (fun c id ->
+             let reset =
+               Conn_state.reset_local c.cs ~stream:id Error.No_error
+             in
+             let fs = Conn_state.discard c.cs ~stream:id in
+             c.live <- c.live - 1 ;
+             Exit (reset, fs) )
+    ; (* The fiber sends its END_STREAM and ends. The stream can stay active,
+         with no reader, until the writer takes the RST_STREAM. *)
+      weighted 1
+      @@ command "end and exit"
+           (conn ^-> responding ^-> judges outcome)
+           (fun (m : Model.t) id r ->
+             let fs = frames r in
+             let s = Model.find m id in
+             s.local_ended <- true ;
+             if s.remote_ended then Model.close m s Ended
+             else begin
+               cover "an active stream after discard" true ;
+               s.rst_pending <- true
+             end ;
+             s.held <- 0 ;
+             s.live <- false ;
+             s.discarded <- true ;
+             List.iter (apply_update m) fs )
+           (fun c id ->
+             Conn_state.end_local c.cs ~stream:id ;
+             let fs = Conn_state.discard c.cs ~stream:id in
+             c.live <- c.live - 1 ;
+             Frames fs )
+    ; (* The writer takes the RST_STREAM NO_ERROR after our END_STREAM. *)
+      weighted 1
+      @@ command "writer resets"
+           (conn ^-> pending ^-> judges outcome)
+           (fun (m : Model.t) id r ->
+             let s = Model.find m id in
+             equal outcome
+               (Exit
+                  ( ( if s.phase = Active then
+                        Some
+                          (Frame.Rst_stream {stream= id; code= Error.No_error})
+                      else None )
+                  , [] ) )
+               (got r) ;
+             if s.phase = Active then Model.close m s Reset_by_us ;
+             s.rst_pending <- false )
+           (fun c id ->
+             Exit (Conn_state.reset_local c.cs ~stream:id Error.No_error, []) )
+    ]
+
+let conn_state_tests =
+  group "Conn_state"
+    ( conn_state_rows @ conn_state_flows
+    @ [ stateful ~count:300 ~steps:120 "behaves like the model of the client"
+          stateful_commands ] )
+
+let () =
+  exit (Windtrap.run "http2" [error_tests; frame_tests; conn_state_tests])
