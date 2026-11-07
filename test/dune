@@ -277,6 +277,13 @@
   weft.sim
   windtrap))
 
+; The suite of HPACK and its Huffman code (RFC 7541).
+
+(test
+ (name test_hpack)
+ (modules test_hpack)
+ (libraries caravan.http2 windtrap))
+
 ; The suite of caravan.html.
 
 (test
