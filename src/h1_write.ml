@@ -5,71 +5,18 @@ type framing =
   | Chunked
   | Close_delimited
 
-(* The Content-Length of the handler, if each of its values is the same number
-   of 1 to 18 digits. Else [None]. [Headers.tokens] drops the empty elements,
-   thus a value is never empty. *)
-let handler_length headers =
-  let valid s =
-    String.length s <= 18
-    && String.for_all (function '0' .. '9' -> true | _ -> false) s
-  in
-  match Headers.tokens "content-length" headers with
-  | n :: rest when valid n && List.for_all (String.equal n) rest ->
-      Some (int_of_string n)
-  | _ ->
-      None
-
 let framing ~meth ~version r =
-  match Response.kind r with
-  | Response.Upgrade _ ->
+  match Message_rules.content ~meth r with
+  | No_content ->
       No_body
-  | Response.Body body -> (
-      let code = Status.code (Response.status r) in
-      if code < 200 || code = 204 || code = 304 then No_body
-      else if Method.equal meth Method.CONNECT && code < 300 then
-        No_body
-        (* RFC 9110 §15.3.6: no content in a 205. RFC 9112 §6.3 would read a 205
-           without a framing field to the close. *)
-      else if code = 205 then Length_only 0
-      else if Method.equal meth Method.HEAD then
-        (* A body with no known length, for example the body of a HEAD response
-           of the client: the Content-Length of the handler, if it is valid. A
-           HEAD response has no body bytes, thus the field cannot change the
-           framing of the connection. *)
-        match Body.length body with
-        | Some n ->
-            Length_only n
-        | None -> (
-          match handler_length (Response.headers r) with
-          | Some n ->
-              Length_only n
-          | None ->
-              No_body )
-      else
-        match Body.length body with
-        | Some n ->
-            Length n
-        | None ->
-            if version = Version.Http_1_0 then Close_delimited else Chunked )
+  | Length_only n ->
+      Length_only n
+  | Length n ->
+      Length n
+  | Unknown_length ->
+      if version = Version.Http_1_0 then Close_delimited else Chunked
 
 let wants_close r = Headers.has_token "connection" "close" (Response.headers r)
-
-(* The fields that the writer drops from a 304. Three are representation
-   metadata that a 304 does not send (RFC 9110 §15.4.5): a cache updates its
-   stored fields from a 304 (RFC 9111 §4.3.4), and these change the stored
-   response. Content-Range has no meaning on a 304 (RFC 9110 §14.4). *)
-let not_on_304 =
-  ["content-type"; "content-encoding"; "content-language"; "content-range"]
-
-(* Fields that the connection owns: the handler's are dropped. *)
-let connection_fields =
-  [ "content-length"
-  ; "transfer-encoding"
-  ; "connection"
-  ; "keep-alive"
-  ; "proxy-connection"
-  ; "te"
-  ; "upgrade" ]
 
 let field w name value =
   Buf_writer.write_string w name ;
@@ -104,10 +51,10 @@ let head w ?date ~version ~keep_alive framing r =
   let dropped name =
     let name = String.lowercase_ascii name in
     let owned =
-      List.mem name connection_fields
+      Message_rules.is_connection_field name
       && not ((upgrade || advertises) && name = "upgrade")
     in
-    owned || (not_modified && List.mem name not_on_304)
+    owned || (not_modified && Message_rules.is_not_on_304 name)
   in
   Headers.iter (fun n v -> if not (dropped n) then field w n v) headers ;
   ( match framing with
@@ -191,7 +138,9 @@ let request_head w framing req =
   in
   let owned name =
     let name = String.lowercase_ascii name in
-    name = "host" || List.mem name connection_fields || List.mem name named
+    name = "host"
+    || Message_rules.is_connection_field name
+    || List.mem name named
   in
   Buf_writer.write_string w (Method.to_string (Request.meth req)) ;
   Buf_writer.write_char w ' ' ;

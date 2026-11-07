@@ -38,8 +38,6 @@ let version s =
   | _ ->
       fail H1_error.Version_not_supported
 
-let is_target_char c = c >= '\x21' && c <= '\x7e'
-
 let request_line limits r =
   let rec skip_empty n =
     match read_line r ~max:limits.max_request_line ~too_long:Uri_too_long with
@@ -56,7 +54,7 @@ let request_line limits r =
         try Method.of_string m
         with Invalid_argument _ -> bad "invalid method %S" m
       in
-      if target = "" || not (String.for_all is_target_char target) then
+      if target = "" || not (String.for_all Token.is_target_char target) then
         bad "invalid request target %S" target ;
       (meth, target, version v)
   | _ ->
