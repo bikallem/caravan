@@ -3269,7 +3269,7 @@ let source_tests =
             files "src" @ files "client" @ files "websocket" @ files "router"
             @ files "middleware" @ files "static" @ files "tls"
             @ files "session" @ files "auth" @ files "compress" @ files "jobs"
-            @ files "html" @ files "testing"
+            @ files "html" @ files "http2" @ files "testing"
           in
           List.iter
             (fun file ->

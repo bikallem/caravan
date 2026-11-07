@@ -117,6 +117,7 @@
                 ./auth
                 ./compress
                 ./html
+                ./http2
                 ./jobs
                 ./testing
                 ./LICENSE

@@ -1,0 +1,11 @@
+; HTTP/2 (RFC 9113, RFC 7541): a server engine for caravan. The frame codec,
+; HPACK, the messages, the connection state and the engine.
+
+(library
+ (name caravan_http2)
+ (public_name caravan.http2)
+ (libraries caravan weft weft.flow)
+ (instrumentation
+  (backend ppx_windtrap.mutate))
+ (instrumentation
+  (backend ppx_windtrap.coverage)))
