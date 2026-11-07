@@ -32,5 +32,6 @@ module Private = struct
   module H1_body = H1_body
   module H1_write = H1_write
   module H1_server = H1_server
+  module Message_rules = Message_rules
   module Accept_error = Accept_error
 end
