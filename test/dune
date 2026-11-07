@@ -265,12 +265,26 @@
 
 ; The suites of caravan.http2.
 
+; The helpers of these suites: the texts of the frames, and the fake client of
+; the engine tests.
+
+(library
+ (name h2_support)
+ (modules h2_support)
+ (libraries caravan.http2 windtrap))
+
+(library
+ (name fake_h2_client)
+ (modules fake_h2_client)
+ (libraries caravan caravan.http2 h2_support sim_support weft weft.flow))
+
 (test
  (name test_http2)
  (modules test_http2)
  (libraries
   caravan
   caravan.http2
+  h2_support
   sim_support
   weft
   weft.flow
@@ -290,3 +304,19 @@
  (name test_html)
  (modules test_html)
  (libraries caravan caravan.html caravan.testing windtrap))
+
+; The engine of caravan.http2 over TCP pairs of the simulator.
+
+(test
+ (name test_h2_engine)
+ (modules test_h2_engine)
+ (libraries
+  caravan
+  caravan.http2
+  h2_support
+  fake_h2_client
+  sim_support
+  weft
+  weft.flow
+  weft.sim
+  windtrap))
