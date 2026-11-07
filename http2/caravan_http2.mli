@@ -14,4 +14,5 @@ module Private : sig
   module Hpack = Hpack
   module Conn_state = Conn_state
   module Message = Message
+  module H2_server = H2_server
 end

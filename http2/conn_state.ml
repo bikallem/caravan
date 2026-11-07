@@ -608,3 +608,5 @@ let peer_max_frame_size t = t.peer_max_frame
 let active_streams t = t.active
 
 let known_streams t = Hashtbl.length t.streams
+
+let receive_window t = t.conn_recv + t.conn_recv_unsent

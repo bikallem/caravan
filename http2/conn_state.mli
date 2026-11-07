@@ -213,3 +213,8 @@ val known_streams : t -> int
 (** [known_streams t] is the count of the stream records: the active streams,
     and the closed streams that the engine did not discard. It goes back to 0
     when all streams ended and were discarded. For the tests. *)
+
+val receive_window : t -> int
+(** [receive_window t] is the connection receive window with its credit that no
+    WINDOW_UPDATE frame sent yet. With no held byte, it is the window of
+    {!create}. For the tests. *)
