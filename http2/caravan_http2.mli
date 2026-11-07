@@ -13,4 +13,5 @@ module Private : sig
   module Huffman = Huffman
   module Hpack = Hpack
   module Conn_state = Conn_state
+  module Message = Message
 end
