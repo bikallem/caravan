@@ -1,5 +1,5 @@
-(* The tests of caravan.http2: the error codes, the frames and the connection
-   state. *)
+(* The tests of caravan.http2: the error codes, the frames, the connection state
+   and the messages. *)
 
 open Windtrap
 open Weft
@@ -2501,5 +2501,526 @@ let conn_state_tests =
     @ [ stateful ~count:300 ~steps:120 "behaves like the model of the client"
           stateful_commands ] )
 
+(* {1 Messages} *)
+
+module Message = Caravan_http2.Private.Message
+module Request = Caravan.Request
+module Response = Caravan.Response
+module Headers = Caravan.Headers
+module Status = Caravan.Status
+module Method = Caravan.Method
+module Body = Caravan.Body
+
+let show_fields l =
+  String.concat "; " (List.map (fun (n, v) -> sprintf "%s: %S" n v) l)
+
+let show_head (h : Message.request_head) =
+  sprintf "%s %S authority=%s [%s] content_length=%s expect=%s"
+    (Method.to_string h.meth) h.path
+    (Option.value ~default:"none" h.authority)
+    (show_fields (Headers.to_list h.headers))
+    (Option.fold ~none:"none" ~some:string_of_int h.content_length)
+    ( match h.expect with
+    | `None ->
+        "none"
+    | `Continue ->
+        "continue"
+    | `Unknown ->
+        "unknown" )
+
+(* The request that the engine makes from [h] (plan section 16). *)
+let request_of_head (h : Message.request_head) =
+  Request.make ~version:Caravan.Version.Http_2 ~scheme:"https"
+    ?authority:h.authority ~headers:h.headers h.meth h.path
+
+let show_request fields =
+  match Message.request fields with
+  | Ok h ->
+      show_head h
+  | Error (Malformed reason) ->
+      "malformed: " ^ reason
+  | Error Misdirected ->
+      "misdirected"
+
+(* The outcomes of [cases], one line for each: the name, then the outcome. *)
+let lines show cases =
+  String.concat "\n" (List.map (fun (name, x) -> name ^ ": " ^ show x) cases)
+
+let get =
+  [ (":method", "GET")
+  ; (":scheme", "https")
+  ; (":authority", "a.example")
+  ; (":path", "/") ]
+
+(* [fields] with the value [v] for the pseudo-field [name], or without it if [v]
+   is [None]. *)
+let with_pseudo name v fields =
+  List.filter_map
+    (fun (n, old) ->
+      if n <> name then Some (n, old) else Option.map (fun v -> (n, v)) v )
+    fields
+
+let connect = [(":method", "CONNECT"); (":authority", "a.example:443")]
+
+let show_plan = function
+  | Message.Send (fields, body) ->
+      sprintf "send [%s] %s" (show_fields fields)
+        ( match body with
+        | No_body ->
+            "no body"
+        | Length n ->
+            sprintf "length %d" n
+        | Unknown_length ->
+            "unknown length" )
+  | Fail_500 reason ->
+      "500: " ^ reason
+
+let show_response ?(meth = Method.GET) ?date r =
+  show_plan (Message.response ~meth ~date r)
+
+let h = Headers.of_list
+
+(* The bytes of the generators: each byte 0 to 255, more often the visible ASCII
+   bytes, and more often the bytes that the rules look at. *)
+let byte_gen =
+  Gen.(
+    frequency
+      [ (1, char)
+      ; (3, char_range '!' '~')
+      ; ( 1
+        , of_list [' '; '\t'; '\x7f'; '\x00'; 'A'; 'a'; ':'; '/'; '@'; '*'; '5']
+        ) ] )
+
+let bytes_gen = Gen.(string_of ~size:(int_range 0 4) byte_gen)
+
+(* A value from [common], or bytes. *)
+let value_gen common = Gen.(frequency [(4, of_list common); (1, bytes_gen)])
+
+(* A regular field. The names that a rule refuses are less frequent. *)
+let regular_gen =
+  Gen.(
+    pair
+      (frequency
+         [ ( 6
+           , value_gen
+               ["host"; "cookie"; "content-length"; "expect"; "accept"; "x-a"]
+           )
+         ; (1, of_list ["te"; "connection"; "Accept"]) ] )
+      (value_gen ["a.example"; "5"; "trailers"; "100-continue"; "x=1"]) )
+
+(* A list of fields: the four pseudo-fields, each one at times absent, then the
+   regular fields. At times a pseudo-field more comes first or last. Thus each
+   rule of [request] can refuse a list, and many lists get to the end of the
+   rules. *)
+let fields_gen =
+  Gen.(
+    with_pp
+      (fun ppf l ->
+        List.iter (fun (n, v) -> Format.fprintf ppf "(%S, %S) " n v) l )
+      (let+ meth = option (value_gen ["GET"; "POST"; "CONNECT"; "OPTIONS"])
+       and+ scheme = option (value_gen ["http"; "https"])
+       and+ authority = option (value_gen ["a.example"; "a.example:80"])
+       and+ path =
+         option
+           (one_of
+              [ of_list ["/"; "*"; "/a?b"]
+              ; map (fun s -> "/" ^ s) bytes_gen
+              ; bytes_gen ] )
+       and+ regular = list ~size:(int_range 0 3) regular_gen
+       and+ extra =
+         frequency
+           [ (8, constant [])
+           ; ( 1
+             , map
+                 (fun f -> [f])
+                 (pair (of_list [":status"; ":x"; ":path"]) bytes_gen) ) ]
+       and+ extra_first = bool in
+       let pseudo =
+         List.filter_map
+           (fun (name, v) -> Option.map (fun v -> (name, v)) v)
+           [ (":method", meth)
+           ; (":scheme", scheme)
+           ; (":authority", authority)
+           ; (":path", path) ]
+       in
+       if extra_first then extra @ pseudo @ regular
+       else pseudo @ regular @ extra ) )
+
+let message_tests =
+  group "Message"
+    [ (* Test 1 of plan section 5: one row for each rule of Malformed. *)
+      test "the malformed requests" (fun () ->
+          expect
+            (lines show_request
+               [ ( "pseudo after regular"
+                 , [ (":method", "GET")
+                   ; (":scheme", "https")
+                   ; ("accept", "*/*")
+                   ; (":path", "/") ] )
+               ; ("unknown pseudo", (":foo", "x") :: get)
+               ; (":status", (":status", "200") :: get)
+               ; ("two :method", (":method", "GET") :: get)
+               ; ("two :scheme", (":scheme", "https") :: get)
+               ; ("two :authority", (":authority", "a.example") :: get)
+               ; ("two :path", (":path", "/") :: get)
+               ; ("uppercase name", get @ [("Accept", "*/*")])
+               ; ("name not a token", get @ [("a b", "x")])
+               ; ("empty name", get @ [("", "x")])
+               ; ("NUL in a value", get @ [("x", "a\x00b")])
+               ; ("SP at the start", get @ [("x", " a")])
+               ; ("HTAB at the end", get @ [("x", "a\t")])
+               ; ("invalid pseudo value", with_pseudo ":path" (Some "/\x00") get)
+               ; ("connection", get @ [("connection", "close")])
+               ; ("keep-alive", get @ [("keep-alive", "5")])
+               ; ("proxy-connection", get @ [("proxy-connection", "x")])
+               ; ("transfer-encoding", get @ [("transfer-encoding", "chunked")])
+               ; ("upgrade", get @ [("upgrade", "h2c")])
+               ; ("te gzip", get @ [("te", "trailers, gzip")])
+               ; ("no :method", with_pseudo ":method" None get)
+               ; ("no :scheme", with_pseudo ":scheme" None get)
+               ; ("no :path", with_pseudo ":path" None get)
+               ; ("empty :path", with_pseudo ":path" (Some "") get)
+               ; ("relative :path", with_pseudo ":path" (Some "a") get)
+               ; ("* for GET", with_pseudo ":path" (Some "*") get)
+               ; ("CONNECT with :scheme", connect @ [(":scheme", "https")])
+               ; ("CONNECT with :path", connect @ [(":path", "/")])
+               ; ("CONNECT, no :authority", [(":method", "CONNECT")])
+               ; ( "CONNECT, host only"
+                 , [(":method", "CONNECT"); ("host", "a.example")] )
+               ; ("userinfo", with_pseudo ":authority" (Some "u@a.example") get)
+               ; ("empty :authority", with_pseudo ":authority" (Some "") get)
+               ; ( "invalid host"
+                 , with_pseudo ":authority" None get @ [("host", "a/b")] )
+               ; ("host differs", get @ [("host", "b.example")])
+               ; ( "two hosts differ"
+                 , with_pseudo ":authority" None get
+                   @ [("host", "a.example"); ("host", "b.example")] )
+               ; ("content-length 1, 2", get @ [("content-length", "1, 2")])
+               ; ( "content-length 1 and 2"
+                 , get @ [("content-length", "1"); ("content-length", "2")] )
+               ; ("content-length x", get @ [("content-length", "x")])
+               ; ( "content-length 19 digits"
+                 , get @ [("content-length", String.make 19 '1')] )
+               ; ("content-length empty", get @ [("content-length", "")])
+               ; ("method not a token", with_pseudo ":method" (Some "G T") get)
+               ; ("SP in :path", with_pseudo ":path" (Some "/a b") get)
+               ; ("HTAB in :path", with_pseudo ":path" (Some "/a\tb") get)
+               ; ("DEL in :path", with_pseudo ":path" (Some "/a\x7f") get)
+               ; ( "byte 0xc3 in :path"
+                 , with_pseudo ":path" (Some "/\xc3\xa9") get )
+               ; ( "CONNECT, no port"
+                 , [(":method", "CONNECT"); (":authority", "a.example")] )
+               ; ( "CONNECT, empty port"
+                 , [(":method", "CONNECT"); (":authority", "a.example:")] )
+               ; ( "empty host, then a host"
+                 , with_pseudo ":authority" None get
+                   @ [("host", ""); ("host", "a.example")] )
+               ; ("empty host and :authority", get @ [("host", "")]) ] )
+          @@ __POS_OF__
+               {|
+            pseudo after regular: malformed: a pseudo-field ":path" after a regular field
+            unknown pseudo: malformed: an unknown pseudo-field ":foo"
+            :status: malformed: a :status field in a request
+            two :method: malformed: two :method fields
+            two :scheme: malformed: two :scheme fields
+            two :authority: malformed: two :authority fields
+            two :path: malformed: two :path fields
+            uppercase name: malformed: an uppercase field name "Accept"
+            name not a token: malformed: an invalid field name or value
+            empty name: malformed: an invalid field name or value
+            NUL in a value: malformed: an invalid field name or value
+            SP at the start: malformed: an invalid field name or value
+            HTAB at the end: malformed: an invalid field name or value
+            invalid pseudo value: malformed: an invalid value of ":path"
+            connection: malformed: a connection-specific field "connection"
+            keep-alive: malformed: a connection-specific field "keep-alive"
+            proxy-connection: malformed: a connection-specific field "proxy-connection"
+            transfer-encoding: malformed: a connection-specific field "transfer-encoding"
+            upgrade: malformed: a connection-specific field "upgrade"
+            te gzip: malformed: a te field other than trailers
+            no :method: malformed: no :method
+            no :scheme: malformed: no :scheme
+            no :path: malformed: no :path
+            empty :path: malformed: an empty :path
+            relative :path: malformed: a :path that does not start with /
+            * for GET: malformed: a :path that does not start with /
+            CONNECT with :scheme: malformed: a CONNECT with :scheme
+            CONNECT with :path: malformed: a CONNECT with :path
+            CONNECT, no :authority: malformed: a CONNECT with no :authority
+            CONNECT, host only: malformed: a CONNECT with no :authority
+            userinfo: malformed: an invalid authority
+            empty :authority: malformed: an invalid authority
+            invalid host: malformed: an invalid authority
+            host differs: malformed: a host field that is not the authority
+            two hosts differ: malformed: a host field that is not the authority
+            content-length 1, 2: malformed: an invalid content-length
+            content-length 1 and 2: malformed: an invalid content-length
+            content-length x: malformed: an invalid content-length
+            content-length 19 digits: malformed: an invalid content-length
+            content-length empty: malformed: an invalid content-length
+            method not a token: malformed: a :method that is not a token
+            SP in :path: malformed: a :path with a byte that is not visible ASCII
+            HTAB in :path: malformed: a :path with a byte that is not visible ASCII
+            DEL in :path: malformed: an invalid value of ":path"
+            byte 0xc3 in :path: malformed: a :path with a byte that is not visible ASCII
+            CONNECT, no port: malformed: a CONNECT :authority that is not host:port
+            CONNECT, empty port: malformed: a CONNECT :authority that is not host:port
+            empty host, then a host: malformed: a host field that is not the authority
+            empty host and :authority: malformed: a host field that is not the authority
+            |} )
+    ; (* Test 2. *)
+      test "valid requests" (fun () ->
+          let show fields =
+            match Message.request fields with
+            | Ok head ->
+                sprintf "%s; cookies [%s]" (show_head head)
+                  (show_fields (Request.cookies (request_of_head head)))
+            | Error _ ->
+                show_request fields
+          in
+          expect
+            (lines show
+               [ ("GET", get)
+               ; ("GET, host and :authority", get @ [("host", "A.example")])
+               ; ( "GET, host only"
+                 , with_pseudo ":authority" None get
+                   @ [("host", "a.example:80"); ("host", "a.example:80")] )
+               ; ("GET, no authority", with_pseudo ":authority" None get)
+               ; ("CONNECT", connect)
+               ; ( "OPTIONS *"
+                 , with_pseudo ":method" (Some "OPTIONS")
+                     (with_pseudo ":path" (Some "*") get) )
+               ; ( "two cookie fields"
+                 , get @ [("cookie", "a=1; b=2"); ("x", "y"); ("cookie", "c=3")]
+                 )
+               ; ( "empty cookie values"
+                 , get @ [("cookie", ""); ("cookie", "a=1"); ("cookie", "")] )
+               ; ("one cookie field", get @ [("cookie", "a=1")])
+               ; ( "POST with a length"
+                 , with_pseudo ":method" (Some "POST") get
+                   @ [("content-length", "5, 5"); ("te", "Trailers")] )
+               ; ("expect", get @ [("expect", "100-Continue")])
+               ; ("other expect", get @ [("expect", "x")])
+               ; ( "two expect"
+                 , get @ [("expect", "100-continue"); ("expect", "100-continue")]
+                 )
+               ; ( "expect list"
+                 , get @ [("expect", "100-continue, 100-continue")] )
+               ; ("expect list, other", get @ [("expect", "100-continue, x")])
+               ; ("empty expect", get @ [("expect", "")])
+               ; ( "empty host only"
+                 , with_pseudo ":authority" None get @ [("host", "")] )
+               ; ( "two empty hosts"
+                 , with_pseudo ":authority" None get
+                   @ [("host", ""); ("host", "")] )
+               ; ( "IPv6 authority"
+                 , with_pseudo ":authority" (Some "[::1]:8443") get )
+               ; ("extension method", with_pseudo ":method" (Some "PURGE") get)
+               ; ("value with inner SP", get @ [("x", "a b")]) ] )
+          @@ __POS_OF__
+               {|
+            GET: GET "/" authority=a.example [] content_length=none expect=none; cookies []
+            GET, host and :authority: GET "/" authority=a.example [host: "A.example"] content_length=none expect=none; cookies []
+            GET, host only: GET "/" authority=a.example:80 [host: "a.example:80"; host: "a.example:80"] content_length=none expect=none; cookies []
+            GET, no authority: GET "/" authority=none [] content_length=none expect=none; cookies []
+            CONNECT: CONNECT "" authority=a.example:443 [] content_length=none expect=none; cookies []
+            OPTIONS *: OPTIONS "*" authority=a.example [] content_length=none expect=none; cookies []
+            two cookie fields: GET "/" authority=a.example [cookie: "a=1; b=2; c=3"; x: "y"] content_length=none expect=none; cookies [a: "1"; b: "2"; c: "3"]
+            empty cookie values: GET "/" authority=a.example [cookie: "a=1"] content_length=none expect=none; cookies [a: "1"]
+            one cookie field: GET "/" authority=a.example [cookie: "a=1"] content_length=none expect=none; cookies [a: "1"]
+            POST with a length: POST "/" authority=a.example [content-length: "5, 5"; te: "Trailers"] content_length=5 expect=none; cookies []
+            expect: GET "/" authority=a.example [expect: "100-Continue"] content_length=none expect=continue; cookies []
+            other expect: GET "/" authority=a.example [expect: "x"] content_length=none expect=unknown; cookies []
+            two expect: GET "/" authority=a.example [expect: "100-continue"; expect: "100-continue"] content_length=none expect=continue; cookies []
+            expect list: GET "/" authority=a.example [expect: "100-continue, 100-continue"] content_length=none expect=continue; cookies []
+            expect list, other: GET "/" authority=a.example [expect: "100-continue, x"] content_length=none expect=unknown; cookies []
+            empty expect: GET "/" authority=a.example [expect: ""] content_length=none expect=none; cookies []
+            empty host only: GET "/" authority=none [host: ""] content_length=none expect=none; cookies []
+            two empty hosts: GET "/" authority=none [host: ""; host: ""] content_length=none expect=none; cookies []
+            IPv6 authority: GET "/" authority=[::1]:8443 [] content_length=none expect=none; cookies []
+            extension method: PURGE "/" authority=a.example [] content_length=none expect=none; cookies []
+            value with inner SP: GET "/" authority=a.example [x: "a b"] content_length=none expect=none; cookies []
+            |} )
+    ; (* Test 3. *)
+      test "the scheme of a request" (fun () ->
+          expect
+            (lines show_request
+               [ ("https", get)
+               ; ("http", with_pseudo ":scheme" (Some "http") get)
+               ; ("HTTPS", with_pseudo ":scheme" (Some "HTTPS") get)
+               ; ("foo", with_pseudo ":scheme" (Some "foo") get)
+               ; ( "foo and malformed"
+                 , with_pseudo ":scheme" (Some "foo") get @ [("connection", "x")]
+                 ) ] )
+          @@ __POS_OF__
+               {|
+            https: GET "/" authority=a.example [] content_length=none expect=none
+            http: GET "/" authority=a.example [] content_length=none expect=none
+            HTTPS: GET "/" authority=a.example [] content_length=none expect=none
+            foo: misdirected
+            foo and malformed: malformed: a connection-specific field "connection"
+            |} )
+    ; (* Test 4. *)
+      test "trailers" (fun () ->
+          let show fields =
+            match Message.trailers fields with
+            | Ok t ->
+                sprintf "[%s]" (show_fields (Headers.to_list t))
+            | Error reason ->
+                "error: " ^ reason
+          in
+          expect
+            (lines show
+               [ ("valid", [("x-checksum", "abc"); ("te", "trailers")])
+               ; ("empty", [])
+               ; ("pseudo-field", [(":path", "/")])
+               ; ("connection", [("connection", "close")])
+               ; ("uppercase name", [("X-Checksum", "abc")])
+               ; ("name not a token", [("a b", "x")])
+               ; ("invalid value", [("x", "a\nb")])
+               ; ("te gzip", [("te", "gzip")]) ] )
+          @@ __POS_OF__
+               {|
+            valid: [x-checksum: "abc"; te: "trailers"]
+            empty: []
+            pseudo-field: error: a pseudo-field ":path" in trailers
+            connection: error: a connection-specific field "connection"
+            uppercase name: error: an uppercase field name "X-Checksum"
+            name not a token: error: an invalid field name or value
+            invalid value: error: an invalid field name or value
+            te gzip: error: a te field other than trailers
+            |} )
+    ; (* Test 5. *)
+      test "responses" (fun () ->
+          let ok = Response.string "hello" in
+          let fields =
+            h
+              [ ("Connection", "X-Foo, keep-alive")
+              ; ("X-Foo", "1")
+              ; ("X-Bar", "2")
+              ; ("Keep-Alive", "5")
+              ; ("Transfer-Encoding", "chunked")
+              ; ("Upgrade", "h2c")
+              ; ("TE", "trailers")
+              ; ("Proxy-Connection", "x")
+              ; ("Content-Length", "99")
+              ; ("Set-Cookie", "a=1")
+              ; ("Set-Cookie", "b=2") ]
+          in
+          let unknown = Body.of_writer (fun _ -> ()) in
+          let content_fields =
+            h
+              [ ("Content-Type", "text/html")
+              ; ("Content-Encoding", "gzip")
+              ; ("Content-Language", "en")
+              ; ("Content-Range", "bytes 0-1/2")
+              ; ("ETag", "\"x\"") ]
+          in
+          expect
+            (lines
+               (fun f -> f ())
+               [ ("200", fun () -> show_response ok)
+               ; ("200, date", fun () -> show_response ~date:"D" ok)
+               ; ( "200, own date"
+                 , fun () ->
+                     show_response ~date:"D"
+                       (Response.string ~headers:(h [("Date", "E")]) "x") )
+               ; ( "Connection: date"
+                 , fun () ->
+                     show_response ~date:"D"
+                       (Response.string
+                          ~headers:(h [("Connection", "Date"); ("Date", "E")])
+                          "x" ) )
+               ; ( "unknown length"
+                 , fun () -> show_response (Response.make unknown) )
+               ; ("HEAD", fun () -> show_response ~meth:HEAD ok)
+               ; ( "HEAD, unknown length"
+                 , fun () ->
+                     show_response ~meth:HEAD
+                       (Response.make
+                          ~headers:(h [("Content-Length", "7")])
+                          unknown ) )
+               ; ("204", fun () -> show_response (Response.empty ()))
+               ; ( "304"
+                 , fun () ->
+                     show_response
+                       (Response.make ~status:(Status.v 304)
+                          ~headers:content_fields (Body.of_string "x") ) )
+               ; ( "200, content fields"
+                 , fun () ->
+                     show_response
+                       (Response.make ~headers:content_fields Body.empty) )
+               ; ( "205"
+                 , fun () ->
+                     show_response (Response.string ~status:(Status.v 205) "x")
+                 )
+               ; ("CONNECT 200", fun () -> show_response ~meth:CONNECT ok)
+               ; ( "CONNECT 404"
+                 , fun () ->
+                     show_response ~meth:CONNECT
+                       (Response.string ~status:(Status.v 404) "no") )
+               ; ("upgrade", fun () -> show_response (Response.upgrade ignore))
+               ; ( "CONNECT upgrade"
+                 , fun () ->
+                     show_response ~meth:CONNECT
+                       (Response.upgrade ~status:Status.ok ignore) )
+               ; ( "fields"
+                 , fun () ->
+                     show_response (Response.make ~headers:fields Body.empty) )
+               ; ( "no connection field"
+                 , fun () ->
+                     show_response
+                       (Response.make
+                          ~headers:(h [("Keep-Alive", "5"); ("X-A", "1")])
+                          Body.empty ) ) ] )
+          @@ __POS_OF__
+               {|
+            200: send [:status: "200"; content-type: "text/plain; charset=utf-8"; content-length: "5"] length 5
+            200, date: send [:status: "200"; date: "D"; content-type: "text/plain; charset=utf-8"; content-length: "5"] length 5
+            200, own date: send [:status: "200"; date: "E"; content-type: "text/plain; charset=utf-8"; content-length: "1"] length 1
+            Connection: date: send [:status: "200"; date: "D"; content-type: "text/plain; charset=utf-8"; content-length: "1"] length 1
+            unknown length: send [:status: "200"] unknown length
+            HEAD: send [:status: "200"; content-type: "text/plain; charset=utf-8"; content-length: "5"] no body
+            HEAD, unknown length: send [:status: "200"; content-length: "7"] no body
+            204: send [:status: "204"] no body
+            304: send [:status: "304"; etag: "\"x\""] no body
+            200, content fields: send [:status: "200"; content-type: "text/html"; content-encoding: "gzip"; content-language: "en"; content-range: "bytes 0-1/2"; etag: "\"x\""; content-length: "0"] length 0
+            205: send [:status: "205"; content-type: "text/plain; charset=utf-8"; content-length: "0"] no body
+            CONNECT 200: 500: a 2xx response to CONNECT: the HTTP/2 engine has no tunnels
+            CONNECT 404: send [:status: "404"; content-type: "text/plain; charset=utf-8"; content-length: "2"] length 2
+            upgrade: 500: an upgrade response: the HTTP/2 engine has no upgrades
+            CONNECT upgrade: 500: an upgrade response: the HTTP/2 engine has no upgrades
+            fields: send [:status: "200"; x-bar: "2"; set-cookie: "a=1"; set-cookie: "b=2"; content-length: "0"] length 0
+            no connection field: send [:status: "200"; x-a: "1"; content-length: "0"] length 0
+            |} )
+    ; test "interim responses" (fun () ->
+          equal
+            (list (pair string string))
+            [(":status", "100")]
+            (Message.interim 100) ;
+          equal
+            (list (pair string string))
+            [(":status", "199")]
+            (Message.interim 199) ;
+          List.iter
+            (fun code ->
+              raises
+                (Invalid_argument (sprintf "Message.interim: %d" code))
+                (fun () -> Message.interim code) )
+            [99; 101; 200] )
+    ; (* Test 6. *)
+      prop ~count:1000
+        "request never raises, and an accepted head makes a request" fields_gen
+        (fun fields ->
+          match Message.request fields with
+          | Ok head ->
+              ignore (request_of_head head) ;
+              (* The join of the cookie fields keeps the fields valid. *)
+              ignore (Headers.of_list (Headers.to_list head.headers))
+          | Error _ ->
+              () ) ]
+
 let () =
-  exit (Windtrap.run "http2" [error_tests; frame_tests; conn_state_tests])
+  exit
+    (Windtrap.run "http2"
+       [error_tests; frame_tests; conn_state_tests; message_tests] )
