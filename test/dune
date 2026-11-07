@@ -67,7 +67,8 @@
   (glob_files ../auth/*.ml)
   (glob_files ../compress/*.ml)
   (glob_files ../jobs/*.ml)
-  (glob_files ../html/*.ml)))
+  (glob_files ../html/*.ml)
+  (glob_files ../http2/*.ml)))
 
 ; The hosts of the numeric tests of Resolver, shared by test_client and
 ; test_numeric_unix.
@@ -259,6 +260,20 @@
   server_support
   sim_support
   weft
+  weft.sim
+  windtrap))
+
+; The suites of caravan.http2.
+
+(test
+ (name test_http2)
+ (modules test_http2)
+ (libraries
+  caravan
+  caravan.http2
+  sim_support
+  weft
+  weft.flow
   weft.sim
   windtrap))
 
