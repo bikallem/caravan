@@ -3,4 +3,5 @@ module Private = struct
   module Frame = Frame
   module Huffman = Huffman
   module Hpack = Hpack
+  module Conn_state = Conn_state
 end
