@@ -9,4 +9,5 @@
 (** Internal modules, exposed for tests. Not part of the public API. *)
 module Private : sig
   module Error = Error
+  module Frame = Frame
 end

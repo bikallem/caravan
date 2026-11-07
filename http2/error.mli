@@ -35,7 +35,7 @@ val pp_code : Format.formatter -> code -> unit
 (** [pp_code] prints a code with its RFC name, for example [PROTOCOL_ERROR], or
     [0x%x] for an unknown code. *)
 
-(** Raised by the HPACK decoder (RFC 7541): a decoding error, which is a
+(** The HPACK decoder (RFC 7541) raises it for a decoding error, which is a
     connection error of type [COMPRESSION_ERROR] (RFC 9113 section 4.3). The
     text tells the cause. *)
 exception Hpack of string
